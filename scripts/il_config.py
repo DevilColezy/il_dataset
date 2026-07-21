@@ -699,6 +699,86 @@ def _validate_config(cfg):
             errors.append(
                 "scenes[{}] obstacle_count range must satisfy 0 <= min <= max".format(i))
 
+    # ── Phase 4: ESDF cache validation ──────────────────────────
+    esdf_cache = g.get("esdf_cache", {})
+    if esdf_cache.get("enabled", True):
+        cache_root = esdf_cache.get("cache_root", "")
+        if not cache_root:
+            errors.append("esdf_cache.cache_root must not be empty")
+        g_cache = esdf_cache.get("global", {})
+        lock_to = g_cache.get("lock_timeout_s", 0)
+        if lock_to <= 0:
+            errors.append("esdf_cache.global.lock_timeout_s must be > 0")
+        bv = g_cache.get("builder_version", 0)
+        if not isinstance(bv, int) or bv <= 0:
+            errors.append("esdf_cache.global.builder_version must be a positive integer")
+        obs_cache = esdf_cache.get("observed", {})
+        if obs_cache.get("persist_across_episodes", False):
+            errors.append("observed ESDF cache must NOT persist across episodes")
+        max_rev = obs_cache.get("maximum_cached_revisions", 0)
+        if max_rev < 1:
+            errors.append("observed.maximum_cached_revisions must be >= 1")
+        occ_thresh = obs_cache.get("occupancy_change_threshold_voxels", 0)
+        if occ_thresh < 0:
+            errors.append("observed.occupancy_change_threshold_voxels must be >= 0")
+
+    # ── Phase 4: DAgger validation ───────────────────────────────
+    dagger_cfg = g.get("dagger", {})
+    if dagger_cfg.get("enabled", False):
+        mode = dagger_cfg.get("rollout_mode", "expert")
+        if mode not in ("expert", "dagger", "learner_debug"):
+            errors.append("dagger.rollout_mode must be expert, dagger, or learner_debug")
+        if mode != "expert":
+            policy = dagger_cfg.get("policy", {})
+            if policy.get("backend", "disabled") == "disabled":
+                errors.append("dagger.policy.backend must not be disabled when dagger is enabled")
+        beta_start = dagger_cfg.get("mixture", {}).get("beta_start", 1.0)
+        beta_end = dagger_cfg.get("mixture", {}).get("beta_end", 0.0)
+        if not (0.0 <= beta_start <= 1.0 and 0.0 <= beta_end <= 1.0):
+            errors.append("dagger beta values must be in [0, 1]")
+        decay = dagger_cfg.get("mixture", {}).get("beta_decay_rounds", 0)
+        if decay <= 0:
+            errors.append("dagger.mixture.beta_decay_rounds must be > 0")
+        mix_mode = dagger_cfg.get("mixture", {}).get("mode", "stochastic_switch")
+        if mix_mode not in ("stochastic_switch",):
+            errors.append("dagger.mixture.mode only supports stochastic_switch")
+        inf_to = dagger_cfg.get("policy", {}).get("inference_timeout_ms", 0)
+        if inf_to <= 0:
+            errors.append("dagger.policy.inference_timeout_ms must be > 0")
+        ttc = dagger_cfg.get("safety", {}).get("minimum_ttc_s", -1)
+        if ttc < 0:
+            errors.append("dagger.safety.minimum_ttc_s must be >= 0")
+        obs_cl = dagger_cfg.get("safety", {}).get("minimum_observed_clearance_m", -1)
+        if obs_cl < 0:
+            errors.append("dagger.safety.minimum_observed_clearance_m must be >= 0")
+        rid = dagger_cfg.get("round_id", -1)
+        if rid < 0:
+            errors.append("dagger.round_id must be non-negative")
+
+    # ── Phase 4: Dynamics validation ─────────────────────────────
+    dyn_cfg = g.get("dynamics", {})
+    if dyn_cfg:
+        backend = dyn_cfg.get("backend", "flightmare")
+        if backend not in ("flightmare", "legacy_kinematic"):
+            errors.append("dynamics.backend must be flightmare or legacy_kinematic")
+        if backend != "flightmare":
+            errors.append("dynamics.backend should be flightmare for production data")
+        sim_hz = dyn_cfg.get("simulation_hz", 0)
+        ctrl_hz_dyn = dyn_cfg.get("control_hz", 0)
+        render_hz = dyn_cfg.get("render_hz", 0)
+        if sim_hz <= 0 or ctrl_hz_dyn <= 0 or render_hz <= 0:
+            errors.append("dynamics frequencies must be > 0")
+        if sim_hz < ctrl_hz_dyn:
+            errors.append("dynamics.simulation_hz ({}) < control_hz ({})".format(sim_hz, ctrl_hz_dyn))
+        if ctrl_hz_dyn < render_hz:
+            errors.append("dynamics.control_hz ({}) < render_hz ({})".format(ctrl_hz_dyn, render_hz))
+        tilt = dyn_cfg.get("velocity_controller", {}).get("maximum_tilt_deg", 0)
+        if not (0 < tilt <= 90):
+            errors.append("maximum_tilt_deg must be in (0, 90]")
+        settle = dyn_cfg.get("reset", {}).get("settle_time_s", -1)
+        if settle < 0:
+            errors.append("dynamics.reset.settle_time_s must be >= 0")
+
     if errors:
         msg = "Config validation failed with {} error(s):\n  • ".format(len(errors))
         msg += "\n  • ".join(errors)

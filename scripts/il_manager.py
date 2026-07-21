@@ -102,6 +102,30 @@ except ImportError:
     _SCENARIO_AVAILABLE = False
     CylinderObstacleSpec = None  # fallback
 
+# Phase 4: ESDF cache, DAgger, dynamics
+try:
+    from il_esdf_cache import GlobalESDFCache, ObservedESDFCache
+    _ESDF_CACHE_AVAILABLE = True
+except ImportError:
+    _ESDF_CACHE_AVAILABLE = False
+    GlobalESDFCache = None; ObservedESDFCache = None
+
+try:
+    from il_dagger import PolicyProvider, DaggerController, PolicyOutput
+    _DAGGER_AVAILABLE = True
+except ImportError:
+    _DAGGER_AVAILABLE = False
+    PolicyProvider = None; DaggerController = None; PolicyOutput = None
+
+try:
+    from il_dynamics import (
+        create_dynamics_backend, DynamicsState, DynamicsBackend,
+        FlightmareDynamicsBackend, LegacyKinematicBackend)
+    _DYNAMICS_AVAILABLE = True
+except ImportError:
+    _DYNAMICS_AVAILABLE = False
+    create_dynamics_backend = None; DynamicsState = None
+
 from il_config import load_config
 
 # Import il_trajectory from THIS package (avoid shadowing by flightmare_dataset_tools)
@@ -412,6 +436,37 @@ class ILManager:
         elif self._use_scene_gen:
             rospy.logwarn("[Manager] Phase 3 modules not available.")
             self._use_scene_gen = False
+
+        # ── Phase 4: ESDF cache, DAgger, dynamics ────────────────────
+        self._global_esdf_cache = None
+        self._observed_esdf_cache = None
+        if _ESDF_CACHE_AVAILABLE and self.g.get("esdf_cache", {}).get("enabled", True):
+            self._global_esdf_cache = GlobalESDFCache(config)
+            self._observed_esdf_cache = ObservedESDFCache(config)
+            rospy.loginfo("[Manager] Phase 4: ESDF caching enabled.")
+
+        self._dagger_ctrl = None
+        self._policy_provider = None
+        dagger_cfg = self.g.get("dagger", {})
+        if dagger_cfg.get("enabled", False) and _DAGGER_AVAILABLE:
+            self._policy_provider = PolicyProvider(config)
+            self._dagger_ctrl = DaggerController(config)
+            rospy.loginfo("[Manager] Phase 4: DAgger enabled (round %d, beta=%.2f).",
+                          self._dagger_ctrl.round_id, self._dagger_ctrl.current_beta)
+
+        self._dynamics = None
+        dyn_cfg = self.g.get("dynamics", {})
+        if _DYNAMICS_AVAILABLE:
+            try:
+                self._dynamics = create_dynamics_backend(config)
+                rospy.loginfo("[Manager] Phase 4: Dynamics backend = %s.",
+                              self._dynamics.backend_name)
+            except RuntimeError as e:
+                rospy.logerr("[Manager] Dynamics init failed: %s", e)
+                rospy.logerr("[Manager] Set dynamics.backend=legacy_kinematic for debug only.")
+        elif dyn_cfg.get("backend", "flightmare") != "legacy_kinematic":
+            rospy.logwarn("[Manager] Phase 4 dynamics module not available; "
+                          "using kinematic integration (debug only).")
 
         # Scene/task tracking
         self._current_scene_obstacles = []  # list of CylinderObstacleSpec

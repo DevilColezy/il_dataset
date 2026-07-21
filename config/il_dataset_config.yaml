@@ -213,6 +213,121 @@ global:
       maximum_invalid_frames_before_reject: 5
       reject_episode_on_inconsistent_side_choice: true
 
+  # ── Phase 4: ESDF Cache ────────────────────────────────────────────
+  esdf_cache:
+    enabled: true
+
+    cache_root: "cache/esdf"
+
+    global:
+      enabled: true
+      format: "npz"
+      compression: true
+      memory_map: false
+
+      validate_hash: true
+      validate_metadata: true
+      rebuild_on_mismatch: true
+
+      atomic_write: true
+      lock_timeout_s: 120.0
+
+      builder_version: 1
+
+    observed:
+      enabled: true
+
+      persist_across_episodes: false
+      rebuild_only_on_map_change: true
+      upload_only_on_revision_change: true
+
+      occupancy_change_threshold_voxels: 1
+      maximum_cached_revisions: 2
+
+  # ── Phase 4: DAgger ────────────────────────────────────────────────
+  dagger:
+    enabled: false
+
+    round_id: 0
+    rollout_mode: "expert"
+
+    seed: 12345
+
+    policy:
+      backend: "disabled"
+      model_path: ""
+      device: "cpu"
+
+      python_module: ""
+      python_class: ""
+
+      onnx_input_names: {}
+      onnx_output_names: {}
+
+      recurrent: true
+      inference_timeout_ms: 30.0
+
+    mixture:
+      mode: "stochastic_switch"
+
+      beta_schedule: "linear"
+      beta_start: 1.0
+      beta_end: 0.0
+      beta_decay_rounds: 5
+
+      sample_scope: "frame"
+
+    safety:
+      enabled: true
+
+      override_on_invalid_policy_output: true
+      override_on_policy_timeout: true
+      override_on_observed_collision_risk: true
+      override_on_expert_failure: false
+
+      minimum_observed_clearance_m: 0.35
+      minimum_ttc_s: 0.60
+
+      fallback_command: "hover"
+
+    aggregation:
+      output_root: "dataset/dagger"
+      append_manifest_atomically: true
+      preserve_original_episode_id: true
+
+  # ── Phase 4: Dynamics ──────────────────────────────────────────────
+  dynamics:
+    backend: "flightmare"
+
+    control_mode: "velocity_yaw_rate"
+
+    simulation_hz: 200.0
+    control_hz: 50.0
+    render_hz: 20.0
+
+    deterministic_time: true
+
+    allow_legacy_kinematic_backend: true
+    legacy_backend_explicit_only: true
+
+    velocity_controller:
+      use_existing_flightmare_controller: true
+
+      kp_velocity: [3.0, 3.0, 3.0]
+      ki_velocity: [0.0, 0.0, 0.0]
+      kd_velocity: [0.2, 0.2, 0.2]
+
+      maximum_acceleration_mps2: [4.0, 4.0, 2.0]
+      maximum_tilt_deg: 35.0
+      maximum_yaw_rate_rps: 1.5
+
+      integrator_limit: [1.0, 1.0, 0.5]
+
+    reset:
+      settle_time_s: 0.30
+      initial_velocity_noise_std_mps: [0.0, 0.0, 0.0]
+      initial_angular_velocity_noise_std_rps: [0.0, 0.0, 0.0]
+
   # ── Start / goal random generation ───────────────────────────────────
   start_goal:
     num_pairs_per_config: 3            # fewer pairs for quick test
@@ -354,7 +469,7 @@ global:
   # ── Data format ──────────────────────────────────────────────────────
   data:
     coordinate_frame: "CAMERA_FLU"
-    schema_version: 9
+    schema_version: 10
     collection_mode: "deterministic_lockstep"
     label_lookahead_time_s: 0.08
     trend_horizontal_bins: 11
