@@ -1,0 +1,55 @@
+<?xml version="1.0"?>
+<!-- ===================================================================
+  Imitation-Learning Dataset Collection  v5  —  State-Machine Manager
+
+  Launches the IL manager node which runs a formal FSM:
+    BOOT → WAIT_UNITY → GEN_OBSTACLES → WAIT_SCENE → EXPORT_PC →
+    WAIT_PC → BUILD_ESDF → GEN_PAIRS → PLAN_GLOBAL_PATHS →
+    VALIDATE_GLOBAL_PATHS → RESET_DRONE → WAIT_STABLE →
+    INIT_LOCAL_PLANNER → START_RECORDING → ONLINE_PLAN_AND_RECORD →
+    STOP_RECORDING → VALIDATE_AND_COMMIT → NEXT_TRAJ / NEXT_CONFIG
+
+  Key v5 changes:
+    - Global A* serves as reference path only (no full-trajectory smoothing)
+    - C++ receding-horizon local planner with pybind11 bindings
+    - Online re-planning with execute-prefix model
+    - Extended data.csv columns for planner metadata
+    - global_path.csv and local_plans.csv sidecar files
+    - Schema version 5
+
+  AvoidBench / Unity must be started manually BEFORE launching:
+    cd ~/flightmare_ws/RPG_Flightmare/AvoidBench_x
+    ./AvoidBench.x86_64 -input-port 10253 -output-port 10254
+
+  ── USAGE ──────────────────────────────────────────────────────
+    roslaunch il_dataset il_dataset_collect.launch
+
+    # Custom config:
+    roslaunch il_dataset il_dataset_collect.launch \
+      config_file:=/path/to/my_config.yaml
+
+    # Dry-run:
+    roslaunch il_dataset il_dataset_collect.launch dry_run:=true
+
+    # Debug visualizations:
+    roslaunch il_dataset il_dataset_collect.launch debug:=true
+  ==================================================================== -->
+<launch>
+  <param name="use_sim_time" value="false"/>
+
+  <arg name="config_file"
+       default="$(find il_dataset)/config/il_dataset_config.yaml"/>
+  <arg name="dry_run" default="false"/>
+  <arg name="debug"   default="false" doc="Enable 2-D ESDF debug PNGs."/>
+
+  <!-- ════════════════════════════════════════════════════════════
+       IL Manager Node  (the ONLY node needed)
+       ════════════════════════════════════════════════════════════ -->
+  <node pkg="il_dataset" type="il_manager.py"
+        name="il_dataset_manager" output="screen" required="true">
+    <param name="config_file" value="$(arg config_file)"/>
+    <param name="dry_run" value="$(arg dry_run)"/>
+    <param name="debug"    value="$(arg debug)"/>
+  </node>
+
+</launch>

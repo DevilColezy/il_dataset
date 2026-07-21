@@ -1,0 +1,276 @@
+# ============================================================================
+#  Imitation Learning Dataset Collection — Configuration  v5
+# ============================================================================
+#  Obstacle regimes:
+#    small_only           – radius 0.15 – 1.0 m   (diameter 0.3 – 2.0 m)
+#    small_medium         – radius 0.15 – 2.5 m   (diameter 0.3 – 5.0 m)
+#    large_medium_small   – radius 0.15 – 4.0 m   (diameter 0.3 – 8.0 m)
+#
+#  Workflow  (state machine):
+#    BOOT → WAIT_UNITY → GEN_OBSTACLES → WAIT_SCENE → EXPORT_PC →
+#    WAIT_PC → BUILD_ESDF → GEN_PAIRS → PLAN_GLOBAL_PATHS →
+#    VALIDATE_GLOBAL_PATHS → RESET_DRONE → WAIT_STABLE →
+#    INIT_LOCAL_PLANNER → START_RECORDING → ONLINE_PLAN_AND_RECORD →
+#    STOP_RECORDING → VALIDATE_AND_COMMIT → NEXT_TRAJ / NEXT_CONFIG
+#
+#  Schema version: 5
+#    - v1: il_pipeline.py     (global.flight, global.connect_timeout, scene.trajectories)
+#    - v2: il_manager.py      (global.fsm, global.control, global.start_goal)
+#    - v3: il_manager.py v3   (sync diagnostics, atomic commit, validated config)
+#    - v4: added vel_source, body_frame_convention metadata
+#    - v5: receding-horizon local planner, C++ pybind11 backend, global A* only
+# ============================================================================
+
+# ── Global settings ──────────────────────────────────────────────────────────
+global:
+  scene_id: 1
+  pub_port: "10253"
+  sub_port: "10254"
+  output_dir: ""
+
+  # ── FSM timeouts (seconds) ───────────────────────────────────────────
+  fsm:
+    connect_timeout:       60.0
+    scene_settle_timeout:  10.0
+    pc_export_timeout:    600.0
+    esdf_build_timeout:    60.0
+    drone_stable_timeout:  10.0
+    trajectory_timeout:   120.0           # max seconds per trajectory flight
+    keep_alive_period:      3.0
+
+  # ── Depth camera ─────────────────────────────────────────────────────
+  depth:
+    width:  640
+    height: 480
+    fov:    90.0
+    max_m:   5.0
+    near:    0.01
+    far:  1000.0
+
+  # ── Point-cloud & ESDF ───────────────────────────────────────────────
+  pointcloud:
+    range:      [30.0, 50.0, 8.0]
+    origin:     [0.0, 20.0, 3.5]
+    # A 0.40 m-wide vehicle spans four samples at 0.10 m.  Keep point-cloud
+    # and ESDF resolution equal so voxelisation cannot create surface holes.
+    resolution: 0.10
+  esdf:
+    resolution:    0.10
+    drone_radius:  0.20              # 0.40 m physical vehicle width
+
+  # ── Control & recording (async: high-freq control, lower-freq save) ──
+  control:
+    # Keep command and capture clocks aligned.  At 640x480 the Unity depth
+    # pipeline did not consume 50 Hz reliably, which caused queued poses to be
+    # discarded and produced mixed 20/40/60/80 ms frame intervals.
+    control_hz: 50.0
+    record_hz:  25.0
+    settle_time: 3.0
+
+  # ── Obstacle generation shared defaults ──────────────────────────────
+  obstacle:
+    area_x:  [-9.0, 11.0]
+    area_y:  [0.0, 30.0]
+    height:   8.0
+    # SmartObstacleSampler produces an obstacle surface gap of:
+    # min_gap + 2*drone_radius + safety_margin = 0.80 m.  A 0.40 m vehicle
+    # therefore has 0.40 m total spare width in every generated pairwise gap.
+    min_gap:        0.20
+    drone_radius:   0.20
+    safety_margin:  0.20
+    border_margin:  0.20               # avoids creating an oversized perimeter corridor
+    candidate_attempts: 60
+    shrink_on_fail:  true
+    shrink_factor:    0.85
+    size_interval:    0.5
+    scale_weights: [0.72, 0.23, 0.05]   # small / medium / large; large is rare
+    avoid_x:      0.0
+    avoid_y:      0.0
+    avoid_radius: 0.0
+    ground_z:     0.0
+
+  # ── Start / goal random generation ───────────────────────────────────
+  start_goal:
+    num_pairs_per_config: 3            # fewer pairs for quick test
+    candidate_pair_multiplier: 2       # replace failed A* candidates when possible
+    start_zone:
+      x: [-8.0, 8.0]
+      y: [-2.0, -1.0]
+      z_min: 2.0
+      z_max: 4.0
+    goal_zone:
+      x: [-8.0, 8.0]
+      y: [31.0, 32.0]
+      z_min: 2.0
+      z_max: 4.0
+    min_start_goal_distance: 15.0
+    max_attempts: 200
+    min_esdf_clearance_at_endpoints: 0.20
+
+  # ── Trajectory planning & dynamics constraints ───────────────────────
+  planning:
+    # ═══════════════════════════════════════════════════════════════════
+    #  Global path planner (A* on ESDF) — ONE call per start→goal pair
+    # ═══════════════════════════════════════════════════════════════════
+    global_planner:
+      coarse_factor: 1                 # full resolution; min-pooling can close narrow corridors
+      epsilon: 1.10                    # <=10% weighted-A* bound; avoids 800k-node failures
+      max_iterations_coarse: 300000
+      max_iterations_full: 800000       # 0.10 m grid has ~3.4x the 0.15 m voxel count
+      max_planning_time_coarse_s: 8.0  # wall-clock guard for downsampled search
+      max_planning_time_full_s: 45.0   # bounded guard sized for the 0.10 m grid
+      cost_weight: 0.0                 # geometric shortest feasible path, no perimeter bias
+      clearance_target: 0.25           # preserve tracking reserve around the global guide
+      min_clearance: 0.15              # 0.20 m body radius + 0.15 m hard surface margin
+      shortcut_enabled: true
+      shortcut_check_spacing: 0.05
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Local receding-horizon planner (C++ pybind11 backend)
+    # ═══════════════════════════════════════════════════════════════════
+    local_planner:
+      backend: "cpp_pybind"
+      # auto uses NLopt/L-BFGS when libnlopt-cxx-dev is available at build
+      # time, otherwise the time-bounded native optimizer is used.
+      optimizer: "auto"
+
+      planner_hz: 30.0
+      horizon_time: 2.5
+      execute_prefix_time: 0.60          # legacy field; position prefixes are no longer replayed
+      velocity_command_lookahead_time: 0.08  # shorter preview reduces corner cutting
+      velocity_tracking_gain: 2.0        # [1/s] feedback toward the collision-checked local path
+      max_plan_age: 0.75                 # measured from request state, never completion time
+      planning_time_budget_ms: 40.0
+
+      lookahead_distance: 4.0
+      min_lookahead_distance: 2.0
+      max_lookahead_distance: 6.0
+      lookahead_velocity_gain: 0.6
+      curvature_lookahead_gain: 1.0
+      local_map_radius: 6.0              # fixed-radius ESDF query/optimization window
+      max_reference_points: 32           # fixed upper bound for local guide complexity
+
+      control_points: 12
+      max_iterations: 200
+      convergence_tolerance: 1.0e-4
+      initial_step_size: 0.1
+      minimum_step_size: 1.0e-4
+      max_cost_samples_per_segment: 64   # bounds every objective evaluation
+
+      min_clearance: 0.15
+      target_clearance: 0.25
+      collision_check_spacing: 0.05
+
+      weight_smooth: 1.0
+      weight_jerk: 0.2
+      weight_guide: 0.8
+      weight_obstacle: 4.0
+      weight_goal: 2.0
+      weight_dynamics: 1.0
+
+      nominal_speed: 1.8
+      max_velocity: 2.5
+      max_acceleration: 3.5
+      max_jerk: 15.0
+      max_yaw_rate: 2.0
+
+      goal_tolerance: 0.30
+      goal_speed_tolerance: 0.20
+      goal_hold_ticks: 3
+
+      max_consecutive_failures: 6
+      failure_grace_time: 1.0            # effective limit also scales with planner_hz
+      reduce_lookahead_on_failure: true
+      emergency_hold_enabled: true
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Validation thresholds for committed data
+    # ═══════════════════════════════════════════════════════════════════
+    validation:
+      require_zero_collision: true
+      require_zero_clearance_violations: true
+      minimum_rows: 10
+      maximum_none_depth_ratio: 0.20
+
+    # ── DEPRECATED (kept for backward compat; NOT used by new pipeline) ──
+    # esdf_optimize, pos_smooth_window, resample_spacing, time_param,
+    # control_lookahead, control_yaw_smooth — these have been superseded
+    # by the local planner.  They remain in the file only so old config
+    # loaders do not crash; il_config.py will emit deprecation warnings.
+    esdf_optimize:
+      enabled: false
+      smooth_iterations: 250
+      smooth_step: 0.35
+      push_iterations: 25
+      push_step: 0.02
+      min_clearance: 0.10
+      target_clearance: 0.20
+      final_smooth_iterations: 80
+
+    time_param:
+      nominal_speed: 1.8
+      max_velocity: 2.5
+      max_acceleration: 3.5
+      max_jerk: 15.0
+      max_yaw_rate: 2.0
+      min_obstacle_clearance: 0.10
+      curvature_slowdown: true
+      curvature_gain: 1.2
+
+    resample_spacing: 0.10
+    pos_smooth_window: 10
+    control_lookahead: 8
+    control_yaw_smooth: 0.92
+
+  # ── Data format ──────────────────────────────────────────────────────
+  data:
+    coordinate_frame: "ROS_WORLD"
+    schema_version: 5
+    # NOTE: The following keys are declared but NOT currently consumed by
+    # the pipeline.  They are reserved for future use:
+    save_obstacle_ply:  true          # (future) per-trajectory PLY export
+    save_trajectory_meta: true        # (always saved; this flag is ignored)
+
+  # ── Sync & commit thresholds ─────────────────────────────────────────
+  sync:
+    max_acceptable_sync_error_ms: 100.0   # reject trajectory if any frame exceeds this
+    max_acceptable_latency_ms:    250.0   # render RTT; frame_id exact matches remain synchronized
+    max_latency_violation_pct:      1.0   # reject sustained latency, not one isolated spike
+    catastrophic_latency_ms:     5000.0   # always reject a multi-second render backlog
+    max_inflight_frames:              4   # bounded pose/render pipeline, prevents unbounded Unity backlog
+    unity_response_timeout_s:       2.0   # abort/reject trajectory if pending frames receive no valid reply
+    max_unmatched_pct:              1.0   # tolerate a few startup/reset replies
+    max_none_depth_pct:             20.0  # max % of frames with missing depth
+
+  commit:
+    strict_collision_policy: true          # reject trajectory on ANY collision
+    atomic_rename:           true          # use .inprogress → rename commit
+
+# ── Scene definitions ────────────────────────────────────────────────────────
+scenes:
+  # ── 1. Small only – very sparse ──────────────────────────────────────────
+  - name: "small_only"
+    target_occupancy: 0.03               # challenging but leaves repeatable local corridors
+    radius_min: 0.15
+    radius_max: 1.0
+    obstacle_count_min: 8
+    obstacle_count_max: 14
+    seeds: [100]
+
+  # ── 2. Small + Medium – moderate ─────────────────────────────────────────
+  - name: "small_medium"
+    target_occupancy: 0.04               # avoid the previous 36-obstacle overload
+    radius_min: 0.15
+    radius_max: 2.5
+    obstacle_count_min: 10
+    obstacle_count_max: 18
+    seeds: [400]
+
+  # ── 3. Full range – slightly denser ──────────────────────────────────────
+  - name: "large_medium_small"
+    target_occupancy: 0.05               # dense evaluation scene without saturating A*
+    radius_min: 0.15
+    radius_max: 4.0
+    obstacle_count_min: 12
+    obstacle_count_max: 20
+    seeds: [700]
