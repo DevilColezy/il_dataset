@@ -34,6 +34,7 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .value("DYNAMICS_VIOLATION", PlannerStatus::DYNAMICS_VIOLATION)
         .value("OUTSIDE_MAP", PlannerStatus::OUTSIDE_MAP)
         .value("EMERGENCY_HOLD", PlannerStatus::EMERGENCY_HOLD)
+        .value("UNKNOWN_SPACE", PlannerStatus::UNKNOWN_SPACE)
         .export_values();
 
     // ── Data structures ──────────────────────────────────────────
@@ -45,6 +46,27 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("acceleration", &VehicleState::acceleration)
         .def_readwrite("yaw", &VehicleState::yaw)
         .def_readwrite("yaw_rate", &VehicleState::yaw_rate);
+
+    py::class_<LocalPlanningRequest>(m, "LocalPlanningRequest",
+        "Phase 2: explicit planning request with guide/terminal separation.")
+        .def(py::init<>())
+        .def_readwrite("state", &LocalPlanningRequest::state)
+        .def_readwrite("previous_progress_s",
+                       &LocalPlanningRequest::previous_progress_s)
+        .def_readwrite("guide_waypoint",
+                       &LocalPlanningRequest::guide_waypoint)
+        .def_readwrite("guide_waypoint_index",
+                       &LocalPlanningRequest::guide_waypoint_index)
+        .def_readwrite("trajectory_terminal",
+                       &LocalPlanningRequest::trajectory_terminal)
+        .def_readwrite("trajectory_terminal_index",
+                       &LocalPlanningRequest::trajectory_terminal_index)
+        .def_readwrite("reference_path_segment",
+                       &LocalPlanningRequest::reference_path_segment)
+        .def_readwrite("forbid_unknown_space",
+                       &LocalPlanningRequest::forbid_unknown_space)
+        .def_readwrite("allow_global_map_fallback",
+                       &LocalPlanningRequest::allow_global_map_fallback);
 
     py::class_<TrajectoryPoint>(m, "TrajectoryPoint",
         "Single point on a dense time-sampled trajectory.")
@@ -70,7 +92,19 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("progress_index", &LocalPlanResult::progress_index)
         .def_readwrite("local_goal_index", &LocalPlanResult::local_goal_index)
         .def_readwrite("local_goal", &LocalPlanResult::local_goal)
-        .def_readwrite("plan_id", &LocalPlanResult::plan_id);
+        .def_readwrite("plan_id", &LocalPlanResult::plan_id)
+        // Phase 2 fields
+        .def_readwrite("guide_waypoint", &LocalPlanResult::guide_waypoint)
+        .def_readwrite("guide_waypoint_index",
+                       &LocalPlanResult::guide_waypoint_index)
+        .def_readwrite("trajectory_terminal",
+                       &LocalPlanResult::trajectory_terminal)
+        .def_readwrite("trajectory_terminal_index",
+                       &LocalPlanResult::trajectory_terminal_index)
+        .def_readwrite("used_global_fallback",
+                       &LocalPlanResult::used_global_fallback)
+        .def_readwrite("used_observed_esdf",
+                       &LocalPlanResult::used_observed_esdf);
 
     py::class_<ValidationResult>(m, "ValidationResult",
         "Result of trajectory collision/clearance validation.")
@@ -175,6 +209,46 @@ PYBIND11_MODULE(_il_local_planner, m) {
              "esdf_data: float32 numpy array [gx, gy, gz]. "
              "ESDF values should already have drone_radius subtracted.")
 
+        // set_observed_esdf: Phase 2 — with known mask
+        .def("set_observed_esdf",
+             [](LocalPlanner& self,
+                py::array_t<float, py::array::c_style | py::array::forcecast> esdf_data,
+                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> known_mask,
+                const Eigen::Vector3d& origin,
+                double resolution,
+                bool unknown_is_free) -> bool {
+                 py::buffer_info ebuf = esdf_data.request();
+                 py::buffer_info kbuf = known_mask.request();
+                 if (ebuf.ndim != 3 || kbuf.ndim != 3) {
+                     PyErr_SetString(PyExc_ValueError,
+                         "ESDF and mask arrays must be 3-dimensional [gx, gy, gz]");
+                     throw py::error_already_set();
+                 }
+                 if (ebuf.shape[0] != kbuf.shape[0] ||
+                     ebuf.shape[1] != kbuf.shape[1] ||
+                     ebuf.shape[2] != kbuf.shape[2]) {
+                     PyErr_SetString(PyExc_ValueError,
+                         "ESDF and mask must have identical dimensions");
+                     throw py::error_already_set();
+                 }
+                 const float* eptr = static_cast<const float*>(ebuf.ptr);
+                 const uint8_t* kptr = static_cast<const uint8_t*>(kbuf.ptr);
+                 int gx = static_cast<int>(ebuf.shape[0]);
+                 int gy = static_cast<int>(ebuf.shape[1]);
+                 int gz = static_cast<int>(ebuf.shape[2]);
+                 return self.setObservedESDF(eptr, kptr, gx, gy, gz,
+                                              origin.x(), origin.y(), origin.z(),
+                                              resolution, unknown_is_free);
+             },
+             py::arg("esdf_data"),
+             py::arg("known_mask"),
+             py::arg("origin"),
+             py::arg("resolution"),
+             py::arg("unknown_is_free"),
+             "Set observed ESDF with known mask (Phase 2). "
+             "esdf_data: float32 [gx, gy, gz]. "
+             "known_mask: uint8 [gx, gy, gz], 0=unknown, 1=known.")
+
         // set_global_path: numpy float64 array, shape [N, 3]
         .def("set_global_path",
              [](LocalPlanner& self,
@@ -210,6 +284,17 @@ PYBIND11_MODULE(_il_local_planner, m) {
              py::arg("current_state"),
              py::arg("previous_progress_s"),
              "Plan a local trajectory from the current state. "
+             "Releases the Python GIL during optimization.")
+
+        // plan_local_with_request: Phase 2
+        .def("plan_local_with_request",
+             [](const LocalPlanner& self,
+                const LocalPlanningRequest& request) -> LocalPlanResult {
+                 py::gil_scoped_release release;
+                 return self.planLocalWithRequest(request);
+             },
+             py::arg("request"),
+             "Phase 2: Plan with explicit guide/terminal/reference segment. "
              "Releases the Python GIL during optimization.")
 
         // validate_trajectory

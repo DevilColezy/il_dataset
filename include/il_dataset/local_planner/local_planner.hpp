@@ -99,6 +99,21 @@ public:
                  double origin_x, double origin_y, double origin_z,
                  double resolution);
 
+    /// Set observed ESDF with known mask (Phase 2).
+    /// @param data  float32 ESDF array [gx, gy, gz]
+    /// @param known_mask  uint8 array [gx, gy, gz]
+    /// @param gx, gy, gz  dimensions
+    /// @param origin_x, origin_y, origin_z  corner
+    /// @param resolution  voxel size
+    /// @param unknown_is_free  legacy vs observed policy
+    /// @return true on success
+    bool setObservedESDF(const float* data,
+                         const uint8_t* known_mask,
+                         int gx, int gy, int gz,
+                         double origin_x, double origin_y, double origin_z,
+                         double resolution,
+                         bool unknown_is_free);
+
     /// Set the global reference path (A* shortcut output).
     /// Data is COPIED once.
     /// @param path  float64 numpy array, shape [N, 3], C-order
@@ -112,12 +127,22 @@ public:
 
     // ── Online planning (MUST be called with GIL released) ─────────
 
-    /// Plan a local trajectory from the current drone state.
+    /// Plan a local trajectory from the current drone state (legacy).
+    /// Uses internal selectLocalGoal() and global ESDF.
     /// @param current_state  latest kinematic state
     /// @param previous_progress_s  progress along global path from last plan
     /// @return  LocalPlanResult with trajectory and metadata
     LocalPlanResult planLocal(const VehicleState& current_state,
                               double previous_progress_s) const;
+
+    /// Plan a local trajectory with explicit request (Phase 2).
+    /// Uses guide_waypoint for reference, trajectory_terminal as optimization
+    /// target, and reference_path_segment for B-spline initialisation.
+    /// Collision checks use isKnownFree() when forbid_unknown_space is true.
+    /// @param request  full planning request
+    /// @return  LocalPlanResult with trajectory and metadata
+    LocalPlanResult planLocalWithRequest(
+        const LocalPlanningRequest& request) const;
 
     /// Validate a trajectory for collisions and clearance.
     /// @param trajectory  the trajectory to validate
@@ -152,6 +177,7 @@ private:
                                    double previous_progress_s) const;
 
     /// Select a local goal on the global path given progress and lookahead.
+    /// @deprecated Phase 2: use external GuideSelector instead. Kept for legacy.
     struct LocalGoalResult {
         Eigen::Vector3d position{Eigen::Vector3d::Zero()};
         int waypoint_index = -1;
@@ -159,6 +185,7 @@ private:
         bool is_final_goal = false;
         bool valid = false;
     };
+    [[deprecated("Phase 2: use external GuideSelector. Kept for legacy async mode.")]]
     LocalGoalResult selectLocalGoal(double progress_s,
                                     const Eigen::Vector3d& current_position,
                                     double current_speed) const;

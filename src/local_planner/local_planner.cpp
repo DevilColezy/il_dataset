@@ -40,6 +40,17 @@ bool LocalPlanner::setESDF(const float* data,
     return esdf_.setData(data, gx, gy, gz, origin_x, origin_y, origin_z, resolution);
 }
 
+bool LocalPlanner::setObservedESDF(const float* data,
+                                    const uint8_t* known_mask,
+                                    int gx, int gy, int gz,
+                                    double origin_x, double origin_y, double origin_z,
+                                    double resolution,
+                                    bool unknown_is_free) {
+    return esdf_.setDataWithMask(data, known_mask, gx, gy, gz,
+                                  origin_x, origin_y, origin_z,
+                                  resolution, unknown_is_free);
+}
+
 bool LocalPlanner::setGlobalPath(const double* path, int n_points) {
     if (path == nullptr || n_points < 2) return false;
 
@@ -1240,6 +1251,276 @@ LocalPlanResult LocalPlanner::planLocal(
         result.status = PlannerStatus::SUCCESS;
         result.message = used_global_fallback ? "OK (global-path fallback)" : "OK";
     }
+
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  Phase 2: planLocalWithRequest — explicit guide/terminal, observed ESDF
+// ─────────────────────────────────────────────────────────────────────
+
+LocalPlanResult LocalPlanner::planLocalWithRequest(
+    const LocalPlanningRequest& request) const {
+
+    auto t_start = std::chrono::steady_clock::now();
+
+    LocalPlanResult result;
+    result.plan_id = plan_id_counter_.fetch_add(1);
+    result.guide_waypoint = request.guide_waypoint;
+    result.guide_waypoint_index = request.guide_waypoint_index;
+    result.trajectory_terminal = request.trajectory_terminal;
+    result.trajectory_terminal_index = request.trajectory_terminal_index;
+    result.used_observed_esdf = esdf_.has_known_mask_;
+
+    // Check readiness
+    if (!isReady()) {
+        result.success = false;
+        result.status = PlannerStatus::NO_GLOBAL_PATH;
+        result.message = "Planner not initialized (no ESDF or global path)";
+        return result;
+    }
+
+    // Check input validity
+    const auto& cs = request.state;
+    if (!std::isfinite(cs.position.x()) ||
+        !std::isfinite(cs.position.y()) ||
+        !std::isfinite(cs.position.z())) {
+        result.success = false;
+        result.status = PlannerStatus::INVALID_INPUT;
+        result.message = "Current state contains NaN/Inf position";
+        return result;
+    }
+
+    // ── Progress tracking ──────────────────────────────────────
+    auto progress = computeProgress(cs.position, request.previous_progress_s);
+    result.progress_s = progress.valid ? progress.progress_s : 0.0;
+    result.progress_index = progress.valid ? progress.segment_index : -1;
+
+    // Use externally-provided terminal as the optimization target
+    Eigen::Vector3d terminal = request.trajectory_terminal;
+    bool near_final_goal = false;
+
+    // If no explicit terminal, fall back to horizon-distance forward point
+    if ((terminal - cs.position).norm() < 1e-6) {
+        // Emergency: use current position + velocity direction
+        terminal = cs.position + cs.velocity.normalized() *
+                   std::max(0.5, cs.velocity.norm() * 0.5);
+    }
+
+    result.local_goal = terminal;  // compatibility alias
+    result.local_goal_index = request.trajectory_terminal_index;
+
+    // Determine collision check function
+    bool forbid_unknown = request.forbid_unknown_space;
+    auto isFreeCheck = [&](double x, double y, double z, double cl) -> bool {
+        if (forbid_unknown && esdf_.has_known_mask_) {
+            return esdf_.isKnownFree(x, y, z, cl);
+        }
+        return esdf_.isFree(x, y, z, cl);
+    };
+
+    // ── Straight-line check ────────────────────────────────────
+    bool direct_clear = true;
+    {
+        Eigen::Vector3d dir = terminal - cs.position;
+        double dist = dir.norm();
+        if (dist > 1e-6) {
+            int steps = std::max(10,
+                static_cast<int>(dist / config_.collision_check_spacing));
+            for (int s = 0; s <= steps && direct_clear; ++s) {
+                double a = static_cast<double>(s) / steps;
+                Eigen::Vector3d pt = cs.position + a * dir;
+                if (!isFreeCheck(pt.x(), pt.y(), pt.z(), config_.min_clearance)) {
+                    direct_clear = false;
+                }
+            }
+        }
+    }
+
+    std::vector<TrajectoryPoint> traj;
+    bool optimized = false;
+    bool used_global_fallback = false;
+
+    if (direct_clear) {
+        int n_samples = static_cast<int>(
+            config_.horizon_time / config_.trajectory_dt);
+        std::vector<Eigen::Vector3d> cp = {cs.position, terminal};
+        traj = sampleTrajectory(cp, cs.position, cs.velocity,
+                                terminal, config_.trajectory_dt, n_samples);
+        optimized = true;
+    } else {
+        // ── Initialize control points from reference path segment ──
+        int n_cp = config_.control_points;
+        std::vector<Eigen::Vector3d> control_points(n_cp);
+
+        const auto& ref_seg = request.reference_path_segment;
+        if (ref_seg.size() >= 2) {
+            // Compute cumulative arc-length on reference segment
+            std::vector<double> ref_arc;
+            ref_arc.push_back(0.0);
+            for (size_t i = 1; i < ref_seg.size(); ++i) {
+                ref_arc.push_back(ref_arc.back() +
+                    (ref_seg[i] - ref_seg[i - 1]).norm());
+            }
+            double ref_total = ref_arc.back();
+
+            // Fix first control point to start position
+            control_points[0] = cs.position;
+
+            if (ref_total > 1e-6) {
+                // Sample control points at uniform arc-length along reference
+                for (int i = 1; i < n_cp; ++i) {
+                    double frac = static_cast<double>(i) / (n_cp - 1);
+                    double target_s = frac * ref_total;
+                    auto it = std::lower_bound(ref_arc.begin(), ref_arc.end(), target_s);
+                    int idx = std::min(static_cast<int>(it - ref_arc.begin()),
+                                       static_cast<int>(ref_seg.size()) - 1);
+                    if (idx == 0) {
+                        control_points[i] = ref_seg[0];
+                    } else {
+                        double s0 = ref_arc[idx - 1];
+                        double s1 = ref_arc[idx];
+                        double alpha = (s1 > s0 + 1e-12) ?
+                            (target_s - s0) / (s1 - s0) : 0.0;
+                        alpha = std::max(0.0, std::min(1.0, alpha));
+                        control_points[i] = ref_seg[idx - 1] * (1.0 - alpha) +
+                                           ref_seg[idx] * alpha;
+                    }
+                }
+            } else {
+                // Degenerate: linear interpolation
+                for (int i = 1; i < n_cp; ++i) {
+                    double alpha = static_cast<double>(i) / (n_cp - 1);
+                    control_points[i] = cs.position * (1.0 - alpha) +
+                                        terminal * alpha;
+                }
+            }
+        } else {
+            // No reference segment: linear from start to terminal
+            control_points[0] = cs.position;
+            for (int i = 1; i < n_cp; ++i) {
+                double alpha = static_cast<double>(i) / (n_cp - 1);
+                control_points[i] = cs.position * (1.0 - alpha) +
+                                    terminal * alpha;
+            }
+        }
+
+        // Build reference segment from A* sub-path (or fallback)
+        std::vector<Eigen::Vector3d> ref_for_cost = ref_seg;
+        if (ref_for_cost.size() < 2) {
+            ref_for_cost = {cs.position, terminal};
+        }
+        if (ref_for_cost.size() > static_cast<size_t>(
+                std::max(2, config_.max_reference_points))) {
+            const size_t keep = static_cast<size_t>(
+                std::max(2, config_.max_reference_points));
+            std::vector<Eigen::Vector3d> bounded;
+            bounded.reserve(keep);
+            for (size_t k = 0; k < keep; ++k) {
+                const size_t idx = k * (ref_for_cost.size() - 1) / (keep - 1);
+                bounded.push_back(ref_for_cost[idx]);
+            }
+            ref_for_cost.swap(bounded);
+        }
+
+        // ── Optimize ───────────────────────────────────────────
+        optimized = optimizeControlPoints(control_points,
+                                          cs.position, cs.velocity,
+                                          terminal, ref_for_cost,
+                                          near_final_goal);
+
+        // ── Sample ─────────────────────────────────────────────
+        int n_samples = static_cast<int>(
+            config_.horizon_time / config_.trajectory_dt);
+        traj = sampleTrajectory(control_points, cs.position, cs.velocity,
+                                terminal, config_.trajectory_dt, n_samples);
+
+        if (!optimized) {
+            auto val = validateTrajectory(traj);
+            if (val.any_collision || !val.all_clear) {
+                // Phase 2: NO global map fallback.
+                // Only allow known-free A* sub-path fallback.
+                if (request.allow_global_map_fallback) {
+                    traj = generateGlobalPathFallback(
+                        cs, progress.progress_s,
+                        config_.lookahead_distance * 0.5);
+                    used_global_fallback = true;
+                }
+                // else: return the (possibly colliding) trajectory;
+                // the caller handles failure via hover/abort.
+            }
+        }
+    }
+
+    // ── Final validation ───────────────────────────────────────
+    auto validation = validateTrajectory(traj);
+
+    if ((validation.any_collision || !validation.all_clear) &&
+        request.allow_global_map_fallback) {
+        auto fallback = generateGlobalPathFallback(
+            cs, progress.progress_s,
+            std::max(config_.min_lookahead_distance,
+                     config_.lookahead_distance * 0.5));
+        auto fb_val = validateTrajectory(fallback);
+        if (!fb_val.any_collision && fb_val.all_clear) {
+            traj = std::move(fallback);
+            validation = fb_val;
+            used_global_fallback = true;
+            optimized = true;
+        }
+    }
+
+    // Check for unknown space violations
+    if (forbid_unknown && esdf_.has_known_mask_) {
+        bool has_unknown = false;
+        for (const auto& tp : traj) {
+            if (!esdf_.isKnown(tp.position.x(), tp.position.y(), tp.position.z())) {
+                has_unknown = true;
+                break;
+            }
+        }
+        if (has_unknown) {
+            result.success = false;
+            result.status = PlannerStatus::UNKNOWN_SPACE;
+            result.message = "Trajectory enters unknown space";
+            result.trajectory = std::move(traj);
+            result.min_clearance = validation.min_clearance;
+            auto t_end = std::chrono::steady_clock::now();
+            result.planning_time_ms = std::chrono::duration<double, std::milli>(
+                t_end - t_start).count();
+            return result;
+        }
+    }
+
+    // ── Populate result ────────────────────────────────────────
+    result.trajectory = std::move(traj);
+    result.min_clearance = validation.min_clearance;
+
+    auto t_end = std::chrono::steady_clock::now();
+    result.planning_time_ms = std::chrono::duration<double, std::milli>(
+        t_end - t_start).count();
+
+    if (validation.any_collision) {
+        result.success = false;
+        result.status = PlannerStatus::COLLISION;
+        result.message = "Trajectory has collision (clearance <= 0)";
+    } else if (!validation.all_clear) {
+        result.success = false;
+        result.status = PlannerStatus::COLLISION;
+        result.message = "Trajectory has " +
+                         std::to_string(validation.clearance_violation_count) +
+                         " clearance violations";
+    } else if (!optimized && !direct_clear) {
+        result.success = false;
+        result.status = PlannerStatus::OPTIMIZATION_FAILED;
+        result.message = "Optimization failed to converge";
+    } else {
+        result.success = true;
+        result.status = PlannerStatus::SUCCESS;
+        result.message = used_global_fallback ? "OK (global-path fallback)" : "OK";
+    }
+
+    result.used_global_fallback = used_global_fallback;
 
     return result;
 }

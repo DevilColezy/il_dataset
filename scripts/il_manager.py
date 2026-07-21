@@ -71,7 +71,37 @@ from il_common import (
     StartGoalGenerator, make_depth_vehicle, make_dummy_vehicle,
     world_vel_to_body, load_ply, wait_for_stable_file,
     integrate_velocity_command,
+    body_rfu_to_flu, body_flu_to_rfu, world_vector_to_body_flu,
 )
+
+# Phase 2: observed map and guide selector
+try:
+    from il_observed_map import (
+        RollingObservedOccupancyMap, ObservedESDF, PinholeCameraModel)
+    _OBSERVED_MAP_AVAILABLE = True
+except ImportError:
+    _OBSERVED_MAP_AVAILABLE = False
+
+try:
+    from il_guide_selector import GuideSelector, GuideSelection
+    _GUIDE_SELECTOR_AVAILABLE = True
+except ImportError:
+    _GUIDE_SELECTOR_AVAILABLE = False
+
+# Phase 3: scene & task generation
+try:
+    from il_scenario import (
+        CylinderObstacleSpec, ObstacleRegion,
+        SceneValidationResult, TaskValidationResult, ObservabilityAuditResult,
+        YamlCylinderSceneGenerator, CylinderSceneValidator,
+        StartGoalTaskGenerator, SideCostEvaluator,
+        SceneManifestWriter, ObstacleVisibilityAuditor,
+    )
+    _SCENARIO_AVAILABLE = True
+except ImportError:
+    _SCENARIO_AVAILABLE = False
+    CylinderObstacleSpec = None  # fallback
+
 from il_config import load_config
 
 # Import il_trajectory from THIS package (avoid shadowing by flightmare_dataset_tools)
@@ -213,6 +243,74 @@ class State(Enum):
 class ILManager:
     """State-machine orchestrator for IL dataset collection."""
 
+    # ── Schema v8 ordered field list for csv.DictWriter ───────────────
+    # Phase 2 adds observed map, guide selection, and planner diagnostics.
+    DATA_SCHEMA_V8_FIELDS = [
+        # -- time & matching --
+        "timestamp_ns", "receive_timestamp_ns", "frame_id",
+        "trajectory_time_s", "latency_ms", "match_method",
+        # -- current state (x_t, before executing expert command) --
+        "x", "y", "z", "qx", "qy", "qz", "qw",
+        "state_vx_world", "state_vy_world", "state_vz_world",
+        "state_vx_flu", "state_vy_flu", "state_vz_flu",
+        # -- expert supervision (sampled from plan generated from x_t) --
+        "expert_label_valid",
+        "expert_vx_world", "expert_vy_world", "expert_vz_world",
+        "expert_vx_flu", "expert_vy_flu", "expert_vz_flu",
+        "expert_yaw_rate",
+        # -- executed next state (x_(t+1), after dt_sample integration) --
+        "executed_next_x", "executed_next_y", "executed_next_z",
+        "executed_next_vx_world", "executed_next_vy_world", "executed_next_vz_world",
+        "executed_next_vx_flu", "executed_next_vy_flu", "executed_next_vz_flu",
+        "executed_next_yaw", "executed_next_yaw_rate",
+        # -- global navigation labels --
+        "global_direction_valid",
+        "global_dir_x_flu", "global_dir_y_flu", "global_dir_z_flu",
+        "global_distance_m", "global_distance_norm",
+        # -- temporary trend labels (stage 2: farthest_visible_astar_waypoint) --
+        "trend_label_valid", "guide_source",
+        "guide_x_world", "guide_y_world", "guide_z_world",
+        "guide_dir_x_flu_exact", "guide_dir_y_flu_exact", "guide_dir_z_flu_exact",
+        "guide_distance_m", "guide_distance_norm",
+        "guide_azimuth_rad", "guide_elevation_rad",
+        "guide_azimuth_bin", "guide_elevation_bin",
+        # guide_azimuth_soft_0 ... guide_elevation_soft_{V-1} (appended dynamically)
+        # -- depth & collision --
+        "depth_file", "collision",
+        # -- start/goal --
+        "start_x", "start_y", "start_z",
+        "goal_x", "goal_y", "goal_z",
+        # -- planner & debug fields --
+        "global_progress_s", "global_progress_ratio", "global_progress_index",
+        "local_goal_index", "plan_id", "plan_time_from_start_s",
+        "planner_status", "planner_success", "planner_compute_ms",
+        "planner_min_clearance", "distance_to_final_goal",
+        # -- legacy compatibility --
+        "legacy_state_vx_rfu", "legacy_state_vy_rfu", "legacy_state_vz_rfu",
+        "legacy_plan_age_ms",
+        # -- Phase 2: observed map diagnostics --
+        "observed_map_revision",
+        "observed_known_voxel_count",
+        "observed_occupied_voxel_count",
+        "observed_free_voxel_count",
+        # -- Phase 2: guide selection diagnostics --
+        "guide_candidate_count",
+        "guide_visible",
+        "guide_depth_visible",
+        "guide_corridor_known_free_ratio",
+        "guide_path_index",
+        "guide_rejection_reason",
+        # -- Phase 2: terminal diagnostics --
+        "terminal_path_index",
+        "terminal_distance_m",
+        "terminal_path_arc_length_m",
+        # -- Phase 2: planner observed ESDF flags --
+        "planner_used_observed_esdf",
+        "planner_unknown_is_free",
+        "planner_used_global_fallback",
+        "reference_segment_point_count",
+    ]
+
     def __init__(self, config):
         self.cfg = config
         self.g = config["global"]
@@ -269,6 +367,60 @@ class ILManager:
             rospy.logwarn("[Manager] Using Python-only mode (no C++ local planner).")
             self._planner_backend = "python_fallback"
             self._cpp_planner = None
+
+        # ── Phase 2: observed map, ESDF, camera model, guide selector ──
+        obs_cfg = self.g.get("observed_map", {})
+        self._use_observed_map = bool(obs_cfg.get("enabled", False))
+        self._observed_map = None
+        self._observed_esdf = None
+        self._camera_model = None
+        self._guide_selector = None
+        self._guide_progress_index = -1
+        self._consecutive_guide_failures = 0
+
+        if self._use_observed_map and _OBSERVED_MAP_AVAILABLE:
+            self._observed_map = RollingObservedOccupancyMap(config)
+            self._observed_esdf = ObservedESDF(config)
+            self._camera_model = PinholeCameraModel(
+                self._depth_cfg["width"], self._depth_cfg["height"],
+                math.radians(self._depth_cfg["fov"]))
+            if _GUIDE_SELECTOR_AVAILABLE:
+                self._guide_selector = GuideSelector(config, self._camera_model)
+            rospy.loginfo("[Manager] Phase 2: observed map + ESDF + guide selector enabled.")
+        elif self._use_observed_map:
+            rospy.logwarn("[Manager] Phase 2 modules not available; falling back to global ESDF.")
+            self._use_observed_map = False
+
+        # ── Phase 3: scene & task generation ────────────────────────
+        sg_cfg = self.g.get("scene_generation", {})
+        self._use_scene_gen = bool(sg_cfg.get("enabled", False))
+        self._scene_generator = None
+        self._scene_validator = None
+        self._task_generator = None
+        self._side_cost_eval = None
+        self._manifest_writer = None
+        self._obs_auditor = None
+
+        if self._use_scene_gen and _SCENARIO_AVAILABLE:
+            self._scene_generator = YamlCylinderSceneGenerator(config)
+            self._scene_validator = CylinderSceneValidator(config)
+            self._task_generator = StartGoalTaskGenerator(config)
+            self._side_cost_eval = SideCostEvaluator(config)
+            self._manifest_writer = SceneManifestWriter(self.output_root)
+            self._obs_auditor = ObstacleVisibilityAuditor(config)
+            rospy.loginfo("[Manager] Phase 3: scene + task generation + observability audit enabled.")
+        elif self._use_scene_gen:
+            rospy.logwarn("[Manager] Phase 3 modules not available.")
+            self._use_scene_gen = False
+
+        # Scene/task tracking
+        self._current_scene_obstacles = []  # list of CylinderObstacleSpec
+        self._current_scene_validation = None
+        self._current_task_validation = None
+        self._current_dominant_obstacle = None
+        self._current_scene_subseed = 0
+        self._current_scene_attempt = 0
+        self._invalid_obs_frame_count = 0
 
         # State machine
         self.state = State.BOOT
@@ -699,6 +851,68 @@ class ILManager:
             time.sleep(0.2)
 
     def _st_generate_obstacle_config(self):
+        # Phase 3: new scene generation pipeline
+        if self._use_scene_gen and self._scene_generator is not None:
+            if self.scene_idx >= int(self.g.get("scene_generation", {}).get(
+                    "max_scene_generation_attempts", 200)):
+                self._enter_state(State.DONE)
+                return
+
+            rospy.loginfo("=" * 60)
+            rospy.loginfo("  PHASE 3 SCENE GENERATION: attempt %d", self.scene_idx + 1)
+            rospy.loginfo("=" * 60)
+
+            # Try generating a valid scene
+            obstacles = []
+            validation = None
+            for attempt in range(self._scene_generator.max_scene_attempts):
+                sub_seed = self.scene_idx * 1000 + attempt
+                obstacles, rejection = self._scene_generator.generate_scene(sub_seed)
+                if not obstacles:
+                    rospy.logwarn("[SceneGen] Attempt %d: %s", attempt + 1, rejection)
+                    continue
+
+                # Validate topology
+                validation = self._scene_validator.validate(
+                    obstacles, self._scene_generator.obstacle_region)
+                if validation.valid:
+                    self._current_scene_obstacles = obstacles
+                    self._current_scene_validation = validation
+                    self._current_scene_subseed = sub_seed
+                    self._current_scene_attempt = attempt + 1
+
+                    # Convert to Unity object format
+                    self.current_obstacles = [
+                        {"id": o.obstacle_id, "x": float(o.center_world[0]),
+                         "y": float(o.center_world[1]), "z": float(o.center_world[2]),
+                         "radius": o.radius_m, "diameter": o.diameter_m(),
+                         "height": o.height_m}
+                        for o in obstacles]
+                    self.current_obj_list = self._scene_generator.generate_unity_objects(obstacles)
+
+                    self.scene_label = "scene_{:04d}_sub{:04d}".format(
+                        self.scene_idx, sub_seed)
+                    rospy.loginfo("[SceneGen] ACCEPTED: %d obstacles, subseed=%d, attempt=%d/%d",
+                                  len(obstacles), sub_seed, attempt + 1,
+                                  self._scene_generator.max_scene_attempts)
+                    break
+                else:
+                    rospy.logwarn("[SceneGen] Attempt %d REJECTED: %s",
+                                  attempt + 1, validation.rejection_reason)
+
+            if not obstacles or (validation is not None and not validation.valid):
+                rospy.logerr("[SceneGen] Exhausted all %d attempts for scene %d.",
+                             self._scene_generator.max_scene_attempts, self.scene_idx)
+                self.scene_idx += 1
+                self._enter_state(State.NEXT_CONFIG)
+                return
+
+            self.scene_idx += 1
+            self._enter_state(State.WAIT_SCENE_READY,
+                              self.g["fsm"]["scene_settle_timeout"])
+            return
+
+        # Legacy: original obstacle generation from scenes list
         if self.scene_idx >= len(self.cfg["scenes"]):
             self._enter_state(State.DONE)
             return
@@ -906,6 +1120,75 @@ class ILManager:
             self._enter_state(State.ERROR)
 
     def _st_generate_start_goal_pairs(self):
+        # Phase 3: new task generation pipeline
+        if (self._use_scene_gen and self._task_generator is not None and
+                self._scene_generator is not None and
+                len(self._current_scene_obstacles) > 0):
+            rospy.loginfo("[FSM] Phase 3: generating tasks via StartGoalTaskGenerator...")
+
+            # Create A* planner for task validation
+            from il_trajectory import AStarPlanner as _AStarPlanner
+
+            def astar_fn(esdf, origin, res, start, goal, min_cl):
+                planner = _AStarPlanner(
+                    esdf, res, origin,
+                    cost_weight=float(self.g.get("planning", {}).get(
+                        "global_planner", {}).get("cost_weight", 0.0)),
+                    clearance_target=float(self.g.get("planning", {}).get(
+                        "global_planner", {}).get("clearance_target", 0.25)))
+                return planner.plan(start, goal, min_clearance=min_cl,
+                                    epsilon=float(self.g.get("planning", {}).get(
+                                        "global_planner", {}).get("epsilon", 1.10)),
+                                    max_iterations=int(self.g.get("planning", {}).get(
+                                        "global_planner", {}).get("max_iterations_full", 800000)))
+
+            tasks = self._task_generator.generate_tasks(
+                self._current_scene_obstacles,
+                self.current_esdf, self.current_esdf_origin,
+                self.g["esdf"]["resolution"],
+                astar_fn,
+                seed=self._current_scene_subseed)
+
+            # Convert to current_pairs format
+            self.current_pairs = []
+            for start, goal, task_val in tasks:
+                pair = {"start": start, "goal": goal, "valid_endpoints": True,
+                        "_task_validation": task_val}
+                self.current_pairs.append(pair)
+
+            self._desired_pair_count = len(self.current_pairs)
+            self.traj_idx = 0
+            self.current_planned = []
+            rospy.loginfo("[FSM] Phase 3: Generated %d validated tasks.", len(self.current_pairs))
+
+            # Write scene manifest
+            if self._manifest_writer is not None and self._current_scene_validation is not None:
+                scene_id = "scene_{:04d}".format(self.scene_idx - 1)
+                task_results_for_manifest = [
+                    pair.get("_task_validation") for pair in self.current_pairs
+                    if pair.get("_task_validation") is not None]
+                self._manifest_writer.write_scene_manifest(
+                    scene_id,
+                    self._scene_generator.base_seed,
+                    self._current_scene_attempt,
+                    self._current_scene_subseed,
+                    self._current_scene_obstacles,
+                    self._current_scene_validation,
+                    task_results_for_manifest,
+                    self._scene_generator.obstacle_region)
+                # Write task manifests
+                for ti, pair in enumerate(self.current_pairs):
+                    tv = pair.get("_task_validation")
+                    if tv is not None:
+                        self._manifest_writer.write_task_manifest(
+                            scene_id,
+                            "task_{:03d}".format(ti),
+                            pair["start"], pair["goal"], tv)
+
+            self._enter_state(State.PLAN_GLOBAL_PATHS)
+            return
+
+        # Legacy: original start-goal pair generation
         sg_cfg = self.g["start_goal"]
         num = sg_cfg.get("num_pairs_per_config", 5)
         candidate_multiplier = max(
@@ -1049,6 +1332,18 @@ class ILManager:
         init_yaw = self._get_current_initial_yaw()
         global_path = plan.get("global_path", [])
 
+        # Phase 3: track task validation for this trajectory
+        self._current_task_validation = plan.get("_task_validation", None)
+        self._current_dominant_obstacle = None
+        self._invalid_obs_frame_count = 0
+        if (self._current_task_validation is not None and
+                self._current_task_validation.dominant_obstacle_id):
+            # Find the dominant obstacle object
+            for obs in getattr(self, "_current_scene_obstacles", []):
+                if obs.obstacle_id == self._current_task_validation.dominant_obstacle_id:
+                    self._current_dominant_obstacle = obs
+                    break
+
         if not global_path:
             rospy.logerr("[FSM] No global path for trajectory %d", self.traj_idx + 1)
             self.traj_idx += 1
@@ -1058,7 +1353,14 @@ class ILManager:
 
         if self._cpp_planner is not None:
             try:
-                # Set ESDF (copied once into C++)
+                # ── Phase 2: Reset observed map for new episode ──────
+                if self._use_observed_map and self._observed_map is not None:
+                    self._observed_map.reset(start)
+                    rospy.loginfo("[FSM] Observed map reset at start position.")
+                self._guide_progress_index = -1
+                self._consecutive_guide_failures = 0
+
+                # Set global ESDF (for legacy fallback / global path tracking)
                 esdf_data = np.asarray(self.current_esdf, dtype=np.float32, order='C')
                 origin = np.array(self.current_esdf_origin, dtype=np.float64)
                 ok = self._cpp_planner.set_esdf(
@@ -1099,9 +1401,22 @@ class ILManager:
         self._enter_state(State.START_RECORDING)
 
     def _st_start_recording(self):
-        """v5: Set up recording files for online planning mode."""
-        self._enter_state(State.ONLINE_PLAN_AND_RECORD,
-                          self.g["fsm"]["trajectory_timeout"])
+        """v7: Set up recording files.  Branches to lockstep or legacy async mode."""
+        collection_mode = self.g.get("data", {}).get(
+            "collection_mode", "deterministic_lockstep")
+
+        if collection_mode == "deterministic_lockstep":
+            self._enter_state(State.ONLINE_PLAN_AND_RECORD,
+                              self.g["fsm"]["trajectory_timeout"])
+        elif collection_mode == "legacy_async":
+            # Route to legacy async handler (renamed)
+            self._enter_state(State.ONLINE_PLAN_AND_RECORD,
+                              self.g["fsm"]["trajectory_timeout"])
+        else:
+            rospy.logwarn("[FSM] Unknown collection_mode '%s', using lockstep.",
+                          collection_mode)
+            self._enter_state(State.ONLINE_PLAN_AND_RECORD,
+                              self.g["fsm"]["trajectory_timeout"])
 
         # Create .inprogress directory
         traj_name = "traj_{:03d}".format(self.traj_idx + 1)
@@ -1129,7 +1444,7 @@ class ILManager:
         self._rec_start_mono = time.monotonic()
         self._rec_start_epoch_ns = int(time.time() * 1e9)
 
-        # v5: Reset planner stats
+        # v7: Reset planner and validation stats
         self._total_replans = 0
         self._successful_replans = 0
         self._failed_replans = 0
@@ -1140,15 +1455,974 @@ class ILManager:
         self._trajectory_reached_goal = False
         self._final_executed_position = None
         self._final_executed_velocity = None
+        self._invalid_expert_label_count = 0
+        self._invalid_trend_label_count = 0
 
     # ═══════════════════════════════════════════════════════════════
-    #  v5: ONLINE_PLAN_AND_RECORD — receding-horizon control loop
+    #  v7: ONLINE_PLAN_AND_RECORD — deterministic lockstep loop
     # ═══════════════════════════════════════════════════════════════
 
     def _st_online_plan_and_record(self):
-        """v5: Online receding-horizon planning and data recording.
+        """v7: Strict single-frame lockstep data collection.
 
-        Control loop at control_hz with C++ local planner at planner_hz.
+        Semantics:
+            depth_t, state_t -> plan -> expert_command_t
+            → execute dt_sample → state_(t+1)
+
+        Timeline per sample:
+            1. Send x_t pose to Unity with frame_id
+            2. Wait for exact frame_id depth response
+            3. Get depth_t, collision status
+            4. Sync call local planner from x_t
+            5. Sample expert command u_t* from new trajectory
+            6. Compute global nav label and local trend label
+            7. Execute dt_sample with sub-steps to reach x_(t+1)
+            8. Save row: depth_t, state_t, nav_t, expert_cmd_t, state_(t+1)
+        """
+        collection_mode = self.g.get("data", {}).get(
+            "collection_mode", "deterministic_lockstep")
+        if collection_mode == "legacy_async":
+            self._st_online_plan_and_record_legacy_async()
+            return
+
+        plan = self.current_planned[self.traj_idx]
+        global_path = plan.get("global_path", [])
+        if not global_path:
+            rospy.logwarn("[ONLINE] Empty global path — finishing.")
+            self._st_finish_recording()
+            return
+
+        # ── Config shorthand ────────────────────────────────────────
+        ctrl_hz = self._control_hz
+        rec_hz = self._record_hz
+        dt_ctrl = 1.0 / ctrl_hz
+        dt_sample = 1.0 / rec_hz
+        depth_max_m = self._depth_cfg["max_m"]
+        img_w, img_h = self._depth_cfg["width"], self._depth_cfg["height"]
+        depth_float_len = img_w * img_h * 4
+
+        data_cfg = self.g.get("data", {})
+        label_lookahead_time_s = float(data_cfg.get("label_lookahead_time_s", 0.08))
+        max_guide_range = float(self._depth_cfg["max_m"])
+
+        lp_cfg = self.g.get("planning", {}).get("local_planner", {})
+        max_velocity = float(lp_cfg.get("max_velocity", 2.5))
+        max_acceleration = float(lp_cfg.get("max_acceleration", 3.5))
+        max_yaw_rate = float(lp_cfg.get("max_yaw_rate", 2.0))
+        goal_tolerance = float(lp_cfg.get("goal_tolerance", 0.30))
+        goal_speed_tol = float(lp_cfg.get("goal_speed_tolerance", 0.20))
+        goal_hold_ticks = int(lp_cfg.get("goal_hold_ticks", 3))
+        configured_failure_limit = int(
+            lp_cfg.get("max_consecutive_failures", 3))
+        unity_response_timeout_s = max(
+            0.25, float(self.g.get("sync", {}).get(
+                "unity_response_timeout_s", 2.0)))
+
+        # Trend bin config
+        trend_h_bins = int(data_cfg.get("trend_horizontal_bins", 11))
+        trend_v_bins = int(data_cfg.get("trend_vertical_bins", 7))
+        trend_sigma_bins = float(data_cfg.get("trend_soft_sigma_bins", 0.75))
+        h_fov_deg = float(self._depth_cfg["fov"])  # horizontal FOV
+        h_fov_rad = math.radians(h_fov_deg)
+        v_fov_rad = 2.0 * math.atan(
+            math.tan(h_fov_rad / 2.0) * img_h / max(img_w, 1))
+        h_bin_edges = np.linspace(-h_fov_rad / 2.0, h_fov_rad / 2.0, trend_h_bins)
+        v_bin_edges = np.linspace(-v_fov_rad / 2.0, v_fov_rad / 2.0, trend_v_bins)
+
+        # ── Build dynamic field list with soft label columns ──────────
+        schema_fields = list(self.DATA_SCHEMA_V8_FIELDS)
+        # Insert soft label columns before depth_file
+        depth_idx = schema_fields.index("depth_file")
+        azi_soft_names = []
+        ele_soft_names = []
+        for i in range(trend_h_bins):
+            name = "guide_azimuth_soft_{}".format(i)
+            azi_soft_names.append(name)
+            schema_fields.insert(depth_idx, name)
+            depth_idx += 1
+        for i in range(trend_v_bins):
+            name = "guide_elevation_soft_{}".format(i)
+            ele_soft_names.append(name)
+            schema_fields.insert(depth_idx, name)
+            depth_idx += 1
+
+        # ── Directories & files ──────────────────────────────────────
+        depth_dir = os.path.join(self._inprogress_dir, "depth")
+        data_path = os.path.join(self._inprogress_dir, "data.csv")
+        sync_path = os.path.join(self._inprogress_dir, "sync.csv")
+        gp_path = os.path.join(self._inprogress_dir, "global_path.csv")
+        lp_path = os.path.join(self._inprogress_dir, "local_plans.csv")
+
+        # ── Open data.csv with DictWriter (schema v7) ─────────────────
+        self._inprogress_file = open(data_path, "w", newline="")
+        self._csv_writer = csv.DictWriter(
+            self._inprogress_file, fieldnames=schema_fields)
+        self._csv_writer.writeheader()
+
+        # ── Sync CSV (kept for per-frame diagnostics) ─────────────────
+        self._sync_file = open(sync_path, "w")
+        self._sync_file.write(
+            "recv_step,frame_id_matched,latency_ms,match_error_ms,match_method,"
+            "is_dropped,ctrl_queue_len,exact_matches,fallback_matches\n")
+
+        # ── Global path CSV ──────────────────────────────────────────
+        self._global_path_file = open(gp_path, "w")
+        self._global_path_file.write("index,x,y,z,s\n")
+        cum_s = 0.0
+        for idx, pt in enumerate(global_path):
+            if idx > 0:
+                cum_s += np.linalg.norm(np.array(pt) - np.array(global_path[idx - 1]))
+            self._global_path_file.write("{},{:.4f},{:.4f},{:.4f},{:.4f}\n".format(
+                idx, pt[0], pt[1], pt[2], cum_s))
+        self._global_path_file.flush()
+
+        # ── Local plans CSV ──────────────────────────────────────────
+        self._local_plans_file = open(lp_path, "w")
+        self._local_plans_file.write(
+            "plan_id,request_timestamp_ns,"
+            "state_x,state_y,state_z,state_vx,state_vy,state_vz,state_yaw,"
+            "local_goal_x,local_goal_y,local_goal_z,"
+            "progress_s,progress_index,local_goal_index,"
+            "status,success,planning_time_ms,min_clearance,traj_point_count\n")
+
+        # ── State variables ──────────────────────────────────────────
+        goal_pt = plan["goal"]
+        goal_np = np.array(goal_pt)
+        global_path_length = plan.get("global_path_length", 0.0)
+        cur_pos = np.array(plan["start"], dtype=np.float64)
+        cur_vel = np.zeros(3, dtype=np.float64)
+        cur_yaw = self._get_current_initial_yaw()
+
+        consecutive_failures = 0
+        sample_index = 0
+        sent_frame_id = 0
+        recording_start_mono = time.monotonic()
+        recording_start_epoch_ns = int(time.time() * 1e9)
+        last_valid_response_mono = time.monotonic()
+        previous_progress_s = -1.0
+        goal_hold_counter = 0
+
+        rospy.loginfo("[ONLINE-LOCKSTEP] Starting. ctrl=%.0fHz rec=%.0fHz dt_sample=%.3fs",
+                      ctrl_hz, rec_hz, dt_sample)
+
+        while not rospy.is_shutdown():
+            if self._timed_out():
+                rospy.logwarn("[ONLINE-LOCKSTEP] Timeout.")
+                self._trajectory_exit_reason = "trajectory_timeout"
+                break
+
+            # ── Step 1: Request depth for current state ──────────────
+            # The depth image and state fields belong to x_t.
+            t_request_mono = time.monotonic()
+            frame_id = sent_frame_id
+            sent_frame_id += 1
+
+            vehicle = make_depth_vehicle(cur_pos.tolist(), float(cur_yaw), self._depth_cfg)
+            msg = {"scene_id": self.g["scene_id"], "frame_id": frame_id,
+                   "vehicles": [vehicle], "objects": self.current_obj_list}
+            self.bridge.send_pose(msg)
+
+            # ── Step 2: Wait for exact frame_id depth response ───────
+            depth_u16, collision, recv_frame_id, recv_time_mono = \
+                self._wait_for_exact_depth_frame(
+                    frame_id, depth_float_len, img_w, img_h,
+                    depth_max_m, unity_response_timeout_s,
+                    last_valid_response_mono)
+            if depth_u16 is None and recv_frame_id is None:
+                # timeout
+                self._trajectory_exit_reason = "unity_response_timeout"
+                rospy.logerr("[ONLINE-LOCKSTEP] Unity response timeout for frame_id=%d.",
+                             frame_id)
+                break
+            if depth_u16 is None:
+                # received wrong frame_id, continue loop
+                continue
+            last_valid_response_mono = recv_time_mono
+            latency_ms = (recv_time_mono - t_request_mono) * 1000.0
+            self._rec_raw_received_frames += 1
+            self._rec_exact_matches += 1
+
+            # ── Save depth PNG ───────────────────────────────────────
+            png_name = "none"
+            depth_m = None
+            if depth_u16 is not None:
+                # Convert uint16 PNG back to float depth for map integration
+                depth_m = depth_u16.astype(np.float64) / 65535.0 * depth_max_m
+                if Image is not None:
+                    png_name = "{:06d}.png".format(sample_index)
+                    Image.fromarray(depth_u16, mode="I;16").save(
+                        os.path.join(depth_dir, png_name))
+
+            # ── Phase 2: Integrate depth into observed map ─────────
+            t_map_start = time.monotonic()
+            guide_sel = GuideSelection()
+            ref_segment = []
+            if self._use_observed_map and self._observed_map is not None and depth_m is not None:
+                timestamp_s = (recv_time_mono - recording_start_mono) + sample_index * dt_sample
+                self._observed_map.integrate_depth(
+                    depth_m, cur_pos.tolist(), float(cur_yaw), timestamp_s)
+                self._observed_map.recenter_if_needed(cur_pos)
+
+                # Rebuild observed ESDF
+                if (self._observed_map.get_revision() %
+                        self._observed_esdf.rebuild_every_n_frames == 0 or
+                        not self._observed_esdf.is_built()):
+                    t_esdf_start = time.monotonic()
+                    occ = self._observed_map.get_occupancy()
+                    known = self._observed_map.get_known_mask()
+                    self._observed_esdf.rebuild(
+                        occ, known,
+                        self._observed_map.get_origin(),
+                        self._observed_map.get_resolution())
+                    t_esdf_ms = (time.monotonic() - t_esdf_start) * 1000.0
+
+                # Select Guide and Terminal
+                if self._guide_selector is not None:
+                    t_guide_start = time.monotonic()
+                    guide_sel = self._guide_selector.select(
+                        global_path, self._guide_progress_index,
+                        cur_pos, float(cur_yaw), cur_vel, depth_m,
+                        self._observed_map, self._observed_esdf)
+                    t_guide_ms = (time.monotonic() - t_guide_start) * 1000.0
+                    if guide_sel.valid:
+                        self._guide_progress_index = max(
+                            self._guide_progress_index, guide_sel.guide_path_index)
+                        self._consecutive_guide_failures = 0
+                        # Get reference segment for planner
+                        ref_segment = self._guide_selector.get_reference_segment(
+                            global_path,
+                            max(0, self._guide_progress_index - 10),
+                            guide_sel.terminal_path_index)
+                    else:
+                        self._consecutive_guide_failures += 1
+            t_map_ms = (time.monotonic() - t_map_start) * 1000.0
+
+            # ── Step 3: Plan from current state (x_t) ───────────────
+            # The expert command is sampled from a plan generated from x_t.
+            # Phase 2: uses observed ESDF and explicit guide/terminal.
+            result = None
+            plan_success = False
+            planner_compute_ms = 0.0
+            planner_status_str = "NO_PLAN"
+            planner_used_obs = 0
+            planner_used_fallback = 0
+
+            if self._cpp_planner is not None:
+                # Set the appropriate ESDF on the planner
+                if (self._use_observed_map and self._observed_esdf is not None and
+                        self._observed_esdf.is_built()):
+                    esdf_arr = self._observed_esdf.get_esdf()
+                    known_arr = self._observed_esdf.get_known_mask()
+                    origin = self._observed_esdf.get_origin()
+                    res = self._observed_esdf.get_resolution()
+                    # Ensure C-contiguous
+                    esdf_arr = np.ascontiguousarray(esdf_arr, dtype=np.float32)
+                    known_arr = np.ascontiguousarray(known_arr.astype(np.uint8))
+                    self._cpp_planner.set_observed_esdf(
+                        esdf_arr, known_arr,
+                        np.array(origin, dtype=np.float64),
+                        float(res), False)  # unknown_is_free = false
+                    planner_used_obs = 1
+                elif self.current_esdf is not None:
+                    # Fallback: use global ESDF (only for legacy/debug)
+                    rospy.logwarn("[ONLINE-LOCKSTEP] No observed ESDF; using global ESDF (legacy).")
+                    esdf_data = np.asarray(self.current_esdf, dtype=np.float32, order='C')
+                    origin = np.array(self.current_esdf_origin, dtype=np.float64)
+                    self._cpp_planner.set_esdf(
+                        esdf_data, origin,
+                        self.g["esdf"]["resolution"])
+
+                t_plan_start = time.monotonic()
+                try:
+                    state = _VehicleState()
+                    state.position = (float(cur_pos[0]), float(cur_pos[1]),
+                                      float(cur_pos[2]))
+                    state.velocity = (float(cur_vel[0]), float(cur_vel[1]),
+                                      float(cur_vel[2]))
+                    state.yaw = float(cur_yaw)
+                    state.yaw_rate = 0.0
+
+                    lp_cfg_local = self.g.get("planning", {}).get("local_planner", {})
+                    forbid_unknown = bool(lp_cfg_local.get("forbid_unknown_space", True))
+                    allow_fb = bool(lp_cfg_local.get("allow_global_map_fallback", False))
+
+                    if guide_sel.valid and ref_segment:
+                        # Phase 2: use explicit request if C++ types are available
+                        _has_new_types = ('_LocalPlanningRequest' in dir() and
+                                          _LocalPlanningRequest is not None)
+                        if _has_new_types:
+                            req = _LocalPlanningRequest()
+                            req.state = state
+                            req.previous_progress_s = previous_progress_s
+                            req.guide_waypoint = (
+                                float(guide_sel.guide_position_world[0]),
+                                float(guide_sel.guide_position_world[1]),
+                                float(guide_sel.guide_position_world[2]))
+                            req.guide_waypoint_index = guide_sel.guide_path_index
+                            req.trajectory_terminal = (
+                                float(guide_sel.terminal_position_world[0]),
+                                float(guide_sel.terminal_position_world[1]),
+                                float(guide_sel.terminal_position_world[2]))
+                            req.trajectory_terminal_index = guide_sel.terminal_path_index
+                            for pt in ref_segment:
+                                req.reference_path_segment.append(
+                                    (float(pt[0]), float(pt[1]), float(pt[2])))
+                            req.forbid_unknown_space = forbid_unknown
+                            req.allow_global_map_fallback = allow_fb
+                            result = self._cpp_planner.plan_local_with_request(req)
+                        else:
+                            # Fallback to legacy plan_local if new types not available
+                            result = self._cpp_planner.plan_local(state, previous_progress_s)
+                    else:
+                        # Guide not valid: use legacy plan_local for hover/low-speed
+                        result = self._cpp_planner.plan_local(state, previous_progress_s)
+
+                    t_plan_end = time.monotonic()
+                    planner_compute_ms = (t_plan_end - t_plan_start) * 1000.0
+                    self._total_replans += 1
+                    self._planning_times_ms.append(
+                        result.planning_time_ms if hasattr(result, 'planning_time_ms') else planner_compute_ms)
+
+                    planner_status_str = str(result.status)
+                    plan_success = result.success
+                    # Check Phase 2 flags
+                    if hasattr(result, 'used_global_fallback'):
+                        planner_used_fallback = 1 if result.used_global_fallback else 0
+                    if hasattr(result, 'used_observed_esdf'):
+                        planner_used_obs = 1 if result.used_observed_esdf else planner_used_obs
+
+                    if result.success:
+                        self._successful_replans += 1
+                        self._executed_clearances.append(result.min_clearance)
+                        previous_progress_s = max(previous_progress_s,
+                                                  result.progress_s)
+                        consecutive_failures = 0
+                        # Write local plan to CSV
+                        self._local_plans_file.write(
+                            "{},{},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},"
+                            "{:.4f},{:.4f},{:.4f},{:.4f},{},{},{},{},{},{:.2f},{:.4f}\n"
+                            .format(result.plan_id,
+                                    int(t_request_mono * 1e9),
+                                    state.position[0], state.position[1], state.position[2],
+                                    state.velocity[0], state.velocity[1], state.velocity[2],
+                                    state.yaw,
+                                    result.local_goal[0], result.local_goal[1], result.local_goal[2],
+                                    result.progress_s, result.progress_index, result.local_goal_index,
+                                    int(result.status), result.success,
+                                    result.planning_time_ms, result.min_clearance,
+                                    len(result.trajectory)))
+                        self._local_plans_file.flush()
+                    else:
+                        self._failed_replans += 1
+                        consecutive_failures += 1
+                        if (int(result.status) == 5 or  # COLLISION
+                            (hasattr(_PlannerStatus, 'COLLISION') and
+                             result.status == _PlannerStatus.COLLISION)):
+                            self._emergency_hold_count += 1
+                except Exception as exc:
+                    rospy.logerr("[ONLINE-LOCKSTEP] Planner exception: %s", exc)
+                    consecutive_failures += 1
+
+            # ── Step 4: Build training row from x_t, plan result, depth ──
+            row = self._build_training_row_v8(
+                cur_pos, cur_vel, cur_yaw,
+                result, plan_success, planner_compute_ms,
+                planner_status_str,
+                goal_np, goal_pt, global_path_length,
+                label_lookahead_time_s, max_guide_range,
+                png_name, collision,
+                plan, sample_index, dt_sample,
+                frame_id, recording_start_mono, recording_start_epoch_ns,
+                t_request_mono, recv_time_mono, latency_ms,
+                h_fov_rad, v_fov_rad, trend_h_bins, trend_v_bins,
+                trend_sigma_bins, h_bin_edges, v_bin_edges,
+                azi_soft_names, ele_soft_names,
+                previous_progress_s,
+                # Phase 2 extras
+                guide_sel, ref_segment,
+                self._observed_map, self._observed_esdf,
+                planner_used_obs, planner_used_fallback,
+            )
+
+            # ── Step 5: Execute dt_sample to advance to x_(t+1) ──────
+            # The executed_next fields belong to x_(t+1).
+            if result is not None and result.success and len(result.trajectory) > 0:
+                exec_next_pos, exec_next_vel, exec_next_yaw, exec_next_yaw_rate = \
+                    self._execute_trajectory_segment(
+                        result, cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
+                        dt_sample, dt_ctrl, sample_index,
+                        max_velocity, max_acceleration, max_yaw_rate)
+            else:
+                # Plan failed: hover in place for dt_sample
+                exec_next_pos, exec_next_vel, exec_next_yaw, exec_next_yaw_rate = \
+                    self._execute_hover(
+                        cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
+                        dt_sample, dt_ctrl,
+                        max_velocity, max_acceleration, max_yaw_rate)
+
+            # Patch executed_next fields with post-execution values
+            row["executed_next_x"] = round(float(exec_next_pos[0]), 4)
+            row["executed_next_y"] = round(float(exec_next_pos[1]), 4)
+            row["executed_next_z"] = round(float(exec_next_pos[2]), 4)
+            row["executed_next_vx_world"] = round(float(exec_next_vel[0]), 4)
+            row["executed_next_vy_world"] = round(float(exec_next_vel[1]), 4)
+            row["executed_next_vz_world"] = round(float(exec_next_vel[2]), 4)
+            exec_next_vel_flu = world_vector_to_body_flu(
+                exec_next_vel, float(exec_next_yaw))
+            row["executed_next_vx_flu"] = round(float(exec_next_vel_flu[0]), 4)
+            row["executed_next_vy_flu"] = round(float(exec_next_vel_flu[1]), 4)
+            row["executed_next_vz_flu"] = round(float(exec_next_vel_flu[2]), 4)
+            row["executed_next_yaw"] = round(float(exec_next_yaw), 6)
+            row["executed_next_yaw_rate"] = round(float(exec_next_yaw_rate), 6)
+
+            # track invalid counts for metadata
+            if row.get("expert_label_valid", 0) == 0:
+                self._invalid_expert_label_count += 1
+            if row.get("trend_label_valid", 0) == 0:
+                self._invalid_trend_label_count += 1
+
+            # Write row (state_t, depth_t, nav_t, expert_cmd_t, state_(t+1))
+            self._csv_writer.writerow(row)
+            self._rec_written_rows += 1
+
+            # ── Sync diagnostics ─────────────────────────────────────
+            self._sync_file.write("{},{},{:.2f},0.00,frame_id_exact,0,0,{},{}\n".format(
+                sample_index, frame_id, latency_ms,
+                self._rec_exact_matches, self._rec_fallback_matches))
+
+            # Advance state to x_(t+1)
+            cur_pos = exec_next_pos
+            cur_vel = exec_next_vel
+            cur_yaw = exec_next_yaw
+
+            # ── Goal check ───────────────────────────────────────────
+            dist_to_goal = float(np.linalg.norm(cur_pos - goal_np))
+            speed = float(np.linalg.norm(cur_vel))
+            if dist_to_goal <= goal_tolerance and speed <= goal_speed_tol:
+                goal_hold_counter += 1
+                if goal_hold_counter >= goal_hold_ticks:
+                    rospy.loginfo("[ONLINE-LOCKSTEP] Goal reached at sample %d.", sample_index)
+                    self._trajectory_reached_goal = True
+                    self._trajectory_exit_reason = "goal_reached"
+                    break
+            else:
+                goal_hold_counter = 0
+
+            # ── Consecutive failure check ───────────────────────────
+            if consecutive_failures >= configured_failure_limit:
+                self._trajectory_exit_reason = "consecutive_planner_failures"
+                rospy.logerr("[ONLINE-LOCKSTEP] %d consecutive planner failures; aborting.",
+                             consecutive_failures)
+                break
+
+            sample_index += 1
+            self._rec_sent_control_frames += 1
+
+        self._final_executed_position = cur_pos.tolist()
+        self._final_executed_velocity = cur_vel.tolist()
+        if self._trajectory_exit_reason == "running":
+            self._trajectory_exit_reason = "shutdown" if rospy.is_shutdown() else "loop_exited"
+        self._close_open_files()
+        self._st_finish_recording()
+
+    # ═══════════════════════════════════════════════════════════════
+    #  Lockstep helper methods
+    # ═══════════════════════════════════════════════════════════════
+
+    def _wait_for_exact_depth_frame(self, target_frame_id, depth_float_len,
+                                     img_w, img_h, depth_max_m,
+                                     unity_response_timeout_s,
+                                     last_valid_response_mono):
+        """Wait for a Unity depth response with exact frame_id match.
+
+        Returns:
+            (depth_u16, collision, recv_frame_id, recv_time_mono)
+            If timeout, returns (None, 0, None, None).
+            If wrong frame_id, returns (None, 0, wrong_fid, recv_time_mono).
+        """
+        deadline = last_valid_response_mono + unity_response_timeout_s
+        while time.monotonic() < deadline and not rospy.is_shutdown():
+            r = self.bridge.try_recv()
+            if r is None:
+                time.sleep(0.001)
+                continue
+
+            msg_dict, img_parts = r
+            _fid = msg_dict.get("pub_frame_id")
+            if _fid is None:
+                _fid = msg_dict.get("frame_id")
+            recv_time_mono = time.monotonic()
+
+            # Check collision
+            collision = 0
+            vehicles = msg_dict.get("pub_vehicles", [])
+            if vehicles and vehicles[0].get("collision", False):
+                collision = 1
+
+            # Verify frame_id match
+            if _fid != target_frame_id:
+                rospy.logwarn("[LOCKSTEP] Discarding stale frame_id=%s (expected %d)",
+                              _fid, target_frame_id)
+                return None, collision, _fid, recv_time_mono
+
+            # Extract depth image
+            depth_u16 = None
+            for part in img_parts:
+                if len(part) >= depth_float_len:
+                    raw = part[:depth_float_len]
+                    df32 = np.frombuffer(raw, dtype=np.float32).reshape((img_h, img_w))
+                    dm = np.flipud(df32 * 100.0)
+                    dm = np.nan_to_num(dm, nan=depth_max_m,
+                                       posinf=depth_max_m, neginf=0)
+                    depth_u16 = np.clip(
+                        dm / max(1e-6, depth_max_m) * 65535,
+                        0, 65535).astype(np.uint16)
+                    break
+
+            return depth_u16, collision, _fid, recv_time_mono
+
+        return None, 0, None, None
+
+    def _sample_expert_command(self, result, label_lookahead_time_s):
+        """Sample expert velocity command from a plan trajectory at fixed lookahead.
+
+        The expert command is sampled from a plan generated from x_t.
+
+        Args:
+            result: LocalPlanResult from C++ planner.
+            label_lookahead_time_s: fixed future time for supervision.
+
+        Returns:
+            (expert_velocity_world, expert_yaw_rate) as numpy arrays/scalars.
+        """
+        if result is None or not result.success or len(result.trajectory) == 0:
+            return np.zeros(3, dtype=np.float64), 0.0
+
+        traj = result.trajectory
+        # Find trajectory point closest to label_lookahead_time_s
+        best_idx = min(range(len(traj)),
+                       key=lambda i: abs(float(traj[i].t) - label_lookahead_time_s))
+        command_point = traj[best_idx]
+        expert_vel_world = np.array(command_point.velocity, dtype=np.float64)
+        expert_yaw_rate = float(command_point.yaw_rate)
+        return expert_vel_world, expert_yaw_rate
+
+    def _execute_trajectory_segment(self, result, cur_pos, cur_vel, cur_yaw,
+                                     dt_sample, dt_ctrl, sample_index,
+                                     max_velocity, max_acceleration, max_yaw_rate):
+        """Execute dt_sample using sub-steps from the plan trajectory.
+
+        Returns:
+            (next_pos, next_vel, next_yaw, avg_yaw_rate) — all numpy arrays/scalars.
+        """
+        pos = np.asarray(cur_pos, dtype=np.float64).copy()
+        vel = np.asarray(cur_vel, dtype=np.float64).copy()
+        yaw = float(cur_yaw)
+        total_yaw_change = 0.0
+
+        if result is None or len(result.trajectory) == 0:
+            # Hover
+            elapsed = 0.0
+            epsilon = 1e-9
+            while elapsed < dt_sample - epsilon:
+                step_dt = min(dt_ctrl, dt_sample - elapsed)
+                desired_vel = np.zeros(3, dtype=np.float64)
+                pos, vel, yaw, yr = integrate_velocity_command(
+                    pos, vel, yaw, desired_vel, step_dt,
+                    max_velocity, max_acceleration, max_yaw_rate)
+                total_yaw_change += yr * step_dt
+                elapsed += step_dt
+            avg_yaw_rate = total_yaw_change / max(dt_sample, 1e-9)
+            return pos, vel, yaw, avg_yaw_rate
+
+        traj = result.trajectory
+        traj_duration = float(traj[-1].t)
+        elapsed = 0.0
+        epsilon = 1e-9
+
+        while elapsed < dt_sample - epsilon:
+            step_dt = min(dt_ctrl, dt_sample - elapsed)
+            # Find trajectory point closest to current elapsed time
+            exec_time = (sample_index * dt_sample) + elapsed
+            clamped_time = min(exec_time, traj_duration)
+            best_idx = min(range(len(traj)),
+                           key=lambda i: abs(float(traj[i].t) - clamped_time))
+            tp = traj[best_idx]
+            desired_vel = np.array(tp.velocity, dtype=np.float64)
+
+            pos, vel, yaw, yr = integrate_velocity_command(
+                pos, vel, yaw, desired_vel, step_dt,
+                max_velocity, max_acceleration, max_yaw_rate)
+            total_yaw_change += yr * step_dt
+            elapsed += step_dt
+
+        avg_yaw_rate = total_yaw_change / max(dt_sample, 1e-9)
+        return pos, vel, yaw, avg_yaw_rate
+
+    def _execute_hover(self, cur_pos, cur_vel, cur_yaw,
+                        dt_sample, dt_ctrl,
+                        max_velocity, max_acceleration, max_yaw_rate):
+        """Execute a zero-velocity hover for dt_sample.
+
+        Returns:
+            (next_pos, next_vel, next_yaw, avg_yaw_rate).
+        """
+        pos = np.asarray(cur_pos, dtype=np.float64).copy()
+        vel = np.asarray(cur_vel, dtype=np.float64).copy()
+        yaw = float(cur_yaw)
+        total_yaw_change = 0.0
+        elapsed = 0.0
+        epsilon = 1e-9
+
+        while elapsed < dt_sample - epsilon:
+            step_dt = min(dt_ctrl, dt_sample - elapsed)
+            desired_vel = np.zeros(3, dtype=np.float64)
+            pos, vel, yaw, yr = integrate_velocity_command(
+                pos, vel, yaw, desired_vel, step_dt,
+                max_velocity, max_acceleration, max_yaw_rate)
+            total_yaw_change += yr * step_dt
+            elapsed += step_dt
+
+        avg_yaw_rate = total_yaw_change / max(dt_sample, 1e-9)
+        return pos, vel, yaw, avg_yaw_rate
+
+    def _build_training_row_v8(self, cur_pos, cur_vel, cur_yaw,
+                                result, plan_success, planner_compute_ms,
+                                planner_status_str,
+                                goal_np, goal_pt, global_path_length,
+                                label_lookahead_time_s, max_guide_range,
+                                png_name, collision,
+                                plan, sample_index, dt_sample,
+                                frame_id, recording_start_mono, recording_start_epoch_ns,
+                                t_request_mono, recv_time_mono, latency_ms,
+                                h_fov_rad, v_fov_rad, trend_h_bins, trend_v_bins,
+                                trend_sigma_bins, h_bin_edges, v_bin_edges,
+                                azi_soft_names, ele_soft_names,
+                                previous_progress_s,
+                                guide_sel=None, ref_segment=None,
+                                observed_map=None, observed_esdf=None,
+                                planner_used_obs=0, planner_used_fallback=0):
+        """Build a schema v7 training row as a dict.
+
+        IMPORTANT SEMANTICS (documented in comments):
+        - The depth image and state fields belong to x_t.
+        - The expert command is sampled from a plan generated from x_t.
+        - The executed_next fields belong to x_(t+1).
+        """
+        row = {}
+
+        # ── Time & matching ──────────────────────────────────────
+        trajectory_time_s = sample_index * dt_sample
+        row["timestamp_ns"] = recording_start_epoch_ns + int(
+            (t_request_mono - recording_start_mono) * 1e9)
+        row["receive_timestamp_ns"] = recording_start_epoch_ns + int(
+            (recv_time_mono - recording_start_mono) * 1e9)
+        row["frame_id"] = frame_id
+        row["trajectory_time_s"] = round(trajectory_time_s, 6)
+        row["latency_ms"] = round(latency_ms, 3)
+        row["match_method"] = "frame_id_exact"
+
+        # ── Current state (x_t) ──────────────────────────────────
+        row["x"] = round(float(cur_pos[0]), 4)
+        row["y"] = round(float(cur_pos[1]), 4)
+        row["z"] = round(float(cur_pos[2]), 4)
+        # Quaternion (yaw only for now)
+        half = 0.5 * float(cur_yaw)
+        row["qx"] = 0.0
+        row["qy"] = 0.0
+        row["qz"] = round(math.sin(half), 6)
+        row["qw"] = round(math.cos(half), 6)
+
+        # Current state velocity (world)
+        row["state_vx_world"] = round(float(cur_vel[0]), 4)
+        row["state_vy_world"] = round(float(cur_vel[1]), 4)
+        row["state_vz_world"] = round(float(cur_vel[2]), 4)
+
+        # Current state velocity (FLU)
+        state_vel_flu = world_vector_to_body_flu(cur_vel, float(cur_yaw))
+        row["state_vx_flu"] = round(float(state_vel_flu[0]), 4)
+        row["state_vy_flu"] = round(float(state_vel_flu[1]), 4)
+        row["state_vz_flu"] = round(float(state_vel_flu[2]), 4)
+
+        # Legacy RFU body velocity (for debug/compat)
+        vx_rfu, vy_rfu, vz_rfu = world_vel_to_body(
+            float(cur_vel[0]), float(cur_vel[1]), float(cur_vel[2]),
+            float(cur_yaw))
+        row["legacy_state_vx_rfu"] = round(vx_rfu, 4)
+        row["legacy_state_vy_rfu"] = round(vy_rfu, 4)
+        row["legacy_state_vz_rfu"] = round(vz_rfu, 4)
+
+        # ── Expert supervision ───────────────────────────────────
+        expert_vel_world, expert_yaw_rate = self._sample_expert_command(
+            result, label_lookahead_time_s)
+
+        row["expert_label_valid"] = 1 if (result is not None and plan_success
+                                           and len(result.trajectory) > 0) else 0
+
+        row["expert_vx_world"] = round(float(expert_vel_world[0]), 4)
+        row["expert_vy_world"] = round(float(expert_vel_world[1]), 4)
+        row["expert_vz_world"] = round(float(expert_vel_world[2]), 4)
+
+        expert_vel_flu = world_vector_to_body_flu(expert_vel_world, float(cur_yaw))
+        row["expert_vx_flu"] = round(float(expert_vel_flu[0]), 4)
+        row["expert_vy_flu"] = round(float(expert_vel_flu[1]), 4)
+        row["expert_vz_flu"] = round(float(expert_vel_flu[2]), 4)
+        row["expert_yaw_rate"] = round(float(expert_yaw_rate), 6)
+
+        # ── Executed next state placeholders ─────────────────────
+        # These are the state BEFORE executing; the AFTER values will
+        # be set below after the execution step. For now, store the
+        # current values as the "executed_next" baseline. The actual
+        # executed_next values are the cur_pos/cur_vel AFTER
+        # _execute_trajectory_segment. Since _build_training_row_v8
+        # is called BEFORE execution, we store the pre-execution
+        # state here as a placeholder which gets overwritten.
+        #
+        # NOTE: The caller (lockstep loop) must update these after
+        # execution. We store them in row and the caller patches them.
+        row["executed_next_x"] = round(float(cur_pos[0]), 4)
+        row["executed_next_y"] = round(float(cur_pos[1]), 4)
+        row["executed_next_z"] = round(float(cur_pos[2]), 4)
+        row["executed_next_vx_world"] = round(float(cur_vel[0]), 4)
+        row["executed_next_vy_world"] = round(float(cur_vel[1]), 4)
+        row["executed_next_vz_world"] = round(float(cur_vel[2]), 4)
+        row["executed_next_vx_flu"] = round(float(state_vel_flu[0]), 4)
+        row["executed_next_vy_flu"] = round(float(state_vel_flu[1]), 4)
+        row["executed_next_vz_flu"] = round(float(state_vel_flu[2]), 4)
+        row["executed_next_yaw"] = round(float(cur_yaw), 6)
+        row["executed_next_yaw_rate"] = 0.0
+
+        # ── Global navigation labels ─────────────────────────────
+        global_delta_world = goal_np - cur_pos
+        global_distance_m = float(np.linalg.norm(global_delta_world))
+        if global_distance_m < 1e-9:
+            row["global_direction_valid"] = 0
+            row["global_dir_x_flu"] = 0.0
+            row["global_dir_y_flu"] = 0.0
+            row["global_dir_z_flu"] = 0.0
+        else:
+            global_delta_flu = world_vector_to_body_flu(
+                global_delta_world, float(cur_yaw))
+            norm = float(np.linalg.norm(global_delta_flu))
+            row["global_direction_valid"] = 1
+            row["global_dir_x_flu"] = round(float(global_delta_flu[0]) / norm, 6)
+            row["global_dir_y_flu"] = round(float(global_delta_flu[1]) / norm, 6)
+            row["global_dir_z_flu"] = round(float(global_delta_flu[2]) / norm, 6)
+        row["global_distance_m"] = round(global_distance_m, 4)
+        row["global_distance_norm"] = round(
+            min(global_distance_m, max_guide_range) / max(max_guide_range, 1e-9), 6)
+
+        # ── Trend labels (Phase 2: farthest_visible_astar_waypoint) ──
+        # If GuideSelector produced a valid guide, use it.
+        # Otherwise fall back to legacy local_planner_goal.
+        if guide_sel is not None and guide_sel.valid:
+            row["guide_source"] = "farthest_visible_astar_waypoint"
+            local_goal_world = guide_sel.guide_position_world.copy()
+            guide_dist = guide_sel.guide_distance_m
+            guide_dir_flu = guide_sel.guide_direction_flu.copy()
+            azimuth = guide_sel.azimuth_rad
+            elevation = guide_sel.elevation_rad
+            guide_norm_val = guide_sel.guide_distance_norm
+        else:
+            row["guide_source"] = "legacy_local_planner_goal"
+            # Temporary stage-1 label source.
+            # This will be replaced by the farthest currently visible A* waypoint.
+            if (result is not None and result.success and
+                    hasattr(result, 'local_goal') and result.local_goal is not None):
+                local_goal_world = np.array(result.local_goal, dtype=np.float64)
+            else:
+                local_goal_world = cur_pos.copy()
+            guide_delta_world = local_goal_world - cur_pos
+            guide_dist = float(np.linalg.norm(guide_delta_world))
+            guide_dir_flu = world_vector_to_body_flu(
+                guide_delta_world, float(cur_yaw))
+            guide_n = float(np.linalg.norm(guide_dir_flu))
+            if guide_n > 1e-9:
+                guide_dir_flu = guide_dir_flu / guide_n
+            azimuth = math.atan2(float(guide_dir_flu[1]), float(guide_dir_flu[0]))
+            elevation = math.atan2(float(guide_dir_flu[2]),
+                                   math.sqrt(float(guide_dir_flu[0])**2 +
+                                            float(guide_dir_flu[1])**2 + 1e-12))
+            guide_norm_val = min(guide_dist, max_guide_range) / max(max_guide_range, 1e-9)
+
+        row["guide_x_world"] = round(float(local_goal_world[0]), 4)
+        row["guide_y_world"] = round(float(local_goal_world[1]), 4)
+        row["guide_z_world"] = round(float(local_goal_world[2]), 4)
+
+        guide_delta_world = local_goal_world - cur_pos
+        guide_distance_m = float(np.linalg.norm(guide_delta_world))
+        if guide_distance_m < 1e-9:
+            # Local goal coincides with current position
+            row["trend_label_valid"] = 0
+            row["guide_dir_x_flu_exact"] = 0.0
+            row["guide_dir_y_flu_exact"] = 0.0
+            row["guide_dir_z_flu_exact"] = 0.0
+            row["guide_distance_m"] = 0.0
+            row["guide_distance_norm"] = 0.0
+            row["guide_azimuth_rad"] = 0.0
+            row["guide_elevation_rad"] = 0.0
+            row["guide_azimuth_bin"] = -1
+            row["guide_elevation_bin"] = -1
+            # All soft labels = 0
+            for name in azi_soft_names:
+                row[name] = 0.0
+            for name in ele_soft_names:
+                row[name] = 0.0
+        else:
+            guide_delta_flu = world_vector_to_body_flu(
+                guide_delta_world, float(cur_yaw))
+            norm = float(np.linalg.norm(guide_delta_flu))
+            gdx = float(guide_delta_flu[0]) / norm
+            gdy = float(guide_delta_flu[1]) / norm
+            gdz = float(guide_delta_flu[2]) / norm
+            row["guide_dir_x_flu_exact"] = round(gdx, 6)
+            row["guide_dir_y_flu_exact"] = round(gdy, 6)
+            row["guide_dir_z_flu_exact"] = round(gdz, 6)
+
+            row["guide_distance_m"] = round(guide_distance_m, 4)
+            row["guide_distance_norm"] = round(
+                min(guide_distance_m, max_guide_range) / max(max_guide_range, 1e-9), 6)
+
+            # Azimuth / elevation in FLU
+            azimuth = math.atan2(gdy, gdx)
+            elevation = math.atan2(gdz, math.sqrt(gdx * gdx + gdy * gdy + 1e-12))
+            row["guide_azimuth_rad"] = round(azimuth, 6)
+            row["guide_elevation_rad"] = round(elevation, 6)
+
+            # Check if guide is within FOV
+            in_h_fov = (-h_fov_rad / 2.0 - 1e-9 <= azimuth <=
+                         h_fov_rad / 2.0 + 1e-9)
+            in_v_fov = (-v_fov_rad / 2.0 - 1e-9 <= elevation <=
+                         v_fov_rad / 2.0 + 1e-9)
+
+            if in_h_fov and in_v_fov:
+                row["trend_label_valid"] = 1
+                # Hard bin
+                h_bin = int(np.argmin(np.abs(h_bin_edges - azimuth)))
+                v_bin = int(np.argmin(np.abs(v_bin_edges - elevation)))
+                row["guide_azimuth_bin"] = h_bin
+                row["guide_elevation_bin"] = v_bin
+
+                # Soft labels (Gaussian weights)
+                h_soft = np.zeros(trend_h_bins, dtype=np.float64)
+                for i in range(trend_h_bins):
+                    bin_err = (azimuth - h_bin_edges[i]) / (
+                        (h_fov_rad / (trend_h_bins - 1)) + 1e-12)
+                    h_soft[i] = math.exp(-0.5 * (bin_err / trend_sigma_bins) ** 2)
+                h_soft /= max(h_soft.sum(), 1e-12)
+                for i, name in enumerate(azi_soft_names):
+                    row[name] = round(float(h_soft[i]), 6)
+
+                v_soft = np.zeros(trend_v_bins, dtype=np.float64)
+                for i in range(trend_v_bins):
+                    bin_err = (elevation - v_bin_edges[i]) / (
+                        (v_fov_rad / (trend_v_bins - 1)) + 1e-12)
+                    v_soft[i] = math.exp(-0.5 * (bin_err / trend_sigma_bins) ** 2)
+                v_soft /= max(v_soft.sum(), 1e-12)
+                for i, name in enumerate(ele_soft_names):
+                    row[name] = round(float(v_soft[i]), 6)
+            else:
+                # Outside FOV
+                row["trend_label_valid"] = 0
+                row["guide_azimuth_bin"] = -1
+                row["guide_elevation_bin"] = -1
+                for name in azi_soft_names:
+                    row[name] = 0.0
+                for name in ele_soft_names:
+                    row[name] = 0.0
+
+        # ── Depth & collision ────────────────────────────────────
+        row["depth_file"] = png_name
+        row["collision"] = collision
+
+        # ── Start / goal ─────────────────────────────────────────
+        row["start_x"] = round(plan["start"][0], 4)
+        row["start_y"] = round(plan["start"][1], 4)
+        row["start_z"] = round(plan["start"][2], 4)
+        row["goal_x"] = round(goal_pt[0], 4)
+        row["goal_y"] = round(goal_pt[1], 4)
+        row["goal_z"] = round(goal_pt[2], 4)
+
+        # ── Planner & debug fields ───────────────────────────────
+        row["global_progress_s"] = round(
+            result.progress_s if result is not None else previous_progress_s, 4)
+        row["global_progress_ratio"] = round(
+            (result.progress_s if result is not None else previous_progress_s)
+            / max(global_path_length, 1e-6), 6)
+        row["global_progress_index"] = (
+            result.progress_index if result is not None else -1)
+        row["local_goal_index"] = (
+            result.local_goal_index if result is not None else -1)
+        row["plan_id"] = (result.plan_id if result is not None else -1)
+        row["plan_time_from_start_s"] = round(
+            float(result.trajectory[0].t) if (result is not None
+                and len(result.trajectory) > 0) else 0.0, 6)
+        row["planner_status"] = planner_status_str
+        row["planner_success"] = plan_success
+        row["planner_compute_ms"] = round(planner_compute_ms, 3)
+        row["planner_min_clearance"] = round(
+            result.min_clearance if result is not None else 0.0, 4)
+        row["distance_to_final_goal"] = round(
+            float(np.linalg.norm(cur_pos - goal_np)), 4)
+        row["legacy_plan_age_ms"] = 0.0
+
+        # ── Phase 2: observed map diagnostics ────────────────────
+        if observed_map is not None:
+            row["observed_map_revision"] = observed_map.get_revision()
+            row["observed_known_voxel_count"] = observed_map.known_voxel_count()
+            row["observed_occupied_voxel_count"] = observed_map.occupied_voxel_count()
+            row["observed_free_voxel_count"] = observed_map.free_voxel_count()
+        else:
+            row["observed_map_revision"] = -1
+            row["observed_known_voxel_count"] = 0
+            row["observed_occupied_voxel_count"] = 0
+            row["observed_free_voxel_count"] = 0
+
+        # ── Phase 2: guide selection diagnostics ─────────────────
+        if guide_sel is not None:
+            row["guide_candidate_count"] = guide_sel.candidate_count
+            row["guide_visible"] = 1 if guide_sel.visible else 0
+            row["guide_depth_visible"] = 1 if guide_sel.depth_visible else 0
+            row["guide_corridor_known_free_ratio"] = round(
+                guide_sel.corridor_known_free_ratio, 4)
+            row["guide_path_index"] = guide_sel.guide_path_index
+            row["guide_rejection_reason"] = guide_sel.rejection_reason[:80] if guide_sel.rejection_reason else ""
+            row["terminal_path_index"] = guide_sel.terminal_path_index
+            row["terminal_distance_m"] = round(
+                float(np.linalg.norm(guide_sel.terminal_position_world - cur_pos)), 4)
+            # Approximate terminal arc length
+            row["terminal_path_arc_length_m"] = round(
+                float(np.linalg.norm(
+                    guide_sel.terminal_position_world - guide_sel.guide_position_world)) +
+                guide_sel.guide_distance_m, 4)
+        else:
+            row["guide_candidate_count"] = 0
+            row["guide_visible"] = 0
+            row["guide_depth_visible"] = 0
+            row["guide_corridor_known_free_ratio"] = 0.0
+            row["guide_path_index"] = -1
+            row["guide_rejection_reason"] = "no_selector"
+            row["terminal_path_index"] = -1
+            row["terminal_distance_m"] = 0.0
+            row["terminal_path_arc_length_m"] = 0.0
+
+        # ── Phase 2: planner flags ───────────────────────────────
+        row["planner_used_observed_esdf"] = planner_used_obs
+        row["planner_unknown_is_free"] = 0  # Phase 2: never treat unknown as free
+        row["planner_used_global_fallback"] = planner_used_fallback
+        row["reference_segment_point_count"] = (
+            len(ref_segment) if ref_segment else 0)
+
+        return row
+
+    # ═══════════════════════════════════════════════════════════════
+    #  v5 legacy: ONLINE_PLAN_AND_RECORD (async planner worker)
+    #  Renamed from _st_online_plan_and_record for backward compat.
+    # ═══════════════════════════════════════════════════════════════
+
+    def _st_online_plan_and_record_legacy_async(self):
+        """v5 legacy: Online receding-horizon planning with async planner worker.
+
         The planner updates a desired velocity asynchronously.  A fixed-rate
         controller limits acceleration/yaw-rate and integrates pose without
         replaying or resetting planner position samples.
@@ -1700,10 +2974,12 @@ class ILManager:
         self._close_open_files()
         self._st_finish_recording()
     def _st_finish_recording(self):
-        """v5: Called after online planning loop exits to finalize recording."""
+        """v7: Called after online planning loop exits to finalize recording."""
         plan = self.current_planned[self.traj_idx]
         ctrl_hz = self.g["control"]["control_hz"]
         rec_hz = self.g["control"]["record_hz"]
+        data_cfg = self.g.get("data", {})
+        schema_version = int(data_cfg.get("schema_version", 7))
 
         # Compute planner stats
         avg_plan_ms = (sum(self._planning_times_ms) / max(len(self._planning_times_ms), 1)
@@ -1722,7 +2998,8 @@ class ILManager:
                         if final_pos is not None else float("inf"))
         reached_goal = bool(self._trajectory_reached_goal)
 
-        # Save metadata to .inprogress (v5)
+        # ── v7 metadata ──────────────────────────────────────────────
+        collection_mode = data_cfg.get("collection_mode", "deterministic_lockstep")
         meta = {
             "scene": self.scene_label,
             "trajectory": "traj_{:03d}".format(self.traj_idx + 1),
@@ -1745,11 +3022,99 @@ class ILManager:
             "valid": plan.get("valid", False),
             "validation_report": plan.get("validation_report", {}),
             "esdf_stats": self.current_esdf_stats if hasattr(self, "current_esdf_stats") else {},
-            "schema_version": 6,
-            "vel_source": "velocity_controller_integrated",
-            "state_source": "velocity_integrated",
-            "body_frame_convention": {"x": "right", "y": "forward", "z": "up"},
-            # v5 planner metadata
+            # ── Schema v8 metadata ──
+            "schema_version": schema_version,
+            "collection_mode": collection_mode,
+            "sample_semantics": "depth_t,state_t,navigation_t -> expert_command_t",
+            "label_lookahead_time_s": float(
+                data_cfg.get("label_lookahead_time_s", 0.08)),
+            "training_coordinate_frame": {
+                "name": "CAMERA_FLU",
+                "x": "forward",
+                "y": "left",
+                "z": "up",
+            },
+            "world_coordinate_frame": "ROS_WORLD_FLU",
+            "legacy_internal_body_frame": {
+                "name": "RFU",
+                "x": "right",
+                "y": "forward",
+                "z": "up",
+            },
+            "guide_source": ("farthest_visible_astar_waypoint"
+                             if self._guide_selector is not None
+                             else "legacy_local_planner_goal"),
+            "guide_selection_rule": ("maximum_forward_astar_path_index_satisfying_"
+                                      "range_fov_depth_visibility_and_known_free_corridor"),
+            "trajectory_terminal_rule": ("farthest_dynamically_reachable_path_point_"
+                                          "not_beyond_guide"),
+            "unknown_space_policy": "occupied_or_infeasible",
+            "global_map_fallback_enabled": False,
+            "trend_horizontal_bins": int(
+                data_cfg.get("trend_horizontal_bins", 11)),
+            "trend_vertical_bins": int(
+                data_cfg.get("trend_vertical_bins", 7)),
+            "trend_soft_sigma_bins": float(
+                data_cfg.get("trend_soft_sigma_bins", 0.75)),
+            "max_guide_range_m": float(self._depth_cfg["max_m"]),
+            "depth_all_valid_in_simulation": True,
+            # ── Phase 2: observed map metadata ──
+            "local_expert_map": "observed_depth_history_esdf",
+            "global_map_usage": [
+                "weighted_astar",
+                "task_feasibility",
+                "offline_audit",
+            ],
+            "global_map_used_for_local_collision_optimization": False,
+            # ── v8 label quality stats ──
+            "invalid_expert_label_count": getattr(
+                self, "_invalid_expert_label_count", 0),
+            "invalid_trend_label_count": getattr(
+                self, "_invalid_trend_label_count", 0),
+            "consecutive_guide_failures": getattr(
+                self, "_consecutive_guide_failures", 0),
+            # ── Phase 3: scene & task metadata ──
+            "scene_generation_enabled": self._use_scene_gen,
+            "scene_obstacle_count": len(getattr(self, "_current_scene_obstacles", [])),
+            "scene_topology_valid": (
+                self._current_scene_validation.valid
+                if self._current_scene_validation is not None else None),
+            "scene_rejection_reason": (
+                self._current_scene_validation.rejection_reason
+                if self._current_scene_validation is not None else ""),
+            "scene_minimum_surface_gap_m": (
+                self._current_scene_validation.minimum_surface_gap_m
+                if self._current_scene_validation is not None else 0.0),
+            "scene_u_shape_detected": (
+                self._current_scene_validation.u_shape_detected
+                if self._current_scene_validation is not None else False),
+            "scene_dead_end_detected": (
+                self._current_scene_validation.dead_end_detected
+                if self._current_scene_validation is not None else False),
+            "task_direct_path_blocked": (
+                self._current_task_validation.direct_path_blocked
+                if self._current_task_validation is not None else None),
+            "task_direct_blocker_count": (
+                self._current_task_validation.direct_blocker_count
+                if self._current_task_validation is not None else 0),
+            "task_detour_ratio": (
+                self._current_task_validation.detour_ratio
+                if self._current_task_validation is not None else 0.0),
+            "task_dominant_obstacle_id": (
+                self._current_task_validation.dominant_obstacle_id
+                if self._current_task_validation is not None else ""),
+            "task_lower_cost_side": (
+                self._current_task_validation.lower_cost_side
+                if self._current_task_validation is not None else ""),
+            "task_side_cost_difference_ratio": (
+                self._current_task_validation.side_cost_difference_ratio
+                if self._current_task_validation is not None else 0.0),
+            "task_global_side_choice_valid": (
+                self._current_task_validation.global_side_choice_valid
+                if self._current_task_validation is not None else None),
+            "observability_invalid_frame_count": getattr(
+                self, "_invalid_obs_frame_count", 0),
+            # ── v5 planner metadata (retained) ──
             "planner_type": "receding_horizon_local",
             "planner_backend": self._planner_backend,
             "local_planner_config": self.g.get("planning", {}).get("local_planner", {}),
@@ -1996,6 +3361,23 @@ class ILManager:
             validation_passed = False
             failure_reasons.append("metadata_missing")
 
+        # 8. Schema v7 lightweight data checks (non-fatal for some)
+        data_cfg = self.g.get("data", {})
+        schema_version = int(data_cfg.get("schema_version", 7))
+        if schema_version >= 7 and os.path.isfile(data_path) and col_map:
+            v7_issues = self._validate_schema_v7(
+                data_path, col_map, data_cfg)
+            if v7_issues:
+                rospy.logwarn("[Validate] Schema v7 issues: %s",
+                              "; ".join(v7_issues[:10]))
+                # Do not reject episode for trend label issues in stage 1,
+                # but track them in metadata.
+                # Only reject for critical structural issues.
+                critical = [i for i in v7_issues if i.startswith("CRITICAL:")]
+                if critical:
+                    failure_reasons.extend(critical)
+                    validation_passed = False
+
         # ── Commit or reject ──────────────────────────────────────
         if validation_passed:
             self._commit_trajectory()
@@ -2005,6 +3387,137 @@ class ILManager:
         self._inprogress_dir = None
         self._final_dir = None
         self._route_next()
+
+    def _validate_schema_v7(self, data_path, col_map, data_cfg):
+        """Lightweight schema v7 data checks. Returns list of issue strings."""
+        issues = []
+        trend_h_bins = int(data_cfg.get("trend_horizontal_bins", 11))
+        trend_v_bins = int(data_cfg.get("trend_vertical_bins", 7))
+
+        try:
+            with open(data_path, "r") as f:
+                reader = csv.DictReader(f)
+                prev_frame_id = -1
+                row_idx = 0
+                for row in reader:
+                    row_idx += 1
+
+                    # Check required v7 fields exist
+                    if "expert_label_valid" not in row:
+                        issues.append("CRITICAL: missing expert_label_valid at row {}".format(row_idx))
+                    if "trend_label_valid" not in row:
+                        issues.append("CRITICAL: missing trend_label_valid at row {}".format(row_idx))
+                    if "match_method" not in row:
+                        issues.append("CRITICAL: missing match_method at row {}".format(row_idx))
+
+                    # match_method must be exact frame_id
+                    mm = row.get("match_method", "")
+                    if mm and mm != "frame_id_exact":
+                        issues.append("CRITICAL: non-exact match_method='{}' at row {}".format(mm, row_idx))
+
+                    # frame_id monotonically increasing
+                    try:
+                        fid = int(row.get("frame_id", -1))
+                        if fid <= prev_frame_id:
+                            issues.append("CRITICAL: non-monotonic frame_id {} -> {} at row {}".format(
+                                prev_frame_id, fid, row_idx))
+                        prev_frame_id = fid
+                    except (ValueError, TypeError):
+                        pass
+
+                    # Check normalized distances in [0, 1]
+                    for fname in ("global_distance_norm", "guide_distance_norm"):
+                        val = row.get(fname)
+                        if val is not None and val != "":
+                            try:
+                                v = float(val)
+                                if v < -1e-6 or v > 1.0 + 1e-6:
+                                    issues.append("{}={} out of [0,1] at row {}".format(fname, v, row_idx))
+                            except ValueError:
+                                pass
+
+                    # Valid global direction should have norm ~1
+                    gdv = row.get("global_direction_valid")
+                    if gdv is not None and str(gdv) == "1":
+                        try:
+                            gdx = float(row.get("global_dir_x_flu", 0))
+                            gdy = float(row.get("global_dir_y_flu", 0))
+                            gdz = float(row.get("global_dir_z_flu", 0))
+                            norm = math.sqrt(gdx*gdx + gdy*gdy + gdz*gdz)
+                            if abs(norm - 1.0) > 0.01:
+                                issues.append("global_dir norm={:.4f} != 1 at row {}".format(norm, row_idx))
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Valid trend direction should have norm ~1
+                    tlv = row.get("trend_label_valid")
+                    if tlv is not None and str(tlv) == "1":
+                        try:
+                            gdx = float(row.get("guide_dir_x_flu_exact", 0))
+                            gdy = float(row.get("guide_dir_y_flu_exact", 0))
+                            gdz = float(row.get("guide_dir_z_flu_exact", 0))
+                            norm = math.sqrt(gdx*gdx + gdy*gdy + gdz*gdz)
+                            if abs(norm - 1.0) > 0.01:
+                                issues.append("guide_dir norm={:.4f} != 1 at row {}".format(norm, row_idx))
+                        except (ValueError, TypeError):
+                            pass
+
+                        # Valid trend: soft label sums should be ~1
+                        h_sum = 0.0
+                        for i in range(trend_h_bins):
+                            key = "guide_azimuth_soft_{}".format(i)
+                            try:
+                                h_sum += float(row.get(key, 0))
+                            except (ValueError, TypeError):
+                                pass
+                        if abs(h_sum - 1.0) > 0.02:
+                            issues.append("azimuth soft sum={:.4f} != 1 at row {}".format(h_sum, row_idx))
+
+                        v_sum = 0.0
+                        for i in range(trend_v_bins):
+                            key = "guide_elevation_soft_{}".format(i)
+                            try:
+                                v_sum += float(row.get(key, 0))
+                            except (ValueError, TypeError):
+                                pass
+                        if abs(v_sum - 1.0) > 0.02:
+                            issues.append("elevation soft sum={:.4f} != 1 at row {}".format(v_sum, row_idx))
+
+                    # Invalid trend: bin should be -1, soft labels all zero
+                    if tlv is not None and str(tlv) == "0":
+                        try:
+                            ab = int(row.get("guide_azimuth_bin", -1))
+                            eb = int(row.get("guide_elevation_bin", -1))
+                            if ab != -1:
+                                issues.append("invalid trend azimuth_bin={} != -1 at row {}".format(ab, row_idx))
+                            if eb != -1:
+                                issues.append("invalid trend elevation_bin={} != -1 at row {}".format(eb, row_idx))
+
+                            for i in range(trend_h_bins):
+                                key = "guide_azimuth_soft_{}".format(i)
+                                try:
+                                    v = float(row.get(key, 0))
+                                    if abs(v) > 1e-9:
+                                        issues.append("invalid trend azimuth_soft non-zero={} at row {}".format(v, row_idx))
+                                        break
+                                except ValueError:
+                                    pass
+                            for i in range(trend_v_bins):
+                                key = "guide_elevation_soft_{}".format(i)
+                                try:
+                                    v = float(row.get(key, 0))
+                                    if abs(v) > 1e-9:
+                                        issues.append("invalid trend elevation_soft non-zero={} at row {}".format(v, row_idx))
+                                        break
+                                except ValueError:
+                                    pass
+                        except (ValueError, TypeError):
+                            pass
+
+        except Exception as exc:
+            issues.append("CRITICAL: schema_v7_validation_exception: {}".format(exc))
+
+        return issues
 
     def _commit_trajectory(self):
         """Atomically rename .inprogress → final directory."""

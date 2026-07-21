@@ -30,6 +30,44 @@ bool ESDFGrid::setData(const float* data,
     data_.resize(total);
     std::memcpy(data_.data(), data, total * sizeof(float));
 
+    // Legacy: no known mask → all voxels known
+    has_known_mask_ = false;
+    unknown_is_free_ = true;  // legacy behaviour
+    known_mask_.clear();
+
+    initialized_ = true;
+    return true;
+}
+
+bool ESDFGrid::setDataWithMask(const float* data,
+                                const uint8_t* known_mask,
+                                int gx, int gy, int gz,
+                                double origin_x, double origin_y, double origin_z,
+                                double resolution,
+                                bool unknown_is_free) {
+    if (data == nullptr || known_mask == nullptr ||
+        gx <= 0 || gy <= 0 || gz <= 0 || resolution <= 0.0) {
+        return false;
+    }
+
+    gx_ = gx;
+    gy_ = gy;
+    gz_ = gz;
+    origin_x_ = origin_x;
+    origin_y_ = origin_y;
+    origin_z_ = origin_z;
+    resolution_ = resolution;
+    inv_resolution_ = 1.0 / resolution;
+    unknown_is_free_ = unknown_is_free;
+
+    size_t total = static_cast<size_t>(gx) * gy * gz;
+    data_.resize(total);
+    std::memcpy(data_.data(), data, total * sizeof(float));
+
+    known_mask_.resize(total);
+    std::memcpy(known_mask_.data(), known_mask, total * sizeof(uint8_t));
+    has_known_mask_ = true;
+
     initialized_ = true;
     return true;
 }
@@ -137,6 +175,44 @@ Eigen::Vector3d ESDFGrid::getGradient(double x, double y, double z,
 }
 
 bool ESDFGrid::isFree(double x, double y, double z, double min_clearance) const {
+    return getValue(x, y, z) > min_clearance;
+}
+
+bool ESDFGrid::isKnown(double x, double y, double z) const {
+    if (!initialized_) return false;
+    // Legacy mode: all in-bounds voxels are known
+    if (!has_known_mask_ || unknown_is_free_) {
+        double gx_f = worldToGridX(x);
+        double gy_f = worldToGridY(y);
+        double gz_f = worldToGridZ(z);
+        return (gx_f >= -0.5 && gx_f <= gx_ - 0.5 &&
+                gy_f >= -0.5 && gy_f <= gy_ - 0.5 &&
+                gz_f >= -0.5 && gz_f <= gz_ - 0.5);
+    }
+
+    // With known mask: check the nearest voxel
+    int ix = static_cast<int>(std::floor(worldToGridX(x)));
+    int iy = static_cast<int>(std::floor(worldToGridY(y)));
+    int iz = static_cast<int>(std::floor(worldToGridZ(z)));
+
+    if (ix < 0 || ix >= gx_ || iy < 0 || iy >= gy_ || iz < 0 || iz >= gz_)
+        return false;  // out of bounds = unknown
+
+    size_t idx = static_cast<size_t>(ix) * gy_ * gz_ +
+                 static_cast<size_t>(iy) * gz_ +
+                 static_cast<size_t>(iz);
+    return known_mask_[idx] != 0;
+}
+
+bool ESDFGrid::isKnownFree(double x, double y, double z,
+                            double min_clearance) const {
+    // If unknown is free (legacy), just check clearance
+    if (!has_known_mask_ || unknown_is_free_) {
+        return isFree(x, y, z, min_clearance);
+    }
+
+    // Must be both known AND have sufficient clearance
+    if (!isKnown(x, y, z)) return false;
     return getValue(x, y, z) > min_clearance;
 }
 

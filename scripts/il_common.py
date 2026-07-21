@@ -157,6 +157,50 @@ def integrate_velocity_command(position, velocity, yaw, desired_velocity, dt,
 
 
 # ============================================================================
+#  FLU coordinate conversion helpers  (schema v7)
+# ============================================================================
+
+def body_rfu_to_flu(vector):
+    """RFU [right, forward, up] -> FLU [forward, left, up].
+
+    Training coordinate frame for neural network input/output.
+    """
+    right, forward, up = vector
+    return np.array([forward, -right, up], dtype=np.float64)
+
+
+def body_flu_to_rfu(vector):
+    """FLU [forward, left, up] -> RFU [right, forward, up].
+
+    Inverse of body_rfu_to_flu.
+    """
+    forward, left, up = vector
+    return np.array([-left, forward, up], dtype=np.float64)
+
+
+def world_vector_to_body_flu(vector_world, yaw):
+    """ROS world vector -> body/navigation FLU.
+
+    Convenience wrapper: world -> body RFU (via world_vel_to_body)
+    then RFU -> FLU (via body_rfu_to_flu).
+
+    Args:
+        vector_world: 3-vector in ROS world frame (X-fwd, Y-left, Z-up).
+        yaw: drone yaw in radians.
+
+    Returns:
+        np.array of shape (3,) in FLU: [forward, left, up].
+    """
+    right, forward, up = world_vel_to_body(
+        float(vector_world[0]),
+        float(vector_world[1]),
+        float(vector_world[2]),
+        float(yaw),
+    )
+    return body_rfu_to_flu([right, forward, up])
+
+
+# ============================================================================
 #  Vehicle / camera builders  (KEPT EXACTLY AS ORIGINAL – compatibility)
 # ============================================================================
 

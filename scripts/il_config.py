@@ -318,6 +318,178 @@ def _validate_config(cfg):
         errors.append("global.control.record_hz ({}) > control_hz ({})".format(
             ctrl["record_hz"], ctrl["control_hz"]))
 
+    # ── Data (schema v7) ────────────────────────────────────────
+    data = g.get("data", {})
+    schema_version = data.get("schema_version", 5)
+    if schema_version >= 7:
+        # label_lookahead_time_s validation
+        lookahead = data.get("label_lookahead_time_s", 0.08)
+        if lookahead <= 0:
+            errors.append(
+                "global.data.label_lookahead_time_s must be > 0, got {}".format(lookahead))
+
+        # trend soft sigma
+        sigma = data.get("trend_soft_sigma_bins", 0.75)
+        if sigma <= 0:
+            errors.append(
+                "global.data.trend_soft_sigma_bins must be > 0, got {}".format(sigma))
+
+        # trend bins must be odd > 1
+        for bin_name in ("trend_horizontal_bins", "trend_vertical_bins"):
+            nb = data.get(bin_name, 1)
+            if not isinstance(nb, int) or nb < 3 or nb % 2 == 0:
+                errors.append(
+                    "global.data.{} must be an odd integer > 1, got {}".format(bin_name, nb))
+
+        # collection_mode validation
+        mode = data.get("collection_mode", "deterministic_lockstep")
+        accepted_modes = ("deterministic_lockstep", "legacy_async")
+        if mode not in accepted_modes:
+            errors.append(
+                "global.data.collection_mode must be one of {}, got '{}'".format(
+                    accepted_modes, mode))
+
+    # ── Observed map (Phase 2) ──────────────────────────────────
+    obs_map = g.get("observed_map", {})
+    if obs_map.get("enabled", False):
+        for key in ("resolution", "size_x_m", "size_y_m", "size_z_m"):
+            val = obs_map.get(key, 0)
+            if not isinstance(val, (int, float)) or val <= 0:
+                errors.append("global.observed_map.{} must be > 0, got {}".format(key, val))
+        # Grid dimensions should map to reasonable integer counts
+        for dim_name, size_key in [("x", "size_x_m"), ("y", "size_y_m"), ("z", "size_z_m")]:
+            res = obs_map.get("resolution", 0.1)
+            size = obs_map.get(size_key, 12.0)
+            if res > 0:
+                n = size / res
+                if n < 2:
+                    errors.append(
+                        "global.observed_map.{}/resolution yields <2 voxels in {} dim".format(
+                            size_key, dim_name))
+        hist = obs_map.get("history_seconds", 4.0)
+        if hist < 0:
+            errors.append("global.observed_map.history_seconds must be >= 0, got {}".format(hist))
+        ratio = obs_map.get("min_known_free_ratio", 0.95)
+        if ratio < 0 or ratio > 1:
+            errors.append("global.observed_map.min_known_free_ratio must be in [0,1], got {}".format(ratio))
+
+    # ── Guide selector (Phase 2) ─────────────────────────────────
+    gs = g.get("guide_selector", {})
+    if gs:
+        mr = gs.get("max_range_m", 5.0)
+        dmax = depth.get("max_m", 5.0)
+        if mr > dmax + 1e-9:
+            errors.append("guide_selector.max_range_m ({}) > depth.max_m ({})".format(mr, dmax))
+        for key in ("corridor_radius_m", "corridor_sample_spacing_m",
+                     "terminal_horizon_s", "terminal_acceleration_limit_mps2"):
+            val = gs.get(key, 0)
+            if not isinstance(val, (int, float)) or val <= 0:
+                errors.append("global.guide_selector.{} must be > 0, got {}".format(key, val))
+        # FOV margins
+        h_margin = gs.get("horizontal_fov_margin_deg", 3.0)
+        v_margin = gs.get("vertical_fov_margin_deg", 3.0)
+        hfov = depth.get("fov", 90.0)
+        if h_margin < 0 or h_margin >= hfov / 2.0:
+            errors.append("guide_selector.horizontal_fov_margin_deg ({}) must be in [0, {})".format(
+                h_margin, hfov / 2.0))
+        if v_margin < 0:
+            errors.append("guide_selector.vertical_fov_margin_deg must be >= 0")
+
+    # ── Phase 2: local_planner observed ESDF config ──────────────
+    lp = g.get("planning", {}).get("local_planner", {})
+    if lp:
+        use_obs = lp.get("use_observed_esdf", True)
+        forbid_unk = lp.get("forbid_unknown_space", True)
+        allow_fb = lp.get("allow_global_map_fallback", False)
+        if not use_obs:
+            errors.append("Phase 2 requires local_planner.use_observed_esdf = true")
+        if allow_fb:
+            errors.append("Phase 2 requires local_planner.allow_global_map_fallback = false")
+
+    # ── Phase 3: scene_generation validation ────────────────────
+    sg_cfg = g.get("scene_generation", {})
+    if sg_cfg.get("enabled", False):
+        # Basic type checks
+        if sg_cfg.get("obstacle_type", "cylinder") != "cylinder":
+            errors.append("Phase 3 only supports obstacle_type='cylinder'")
+        if sg_cfg.get("outside_obstacle_region_policy", "free") != "free":
+            errors.append("outside_obstacle_region_policy must be 'free'")
+
+        # Obstacle region
+        oreg = sg_cfg.get("obstacle_region", {})
+        for k in ("x_min", "x_max", "y_min", "y_max", "z_min", "z_max"):
+            if k not in oreg:
+                errors.append("Missing global.scene_generation.obstacle_region.{}".format(k))
+        if oreg.get("x_min", 0) >= oreg.get("x_max", 0):
+            errors.append("obstacle_region.x_min >= x_max")
+        if oreg.get("y_min", 0) >= oreg.get("y_max", 0):
+            errors.append("obstacle_region.y_min >= y_max")
+        if oreg.get("z_min", 0) >= oreg.get("z_max", 0):
+            errors.append("obstacle_region.z_min >= z_max")
+
+        # Cylinder params
+        cyl = sg_cfg.get("cylinder", {})
+        for k in ("radius_min_m", "radius_max_m", "height_min_m", "height_max_m"):
+            v = cyl.get(k, 0)
+            if v <= 0:
+                errors.append("global.scene_generation.cylinder.{} must be > 0".format(k))
+        if cyl.get("radius_min_m", 0) > cyl.get("radius_max_m", 0):
+            errors.append("cylinder.radius_min_m > radius_max_m")
+        if cyl.get("height_min_m", 0) > cyl.get("height_max_m", 0):
+            errors.append("cylinder.height_min_m > height_max_m")
+        if cyl.get("count_min", 0) > cyl.get("count_max", 0):
+            errors.append("cylinder.count_min > count_max")
+        if cyl.get("minimum_surface_gap_m", 0) < 0:
+            errors.append("cylinder.minimum_surface_gap_m must be >= 0")
+        if cyl.get("minimum_inflated_gap_m", 0) < 0:
+            errors.append("cylinder.minimum_inflated_gap_m must be >= 0")
+
+        # Topology validation
+        topo = sg_cfg.get("topology_validation", {})
+        if topo.get("grid_resolution_m", 0) <= 0:
+            errors.append("topology_validation.grid_resolution_m must be > 0")
+        if topo.get("validation_halo_m", 0) <= 0:
+            errors.append("topology_validation.validation_halo_m must be > 0")
+        if topo.get("escape_ray_count", 0) < 8:
+            errors.append("topology_validation.escape_ray_count must be >= 8")
+        if topo.get("minimum_escape_sector_width_deg", 0) <= 0:
+            errors.append("topology_validation.minimum_escape_sector_width_deg must be > 0")
+        if topo.get("minimum_separated_escape_sectors", 0) < 1:
+            errors.append("minimum_separated_escape_sectors must be >= 1")
+
+        # Task generation
+        tg = sg_cfg.get("task_generation", {})
+        if tg.get("minimum_start_goal_distance_m", 0) > tg.get("maximum_start_goal_distance_m", 0):
+            errors.append("task_generation.minimum_start_goal_distance > maximum")
+        if tg.get("minimum_detour_ratio", 0) < 1.0:
+            errors.append("task_generation.minimum_detour_ratio must be >= 1")
+        if tg.get("maximum_detour_ratio", 0) < tg.get("minimum_detour_ratio", 0):
+            errors.append("task_generation.maximum_detour_ratio < minimum_detour_ratio")
+        if tg.get("maximum_start_goal_height_difference_m", 0) < 0:
+            errors.append("maximum_start_goal_height_difference_m must be >= 0")
+        if tg.get("minimum_direct_blocker_count", 0) < 0:
+            errors.append("minimum_direct_blocker_count must be >= 0")
+        if tg.get("maximum_direct_blocker_count", 0) < tg.get("minimum_direct_blocker_count", 0):
+            errors.append("maximum_direct_blocker_count < minimum_direct_blocker_count")
+
+        # Side cost
+        sc = sg_cfg.get("side_cost", {})
+        if sc.get("minimum_cost_difference_ratio", 0) < 0:
+            errors.append("side_cost.minimum_cost_difference_ratio must be >= 0")
+
+        # Observability
+        obs_audit = sg_cfg.get("observability_audit", {})
+        if obs_audit.get("maximum_invalid_frames_before_reject", 0) < 0:
+            errors.append("maximum_invalid_frames_before_reject must be >= 0")
+
+        # source check
+        if sg_cfg.get("source") == "explicit_yaml":
+            layout = sg_cfg.get("layout_file", "")
+            if not layout:
+                errors.append("explicit_yaml mode requires layout_file")
+            elif not os.path.isfile(layout):
+                errors.append("layout_file not found: {}".format(layout))
+
     # ── Obstacle ────────────────────────────────────────────────
     obs = g.get("obstacle", {})
     if "area_x" in obs:

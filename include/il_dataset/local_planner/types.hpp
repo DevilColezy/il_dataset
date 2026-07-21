@@ -39,7 +39,32 @@ enum class PlannerStatus : int {
     COLLISION = 5,
     DYNAMICS_VIOLATION = 6,
     OUTSIDE_MAP = 7,
-    EMERGENCY_HOLD = 8
+    EMERGENCY_HOLD = 8,
+    UNKNOWN_SPACE = 9  // Phase 2: trajectory enters unknown space
+};
+
+/// Phase 2: Explicit planning request with guide/terminal separation.
+struct LocalPlanningRequest {
+    VehicleState state;
+
+    double previous_progress_s{0.0};
+
+    /// Guide waypoint (farthest visible A* point) — for trend labels.
+    Eigen::Vector3d guide_waypoint{Eigen::Vector3d::Zero()};
+    int guide_waypoint_index{-1};
+
+    /// Trajectory terminal (dynamically reachable) — optimization target.
+    Eigen::Vector3d trajectory_terminal{Eigen::Vector3d::Zero()};
+    int trajectory_terminal_index{-1};
+
+    /// A* sub-path segment for B-spline initialisation.
+    std::vector<Eigen::Vector3d> reference_path_segment;
+
+    /// If true, use isKnownFree() instead of isFree() for collision checks.
+    bool forbid_unknown_space{true};
+
+    /// If true, allow fallback to global path when optimization fails.
+    bool allow_global_map_fallback{false};
 };
 
 /// Complete result of a single local-planning invocation.
@@ -58,6 +83,14 @@ struct LocalPlanResult {
     int local_goal_index = -1;     ///< global-path waypoint index of the local goal
     Eigen::Vector3d local_goal{Eigen::Vector3d::Zero()};
     uint64_t plan_id = 0;          ///< monotonically increasing plan identifier
+
+    // Phase 2: explicit guide/terminal separation
+    Eigen::Vector3d guide_waypoint{Eigen::Vector3d::Zero()};
+    int guide_waypoint_index{-1};
+    Eigen::Vector3d trajectory_terminal{Eigen::Vector3d::Zero()};
+    int trajectory_terminal_index{-1};
+    bool used_global_fallback{false};
+    bool used_observed_esdf{false};
 };
 
 /// Validation result for a trajectory.

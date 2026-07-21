@@ -89,6 +89,130 @@ global:
     avoid_radius: 0.0
     ground_z:     0.0
 
+  # ── Phase 3: Scene & Task Generation ───────────────────────────────
+  scene_generation:
+    enabled: true
+
+    source: "procedural_yaml"
+    obstacle_type: "cylinder"
+
+    seed: 12345
+    max_scene_generation_attempts: 200
+    max_obstacle_sampling_attempts: 5000
+
+    obstacle_region:
+      x_min: -8.0
+      x_max: 8.0
+      y_min: -6.0
+      y_max: 6.0
+      z_min: 0.0
+      z_max: 6.0
+
+    outside_obstacle_region_policy: "free"
+
+    cylinder:
+      count_min: 4
+      count_max: 12
+
+      radius_min_m: 0.40
+      radius_max_m: 1.20
+
+      height_min_m: 5.0
+      height_max_m: 6.0
+
+      require_full_vertical_blocking: true
+
+      region_boundary_margin_m: 0.30
+
+      minimum_surface_gap_m: 1.20
+      minimum_inflated_gap_m: 0.60
+
+      allow_overlap: false
+      allow_inflated_component_merging: false
+
+    topology_validation:
+      enabled: true
+
+      grid_resolution_m: 0.10
+      validation_halo_m: 3.0
+
+      vehicle_radius_m: 0.30
+      safety_margin_m: 0.10
+
+      forbid_enclosed_free_components: true
+      forbid_dead_ends: true
+      forbid_u_shapes: true
+
+      minimum_navigable_corridor_width_m: 0.80
+
+      escape_ray_count: 24
+      minimum_escape_sector_width_deg: 35.0
+      minimum_separated_escape_sectors: 2
+      minimum_escape_sector_separation_deg: 80.0
+
+      dead_end_probe_spacing_m: 0.50
+      dead_end_minimum_depth_m: 1.50
+
+    task_generation:
+      enabled: true
+
+      max_task_sampling_attempts: 1000
+      tasks_per_scene: 20
+
+      start_height_min_m: 1.8
+      start_height_max_m: 2.2
+      goal_height_min_m: 1.8
+      goal_height_max_m: 2.2
+      maximum_start_goal_height_difference_m: 0.20
+
+      start_clearance_m: 0.60
+      goal_clearance_m: 0.60
+
+      minimum_start_goal_distance_m: 8.0
+      maximum_start_goal_distance_m: 30.0
+
+      require_direct_path_blocked: true
+      direct_path_corridor_radius_m: 0.35
+
+      minimum_direct_blocker_count: 1
+      maximum_direct_blocker_count: 3
+
+      require_astar_reachable: true
+
+      minimum_detour_ratio: 1.05
+      maximum_detour_ratio: 1.80
+
+      start_sampling_region:
+        x_min: -12.0
+        x_max: -8.0
+        y_min: -8.0
+        y_max: 8.0
+
+      goal_sampling_region:
+        x_min: 8.0
+        x_max: 12.0
+        y_min: -8.0
+        y_max: 8.0
+
+    side_cost:
+      enabled: true
+
+      minimum_cost_difference_ratio: 0.15
+      portal_lateral_clearance_m: 0.60
+      portal_longitudinal_offset_m: 0.50
+
+      require_both_sides_feasible: false
+      reject_nearly_equal_sides: true
+
+    observability_audit:
+      enabled: true
+
+      require_runtime_side_consistency: true
+      minimum_observed_cost_difference_ratio: 0.05
+
+      maximum_invalid_frames_before_reject: 5
+      reject_episode_on_inconsistent_side_choice: true
+
   # ── Start / goal random generation ───────────────────────────────────
   start_goal:
     num_pairs_per_config: 3            # fewer pairs for quick test
@@ -183,6 +307,11 @@ global:
       reduce_lookahead_on_failure: true
       emergency_hold_enabled: true
 
+      # ── Phase 2: observed ESDF usage ──
+      use_observed_esdf: true
+      forbid_unknown_space: true
+      allow_global_map_fallback: false
+
     # ═══════════════════════════════════════════════════════════════════
     #  Validation thresholds for committed data
     # ═══════════════════════════════════════════════════════════════════
@@ -224,12 +353,64 @@ global:
 
   # ── Data format ──────────────────────────────────────────────────────
   data:
-    coordinate_frame: "ROS_WORLD"
-    schema_version: 5
+    coordinate_frame: "CAMERA_FLU"
+    schema_version: 9
+    collection_mode: "deterministic_lockstep"
+    label_lookahead_time_s: 0.08
+    trend_horizontal_bins: 11
+    trend_vertical_bins: 7
+    trend_soft_sigma_bins: 0.75
     # NOTE: The following keys are declared but NOT currently consumed by
     # the pipeline.  They are reserved for future use:
     save_obstacle_ply:  true          # (future) per-trajectory PLY export
     save_trajectory_meta: true        # (always saved; this flag is ignored)
+
+  # ── Observed local occupancy map (Phase 2) ───────────────────────────
+  observed_map:
+    enabled: true
+
+    resolution: 0.10
+
+    size_x_m: 12.0
+    size_y_m: 12.0
+    size_z_m: 5.0
+
+    history_seconds: 4.0
+
+    occupied_endpoint_margin_m: 0.05
+
+    unknown_is_free: false
+
+    min_known_free_ratio: 0.95
+
+    esdf_max_distance_m: 5.0
+
+    rebuild_every_n_frames: 1
+
+    depth_integration_step: 4
+
+  # ── Guide selector (Phase 2) ─────────────────────────────────────────
+  guide_selector:
+    max_range_m: 5.0
+
+    horizontal_fov_margin_deg: 3.0
+    vertical_fov_margin_deg: 3.0
+
+    depth_visibility_tolerance_m: 0.20
+
+    corridor_radius_m: 0.35
+    corridor_sample_spacing_m: 0.10
+
+    min_clearance_m: 0.35
+
+    path_search_max_points: 200
+
+    terminal_horizon_s: 1.5
+    terminal_acceleration_limit_mps2: 3.0
+    terminal_min_distance_m: 0.40
+
+    use_depth_projection_visibility: true
+    use_known_free_corridor: true
 
   # ── Sync & commit thresholds ─────────────────────────────────────────
   sync:
