@@ -418,8 +418,8 @@ global:
       emergency_hold_enabled: true
 
       # ── Phase 2: observed ESDF usage ──
-      use_observed_esdf: true
-      forbid_unknown_space: true
+      use_observed_esdf: false
+      forbid_unknown_space: false
       allow_global_map_fallback: false
 
     # ═══════════════════════════════════════════════════════════════════
@@ -497,7 +497,7 @@ global:
     terminal_min_distance_m: 0.40
 
     use_depth_projection_visibility: true
-    use_known_free_corridor: true
+    use_known_free_corridor: false
 
   # ── Sync & commit thresholds ─────────────────────────────────────────
   sync:

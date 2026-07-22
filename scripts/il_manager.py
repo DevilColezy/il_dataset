@@ -381,15 +381,18 @@ class ILManager:
         "guide_candidate_count",
         "guide_visible",
         "guide_depth_visible",
+        "guide_corridor_check_enabled",
         "guide_corridor_known_free_ratio",
         "guide_path_index",
         "guide_rejection_reason",
         # -- Phase 2: terminal diagnostics --
         "terminal_path_index",
+        "terminal_x_world", "terminal_y_world", "terminal_z_world",
         "terminal_distance_m",
         "terminal_path_arc_length_m",
         # -- Phase 2: planner observed ESDF flags --
         "planner_used_observed_esdf",
+        "planner_map_source",
         "planner_unknown_is_free",
         "planner_used_global_fallback",
         "reference_segment_point_count",
@@ -462,6 +465,8 @@ class ILManager:
         # ── Phase 2: observed map, ESDF, camera model, guide selector ──
         obs_cfg = self.g.get("observed_map", {})
         self._use_observed_map = bool(obs_cfg.get("enabled", False))
+        self._use_observed_esdf = bool(
+            lp_cfg.get("use_observed_esdf", False))
         self._observed_map = None
         self._observed_esdf = None
         self._camera_model = None
@@ -472,9 +477,6 @@ class ILManager:
         if self._use_observed_map and _OBSERVED_MAP_AVAILABLE:
             self._observed_map = RollingObservedOccupancyMap(config)
             self._observed_esdf = ObservedESDF(config)
-            self._camera_model = PinholeCameraModel(
-                self._depth_cfg["width"], self._depth_cfg["height"],
-                math.radians(self._depth_cfg["fov"]))
         elif self._use_observed_map:
             raise RuntimeError("Observed-map module is required but unavailable")
         if self.g.get("scene_generation", {}).get("enabled", False) and not _SCENARIO_AVAILABLE:
@@ -483,12 +485,18 @@ class ILManager:
             raise RuntimeError("DAgger module is required but unavailable")
         if not _ESDF_CACHE_AVAILABLE:
             raise RuntimeError("ESDF cache module is required but unavailable")
-        if self._use_observed_map and _GUIDE_SELECTOR_AVAILABLE:
+        # Guide selection depends on the current camera frame, not on whether
+        # depth history is fused into an observed occupancy map.
+        if _GUIDE_SELECTOR_AVAILABLE and _OBSERVED_MAP_AVAILABLE:
+            self._camera_model = PinholeCameraModel(
+                self._depth_cfg["width"], self._depth_cfg["height"],
+                math.radians(self._depth_cfg["fov"]))
             self._guide_selector = GuideSelector(config, self._camera_model)
-            rospy.loginfo("[Manager] Phase 2: observed map + ESDF + guide selector enabled.")
-        elif self._use_observed_map:
-            rospy.logwarn("[Manager] Phase 2 modules not available; falling back to global ESDF.")
-            self._use_observed_map = False
+            rospy.loginfo(
+                "[Manager] Guide selector enabled (current depth + camera FOV).")
+        else:
+            raise RuntimeError(
+                "GuideSelector and camera model are required for formal collection")
 
         # ── Phase 3: scene & task generation ────────────────────────
         sg_cfg = self.g.get("scene_generation", {})
@@ -1594,13 +1602,10 @@ class ILManager:
                 self._guide_progress_index = -1
                 self._consecutive_guide_failures = 0
 
-                # The complete global ESDF is deliberately never uploaded to
-                # the online local planner when observed_map is enabled —
-                # the first lockstep depth frame builds and uploads the
-                # finite-observation ESDF before plan().
-                # When observed_map is disabled, upload the global ESDF
-                # directly so the planner can use it for all planning.
-                if not self._use_observed_map and self.current_esdf is not None:
+                # Planner-map choice is independent from Guide selection.
+                # In global-ESDF mode the complete ESDF is uploaded once here;
+                # current depth is still used every frame for Guide visibility.
+                if not self._use_observed_esdf and self.current_esdf is not None:
                     esdf_c = np.ascontiguousarray(
                         self.current_esdf, dtype=np.float32)
                     origin = np.array(self.current_esdf_origin,
@@ -1937,6 +1942,9 @@ class ILManager:
             guide_sel = GuideSelection()
             observability_result = None
             ref_segment = []
+            t_int_ms = 0.0
+            t_esdf_ms = 0.0
+            t_guide_ms = 0.0
             if self._use_observed_map and self._observed_map is not None and depth_m is not None:
                 timestamp_s = sample_index * dt_sample
                 if self._observed_map.recenter_if_needed(cur_pos):
@@ -1972,27 +1980,6 @@ class ILManager:
                             self._observed_esdf.get_resolution())
                     t_esdf_ms = (time.monotonic() - t_esdf_start) * 1000.0
 
-                # Select Guide and Terminal
-                if self._guide_selector is not None:
-                    t_guide_start = time.monotonic()
-                    guide_sel = self._guide_selector.select(
-                        global_path, self._guide_progress_index,
-                        cur_pos, float(cur_yaw), cur_vel, depth_m,
-                        self._observed_map, self._observed_esdf,
-                        dynamics_state.quaternion_world_body)
-                    t_guide_ms = (time.monotonic() - t_guide_start) * 1000.0
-                    if guide_sel.valid:
-                        self._guide_progress_index = max(
-                            self._guide_progress_index,
-                            guide_sel.progress_path_index)
-                        self._consecutive_guide_failures = 0
-                        # Get reference segment for planner
-                        ref_segment = self._guide_selector.get_reference_segment(
-                            global_path,
-                            max(0, self._guide_progress_index),
-                            guide_sel.terminal_path_index)
-                    else:
-                        self._consecutive_guide_failures += 1
                 if (self._obs_auditor is not None and
                         self._current_task_validation is not None and
                         self._current_dominant_obstacle is not None):
@@ -2011,6 +1998,33 @@ class ILManager:
                         self._observability_trigger_count += 1
                     if observability_result.side_choice_consistent:
                         self._observability_consistent_count += 1
+
+            # Select Guide/Terminal from the current depth frame regardless of
+            # whether observed occupancy fusion is enabled. The quaternion is
+            # used for the full world-to-camera FLU transform.
+            if self._guide_selector is not None:
+                t_guide_start = time.monotonic()
+                guide_sel = self._guide_selector.select(
+                    global_path, self._guide_progress_index,
+                    cur_pos, float(cur_yaw), cur_vel, depth_m,
+                    self._observed_map, self._observed_esdf,
+                    dynamics_state.quaternion_world_body)
+                t_guide_ms = (time.monotonic() - t_guide_start) * 1000.0
+                if guide_sel.valid:
+                    self._guide_progress_index = max(
+                        self._guide_progress_index,
+                        guide_sel.progress_path_index)
+                    ref_segment = self._guide_selector.get_reference_segment(
+                        global_path, max(0, self._guide_progress_index),
+                        guide_sel.terminal_path_index)
+                    if len(ref_segment) >= 2:
+                        self._consecutive_guide_failures = 0
+                    else:
+                        guide_sel.valid = False
+                        guide_sel.rejection_reason = "reference_segment_too_short"
+                        self._consecutive_guide_failures += 1
+                else:
+                    self._consecutive_guide_failures += 1
             t_map_ms = (time.monotonic() - t_map_start) * 1000.0
             # Diagnostic: log Phase-2 timing breakdown when it exceeds 100 ms
             if t_map_ms > 100.0:
@@ -2050,7 +2064,7 @@ class ILManager:
 
             if self._cpp_planner is not None:
                 # ── ESDF selection ────────────────────────────────
-                if (self._use_observed_map and self._observed_esdf is not None and
+                if (self._use_observed_esdf and self._observed_esdf is not None and
                         self._observed_esdf.is_built()):
                     # Phase 2: upload observed ESDF every frame.
                     esdf_arr = self._observed_esdf.get_esdf()
@@ -2072,7 +2086,7 @@ class ILManager:
                         if self._observed_esdf_cache is not None:
                             self._observed_esdf_cache.on_uploaded()
                     planner_used_obs = 1
-                elif not self._use_observed_map:
+                elif not self._use_observed_esdf:
                     # Global ESDF already uploaded once at init; no per-frame
                     # upload needed.  planner_used_obs stays 0.
                     pass
@@ -2095,12 +2109,13 @@ class ILManager:
                     state.yaw_rate = 0.0
 
                     lp_cfg_local = self.g.get("planning", {}).get("local_planner", {})
-                    forbid_unknown = bool(lp_cfg_local.get("forbid_unknown_space", True))
+                    forbid_unknown = bool(lp_cfg_local.get("forbid_unknown_space", False))
                     allow_fb = bool(lp_cfg_local.get("allow_global_map_fallback", False))
 
-                    if (planner_used_obs and guide_sel.valid and
-                            len(ref_segment) >= 2):
-                        # Phase 2: use explicit guide/terminal from guide selector
+                    if guide_sel.valid and len(ref_segment) >= 2:
+                        # Always preserve the explicit Guide/Terminal contract,
+                        # regardless of whether the planner map is global or
+                        # observed ESDF.
                         _has_new_types = _LocalPlanningRequest is not None
                         if _has_new_types:
                             req = _LocalPlanningRequest()
@@ -2125,12 +2140,6 @@ class ILManager:
                         else:
                             raise RuntimeError(
                                 "C++ binding lacks LocalPlanningRequest; legacy online planning is forbidden")
-                    elif not self._use_observed_map:
-                        # Global ESDF mode: use legacy plan_local which
-                        # internally selects the local goal from the global
-                        # path using the global ESDF.
-                        result = self._cpp_planner.plan_local(
-                            state, previous_progress_s)
                     else:
                         result = None
 
@@ -2141,7 +2150,9 @@ class ILManager:
                         result.planning_time_ms if hasattr(result, 'planning_time_ms') else planner_compute_ms)
 
                     if result is None:
-                        planner_status_str = "NO_OBSERVED_GUIDE"
+                        planner_status_str = (
+                            guide_sel.rejection_reason or
+                            "INVALID_GUIDE_OR_REFERENCE_SEGMENT")
                         plan_success = False
                         consecutive_failures += 1
                     else:
@@ -2975,32 +2986,45 @@ class ILManager:
             row["guide_candidate_count"] = guide_sel.candidate_count
             row["guide_visible"] = 1 if guide_sel.visible else 0
             row["guide_depth_visible"] = 1 if guide_sel.depth_visible else 0
+            row["guide_corridor_check_enabled"] = (
+                1 if guide_sel.corridor_check_enabled else 0)
             row["guide_corridor_known_free_ratio"] = round(
                 guide_sel.corridor_known_free_ratio, 4)
             row["guide_path_index"] = guide_sel.guide_path_index
             row["guide_rejection_reason"] = guide_sel.rejection_reason[:80] if guide_sel.rejection_reason else ""
             row["terminal_path_index"] = guide_sel.terminal_path_index
+            row["terminal_x_world"] = round(
+                float(guide_sel.terminal_position_world[0]), 4)
+            row["terminal_y_world"] = round(
+                float(guide_sel.terminal_position_world[1]), 4)
+            row["terminal_z_world"] = round(
+                float(guide_sel.terminal_position_world[2]), 4)
             row["terminal_distance_m"] = round(
-                float(np.linalg.norm(guide_sel.terminal_position_world - cur_pos)), 4)
-            # Approximate terminal arc length
+                guide_sel.terminal_distance_m, 4)
             row["terminal_path_arc_length_m"] = round(
-                float(np.linalg.norm(
-                    guide_sel.terminal_position_world - guide_sel.guide_position_world)) +
-                guide_sel.guide_distance_m, 4)
+                guide_sel.terminal_path_arc_length_m, 4)
         else:
             row["guide_candidate_count"] = 0
             row["guide_visible"] = 0
             row["guide_depth_visible"] = 0
-            row["guide_corridor_known_free_ratio"] = 0.0
+            row["guide_corridor_check_enabled"] = 0
+            row["guide_corridor_known_free_ratio"] = -1.0
             row["guide_path_index"] = -1
             row["guide_rejection_reason"] = "no_selector"
             row["terminal_path_index"] = -1
+            row["terminal_x_world"] = 0.0
+            row["terminal_y_world"] = 0.0
+            row["terminal_z_world"] = 0.0
             row["terminal_distance_m"] = 0.0
             row["terminal_path_arc_length_m"] = 0.0
 
         # ── Phase 2: planner flags ───────────────────────────────
         row["planner_used_observed_esdf"] = planner_used_obs
-        row["planner_unknown_is_free"] = 0  # Phase 2: never treat unknown as free
+        row["planner_map_source"] = (
+            "observed_esdf" if planner_used_obs else "global_esdf")
+        # A complete global ESDF has no observed/unknown mask; collision and
+        # outside-map checks remain active, so do not describe unknown as free.
+        row["planner_unknown_is_free"] = 0
         row["planner_used_global_fallback"] = planner_used_fallback
         row["reference_segment_point_count"] = (
             len(ref_segment) if ref_segment else 0)
@@ -3619,8 +3643,9 @@ class ILManager:
             # ── Schema v8 metadata ──
             "schema_version": schema_version,
             "collection_mode": collection_mode,
-            "sample_semantics": ("depth_t,state_t,navigation_t -> expert_command_t," 
-                                 "learner_command_t,selected_command_t -> actual_state_t+1"),
+            "sample_semantics": (
+                "depth_t,state_t -> guide_t,expert_command_t; selected command "
+                "is executed through Flightmare dynamics"),
             "label_lookahead_time_s": float(
                 data_cfg.get("label_lookahead_time_s", 0.08)),
             "training_coordinate_frame": {
@@ -3636,12 +3661,15 @@ class ILManager:
                 "y": "forward",
                 "z": "up",
             },
-            "guide_source": "farthest_visible_astar_waypoint_or_invalid",
-            "guide_selection_rule": ("maximum_forward_astar_path_index_satisfying_"
-                                      "range_fov_depth_visibility_and_known_free_corridor"),
-            "trajectory_terminal_rule": ("farthest_dynamically_reachable_path_point_"
-                                          "not_beyond_guide"),
-            "unknown_space_policy": "occupied_or_infeasible",
+            "guide_source": "farthest_visible_astar_waypoint",
+            "guide_visibility_source": "current_depth_and_camera_fov",
+            "guide_selection_rule": (
+                "maximum_forward_astar_path_index_satisfying_range_fov_"
+                "and_current_depth_visibility"),
+            "guide_known_free_corridor_check_enabled": False,
+            "trajectory_terminal_rule": (
+                "farthest_dynamically_reachable_astar_path_point_not_beyond_guide"),
+            "unknown_space_policy": "not_applicable_to_complete_global_esdf",
             "global_map_fallback_enabled": False,
             "trend_horizontal_bins": int(
                 data_cfg.get("trend_horizontal_bins", 11)),
@@ -3652,13 +3680,22 @@ class ILManager:
             "max_guide_range_m": float(self._depth_cfg["max_m"]),
             "depth_all_valid_in_simulation": True,
             # ── Phase 2: observed map metadata ──
-            "local_expert_map": "observed_depth_history_esdf",
+            "local_planner_map_source": "global_esdf",
+            "local_expert_map": "global_esdf",
+            "observed_map_enabled": False,
+            "observed_esdf_enabled": False,
+            "local_trajectory_collision_check": "global_esdf",
+            "trend_supervision_source": "guide_waypoint",
+            "control_supervision_source": (
+                "future_velocity_and_yaw_rate_sampled_from_local_bspline"),
             "global_map_usage": [
                 "weighted_astar",
                 "task_feasibility",
                 "offline_audit",
+                "local_bspline_optimization",
+                "local_trajectory_collision_validation",
             ],
-            "global_map_used_for_local_collision_optimization": False,
+            "global_map_used_for_local_collision_optimization": True,
             "global_esdf_cache_key": self._current_esdf_cache_key,
             "global_esdf_cache_hit": self._current_esdf_cache_hit,
             "global_esdf_cache_stats": (
@@ -3997,18 +4034,34 @@ class ILManager:
                         failure_reasons.append(
                             "invalid_expert_label_at_row:{}".format(row_index))
                         break
-                    # Phase 2 ESDF checks: only required when observed_map is active.
-                    if self._use_observed_map:
-                        if str(row.get("planner_used_observed_esdf", "0")) != "1":
-                            validation_passed = False
-                            failure_reasons.append(
-                                "planner_not_using_observed_esdf_at_row:{}".format(row_index))
-                            break
-                        if str(row.get("planner_used_global_fallback", "1")) != "0":
-                            validation_passed = False
-                            failure_reasons.append(
-                                "global_fallback_at_row:{}".format(row_index))
-                            break
+                    formal_checks = (
+                        (str(row.get("trend_label_valid", "0")) == "1",
+                         "invalid_trend_label"),
+                        (row.get("guide_source", "") ==
+                         "farthest_visible_astar_waypoint", "invalid_guide_source"),
+                        (str(row.get("guide_visible", "0")) == "1",
+                         "guide_not_visible"),
+                        (str(row.get("guide_depth_visible", "0")) == "1",
+                         "guide_not_depth_visible"),
+                        (str(row.get("guide_corridor_check_enabled", "1")) == "0",
+                         "unexpected_guide_corridor_check"),
+                        (str(row.get("planner_success", "")).lower() in
+                         ("1", "true"), "planner_unsuccessful"),
+                        (row.get("planner_map_source", "") == "global_esdf",
+                         "planner_map_not_global_esdf"),
+                        (str(row.get("planner_used_observed_esdf", "1")) == "0",
+                         "planner_used_observed_esdf"),
+                        (str(row.get("planner_used_global_fallback", "1")) == "0",
+                         "global_fallback"),
+                    )
+                    failed_check = next(
+                        (name for passed, name in formal_checks if not passed),
+                        None)
+                    if failed_check is not None:
+                        validation_passed = False
+                        failure_reasons.append(
+                            "{}_at_row:{}".format(failed_check, row_index))
+                        break
 
         if self._dynamics is None or self._dynamics.backend_name != "flightmare":
             validation_passed = False
@@ -4086,7 +4139,13 @@ class ILManager:
             "selected_command_yaw_rate", "final_executed_actor",
             "actual_next_vx_flu", "actual_next_vy_flu",
             "actual_next_vz_flu", "scene_id", "task_id",
-            "planner_used_observed_esdf", "planner_used_global_fallback")
+            "guide_source", "guide_visible", "guide_depth_visible",
+            "guide_candidate_count", "guide_path_index",
+            "terminal_path_index", "terminal_x_world", "terminal_y_world",
+            "terminal_z_world", "guide_corridor_check_enabled",
+            "guide_corridor_known_free_ratio", "planner_success",
+            "planner_map_source", "planner_used_observed_esdf",
+            "planner_used_global_fallback", "reference_segment_point_count")
 
         try:
             with open(data_path, "r") as f:
@@ -4158,12 +4217,18 @@ class ILManager:
                         except (ValueError, TypeError):
                             issues.append("CRITICAL: unparseable learner command at row {}".format(row_idx))
 
-                    # Phase 2 validation: only relevant when observed_map is enabled.
-                    if self._use_observed_map:
-                        if str(row.get("planner_used_observed_esdf", "0")) != "1":
-                            issues.append("CRITICAL: planner did not use observed ESDF at row {}".format(row_idx))
-                        if str(row.get("planner_used_global_fallback", "1")) != "0":
-                            issues.append("CRITICAL: planner used global fallback at row {}".format(row_idx))
+                    if row.get("planner_map_source", "") != "global_esdf":
+                        issues.append(
+                            "CRITICAL: planner map is not global ESDF at row {}".format(
+                                row_idx))
+                    if str(row.get("planner_used_observed_esdf", "1")) != "0":
+                        issues.append(
+                            "CRITICAL: planner used observed ESDF at row {}".format(
+                                row_idx))
+                    if str(row.get("planner_used_global_fallback", "1")) != "0":
+                        issues.append(
+                            "CRITICAL: planner used global fallback at row {}".format(
+                                row_idx))
 
                     # Valid global direction should have norm ~1
                     gdv = row.get("global_direction_valid")

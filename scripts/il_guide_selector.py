@@ -2,16 +2,16 @@
 """
 il_guide_selector.py  —  Farthest-visible A* waypoint selector for IL dataset v8.
 
-Phase 2: Selects the farthest visible A* waypoint (Guide) and a dynamically
-reachable Terminal from the observed map. Guide is used for trend labels;
-Terminal is the trajectory optimization target.
+Selects the farthest currently visible A* waypoint (Guide) and a dynamically
+reachable Terminal. Guide is used for trend labels; Terminal is the trajectory
+optimization target.
 
 Key design:
   - Guide = farthest forward A* path index satisfying:
-      range, FOV, depth visibility, known-free corridor constraints.
+      range, FOV, and current-depth visibility constraints.
   - Terminal = farthest dynamically reachable path point not beyond Guide.
-  - Unknown space is NOT treated as free.
-  - No global map fallback for visibility checks.
+  - The optional known-free corridor check is independent and disabled in the
+    global-ESDF production mode.
 """
 
 from __future__ import print_function, division
@@ -40,6 +40,8 @@ class GuideSelection:
     terminal_position_world: np.ndarray = field(
         default_factory=lambda: np.zeros(3))
     terminal_path_index: int = -1
+    terminal_distance_m: float = 0.0
+    terminal_path_arc_length_m: float = 0.0
 
     # Guide direction in FLU (for trend labels)
     guide_direction_flu: np.ndarray = field(
@@ -55,7 +57,8 @@ class GuideSelection:
     candidate_count: int = 0
     visible: bool = False
     depth_visible: bool = False
-    corridor_known_free_ratio: float = 0.0
+    corridor_check_enabled: bool = False
+    corridor_known_free_ratio: float = -1.0
     rejection_reason: str = ""
 
 
@@ -95,7 +98,7 @@ class GuideSelector:
         self.use_depth_projection = bool(
             gs_cfg.get("use_depth_projection_visibility", True))
         self.use_known_free_corridor = bool(
-            gs_cfg.get("use_known_free_corridor", True))
+            gs_cfg.get("use_known_free_corridor", False))
 
         self._camera = camera_model
 
@@ -106,7 +109,8 @@ class GuideSelector:
     def select(self, global_path_world, previous_progress_index,
                current_position_world, current_yaw,
                current_velocity_world, depth_m,
-               observed_map, observed_esdf, current_quaternion_xyzw=None):
+               observed_map=None, observed_esdf=None,
+               current_quaternion_xyzw=None):
         """Select Guide and Terminal from global A* path.
 
         Args:
@@ -116,8 +120,9 @@ class GuideSelector:
             current_yaw: radians.
             current_velocity_world: [vx, vy, vz].
             depth_m: (H, W) depth image.
-            observed_map: RollingObservedOccupancyMap.
-            observed_esdf: ObservedESDF.
+            observed_map: optional RollingObservedOccupancyMap, required only
+                when known-free corridor checking is enabled.
+            observed_esdf: optional ObservedESDF (reserved for corridor modes).
 
         Returns:
             GuideSelection with guide and terminal positions.
@@ -127,6 +132,14 @@ class GuideSelector:
         if not global_path_world or len(global_path_world) < 2:
             sel.rejection_reason = "empty_global_path"
             return sel
+        if self.use_depth_projection and depth_m is None:
+            sel.rejection_reason = "missing_depth"
+            return sel
+        if self.use_known_free_corridor and observed_map is None:
+            sel.rejection_reason = "known_free_corridor_requires_observed_map"
+            return sel
+
+        sel.corridor_check_enabled = self.use_known_free_corridor
 
         pos = np.asarray(current_position_world, dtype=np.float64)
         vel = np.asarray(current_velocity_world, dtype=np.float64)
@@ -187,9 +200,7 @@ class GuideSelector:
                 continue
 
             # 5. Known-free corridor check
-            corridor_ok = True
-            corridor_ratio = 1.0
-            if self.use_known_free_corridor and observed_map is not None:
+            if self.use_known_free_corridor:
                 corridor_ratio = observed_map.sample_known_free_ratio_along_corridor(
                     pos, pt, self.corridor_radius_m,
                     self.corridor_sample_spacing_m,
@@ -197,7 +208,6 @@ class GuideSelector:
                 min_ratio = getattr(observed_map, 'min_known_free_ratio', 0.95)
                 if corridor_ratio < min_ratio:
                     visible = False
-                    corridor_ok = False
                     continue
 
             # All checks passed
@@ -235,12 +245,12 @@ class GuideSelector:
 
         sel.depth_visible = True
 
-        if self.use_known_free_corridor and observed_map is not None:
+        if self.use_known_free_corridor:
             sel.corridor_known_free_ratio = observed_map.sample_known_free_ratio_along_corridor(
                 pos, guide_pt, self.corridor_radius_m,
                 self.corridor_sample_spacing_m, self.min_clearance_m)
         else:
-            sel.corridor_known_free_ratio = 1.0
+            sel.corridor_known_free_ratio = -1.0
 
         # ── Select Terminal (dynamically reachable) ─────────────
         speed = float(np.linalg.norm(vel))
@@ -274,8 +284,18 @@ class GuideSelector:
                     term_pt = pt_i
                     break
 
+        # Record the actual A* arc length after any minimum-distance push.
+        terminal_arc_len = 0.0
+        for i in range(start_index, term_idx):
+            terminal_arc_len += float(np.linalg.norm(
+                np.asarray(global_path_world[i + 1], dtype=np.float64) -
+                np.asarray(global_path_world[i], dtype=np.float64)))
+        term_dist = float(np.linalg.norm(term_pt - pos))
+
         sel.terminal_position_world = term_pt
         sel.terminal_path_index = term_idx
+        sel.terminal_distance_m = term_dist
+        sel.terminal_path_arc_length_m = terminal_arc_len
         sel.valid = True
 
         return sel

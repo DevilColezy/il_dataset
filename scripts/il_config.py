@@ -382,15 +382,25 @@ def _validate_config(cfg):
                 h_margin, hfov / 2.0))
         if v_margin < 0:
             errors.append("guide_selector.vertical_fov_margin_deg must be >= 0")
+        if not gs.get("use_depth_projection_visibility", True):
+            errors.append(
+                "formal collection requires guide_selector."
+                "use_depth_projection_visibility = true")
+        if (gs.get("use_known_free_corridor", False) and
+                not obs_map.get("enabled", False)):
+            errors.append(
+                "guide_selector.use_known_free_corridor requires "
+                "observed_map.enabled = true")
 
     # ── Phase 2: local_planner observed ESDF config ──────────────
     lp = g.get("planning", {}).get("local_planner", {})
     if lp:
-        use_obs = lp.get("use_observed_esdf", True)
-        forbid_unk = lp.get("forbid_unknown_space", True)
+        use_obs = lp.get("use_observed_esdf", False)
         allow_fb = lp.get("allow_global_map_fallback", False)
-        if not use_obs:
-            errors.append("Phase 2 requires local_planner.use_observed_esdf = true")
+        if use_obs and not obs_map.get("enabled", False):
+            errors.append(
+                "local_planner.use_observed_esdf requires "
+                "observed_map.enabled = true")
         if allow_fb:
             errors.append("Phase 2 requires local_planner.allow_global_map_fallback = false")
 
