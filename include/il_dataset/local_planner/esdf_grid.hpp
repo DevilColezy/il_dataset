@@ -82,6 +82,9 @@ public:
     /// Whether the ESDF has been initialized with valid data.
     bool initialized() const { return initialized_; }
 
+    /// Whether a known mask is available (Phase 2 observed ESDF).
+    bool hasKnownMask() const { return has_known_mask_; }
+
     /// Memory size in bytes.
     size_t memoryBytes() const { return data_.size() * sizeof(float); }
 

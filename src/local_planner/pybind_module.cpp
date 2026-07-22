@@ -37,10 +37,10 @@ class FlightmareDynamicsBridge {
              const Eigen::Vector3d& angular_velocity) {
     flightlib::QuadState state;
     state.setZero();
-    state.p = position;
-    state.qx = quaternion_wxyz;
-    state.v = velocity;
-    state.w = angular_velocity;
+    state.p = position.cast<float>();
+    state.qx = quaternion_wxyz.cast<float>();
+    state.v = velocity.cast<float>();
+    state.w = angular_velocity.cast<float>();
     state.t = 0.0;
     return quadrotor_.reset(state);
   }
@@ -55,7 +55,7 @@ class FlightmareDynamicsBridge {
     flightlib::Command command;
     command.t = stateTime();
     command.collective_thrust = collective_thrust;
-    command.omega = body_rates;
+    command.omega = body_rates.cast<float>();
     return quadrotor_.run(command, dt);
   }
 
@@ -66,7 +66,7 @@ class FlightmareDynamicsBridge {
     }
     Eigen::VectorXd output(flightlib::QuadState::SIZE + 1);
     output[0] = state.t;
-    output.tail(flightlib::QuadState::SIZE) = state.x;
+    output.tail(flightlib::QuadState::SIZE) = state.x.cast<double>();
     return output;
   }
 

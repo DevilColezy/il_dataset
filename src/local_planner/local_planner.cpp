@@ -1287,7 +1287,7 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
     result.guide_waypoint_index = request.guide_waypoint_index;
     result.trajectory_terminal = request.trajectory_terminal;
     result.trajectory_terminal_index = request.trajectory_terminal_index;
-    result.used_observed_esdf = esdf_.has_known_mask_;
+    result.used_observed_esdf = esdf_.hasKnownMask();
 
     // Check readiness
     if (!isReady()) {
@@ -1330,7 +1330,7 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
     // Determine collision check function
     bool forbid_unknown = request.forbid_unknown_space;
     auto isFreeCheck = [&](double x, double y, double z, double cl) -> bool {
-        if (forbid_unknown && esdf_.has_known_mask_) {
+        if (forbid_unknown && esdf_.hasKnownMask()) {
             return esdf_.isKnownFree(x, y, z, cl);
         }
         return esdf_.isFree(x, y, z, cl);
@@ -1490,7 +1490,7 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
     }
 
     // Check for unknown space violations
-    if (forbid_unknown && esdf_.has_known_mask_) {
+    if (forbid_unknown && esdf_.hasKnownMask()) {
         bool has_unknown = false;
         for (const auto& tp : traj) {
             if (!esdf_.isKnown(tp.position.x(), tp.position.y(), tp.position.z())) {

@@ -16,6 +16,9 @@ find_package(catkin REQUIRED COMPONENTS
 # ── Eigen3 ──────────────────────────────────────────────────────
 find_package(Eigen3 REQUIRED)
 
+# ── OpenCV (required by flightlib headers) ──────────────────────
+find_package(OpenCV REQUIRED)
+
 # Optional external nonlinear optimizer.  The planner remains buildable on
 # systems without NLopt and falls back to its bounded native optimizer.
 find_package(NLopt QUIET)
@@ -56,6 +59,7 @@ find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 include_directories(
   include
   ${EIGEN3_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
   ${pybind11_INCLUDE_DIRS}
   ${Python3_INCLUDE_DIRS}
   ${catkin_INCLUDE_DIRS}
@@ -106,8 +110,8 @@ pybind11_add_module(_il_local_planner
 target_compile_options(_il_local_planner PRIVATE -O3 -Wall -Wextra)
 target_link_libraries(_il_local_planner PRIVATE
   il_local_planner_lib
-  flightlib
   ${catkin_LIBRARIES}
+  stdc++fs
 )
 
 # Place the .so next to the Python scripts so "import _il_local_planner" works
