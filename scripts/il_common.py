@@ -159,6 +159,68 @@ def shortest_angle_diff(a, b):
     return normalize_angle(b - a)
 
 
+def yaw_from_world_velocity(velocity, fallback_yaw=0.0,
+                            yaw_speed_threshold=0.05):
+    """Return the project yaw whose vehicle nose follows a world velocity.
+
+    Flightmare/ROS convention in this package is yaw=0 facing world +Y.
+    At very low horizontal speed the direction is undefined, so preserve the
+    supplied fallback yaw instead of reacting to numerical velocity noise.
+    """
+    vel = np.asarray(velocity, dtype=np.float64)
+    if vel.shape != (3,) or not np.all(np.isfinite(vel)):
+        raise ValueError("velocity must be a finite 3-vector")
+    if float(np.linalg.norm(vel[:2])) <= yaw_speed_threshold:
+        return normalize_angle(float(fallback_yaw))
+    return normalize_angle(math.atan2(float(vel[1]), float(vel[0])) -
+                           math.pi / 2.0)
+
+
+def yaw_rate_for_world_velocity(current_yaw, velocity, tracking_gain,
+                                max_yaw_rate, yaw_speed_threshold=0.05):
+    """Closed-loop yaw-rate command that points the nose along velocity."""
+    if tracking_gain <= 0.0 or max_yaw_rate <= 0.0:
+        raise ValueError("tracking_gain and max_yaw_rate must be > 0")
+    vel = np.asarray(velocity, dtype=np.float64)
+    if vel.shape != (3,) or not np.all(np.isfinite(vel)):
+        raise ValueError("velocity must be a finite 3-vector")
+    if float(np.linalg.norm(vel[:2])) <= yaw_speed_threshold:
+        return 0.0
+    target_yaw = yaw_from_world_velocity(
+        vel, current_yaw, yaw_speed_threshold)
+    yaw_error = shortest_angle_diff(float(current_yaw), target_yaw)
+    return max(-max_yaw_rate,
+               min(max_yaw_rate, tracking_gain * yaw_error))
+
+
+def quantize_bounded_vector(vector, max_norm, decimals=6):
+    """Quantize a command vector without serializing it above its limit.
+
+    Component-wise rounding can increase a vector norm even when the original
+    vector was exactly clamped to ``max_norm``. Reserve one worst-case rounding
+    interval at the boundary, then quantize, so schema validation sees the
+    same bounded command that the controller received.
+    """
+    value = np.asarray(vector, dtype=np.float64).copy()
+    if value.ndim != 1 or value.size == 0 or not np.all(np.isfinite(value)):
+        raise ValueError("vector must be a finite non-empty 1-D array")
+    if max_norm <= 0.0 or decimals < 0:
+        raise ValueError("max_norm must be > 0 and decimals must be >= 0")
+
+    norm = float(np.linalg.norm(value))
+    if norm > max_norm:
+        value *= max_norm / max(norm, 1e-12)
+
+    quantum = 10.0 ** (-decimals)
+    rounding_bound = math.sqrt(float(value.size)) * 0.5 * quantum
+    quantized = np.round(value, decimals)
+    if float(np.linalg.norm(quantized)) > max_norm:
+        safe_norm = max(0.0, max_norm - 2.0 * rounding_bound)
+        quantized = np.round(value * (safe_norm / max(
+            float(np.linalg.norm(value)), 1e-12)), decimals)
+    return quantized
+
+
 def integrate_velocity_command(position, velocity, yaw, desired_velocity, dt,
                                max_velocity, max_acceleration,
                                max_yaw_rate, yaw_speed_threshold=0.05):

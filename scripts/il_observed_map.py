@@ -132,6 +132,8 @@ class RollingObservedOccupancyMap:
         self.unknown_is_free = bool(cfg.get("unknown_is_free", False))
         self.min_known_free_ratio = float(cfg.get("min_known_free_ratio", 0.95))
         self.depth_step = int(cfg.get("depth_integration_step", 4))
+        self.free_space_spacing = float(cfg.get(
+            "free_space_sample_spacing_m", self.resolution * 5.0))
         depth_cfg = config.get("global", {}).get("depth", {})
         self.horizontal_fov_rad = math.radians(float(depth_cfg.get("fov", 90.0)))
         self.max_depth_m = float(depth_cfg.get("max_m", 5.0))
@@ -255,19 +257,48 @@ class RollingObservedOccupancyMap:
         # Purge expired history
         changed = self._purge_expired(timestamp_s)
 
-        # Rasterize each ray end-point
+        # ── Delegate the heavy lifting (occupied marking + free-space
+        #     ray-casting) to C++ to avoid Python-loop overhead. ────────
+        try:
+            from _il_local_planner import integrate_depth as _cpp_integrate
+            n_changed = _cpp_integrate(
+                np.ascontiguousarray(points_world, dtype=np.float64),
+                np.ascontiguousarray(points_cam[:, 2], dtype=np.float64),
+                np.ascontiguousarray(cam_pos, dtype=np.float64),
+                self._occ,
+                self._last_obs_time,
+                self.occ_endpoint_margin,
+                self.free_space_spacing,
+                self.resolution,
+                self.max_depth_m,
+                timestamp_s,
+                np.ascontiguousarray(self._origin_world, dtype=np.float64),
+                np.array([self.gx, self.gy, self.gz], dtype=np.int32))
+            if n_changed > 0:
+                changed = True
+        except ImportError:
+            # Fall back to Python implementation (slow).
+            if self._integrate_depth_python(
+                    points_world, points_cam, cam_pos, timestamp_s):
+                changed = True
+
+        if changed:
+            self._revision += 1
+        self.total_integrations += 1
+
+    def _integrate_depth_python(self, points_world, points_cam, cam_pos,
+                                timestamp_s):
+        """Python fallback for ray integration (used when C++ is unavailable)."""
+        changed = False
         occ_grid_ix = self._world_to_grid_int(points_world)
         occ_grid_iy = occ_grid_ix[:, 1]
         occ_grid_iz = occ_grid_ix[:, 2]
         occ_grid_ix = occ_grid_ix[:, 0]
         in_b = self._in_bounds(occ_grid_ix, occ_grid_iy, occ_grid_iz)
 
-        # A sample at the sensor maximum range means "no return" and marks
-        # only traversed free space, not a synthetic occupied shell.
         endpoint_hit = points_cam[:, 2] < (
             self.max_depth_m - max(self.occ_endpoint_margin, 1e-3))
 
-        # Mark occupied endpoints for real returns only.
         for k in np.where(in_b & endpoint_hit)[0]:
             ix, iy, iz = occ_grid_ix[k], occ_grid_iy[k], occ_grid_iz[k]
             if self._occ[ix, iy, iz] != OCCUPIED:
@@ -275,37 +306,27 @@ class RollingObservedOccupancyMap:
                 changed = True
             self._last_obs_time[ix, iy, iz] = timestamp_s
 
-        # Mark free space along rays using simplified sampling
-        # Sample at resolution intervals along each ray
-        for k in range(len(points_world)):
-            if not in_b[k]:
-                # Check if at least the ray enters the grid
-                pass  # skip rays ending outside
-
+        spacing = max(self.free_space_spacing, self.resolution)
+        in_b_indices = np.where(in_b)[0]
+        for k in in_b_indices:
             end_pt = points_world[k]
             ray_dir = end_pt - cam_pos
             ray_len = float(np.linalg.norm(ray_dir))
             if ray_len < 1e-6:
                 continue
-
             ray_dir /= ray_len
-            # Sample along ray at resolution intervals
-            n_samples = max(1, int(ray_len / self.resolution))
+            n_samples = max(1, int((ray_len - self.occ_endpoint_margin) / spacing))
             for s in range(n_samples):
                 frac = s / max(n_samples, 1)
                 pt = cam_pos + frac * ray_dir * (ray_len - self.occ_endpoint_margin)
                 g = self._world_to_grid_int(pt)
                 if self._in_bounds(g[0], g[1], g[2]):
                     ix, iy, iz = int(g[0]), int(g[1]), int(g[2])
-                    # Only set FREE if not already OCCUPIED (occupy-first policy)
                     if self._occ[ix, iy, iz] == UNKNOWN:
                         self._occ[ix, iy, iz] = FREE
                         self._last_obs_time[ix, iy, iz] = timestamp_s
                         changed = True
-
-        if changed:
-            self._revision += 1
-        self.total_integrations += 1
+        return changed
 
     def _purge_expired(self, now_s):
         """Reset expired voxels to UNKNOWN."""

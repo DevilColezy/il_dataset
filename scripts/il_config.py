@@ -567,6 +567,10 @@ def _validate_config(cfg):
                            lp.get("velocity_command_lookahead_time", 0.12))
         _validate_positive("global.planning.local_planner.velocity_tracking_gain",
                            lp.get("velocity_tracking_gain", 1.5))
+        _validate_positive("global.planning.local_planner.yaw_tracking_gain",
+                           lp.get("yaw_tracking_gain", 3.0))
+        _validate_positive("global.planning.local_planner.yaw_speed_threshold",
+                           lp.get("yaw_speed_threshold", 0.10))
         _validate_positive("global.planning.local_planner.max_plan_age",
                            lp.get("max_plan_age", 0.50))
         _validate_positive("global.planning.local_planner.lookahead_distance",
@@ -624,7 +628,8 @@ def _validate_config(cfg):
         # Validate all positive
         for key in ("planner_hz", "horizon_time", "execute_prefix_time",
                      "velocity_command_lookahead_time", "max_plan_age",
-                     "velocity_tracking_gain",
+                     "velocity_tracking_gain", "yaw_tracking_gain",
+                     "yaw_speed_threshold",
                      "lookahead_distance", "min_lookahead_distance", "max_lookahead_distance",
                      "lookahead_velocity_gain", "local_map_radius", "max_reference_points",
                      "control_points", "max_iterations", "max_cost_samples_per_segment",
@@ -771,6 +776,10 @@ def _validate_config(cfg):
         if ctrl_hz_dyn < render_hz:
             errors.append("dynamics.control_hz ({}) must be >= render_hz ({})".format(
                 ctrl_hz_dyn, render_hz))
+        record_hz = g.get("control", {}).get("record_hz", 0)
+        if record_hz > render_hz:
+            errors.append("control.record_hz ({}) must be <= dynamics.render_hz ({})".format(
+                record_hz, render_hz))
         vc_cfg = dyn_cfg.get("velocity_controller", {})
         if not vc_cfg.get("use_existing_flightmare_controller", False):
             errors.append("Flightmare's body-rate controller must remain enabled")

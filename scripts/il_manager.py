@@ -22,7 +22,7 @@ Usage:
 
 from __future__ import print_function, division
 
-import json, math, os, sys, time, random, copy, threading, shutil, traceback, csv
+import json, math, os, sys, time, random, copy, threading, shutil, traceback, csv, inspect, queue
 import numpy as np
 
 import rospy
@@ -70,7 +70,8 @@ from il_common import (
     UnityBridge, ESDFBuilder, SyncBuffer, ObstacleGenerator,
     StartGoalGenerator, make_depth_vehicle, make_dummy_vehicle,
     world_vel_to_body, load_ply, wait_for_stable_file,
-    integrate_velocity_command,
+    integrate_velocity_command, yaw_rate_for_world_velocity,
+    quantize_bounded_vector,
     body_rfu_to_flu, body_flu_to_rfu, world_vector_to_body_flu,
     world_vector_to_body_flu_quat,
     body_flu_to_world_quat,
@@ -135,6 +136,7 @@ import importlib.util as _importlib_util
 _il_traj_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "il_trajectory.py")
 _il_traj_spec = _importlib_util.spec_from_file_location("il_trajectory", _il_traj_path)
 _il_traj = _importlib_util.module_from_spec(_il_traj_spec)
+sys.modules["il_trajectory"] = _il_traj  # register before exec to prevent re-import
 _il_traj_spec.loader.exec_module(_il_traj)
 GlobalPathPlanner = _il_traj.GlobalPathPlanner
 TrajectoryPlanner = _il_traj.TrajectoryPlanner  # for backward compat
@@ -230,6 +232,44 @@ class _AsyncPlannerWorker(object):
                 # backlog that could later overwrite a newer vehicle state.
                 self._completed = completed
                 self._busy = False
+
+
+class _AsyncImageWriter(object):
+    """Bounded background writer for depth PNG compression and disk I/O."""
+
+    def __init__(self, max_pending=16):
+        self._queue = queue.Queue(maxsize=max(1, int(max_pending)))
+        self._error = None
+        self._thread = threading.Thread(
+            target=self._run, name="il_depth_image_writer")
+        self._thread.daemon = True
+        self._thread.start()
+
+    def submit(self, path, depth_u16):
+        if self._error is not None:
+            raise RuntimeError("depth image writer failed: {}".format(
+                self._error))
+        self._queue.put((path, depth_u16))
+
+    def close(self):
+        self._queue.put(None)
+        self._thread.join()
+        if self._error is not None:
+            raise RuntimeError("depth image writer failed: {}".format(
+                self._error))
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                path, depth_u16 = item
+                Image.fromarray(depth_u16, mode="I;16").save(path)
+            except Exception as exc:
+                self._error = exc
+            finally:
+                self._queue.task_done()
 
 
 def _resolve_path(pkg_rel):
@@ -443,8 +483,8 @@ class ILManager:
             raise RuntimeError("DAgger module is required but unavailable")
         if not _ESDF_CACHE_AVAILABLE:
             raise RuntimeError("ESDF cache module is required but unavailable")
-            if _GUIDE_SELECTOR_AVAILABLE:
-                self._guide_selector = GuideSelector(config, self._camera_model)
+        if self._use_observed_map and _GUIDE_SELECTOR_AVAILABLE:
+            self._guide_selector = GuideSelector(config, self._camera_model)
             rospy.loginfo("[Manager] Phase 2: observed map + ESDF + guide selector enabled.")
         elif self._use_observed_map:
             rospy.logwarn("[Manager] Phase 2 modules not available; falling back to global ESDF.")
@@ -780,6 +820,14 @@ class ILManager:
 
     # ── File lifecycle ──────────────────────────────────────────────
     def _close_open_files(self):
+        image_writer = getattr(self, "_image_writer", None)
+        if image_writer is not None:
+            try:
+                image_writer.close()
+            except Exception as exc:
+                rospy.logerr("[Recorder] Async image writer failed: %s", exc)
+                self._trajectory_exit_reason = "image_writer_failure"
+            self._image_writer = None
         for attr in ("_inprogress_file", "_sync_file", "_global_path_file", "_local_plans_file"):
             f = getattr(self, attr, None)
             if f is not None:
@@ -1248,8 +1296,10 @@ class ILManager:
                 len(self._current_scene_obstacles) > 0):
             rospy.loginfo("[FSM] Phase 3: generating tasks via StartGoalTaskGenerator...")
 
-            # Create A* planner for task validation
-            from il_trajectory import AStarPlanner as _AStarPlanner
+            # Use the il_trajectory module already loaded via importlib at
+            # module level (line ~133), which is guaranteed to come from
+            # THIS package regardless of devel-space symlink resolution.
+            _AStarPlanner = _il_traj.AStarPlanner
 
             def astar_fn(esdf, origin, res, start, goal, min_cl):
                 planner = _AStarPlanner(
@@ -1545,9 +1595,26 @@ class ILManager:
                 self._consecutive_guide_failures = 0
 
                 # The complete global ESDF is deliberately never uploaded to
-                # the online local planner.  The first lockstep depth frame
-                # builds and uploads the finite-observation ESDF before plan().
-                # Set only the global reference path here.
+                # the online local planner when observed_map is enabled —
+                # the first lockstep depth frame builds and uploads the
+                # finite-observation ESDF before plan().
+                # When observed_map is disabled, upload the global ESDF
+                # directly so the planner can use it for all planning.
+                if not self._use_observed_map and self.current_esdf is not None:
+                    esdf_c = np.ascontiguousarray(
+                        self.current_esdf, dtype=np.float32)
+                    origin = np.array(self.current_esdf_origin,
+                                      dtype=np.float64).reshape(3, 1)
+                    ok = self._cpp_planner.set_esdf(
+                        esdf_c, origin,
+                        float(self.g["esdf"]["resolution"]))
+                    if not ok:
+                        rospy.logerr("[FSM] Failed to set global ESDF in C++ planner")
+                        self._enter_state(State.ERROR)
+                        return
+                    rospy.loginfo("[FSM] Uploaded global ESDF (%s) to C++ planner.",
+                                  "×".join(str(d) for d in self.current_esdf.shape))
+                # Set the global reference path.
                 gp_np = np.array(global_path, dtype=np.float64, order='C')
                 ok = self._cpp_planner.set_global_path(gp_np)
                 if not ok:
@@ -1694,11 +1761,21 @@ class ILManager:
         max_velocity = float(lp_cfg.get("max_velocity", 2.5))
         max_acceleration = float(lp_cfg.get("max_acceleration", 3.5))
         max_yaw_rate = float(lp_cfg.get("max_yaw_rate", 2.0))
+        command_lookahead_time = float(
+            lp_cfg.get("velocity_command_lookahead_time", 0.08))
+        velocity_tracking_gain = float(
+            lp_cfg.get("velocity_tracking_gain", 2.0))
+        yaw_tracking_gain = float(lp_cfg.get("yaw_tracking_gain", 3.0))
+        yaw_speed_threshold = float(lp_cfg.get("yaw_speed_threshold", 0.10))
         goal_tolerance = float(lp_cfg.get("goal_tolerance", 0.30))
         goal_speed_tol = float(lp_cfg.get("goal_speed_tolerance", 0.20))
         goal_hold_ticks = int(lp_cfg.get("goal_hold_ticks", 3))
         configured_failure_limit = int(
             lp_cfg.get("max_consecutive_failures", 3))
+        failure_grace_time = float(lp_cfg.get("failure_grace_time", 1.0))
+        effective_failure_limit = max(
+            configured_failure_limit,
+            int(math.ceil(failure_grace_time * self._planner_hz)))
         unity_response_timeout_s = max(
             0.25, float(self.g.get("sync", {}).get(
                 "unity_response_timeout_s", 2.0)))
@@ -1769,6 +1846,9 @@ class ILManager:
             "local_goal_x,local_goal_y,local_goal_z,"
             "progress_s,progress_index,local_goal_index,"
             "status,success,planning_time_ms,min_clearance,traj_point_count\n")
+        self._image_writer = (_AsyncImageWriter(
+            data_cfg.get("image_write_queue_size", 16))
+            if Image is not None else None)
 
         # ── State variables ──────────────────────────────────────────
         goal_pt = plan["goal"]
@@ -1849,10 +1929,8 @@ class ILManager:
             if depth_u16 is not None:
                 # Convert uint16 PNG back to float depth for map integration
                 depth_m = depth_u16.astype(np.float64) / 65535.0 * depth_max_m
-                if Image is not None:
+                if self._image_writer is not None:
                     png_name = "{:06d}.png".format(sample_index)
-                    Image.fromarray(depth_u16, mode="I;16").save(
-                        os.path.join(depth_dir, png_name))
 
             # ── Phase 2: Integrate depth into observed map ─────────
             t_map_start = time.monotonic()
@@ -1865,9 +1943,11 @@ class ILManager:
                     self._observed_esdf.reset()
                     if self._observed_esdf_cache is not None:
                         self._observed_esdf_cache.reset()
+                t_int_start = time.monotonic()
                 self._observed_map.integrate_depth(
                     depth_m, cur_pos.tolist(),
                     dynamics_state.quaternion_world_body, timestamp_s)
+                t_int_ms = (time.monotonic() - t_int_start) * 1000.0
 
                 # Rebuild observed ESDF
                 map_revision = self._observed_map.get_revision()
@@ -1932,6 +2012,20 @@ class ILManager:
                     if observability_result.side_choice_consistent:
                         self._observability_consistent_count += 1
             t_map_ms = (time.monotonic() - t_map_start) * 1000.0
+            # Diagnostic: log Phase-2 timing breakdown when it exceeds 100 ms
+            if t_map_ms > 100.0:
+                _parts = ["map=%.0fms" % t_map_ms,
+                          "int=%.0fms" % t_int_ms]
+                try:
+                    _parts.append("esdf=%.0fms" % t_esdf_ms)
+                except NameError:
+                    pass
+                try:
+                    _parts.append("guide=%.0fms" % t_guide_ms)
+                except NameError:
+                    pass
+                rospy.logwarn("[LOCKSTEP] Phase-2 timing: %s (frame %d)",
+                              ", ".join(_parts), sample_index)
 
             obs_cfg_runtime = self.g.get("scene_generation", {}).get(
                 "observability_audit", {})
@@ -1955,14 +2049,14 @@ class ILManager:
             planner_used_fallback = 0
 
             if self._cpp_planner is not None:
-                # Set the appropriate ESDF on the planner
+                # ── ESDF selection ────────────────────────────────
                 if (self._use_observed_map and self._observed_esdf is not None and
                         self._observed_esdf.is_built()):
+                    # Phase 2: upload observed ESDF every frame.
                     esdf_arr = self._observed_esdf.get_esdf()
                     known_arr = self._observed_esdf.get_known_mask()
                     origin = self._observed_esdf.get_origin()
                     res = self._observed_esdf.get_resolution()
-                    # Ensure C-contiguous
                     esdf_arr = np.ascontiguousarray(esdf_arr, dtype=np.float32)
                     known_arr = np.ascontiguousarray(known_arr.astype(np.uint8))
                     should_upload = (
@@ -1972,12 +2066,16 @@ class ILManager:
                         upload_ok = self._cpp_planner.set_observed_esdf(
                             esdf_arr, known_arr,
                             np.array(origin, dtype=np.float64),
-                            float(res), False)  # unknown_is_free = false
+                            float(res), False)
                         if not upload_ok:
                             raise RuntimeError("C++ rejected observed ESDF upload")
                         if self._observed_esdf_cache is not None:
                             self._observed_esdf_cache.on_uploaded()
                     planner_used_obs = 1
+                elif not self._use_observed_map:
+                    # Global ESDF already uploaded once at init; no per-frame
+                    # upload needed.  planner_used_obs stays 0.
+                    pass
                 else:
                     rospy.logwarn_throttle(
                         1.0, "[ONLINE-LOCKSTEP] Observed ESDF unavailable; holding.")
@@ -2002,9 +2100,8 @@ class ILManager:
 
                     if (planner_used_obs and guide_sel.valid and
                             len(ref_segment) >= 2):
-                        # Phase 2: use explicit request if C++ types are available
-                        _has_new_types = ('_LocalPlanningRequest' in dir() and
-                                          _LocalPlanningRequest is not None)
+                        # Phase 2: use explicit guide/terminal from guide selector
+                        _has_new_types = _LocalPlanningRequest is not None
                         if _has_new_types:
                             req = _LocalPlanningRequest()
                             req.state = state
@@ -2028,6 +2125,12 @@ class ILManager:
                         else:
                             raise RuntimeError(
                                 "C++ binding lacks LocalPlanningRequest; legacy online planning is forbidden")
+                    elif not self._use_observed_map:
+                        # Global ESDF mode: use legacy plan_local which
+                        # internally selects the local goal from the global
+                        # path using the global ESDF.
+                        result = self._cpp_planner.plan_local(
+                            state, previous_progress_s)
                     else:
                         result = None
 
@@ -2179,9 +2282,9 @@ class ILManager:
                                 if learner_output is not None else np.zeros(3))
             row.update({
                 "learner_output_valid": int(learner_output is not None and learner_output.valid),
-                "learner_vx_flu": round(float(learner_velocity[0]), 4),
-                "learner_vy_flu": round(float(learner_velocity[1]), 4),
-                "learner_vz_flu": round(float(learner_velocity[2]), 4),
+                "learner_vx_flu": round(float(learner_velocity[0]), 6),
+                "learner_vy_flu": round(float(learner_velocity[1]), 6),
+                "learner_vz_flu": round(float(learner_velocity[2]), 6),
                 "learner_yaw_rate": round(float(learner_output.yaw_rate) if learner_output is not None else 0.0, 6),
                 "learner_inference_ms": round(float(learner_output.inference_ms) if learner_output is not None else 0.0, 3),
                 "dagger_round_id": self._dagger_ctrl.round_id if self._dagger_ctrl is not None else -1,
@@ -2190,9 +2293,9 @@ class ILManager:
                 "initial_selected_actor": self._dagger_ctrl.last_initial_actor if self._dagger_ctrl is not None else "expert",
                 "safety_override": int(safety_override),
                 "override_reason": override_reason,
-                "selected_command_vx_flu": round(float(selected_velocity_flu[0]), 4),
-                "selected_command_vy_flu": round(float(selected_velocity_flu[1]), 4),
-                "selected_command_vz_flu": round(float(selected_velocity_flu[2]), 4),
+                "selected_command_vx_flu": round(float(selected_velocity_flu[0]), 6),
+                "selected_command_vy_flu": round(float(selected_velocity_flu[1]), 6),
+                "selected_command_vz_flu": round(float(selected_velocity_flu[2]), 6),
                 "selected_command_yaw_rate": round(float(selected_yaw_rate), 6),
                 "final_executed_actor": final_actor,
             })
@@ -2205,7 +2308,9 @@ class ILManager:
                     self._execute_trajectory_segment(
                         result, cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
                         dt_sample, dt_ctrl, sample_index,
-                        max_velocity, max_acceleration, max_yaw_rate)
+                        max_velocity, max_acceleration, max_yaw_rate,
+                        command_lookahead_time, velocity_tracking_gain,
+                        yaw_tracking_gain, yaw_speed_threshold)
             elif final_actor == "learner":
                 exec_next_pos, exec_next_vel, exec_next_yaw, exec_next_yaw_rate = \
                     self._execute_velocity_command(
@@ -2254,9 +2359,16 @@ class ILManager:
             if row.get("trend_label_valid", 0) == 0:
                 self._invalid_trend_label_count += 1
 
-            # Write row (state_t, depth_t, nav_t, expert_cmd_t, state_(t+1))
-            self._csv_writer.writerow(row)
-            self._rec_written_rows += 1
+            # A transient failed replan executes a braking hover and remains
+            # part of the dynamics timeline, but it is not a valid imitation
+            # label.  Do not poison the whole trajectory by writing it as a
+            # training row; keep trying within the configured grace period.
+            if bool(row.get("expert_label_valid", 0)):
+                if self._image_writer is not None and depth_u16 is not None:
+                    self._image_writer.submit(
+                        os.path.join(depth_dir, png_name), depth_u16)
+                self._csv_writer.writerow(row)
+                self._rec_written_rows += 1
 
             # ── Sync diagnostics ─────────────────────────────────────
             self._sync_file.write("{},{},{:.2f},0.00,frame_id_exact,0,0,{},{}\n".format(
@@ -2282,7 +2394,7 @@ class ILManager:
                 goal_hold_counter = 0
 
             # ── Consecutive failure check ───────────────────────────
-            if consecutive_failures >= configured_failure_limit:
+            if consecutive_failures >= effective_failure_limit:
                 self._trajectory_exit_reason = "consecutive_planner_failures"
                 rospy.logerr("[ONLINE-LOCKSTEP] %d consecutive planner failures; aborting.",
                              consecutive_failures)
@@ -2290,6 +2402,14 @@ class ILManager:
 
             sample_index += 1
             self._rec_sent_control_frames += 1
+
+            # Deterministic simulation steps still need a wall-clock cadence
+            # for smooth Unity playback.  Rendering/PNG work can overlap this
+            # wait, but the vehicle will never run faster than record_hz.
+            next_sample_deadline = recording_start_mono + sample_index * dt_sample
+            remaining = next_sample_deadline - time.monotonic()
+            if remaining > 0.0:
+                time.sleep(remaining)
 
         self._final_executed_position = cur_pos.tolist()
         self._final_executed_velocity = cur_vel.tolist()
@@ -2308,12 +2428,14 @@ class ILManager:
                                      last_valid_response_mono):
         """Wait for a Unity depth response with exact frame_id match.
 
+        Drains stale (non-matching) frames internally until the correct
+        frame_id arrives or the deadline expires.
+
         Returns:
             (depth_u16, collision, recv_frame_id, recv_time_mono)
             If timeout, returns (None, 0, None, None).
-            If wrong frame_id, returns (None, 0, wrong_fid, recv_time_mono).
         """
-        deadline = last_valid_response_mono + unity_response_timeout_s
+        deadline = time.monotonic() + unity_response_timeout_s
         while time.monotonic() < deadline and not rospy.is_shutdown():
             r = self.bridge.try_recv()
             if r is None:
@@ -2332,11 +2454,11 @@ class ILManager:
             if vehicles and vehicles[0].get("collision", False):
                 collision = 1
 
-            # Verify frame_id match
+            # Verify frame_id match — drain stale frames, keep waiting
             if _fid != target_frame_id:
                 rospy.logwarn("[LOCKSTEP] Discarding stale frame_id=%s (expected %d)",
                               _fid, target_frame_id)
-                return None, collision, _fid, recv_time_mono
+                continue
 
             # Extract depth image
             depth_u16 = None
@@ -2356,7 +2478,8 @@ class ILManager:
 
         return None, 0, None, None
 
-    def _sample_expert_command(self, result, label_lookahead_time_s):
+    def _sample_expert_command(self, result, label_lookahead_time_s,
+                               current_yaw):
         """Sample expert velocity command from a plan trajectory at fixed lookahead.
 
         The expert command is sampled from a plan generated from x_t.
@@ -2377,12 +2500,34 @@ class ILManager:
                        key=lambda i: abs(float(traj[i].t) - label_lookahead_time_s))
         command_point = traj[best_idx]
         expert_vel_world = np.array(command_point.velocity, dtype=np.float64)
-        expert_yaw_rate = float(command_point.yaw_rate)
+        lp_cfg = self.g.get("planning", {}).get("local_planner", {})
+        max_velocity = float(lp_cfg.get("max_velocity", 2.5))
+        max_yaw_rate = float(lp_cfg.get("max_yaw_rate", 2.0))
+        yaw_tracking_gain = float(lp_cfg.get("yaw_tracking_gain", 3.0))
+        yaw_speed_threshold = float(lp_cfg.get("yaw_speed_threshold", 0.10))
+
+        # Keep labels inside the same hard limit used by execution and schema
+        # validation. The spline can exceed it slightly around a measured
+        # initial velocity even when its nominal samples were clamped.
+        expert_speed = float(np.linalg.norm(expert_vel_world))
+        if expert_speed > max_velocity:
+            expert_vel_world *= max_velocity / max(expert_speed, 1e-9)
+
+        # A new receding-horizon plan is generated every frame. Its first
+        # open-loop yaw derivative repeatedly saturated in real captures and
+        # made the vehicle spin. Close the loop against measured yaw instead.
+        expert_yaw_rate = yaw_rate_for_world_velocity(
+            current_yaw, expert_vel_world, yaw_tracking_gain,
+            max_yaw_rate, yaw_speed_threshold)
         return expert_vel_world, expert_yaw_rate
 
     def _execute_trajectory_segment(self, result, cur_pos, cur_vel, cur_yaw,
                                      dt_sample, dt_ctrl, sample_index,
-                                     max_velocity, max_acceleration, max_yaw_rate):
+                                     max_velocity, max_acceleration, max_yaw_rate,
+                                     command_lookahead_time=0.08,
+                                     velocity_tracking_gain=2.0,
+                                     yaw_tracking_gain=3.0,
+                                     yaw_speed_threshold=0.10):
         """Execute dt_sample using sub-steps from the plan trajectory.
 
         Returns:
@@ -2431,19 +2576,34 @@ class ILManager:
             # Every result is a newly planned trajectory whose time origin is
             # the current state x_t.  Never carry the episode sample index into
             # this local trajectory's clock.
-            exec_time = elapsed
+            # t=0 deliberately carries the current velocity for continuity.
+            # Sampling only at elapsed=0 on every fresh replan therefore
+            # perpetuates reset drift and never executes the forward plan.
+            # Preview the same collision-checked trajectory by the configured
+            # command lookahead, then add position feedback toward it.
+            exec_time = elapsed + max(0.0, command_lookahead_time)
             clamped_time = min(exec_time, traj_duration)
             best_idx = min(range(len(traj)),
                            key=lambda i: abs(float(traj[i].t) - clamped_time))
             tp = traj[best_idx]
-            desired_vel_world = np.array(tp.velocity, dtype=np.float64)
+            reference_pos = np.array(tp.position, dtype=np.float64)
+            feedforward_vel = np.array(tp.velocity, dtype=np.float64)
+            desired_vel_world = (feedforward_vel +
+                                 velocity_tracking_gain *
+                                 (reference_pos - pos))
+            desired_speed = float(np.linalg.norm(desired_vel_world))
+            if desired_speed > max_velocity:
+                desired_vel_world *= max_velocity / max(desired_speed, 1e-9)
+            yaw_rate_cmd = yaw_rate_for_world_velocity(
+                yaw, desired_vel_world, yaw_tracking_gain,
+                max_yaw_rate, yaw_speed_threshold)
             if self._dynamics.backend_name == "flightmare":
                 command_state = self._dynamics.get_state()
                 desired_vel_flu = world_vector_to_body_flu_quat(
                     desired_vel_world,
                     command_state.quaternion_world_body)
                 if not self._dynamics.step_velocity_command(
-                        desired_vel_flu, float(tp.yaw_rate), step_dt):
+                        desired_vel_flu, yaw_rate_cmd, step_dt):
                     raise RuntimeError("Flightmare trajectory step failed")
                 ds = self._dynamics.get_state()
                 pos, vel = ds.position_world.copy(), ds.velocity_world.copy()
@@ -2585,20 +2745,25 @@ class ILManager:
 
         # ── Expert supervision ───────────────────────────────────
         expert_vel_world, expert_yaw_rate = self._sample_expert_command(
-            result, label_lookahead_time_s)
+            result, label_lookahead_time_s, cur_yaw)
 
         row["expert_label_valid"] = 1 if (result is not None and plan_success
                                            and len(result.trajectory) > 0) else 0
 
-        row["expert_vx_world"] = round(float(expert_vel_world[0]), 4)
-        row["expert_vy_world"] = round(float(expert_vel_world[1]), 4)
-        row["expert_vz_world"] = round(float(expert_vel_world[2]), 4)
+        row["expert_vx_world"] = round(float(expert_vel_world[0]), 6)
+        row["expert_vy_world"] = round(float(expert_vel_world[1]), 6)
+        row["expert_vz_world"] = round(float(expert_vel_world[2]), 6)
 
         expert_vel_flu = world_vector_to_body_flu_quat(
             expert_vel_world, current_quaternion_xyzw)
-        row["expert_vx_flu"] = round(float(expert_vel_flu[0]), 4)
-        row["expert_vy_flu"] = round(float(expert_vel_flu[1]), 4)
-        row["expert_vz_flu"] = round(float(expert_vel_flu[2]), 4)
+        expert_vel_flu = quantize_bounded_vector(
+            expert_vel_flu,
+            float(self.g.get("planning", {}).get(
+                "local_planner", {}).get("max_velocity", 2.5)),
+            decimals=6)
+        row["expert_vx_flu"] = float(expert_vel_flu[0])
+        row["expert_vy_flu"] = float(expert_vel_flu[1])
+        row["expert_vz_flu"] = float(expert_vel_flu[2])
         row["expert_yaw_rate"] = round(float(expert_yaw_rate), 6)
 
         # ── Executed next state placeholders ─────────────────────
@@ -3832,16 +3997,18 @@ class ILManager:
                         failure_reasons.append(
                             "invalid_expert_label_at_row:{}".format(row_index))
                         break
-                    if str(row.get("planner_used_observed_esdf", "0")) != "1":
-                        validation_passed = False
-                        failure_reasons.append(
-                            "planner_not_using_observed_esdf_at_row:{}".format(row_index))
-                        break
-                    if str(row.get("planner_used_global_fallback", "1")) != "0":
-                        validation_passed = False
-                        failure_reasons.append(
-                            "global_fallback_at_row:{}".format(row_index))
-                        break
+                    # Phase 2 ESDF checks: only required when observed_map is active.
+                    if self._use_observed_map:
+                        if str(row.get("planner_used_observed_esdf", "0")) != "1":
+                            validation_passed = False
+                            failure_reasons.append(
+                                "planner_not_using_observed_esdf_at_row:{}".format(row_index))
+                            break
+                        if str(row.get("planner_used_global_fallback", "1")) != "0":
+                            validation_passed = False
+                            failure_reasons.append(
+                                "global_fallback_at_row:{}".format(row_index))
+                            break
 
         if self._dynamics is None or self._dynamics.backend_name != "flightmare":
             validation_passed = False
@@ -3861,15 +4028,15 @@ class ILManager:
                 validation_passed = False
                 failure_reasons.append("task_or_side_cost_invalid")
         obs_cfg = self.g.get("scene_generation", {}).get("observability_audit", {})
-        if (obs_cfg.get("enabled", False) and self._invalid_obs_frame_count >=
-                int(obs_cfg.get("maximum_invalid_frames_before_reject", 5))):
-            validation_passed = False
-            failure_reasons.append("runtime_side_choice_unobservable")
-        if (obs_cfg.get("enabled", False) and
-                (self._observability_trigger_count == 0 or
-                 self._observability_consistent_count == 0)):
-            validation_passed = False
-            failure_reasons.append("runtime_observability_audit_not_established")
+        if self._use_observed_map and obs_cfg.get("enabled", False):
+            if self._invalid_obs_frame_count >= int(obs_cfg.get(
+                    "maximum_invalid_frames_before_reject", 5)):
+                validation_passed = False
+                failure_reasons.append("runtime_side_choice_unobservable")
+            if (self._observability_trigger_count == 0 or
+                    self._observability_consistent_count == 0):
+                validation_passed = False
+                failure_reasons.append("runtime_observability_audit_not_established")
         if self._dagger_ctrl is not None:
             if (self._dagger_ctrl.rollout_mode != "expert" and
                     not self._policy_provider.model_hash()):
@@ -3991,10 +4158,12 @@ class ILManager:
                         except (ValueError, TypeError):
                             issues.append("CRITICAL: unparseable learner command at row {}".format(row_idx))
 
-                    if str(row.get("planner_used_observed_esdf", "0")) != "1":
-                        issues.append("CRITICAL: planner did not use observed ESDF at row {}".format(row_idx))
-                    if str(row.get("planner_used_global_fallback", "1")) != "0":
-                        issues.append("CRITICAL: planner used global fallback at row {}".format(row_idx))
+                    # Phase 2 validation: only relevant when observed_map is enabled.
+                    if self._use_observed_map:
+                        if str(row.get("planner_used_observed_esdf", "0")) != "1":
+                            issues.append("CRITICAL: planner did not use observed ESDF at row {}".format(row_idx))
+                        if str(row.get("planner_used_global_fallback", "1")) != "0":
+                            issues.append("CRITICAL: planner used global fallback at row {}".format(row_idx))
 
                     # Valid global direction should have norm ~1
                     gdv = row.get("global_direction_valid")

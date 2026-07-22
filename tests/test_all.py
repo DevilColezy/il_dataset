@@ -955,6 +955,63 @@ def test_body_vel_forward_positive():
     assert abs(vx_b) < 0.1
 
 
+def test_world_plus_y_is_positive_camera_forward_roundtrip():
+    """The first logged task travels mainly ROS +Y, never FLU backward."""
+    from il_common import (world_vector_to_body_flu_quat,
+                           body_flu_to_world_quat)
+    q_identity = np.array([0.0, 0.0, 0.0, 1.0])
+    world_command = np.array([0.0, 1.0, 0.0])
+    flu_command = world_vector_to_body_flu_quat(
+        world_command, q_identity)
+    assert_all_close(flu_command, [1.0, 0.0, 0.0])
+    assert_all_close(body_flu_to_world_quat(
+        flu_command, q_identity), world_command)
+
+
+def test_yaw_rate_tracks_world_velocity_direction():
+    from il_common import yaw_from_world_velocity, yaw_rate_for_world_velocity
+
+    assert abs(yaw_from_world_velocity([0.0, 1.0, 0.0])) < 1e-9
+    assert abs(yaw_from_world_velocity([1.0, 0.0, 0.0]) +
+               math.pi / 2.0) < 1e-9
+
+    # Facing +X while flying +Y must turn negative toward yaw=0. The captured
+    # planner feed-forward command incorrectly returned +2 rad/s here.
+    rate = yaw_rate_for_world_velocity(
+        math.pi / 2.0, [0.0, 1.0, 0.0], 3.0, 2.0, 0.10)
+    assert rate < 0.0
+    assert abs(rate) <= 2.0
+
+
+def test_yaw_rate_uses_shortest_wrap_and_holds_at_low_speed():
+    from il_common import yaw_rate_for_world_velocity
+
+    # Velocity target corresponds to -179 degrees while current yaw is +179.
+    target = math.radians(-179.0)
+    velocity = [math.cos(target + math.pi / 2.0),
+                math.sin(target + math.pi / 2.0), 0.0]
+    rate = yaw_rate_for_world_velocity(
+        math.radians(179.0), velocity, 3.0, 2.0, 0.10)
+    assert 0.0 < rate < 0.2
+    assert yaw_rate_for_world_velocity(
+        1.0, [0.01, 0.01, 0.0], 3.0, 2.0, 0.10) == 0.0
+
+
+def test_bounded_command_remains_bounded_after_csv_quantization():
+    from il_common import quantize_bounded_vector
+
+    # These component patterns are taken from rows rejected in the captured
+    # dataset after four-decimal serialization inflated their norm.
+    cases = ([2.4997, -0.0038, 0.0405],
+             [2.4999, -0.0266, 0.0051],
+             [2.4893, 0.0031, 0.2312],
+             [2.5, 0.0118, 0.0031])
+    for case in cases:
+        bounded = quantize_bounded_vector(case, 2.5, decimals=6)
+        assert np.linalg.norm(bounded) <= 2.5
+        assert np.all(np.isfinite(bounded))
+
+
 def test_body_vel_right_positive():
     from il_common import world_vel_to_body
     vx_b, vy_b, vz_b = world_vel_to_body(1, 0, 0, 0)

@@ -324,6 +324,8 @@ class CylinderSceneValidator:
         self.inflated_extra = self.vehicle_r + self.safety_m
 
         self.min_corridor_w = float(topo.get("minimum_navigable_corridor_width_m", 0.80))
+        self.forbid_u_shapes = bool(topo.get("forbid_u_shapes", True))
+        self.forbid_dead_ends = bool(topo.get("forbid_dead_ends", True))
         self.escape_rays = int(topo.get("escape_ray_count", 24))
         self.min_sector_w_deg = float(topo.get("minimum_escape_sector_width_deg", 35.0))
         self.min_sectors = int(topo.get("minimum_separated_escape_sectors", 2))
@@ -464,11 +466,11 @@ class CylinderSceneValidator:
         result.dead_end_detected = dead_detected
         result.dead_end_max_depth_m = max_depth
 
-        if u_detected:
+        if self.forbid_u_shapes and u_detected:
             result.valid = False
             result.rejection_reason = "SCENE_U_SHAPE"
             return result
-        if dead_detected:
+        if self.forbid_dead_ends and dead_detected:
             result.valid = False
             result.rejection_reason = "SCENE_DEAD_END"
             return result
@@ -1021,9 +1023,8 @@ class SideCostEvaluator:
                 result.side_cost_difference_ratio = (left_cost - right_cost) / max(right_cost, 1e-6)
 
             if self.reject_equal and result.side_cost_difference_ratio < self.min_cost_diff_ratio:
-                result.rejection_reason = "TASK_LEFT_RIGHT_COST_TOO_SIMILAR"
-                result.global_side_choice_valid = False
-                return result
+                # Costs nearly equal — default to RIGHT instead of rejecting.
+                result.lower_cost_side = "RIGHT"
             result.global_side_choice_valid = True
         elif result.left_path_valid:
             result.lower_cost_side = "LEFT"

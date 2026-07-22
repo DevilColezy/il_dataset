@@ -64,7 +64,9 @@ global:
     # pipeline did not consume 50 Hz reliably, which caused queued poses to be
     # discarded and produced mixed 20/40/60/80 ms frame intervals.
     control_hz: 50.0
-    record_hz:  25.0
+    # Windows Unity + WSL transport target.  640x480 RFloat depth is about
+    # 1.2 MiB/frame, so 30 Hz remains practical while looking smooth.
+    record_hz:  30.0
 
   # ── Obstacle generation shared defaults ──────────────────────────────
   obstacle:
@@ -96,35 +98,35 @@ global:
     obstacle_type: "cylinder"
 
     seed: 12345
-    max_scene_generation_attempts: 200
+    max_scene_generation_attempts: 500
     max_obstacle_sampling_attempts: 5000
 
     obstacle_region:
-      x_min: -8.0
-      x_max: 8.0
-      y_min: -6.0
-      y_max: 6.0
+      x_min: -9.0
+      x_max: 11.0
+      y_min: 0.0
+      y_max: 30.0
       z_min: 0.0
-      z_max: 6.0
+      z_max: 8.0
 
     outside_obstacle_region_policy: "free"
 
     cylinder:
-      count_min: 4
-      count_max: 12
+      count_min: 6
+      count_max: 10
 
-      radius_min_m: 0.40
-      radius_max_m: 1.20
+      radius_min_m: 0.30
+      radius_max_m: 2.0
 
-      height_min_m: 5.0
-      height_max_m: 6.0
+      height_min_m: 8.0
+      height_max_m: 8.0
 
       require_full_vertical_blocking: true
 
       region_boundary_margin_m: 0.30
 
-      minimum_surface_gap_m: 1.20
-      minimum_inflated_gap_m: 0.60
+      minimum_surface_gap_m: 0.80
+      minimum_inflated_gap_m: 0.40
 
       allow_overlap: false
       allow_inflated_component_merging: false
@@ -139,10 +141,10 @@ global:
       safety_margin_m: 0.10
 
       forbid_enclosed_free_components: true
-      forbid_dead_ends: true
-      forbid_u_shapes: true
+      forbid_dead_ends: false
+      forbid_u_shapes: false
 
-      minimum_navigable_corridor_width_m: 0.80
+      minimum_navigable_corridor_width_m: 0.60
 
       escape_ray_count: 24
       minimum_escape_sector_width_deg: 35.0
@@ -156,7 +158,7 @@ global:
       enabled: true
 
       max_task_sampling_attempts: 1000
-      tasks_per_scene: 20
+      tasks_per_scene: 5
 
       start_height_min_m: 1.8
       start_height_max_m: 2.2
@@ -168,7 +170,7 @@ global:
       goal_clearance_m: 0.60
 
       minimum_start_goal_distance_m: 8.0
-      maximum_start_goal_distance_m: 30.0
+      maximum_start_goal_distance_m: 40.0
 
       require_direct_path_blocked: true
       direct_path_corridor_radius_m: 0.35
@@ -182,16 +184,16 @@ global:
       maximum_detour_ratio: 1.80
 
       start_sampling_region:
-        x_min: -12.0
-        x_max: -8.0
-        y_min: -8.0
-        y_max: 8.0
+        x_min: -8.0
+        x_max: 10.0
+        y_min: -2.0
+        y_max: -1.0
 
       goal_sampling_region:
         x_min: 8.0
-        x_max: 12.0
-        y_min: -8.0
-        y_max: 8.0
+        x_max: 10.0
+        y_min: 30.0
+        y_max: 32.0
 
     side_cost:
       enabled: true
@@ -291,7 +293,7 @@ global:
 
     simulation_hz: 200.0
     control_hz: 50.0
-    render_hz: 20.0
+    render_hz: 30.0
 
     deterministic_time: true
 
@@ -307,7 +309,7 @@ global:
 
       maximum_acceleration_mps2: [4.0, 4.0, 2.0]
       maximum_tilt_deg: 35.0
-      maximum_yaw_rate_rps: 1.5
+      maximum_yaw_rate_rps: 2.0
       attitude_gain: 6.0
       maximum_body_rate_rps: 6.0
 
@@ -369,6 +371,8 @@ global:
       execute_prefix_time: 0.60          # legacy field; position prefixes are no longer replayed
       velocity_command_lookahead_time: 0.08  # shorter preview reduces corner cutting
       velocity_tracking_gain: 2.0        # [1/s] feedback toward the collision-checked local path
+      yaw_tracking_gain: 3.0             # [1/s] align nose to commanded velocity
+      yaw_speed_threshold: 0.10          # [m/s] hold yaw below this horizontal speed
       max_plan_age: 0.75                 # measured from request state, never completion time
       planning_time_budget_ms: 40.0
 
@@ -438,6 +442,7 @@ global:
     coordinate_frame: "CAMERA_FLU"
     schema_version: 10
     collection_mode: "deterministic_lockstep"
+    image_write_queue_size: 16
     label_lookahead_time_s: 0.08
     trend_horizontal_bins: 11
     trend_vertical_bins: 7
@@ -445,7 +450,7 @@ global:
 
   # ── Observed local occupancy map (Phase 2) ───────────────────────────
   observed_map:
-    enabled: true
+    enabled: false
 
     resolution: 0.10
 
@@ -465,7 +470,11 @@ global:
 
     rebuild_every_n_frames: 1
 
-    depth_integration_step: 4
+    depth_integration_step: 8
+
+    # Free-space ray sampling spacing (metres).  Coarser than voxel
+    # resolution to keep the Python ray-casting loop performant.
+    free_space_sample_spacing_m: 0.50
 
   # ── Guide selector (Phase 2) ─────────────────────────────────────────
   guide_selector:

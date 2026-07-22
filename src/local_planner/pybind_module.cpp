@@ -12,6 +12,7 @@
 #include <pybind11/stl.h>
 
 #include <cmath>
+#include <memory>
 #include <stdexcept>
 
 #include "flightlib/common/command.hpp"
@@ -22,6 +23,7 @@
 #include "il_dataset/local_planner/types.hpp"
 #include "il_dataset/local_planner/esdf_grid.hpp"
 #include "il_dataset/local_planner/local_planner.hpp"
+#include "il_dataset/local_planner/depth_integrator.hpp"
 
 namespace py = pybind11;
 
@@ -29,7 +31,9 @@ namespace {
 
 class FlightmareDynamicsBridge {
  public:
-  FlightmareDynamicsBridge() = default;
+  FlightmareDynamicsBridge()
+    : quadrotor_(std::make_unique<flightlib::Quadrotor>(
+          flightlib::QuadrotorDynamics(1.0, 0.25))) {}
 
   bool reset(const Eigen::Vector3d& position,
              const Eigen::Vector4d& quaternion_wxyz,
@@ -42,7 +46,7 @@ class FlightmareDynamicsBridge {
     state.v = velocity.cast<float>();
     state.w = angular_velocity.cast<float>();
     state.t = 0.0;
-    return quadrotor_.reset(state);
+    return quadrotor_->reset(state);
   }
 
   bool run(double collective_thrust,
@@ -56,12 +60,12 @@ class FlightmareDynamicsBridge {
     command.t = stateTime();
     command.collective_thrust = collective_thrust;
     command.omega = body_rates.cast<float>();
-    return quadrotor_.run(command, dt);
+    return quadrotor_->run(command, dt);
   }
 
   Eigen::VectorXd state() const {
     flightlib::QuadState state;
-    if (!quadrotor_.getState(&state)) {
+    if (!quadrotor_->getState(&state)) {
       throw std::runtime_error("flightlib::Quadrotor::getState failed");
     }
     Eigen::VectorXd output(flightlib::QuadState::SIZE + 1);
@@ -73,10 +77,10 @@ class FlightmareDynamicsBridge {
  private:
   double stateTime() const {
     flightlib::QuadState state;
-    return quadrotor_.getState(&state) ? state.t : 0.0;
+    return quadrotor_->getState(&state) ? state.t : 0.0;
   }
 
-  flightlib::Quadrotor quadrotor_;
+  std::unique_ptr<flightlib::Quadrotor> quadrotor_;
 };
 
 }  // namespace
@@ -410,4 +414,22 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_property_readonly("resolution", &ESDFGrid::resolution)
         .def_property_readonly("initialized", &ESDFGrid::initialized)
         .def_property_readonly("memory_bytes", &ESDFGrid::memoryBytes);
+
+    // ── Depth integrator ─────────────────────────────────────────
+    m.def("integrate_depth", &integrate_depth,
+          py::arg("points_world"),
+          py::arg("points_cam_z"),
+          py::arg("cam_pos"),
+          py::arg("occ_grid"),
+          py::arg("last_obs_time"),
+          py::arg("occ_endpoint_margin"),
+          py::arg("free_space_spacing"),
+          py::arg("resolution"),
+          py::arg("max_depth_m"),
+          py::arg("timestamp_s"),
+          py::arg("origin"),
+          py::arg("grid_dims"),
+          "Integrate depth rays into occupancy grid (C++). "
+          "Modifies occ_grid and last_obs_time in-place. "
+          "Returns number of changed voxels.");
 }

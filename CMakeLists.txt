@@ -106,6 +106,7 @@ endif()
 # ── pybind11 Python module ──────────────────────────────────────
 pybind11_add_module(_il_local_planner
   src/local_planner/pybind_module.cpp
+  src/local_planner/depth_integrator.cpp
 )
 target_compile_options(_il_local_planner PRIVATE -O3 -Wall -Wextra)
 target_link_libraries(_il_local_planner PRIVATE
