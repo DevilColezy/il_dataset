@@ -316,10 +316,20 @@ class ILManager:
         # -- time & matching --
         "timestamp_ns", "receive_timestamp_ns", "frame_id",
         "trajectory_time_s", "latency_ms", "match_method",
+        "frame_valid", "frame_invalid_reason",
         # -- current state (x_t, before executing expert command) --
         "x", "y", "z", "qx", "qy", "qz", "qw",
         "state_vx_world", "state_vy_world", "state_vz_world",
         "state_vx_flu", "state_vy_flu", "state_vz_flu",
+        "state_angular_velocity_x_body", "state_angular_velocity_y_body",
+        "state_angular_velocity_z_body",
+        # -- last upper-level command actually executed before depth_t --
+        "previous_executed_command_valid",
+        "previous_executed_command_frame_id", "previous_executed_actor",
+        "previous_executed_command_vx_flu",
+        "previous_executed_command_vy_flu",
+        "previous_executed_command_vz_flu",
+        "previous_executed_command_yaw_rate",
         # -- expert supervision (sampled from plan generated from x_t) --
         "expert_label_valid",
         "expert_vx_world", "expert_vy_world", "expert_vz_world",
@@ -1714,6 +1724,8 @@ class ILManager:
         self._final_executed_velocity = None
         self._invalid_expert_label_count = 0
         self._invalid_trend_label_count = 0
+        self._episode_invalid_frame_count = 0
+        self._episode_invalid_reason_counts = {}
 
     # ═══════════════════════════════════════════════════════════════
     #  v7: ONLINE_PLAN_AND_RECORD — deterministic lockstep loop
@@ -1879,6 +1891,11 @@ class ILManager:
         last_valid_response_mono = time.monotonic()
         previous_progress_s = -1.0
         goal_hold_counter = 0
+        previous_command_valid = False
+        previous_command_frame_id = -1
+        previous_command_actor = "episode_start"
+        previous_command_velocity_flu = np.zeros(3, dtype=np.float64)
+        previous_command_yaw_rate = 0.0
 
         rospy.loginfo("[ONLINE-LOCKSTEP] Starting. ctrl=%.0fHz rec=%.0fHz dt_sample=%.3fs",
                       ctrl_hz, rec_hz, dt_sample)
@@ -2217,6 +2234,23 @@ class ILManager:
                 planner_used_obs, planner_used_fallback,
                 dynamics_state.quaternion_world_body,
             )
+            for axis, value in zip(
+                    ("x", "y", "z"), dynamics_state.angular_velocity_body):
+                row["state_angular_velocity_{}_body".format(axis)] = round(
+                    float(value), 6)
+            row["previous_executed_command_valid"] = int(
+                previous_command_valid)
+            row["previous_executed_command_frame_id"] = int(
+                previous_command_frame_id)
+            row["previous_executed_actor"] = previous_command_actor
+            row["previous_executed_command_vx_flu"] = round(
+                float(previous_command_velocity_flu[0]), 6)
+            row["previous_executed_command_vy_flu"] = round(
+                float(previous_command_velocity_flu[1]), 6)
+            row["previous_executed_command_vz_flu"] = round(
+                float(previous_command_velocity_flu[2]), 6)
+            row["previous_executed_command_yaw_rate"] = round(
+                float(previous_command_yaw_rate), 6)
             row["observability_check_triggered"] = int(
                 observability_result is not None and
                 observability_result.observability_check_triggered)
@@ -2315,7 +2349,9 @@ class ILManager:
             # The executed_next fields belong to x_(t+1).
             if (final_actor == "expert" and result is not None and result.success and
                     len(result.trajectory) > 0):
-                exec_next_pos, exec_next_vel, exec_next_yaw, exec_next_yaw_rate = \
+                (exec_next_pos, exec_next_vel, exec_next_yaw,
+                 exec_next_yaw_rate, executed_command_velocity_flu,
+                 executed_command_yaw_rate) = \
                     self._execute_trajectory_segment(
                         result, cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
                         dt_sample, dt_ctrl, sample_index,
@@ -2323,12 +2359,16 @@ class ILManager:
                         command_lookahead_time, velocity_tracking_gain,
                         yaw_tracking_gain, yaw_speed_threshold)
             elif final_actor == "learner":
-                exec_next_pos, exec_next_vel, exec_next_yaw, exec_next_yaw_rate = \
+                (exec_next_pos, exec_next_vel, exec_next_yaw,
+                 exec_next_yaw_rate, executed_command_velocity_flu,
+                 executed_command_yaw_rate) = \
                     self._execute_velocity_command(
                         selected_velocity_flu, selected_yaw_rate, dt_sample)
             else:
                 # A safety actor or invalid expert holds position.
-                exec_next_pos, exec_next_vel, exec_next_yaw, exec_next_yaw_rate = \
+                (exec_next_pos, exec_next_vel, exec_next_yaw,
+                 exec_next_yaw_rate, executed_command_velocity_flu,
+                 executed_command_yaw_rate) = \
                     self._execute_hover(
                         cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
                         dt_sample, dt_ctrl,
@@ -2364,22 +2404,71 @@ class ILManager:
             row["yaw_rate_tracking_error"] = round(
                 abs(float(exec_next_yaw_rate) - selected_yaw_rate), 6)
 
+            # A frame is valid only when the image-time state, perception
+            # labels, plan, and the command/state transition are all usable.
+            # Count invalid frames even though the episode will later be moved
+            # to _failed; this prevents filtering bad rows from hiding a bad
+            # episode during commit validation.
+            frame_invalid_reasons = []
+            if depth_m is None or png_name == "none":
+                frame_invalid_reasons.append("missing_depth")
+            if bool(collision):
+                frame_invalid_reasons.append("collision")
+            if not np.all(np.isfinite(
+                    dynamics_state.angular_velocity_body)):
+                frame_invalid_reasons.append("invalid_image_time_angular_velocity")
+            if sample_index > 0 and not previous_command_valid:
+                frame_invalid_reasons.append("missing_previous_executed_command")
+            if guide_sel is None or not guide_sel.valid:
+                frame_invalid_reasons.append("invalid_guide")
+            if len(ref_segment) < 2:
+                frame_invalid_reasons.append("invalid_reference_segment")
+            if not bool(plan_success):
+                frame_invalid_reasons.append("planner_failure")
+            if not bool(row.get("expert_label_valid", 0)):
+                frame_invalid_reasons.append("invalid_expert_label")
+            if not bool(row.get("trend_label_valid", 0)):
+                frame_invalid_reasons.append("invalid_trend_label")
+            if planner_used_obs:
+                frame_invalid_reasons.append("unexpected_observed_esdf")
+            if planner_used_fallback:
+                frame_invalid_reasons.append("planner_global_fallback")
+            if (not np.all(np.isfinite(executed_command_velocity_flu)) or
+                    not np.isfinite(executed_command_yaw_rate)):
+                frame_invalid_reasons.append("invalid_executed_command")
+            elif (float(np.linalg.norm(executed_command_velocity_flu)) >
+                    max_velocity + 1e-6 or
+                    abs(float(executed_command_yaw_rate)) >
+                    max_yaw_rate + 1e-6):
+                frame_invalid_reasons.append("executed_command_out_of_bounds")
+            if (not np.all(np.isfinite(actual_state.position_world)) or
+                    not np.all(np.isfinite(actual_state.velocity_world)) or
+                    not np.all(np.isfinite(actual_state.angular_velocity_body))):
+                frame_invalid_reasons.append("invalid_actual_next_state")
+
+            # Preserve order while avoiding duplicate reasons.
+            frame_invalid_reasons = list(dict.fromkeys(frame_invalid_reasons))
+            row["frame_valid"] = int(not frame_invalid_reasons)
+            row["frame_invalid_reason"] = ";".join(frame_invalid_reasons)
+            if frame_invalid_reasons:
+                self._episode_invalid_frame_count += 1
+                for reason in frame_invalid_reasons:
+                    self._episode_invalid_reason_counts[reason] = (
+                        self._episode_invalid_reason_counts.get(reason, 0) + 1)
+
             # track invalid counts for metadata
             if row.get("expert_label_valid", 0) == 0:
                 self._invalid_expert_label_count += 1
             if row.get("trend_label_valid", 0) == 0:
                 self._invalid_trend_label_count += 1
 
-            # A transient failed replan executes a braking hover and remains
-            # part of the dynamics timeline, but it is not a valid imitation
-            # label.  Do not poison the whole trajectory by writing it as a
-            # training row; keep trying within the configured grace period.
-            if bool(row.get("expert_label_valid", 0)):
-                if self._image_writer is not None and depth_u16 is not None:
-                    self._image_writer.submit(
-                        os.path.join(depth_dir, png_name), depth_u16)
-                self._csv_writer.writerow(row)
-                self._rec_written_rows += 1
+            # Write every processed frame for failed-episode diagnostics.
+            # A production episode is committed only when every row is valid.
+            if self._image_writer is not None and depth_u16 is not None:
+                self._image_writer.submit(
+                    os.path.join(depth_dir, png_name), depth_u16)
+            self._csv_writer.writerow(row)
+            self._rec_written_rows += 1
 
             # ── Sync diagnostics ─────────────────────────────────────
             self._sync_file.write("{},{},{:.2f},0.00,frame_id_exact,0,0,{},{}\n".format(
@@ -2390,6 +2479,14 @@ class ILManager:
             cur_pos = exec_next_pos
             cur_vel = exec_next_vel
             cur_yaw = exec_next_yaw
+            previous_command_valid = bool(
+                np.all(np.isfinite(executed_command_velocity_flu)) and
+                np.isfinite(executed_command_yaw_rate))
+            previous_command_frame_id = frame_id
+            previous_command_actor = final_actor
+            previous_command_velocity_flu = np.asarray(
+                executed_command_velocity_flu, dtype=np.float64).copy()
+            previous_command_yaw_rate = float(executed_command_yaw_rate)
 
             # ── Goal check ───────────────────────────────────────────
             dist_to_goal = float(np.linalg.norm(cur_pos - goal_np))
@@ -2542,7 +2639,8 @@ class ILManager:
         """Execute dt_sample using sub-steps from the plan trajectory.
 
         Returns:
-            (next_pos, next_vel, next_yaw, avg_yaw_rate) — all numpy arrays/scalars.
+            next state, average measured yaw rate, and the final upper-level
+            velocity/yaw-rate command actually sent during this segment.
         """
         pos = np.asarray(cur_pos, dtype=np.float64).copy()
         vel = np.asarray(cur_vel, dtype=np.float64).copy()
@@ -2574,12 +2672,15 @@ class ILManager:
                 total_yaw_change += yr * step_dt
                 elapsed += step_dt
             avg_yaw_rate = total_yaw_change / max(dt_sample, 1e-9)
-            return pos, vel, yaw, avg_yaw_rate
+            return (pos, vel, yaw, avg_yaw_rate,
+                    np.zeros(3, dtype=np.float64), 0.0)
 
         traj = result.trajectory
         traj_duration = float(traj[-1].t)
         elapsed = 0.0
         epsilon = 1e-9
+        last_command_flu = np.zeros(3, dtype=np.float64)
+        last_command_yaw_rate = 0.0
 
         while elapsed < dt_sample - epsilon:
             step_dt = min(dt_ctrl, dt_sample - elapsed)
@@ -2613,6 +2714,8 @@ class ILManager:
                 desired_vel_flu = world_vector_to_body_flu_quat(
                     desired_vel_world,
                     command_state.quaternion_world_body)
+                last_command_flu = desired_vel_flu.copy()
+                last_command_yaw_rate = float(yaw_rate_cmd)
                 if not self._dynamics.step_velocity_command(
                         desired_vel_flu, yaw_rate_cmd, step_dt):
                     raise RuntimeError("Flightmare trajectory step failed")
@@ -2623,6 +2726,9 @@ class ILManager:
                                  1.0 - 2.0 * (qy*qy + qz*qz))
                 yr = float(ds.angular_velocity_body[2])
             else:
+                last_command_flu = world_vector_to_body_flu(
+                    desired_vel_world, yaw)
+                last_command_yaw_rate = float(yaw_rate_cmd)
                 pos, vel, yaw, yr = integrate_velocity_command(
                     pos, vel, yaw, desired_vel_world, step_dt,
                     max_velocity, max_acceleration, max_yaw_rate)
@@ -2630,7 +2736,8 @@ class ILManager:
             elapsed += step_dt
 
         avg_yaw_rate = total_yaw_change / max(dt_sample, 1e-9)
-        return pos, vel, yaw, avg_yaw_rate
+        return (pos, vel, yaw, avg_yaw_rate,
+                last_command_flu, last_command_yaw_rate)
 
     def _execute_hover(self, cur_pos, cur_vel, cur_yaw,
                         dt_sample, dt_ctrl,
@@ -2638,7 +2745,8 @@ class ILManager:
         """Execute a zero-velocity hover for dt_sample.
 
         Returns:
-            (next_pos, next_vel, next_yaw, avg_yaw_rate).
+            next state, average measured yaw rate, and the final zero hover
+            command actually sent during this segment.
         """
         pos = np.asarray(cur_pos, dtype=np.float64).copy()
         vel = np.asarray(cur_vel, dtype=np.float64).copy()
@@ -2668,7 +2776,8 @@ class ILManager:
             elapsed += step_dt
 
         avg_yaw_rate = total_yaw_change / max(dt_sample, 1e-9)
-        return pos, vel, yaw, avg_yaw_rate
+        return (pos, vel, yaw, avg_yaw_rate,
+                np.zeros(3, dtype=np.float64), 0.0)
 
     def _execute_velocity_command(self, velocity_flu, yaw_rate, duration_s):
         """Execute one selected learner/safety command through the backend."""
@@ -2681,7 +2790,9 @@ class ILManager:
         yaw = math.atan2(2.0 * (qw*qz + qx*qy),
                          1.0 - 2.0 * (qy*qy + qz*qz))
         return (state.position_world.copy(), state.velocity_world.copy(), yaw,
-                float(state.angular_velocity_body[2]))
+                float(state.angular_velocity_body[2]),
+                np.asarray(velocity_flu, dtype=np.float64).copy(),
+                float(yaw_rate))
 
     def _build_training_row_v8(self, cur_pos, cur_vel, cur_yaw,
                                 result, plan_success, planner_compute_ms,
@@ -3646,6 +3757,12 @@ class ILManager:
             "sample_semantics": (
                 "depth_t,state_t -> guide_t,expert_command_t; selected command "
                 "is executed through Flightmare dynamics"),
+            "image_time_angular_velocity_semantics": (
+                "state_angular_velocity_*_body belongs to depth_t/state_t"),
+            "previous_executed_command_semantics": (
+                "last upper-level velocity_flu/yaw_rate command actually sent "
+                "to dynamics before depth_t; unavailable only at episode start"),
+            "episode_validity_policy": "reject_if_any_processed_frame_is_invalid",
             "label_lookahead_time_s": float(
                 data_cfg.get("label_lookahead_time_s", 0.08)),
             "training_coordinate_frame": {
@@ -3728,6 +3845,10 @@ class ILManager:
                 self, "_invalid_expert_label_count", 0),
             "invalid_trend_label_count": getattr(
                 self, "_invalid_trend_label_count", 0),
+            "invalid_frame_count": getattr(
+                self, "_episode_invalid_frame_count", 0),
+            "invalid_frame_reason_counts": getattr(
+                self, "_episode_invalid_reason_counts", {}),
             "consecutive_guide_failures": getattr(
                 self, "_consecutive_guide_failures", 0),
             # ── Phase 3: scene & task metadata ──
@@ -4024,11 +4145,29 @@ class ILManager:
                                          np.array(plan["goal"])))
                     if self._final_executed_position is not None else float("inf")))
 
+        invalid_frame_count = int(getattr(
+            self, "_episode_invalid_frame_count", 0))
+        if invalid_frame_count > 0:
+            validation_passed = False
+            reason_counts = getattr(
+                self, "_episode_invalid_reason_counts", {})
+            failure_reasons.append(
+                "episode_contains_invalid_frames: count={} reasons={}".format(
+                    invalid_frame_count,
+                    json.dumps(reason_counts, sort_keys=True)))
+
         # Production acceptance invariants.  These checks use recorded fields,
         # not metadata claims.
         if os.path.isfile(data_path) and col_map:
             with open(data_path, "r") as f:
                 for row_index, row in enumerate(csv.DictReader(f), 1):
+                    if str(row.get("frame_valid", "0")) != "1":
+                        validation_passed = False
+                        failure_reasons.append(
+                            "invalid_frame_at_row:{}:{}".format(
+                                row_index,
+                                row.get("frame_invalid_reason", "unspecified")))
+                        break
                     if str(row.get("expert_label_valid", "0")) != "1":
                         validation_passed = False
                         failure_reasons.append(
@@ -4133,6 +4272,16 @@ class ILManager:
         max_velocity = float(lp_cfg.get("max_velocity", 2.5))
         max_yaw_rate = float(lp_cfg.get("max_yaw_rate", 2.0))
         required_fields = (
+            "frame_valid", "frame_invalid_reason",
+            "state_angular_velocity_x_body",
+            "state_angular_velocity_y_body",
+            "state_angular_velocity_z_body",
+            "previous_executed_command_valid",
+            "previous_executed_command_frame_id", "previous_executed_actor",
+            "previous_executed_command_vx_flu",
+            "previous_executed_command_vy_flu",
+            "previous_executed_command_vz_flu",
+            "previous_executed_command_yaw_rate",
             "expert_label_valid", "trend_label_valid", "match_method",
             "learner_output_valid", "selected_command_vx_flu",
             "selected_command_vy_flu", "selected_command_vz_flu",
@@ -4159,6 +4308,42 @@ class ILManager:
                         if required not in row:
                             issues.append("CRITICAL: missing {} at row {}".format(
                                 required, row_idx))
+
+                    if str(row.get("frame_valid", "0")) != "1":
+                        issues.append(
+                            "CRITICAL: invalid frame at row {}: {}".format(
+                                row_idx,
+                                row.get("frame_invalid_reason", "unspecified")))
+
+                    try:
+                        image_angular_velocity = np.array([
+                            float(row.get("state_angular_velocity_x_body", "nan")),
+                            float(row.get("state_angular_velocity_y_body", "nan")),
+                            float(row.get("state_angular_velocity_z_body", "nan"))])
+                        if not np.all(np.isfinite(image_angular_velocity)):
+                            issues.append(
+                                "CRITICAL: invalid image-time angular velocity at row {}".format(
+                                    row_idx))
+                        previous_command_valid = str(row.get(
+                            "previous_executed_command_valid", "0")) == "1"
+                        if row_idx > 1 and not previous_command_valid:
+                            issues.append(
+                                "CRITICAL: missing previous executed command at row {}".format(
+                                    row_idx))
+                        if previous_command_valid:
+                            previous_command = np.array([
+                                float(row.get("previous_executed_command_vx_flu", "nan")),
+                                float(row.get("previous_executed_command_vy_flu", "nan")),
+                                float(row.get("previous_executed_command_vz_flu", "nan")),
+                                float(row.get("previous_executed_command_yaw_rate", "nan"))])
+                            if not np.all(np.isfinite(previous_command)):
+                                issues.append(
+                                    "CRITICAL: invalid previous executed command at row {}".format(
+                                        row_idx))
+                    except (ValueError, TypeError):
+                        issues.append(
+                            "CRITICAL: unparseable image-time state/history at row {}".format(
+                                row_idx))
 
                     # match_method must be exact frame_id
                     mm = row.get("match_method", "")
