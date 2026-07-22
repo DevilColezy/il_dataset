@@ -190,18 +190,35 @@ bool ESDFGrid::isKnown(double x, double y, double z) const {
                 gz_f >= -0.5 && gz_f <= gz_ - 0.5);
     }
 
-    // With known mask: check the nearest voxel
-    int ix = static_cast<int>(std::floor(worldToGridX(x)));
-    int iy = static_cast<int>(std::floor(worldToGridY(y)));
-    int iz = static_cast<int>(std::floor(worldToGridZ(z)));
-
-    if (ix < 0 || ix >= gx_ || iy < 0 || iy >= gy_ || iz < 0 || iz >= gz_)
-        return false;  // out of bounds = unknown
-
-    size_t idx = static_cast<size_t>(ix) * gy_ * gz_ +
-                 static_cast<size_t>(iy) * gz_ +
-                 static_cast<size_t>(iz);
-    return known_mask_[idx] != 0;
+    // A clearance query is trilinearly interpolated.  It is known only when
+    // every voxel that can contribute to that interpolation is known; checking
+    // just floor(x,y,z) can otherwise manufacture clearance across an unknown
+    // boundary.
+    const double gx_f = worldToGridX(x);
+    const double gy_f = worldToGridY(y);
+    const double gz_f = worldToGridZ(z);
+    if (gx_f < 0.0 || gx_f > gx_ - 1.0 ||
+        gy_f < 0.0 || gy_f > gy_ - 1.0 ||
+        gz_f < 0.0 || gz_f > gz_ - 1.0) {
+        return false;
+    }
+    const int ix0 = static_cast<int>(std::floor(gx_f));
+    const int iy0 = static_cast<int>(std::floor(gy_f));
+    const int iz0 = static_cast<int>(std::floor(gz_f));
+    const int ix1 = std::min(ix0 + 1, gx_ - 1);
+    const int iy1 = std::min(iy0 + 1, gy_ - 1);
+    const int iz1 = std::min(iz0 + 1, gz_ - 1);
+    for (const int ix : {ix0, ix1}) {
+        for (const int iy : {iy0, iy1}) {
+            for (const int iz : {iz0, iz1}) {
+                const size_t idx = static_cast<size_t>(ix) * gy_ * gz_ +
+                                   static_cast<size_t>(iy) * gz_ +
+                                   static_cast<size_t>(iz);
+                if (known_mask_[idx] == 0) return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool ESDFGrid::isKnownFree(double x, double y, double z,

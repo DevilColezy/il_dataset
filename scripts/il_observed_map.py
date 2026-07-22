@@ -19,6 +19,8 @@ from __future__ import print_function, division
 import math, time, collections
 import numpy as np
 
+from il_common import quaternion_xyzw_to_rotation
+
 # Camera coordinate convention (documented):
 #   Flightmare depth camera: optical axis = +Z (forward in Unity),
 #   image x = right, image y = down (OpenCV convention after flip).
@@ -130,6 +132,9 @@ class RollingObservedOccupancyMap:
         self.unknown_is_free = bool(cfg.get("unknown_is_free", False))
         self.min_known_free_ratio = float(cfg.get("min_known_free_ratio", 0.95))
         self.depth_step = int(cfg.get("depth_integration_step", 4))
+        depth_cfg = config.get("global", {}).get("depth", {})
+        self.horizontal_fov_rad = math.radians(float(depth_cfg.get("fov", 90.0)))
+        self.max_depth_m = float(depth_cfg.get("max_m", 5.0))
 
         # Grid dimensions
         inv_res = 1.0 / self.resolution
@@ -203,6 +208,8 @@ class RollingObservedOccupancyMap:
         half_size = min(self.size_x_m, self.size_y_m) / 4.0
         if displacement > half_size:
             self.reset(center_world)
+            return True
+        return False
 
     def integrate_depth(self, depth_m, camera_position_world,
                         camera_rotation_world, timestamp_s):
@@ -211,15 +218,15 @@ class RollingObservedOccupancyMap:
         Args:
             depth_m: (H, W) float array of depth in metres.
             camera_position_world: [x, y, z] in ROS world.
-            camera_rotation_world: yaw in radians (ROS convention).
+            camera_rotation_world: body-to-world ROS quaternion ``[x,y,z,w]``;
+                a scalar yaw is accepted only for legacy/debug callers.
             timestamp_s: monotonic time for history window.
         """
         if not self._initialized:
             return
 
         cam = PinholeCameraModel(
-            depth_m.shape[1], depth_m.shape[0],
-            math.radians(90.0))  # FOV from config, placeholder
+            depth_m.shape[1], depth_m.shape[0], self.horizontal_fov_rad)
 
         # Back-project depth
         points_cam, _ = cam.backproject_depth(depth_m, step=self.depth_step)
@@ -228,21 +235,25 @@ class RollingObservedOccupancyMap:
 
         # Camera → FLU → World
         points_flu = cam.cam_to_flu(points_cam)
-        yaw = float(camera_rotation_world)
-        cos_y = math.cos(yaw)
-        sin_y = math.sin(yaw)
-        # FLU to world: rotate by yaw around Z, then translate
-        points_world = np.zeros_like(points_flu)
-        points_world[:, 0] = points_flu[:, 0] * cos_y - points_flu[:, 1] * sin_y
-        points_world[:, 1] = points_flu[:, 0] * sin_y + points_flu[:, 1] * cos_y
-        points_world[:, 2] = points_flu[:, 2]
+        rotation = np.asarray(camera_rotation_world)
+        if rotation.shape == (4,):
+            body_to_world = quaternion_xyzw_to_rotation(rotation)
+        else:
+            yaw = float(camera_rotation_world)
+            cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+            body_to_world = np.array(
+                [[cos_y, -sin_y, 0.0], [sin_y, cos_y, 0.0],
+                 [0.0, 0.0, 1.0]], dtype=np.float64)
+        points_flightlib_body = np.column_stack(
+            [-points_flu[:, 1], points_flu[:, 0], points_flu[:, 2]])
+        points_world = points_flightlib_body.dot(body_to_world.T)
         points_world += np.asarray(camera_position_world, dtype=np.float64)
 
         # Camera position in world
         cam_pos = np.asarray(camera_position_world, dtype=np.float64)
 
         # Purge expired history
-        self._purge_expired(timestamp_s)
+        changed = self._purge_expired(timestamp_s)
 
         # Rasterize each ray end-point
         occ_grid_ix = self._world_to_grid_int(points_world)
@@ -251,11 +262,17 @@ class RollingObservedOccupancyMap:
         occ_grid_ix = occ_grid_ix[:, 0]
         in_b = self._in_bounds(occ_grid_ix, occ_grid_iy, occ_grid_iz)
 
-        # Mark occupied endpoints
-        for k in np.where(in_b)[0]:
+        # A sample at the sensor maximum range means "no return" and marks
+        # only traversed free space, not a synthetic occupied shell.
+        endpoint_hit = points_cam[:, 2] < (
+            self.max_depth_m - max(self.occ_endpoint_margin, 1e-3))
+
+        # Mark occupied endpoints for real returns only.
+        for k in np.where(in_b & endpoint_hit)[0]:
             ix, iy, iz = occ_grid_ix[k], occ_grid_iy[k], occ_grid_iz[k]
             if self._occ[ix, iy, iz] != OCCUPIED:
                 self._occ[ix, iy, iz] = OCCUPIED
+                changed = True
             self._last_obs_time[ix, iy, iz] = timestamp_s
 
         # Mark free space along rays using simplified sampling
@@ -284,8 +301,10 @@ class RollingObservedOccupancyMap:
                     if self._occ[ix, iy, iz] == UNKNOWN:
                         self._occ[ix, iy, iz] = FREE
                         self._last_obs_time[ix, iy, iz] = timestamp_s
+                        changed = True
 
-        self._revision += 1
+        if changed:
+            self._revision += 1
         self.total_integrations += 1
 
     def _purge_expired(self, now_s):
@@ -293,8 +312,11 @@ class RollingObservedOccupancyMap:
         if self.history_seconds <= 0:
             return
         expired = (now_s - self._last_obs_time) > self.history_seconds
-        self._occ[expired & (self._occ != UNKNOWN)] = UNKNOWN
+        changed_mask = expired & (self._occ != UNKNOWN)
+        changed = bool(np.any(changed_mask))
+        self._occ[changed_mask] = UNKNOWN
         self._last_obs_time[expired] = -1.0
+        return changed
 
     def get_occupancy(self):
         """Return the occupancy grid (gx, gy, gz) uint8."""
@@ -364,6 +386,16 @@ class RollingObservedOccupancyMap:
         known_free_count = 0
         total_samples = 0
 
+        radius_voxels = max(0, int(math.ceil(radius_m / self.resolution)))
+        offsets = []
+        for dx in range(-radius_voxels, radius_voxels + 1):
+            for dy in range(-radius_voxels, radius_voxels + 1):
+                for dz in range(-radius_voxels, radius_voxels + 1):
+                    if math.sqrt(dx*dx + dy*dy + dz*dz) * self.resolution <= radius_m + 1e-9:
+                        offsets.append((dx, dy, dz))
+        if not offsets:
+            offsets = [(0, 0, 0)]
+
         for i in range(n_samples):
             frac = i / max(n_samples - 1, 1)
             center_pt = start + frac * vec
@@ -371,9 +403,14 @@ class RollingObservedOccupancyMap:
             if not self._in_bounds(g[0], g[1], g[2]):
                 continue
             total_samples += 1
-            if self._occ[int(g[0]), int(g[1]), int(g[2])] == FREE:
-                # Simplified: only check center point for now.
-                # Full drone-radius check would require ESDF.
+            corridor_free = True
+            for dx, dy, dz in offsets:
+                ix, iy, iz = int(g[0] + dx), int(g[1] + dy), int(g[2] + dz)
+                if (not self._in_bounds(ix, iy, iz) or
+                        self._occ[ix, iy, iz] != FREE):
+                    corridor_free = False
+                    break
+            if corridor_free:
                 known_free_count += 1
 
         if total_samples == 0:
@@ -395,6 +432,14 @@ class ObservedESDF:
 
         self._esdf = None  # (gx, gy, gz) float32
         self._known_mask = None  # (gx, gy, gz) bool
+        self._origin = None
+        self._resolution = 0.0
+        self._built = False
+        self._build_count = 0
+
+    def reset(self):
+        self._esdf = None
+        self._known_mask = None
         self._origin = None
         self._resolution = 0.0
         self._built = False
@@ -460,3 +505,16 @@ class ObservedESDF:
 
     def is_built(self):
         return self._built
+
+    def value_at(self, point_world):
+        """Nearest-voxel observed clearance, or ``None`` for unknown/OOB."""
+        if not self._built:
+            return None
+        g = np.floor((np.asarray(point_world, dtype=np.float64) - self._origin) /
+                     self._resolution).astype(np.int64)
+        if np.any(g < 0) or np.any(g >= np.asarray(self._esdf.shape)):
+            return None
+        idx = tuple(int(v) for v in g)
+        if not self._known_mask[idx]:
+            return None
+        return float(self._esdf[idx])

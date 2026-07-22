@@ -20,7 +20,8 @@ import math
 import numpy as np
 from dataclasses import dataclass, field
 
-from il_common import world_vector_to_body_flu
+from il_common import (world_vector_to_body_flu,
+                       world_vector_to_body_flu_quat)
 from il_observed_map import PinholeCameraModel
 
 
@@ -33,6 +34,7 @@ class GuideSelection:
     guide_position_world: np.ndarray = field(
         default_factory=lambda: np.zeros(3))
     guide_path_index: int = -1
+    progress_path_index: int = -1
 
     # Terminal (dynamically reachable point) — for trajectory optimization
     terminal_position_world: np.ndarray = field(
@@ -104,7 +106,7 @@ class GuideSelector:
     def select(self, global_path_world, previous_progress_index,
                current_position_world, current_yaw,
                current_velocity_world, depth_m,
-               observed_map, observed_esdf):
+               observed_map, observed_esdf, current_quaternion_xyzw=None):
         """Select Guide and Terminal from global A* path.
 
         Args:
@@ -132,6 +134,7 @@ class GuideSelector:
         # ── Find nearest forward path index ─────────────────────
         start_index = self._find_forward_start_index(
             global_path_world, previous_progress_index, pos)
+        sel.progress_path_index = start_index
 
         # ── Compute camera FOV limits ──────────────────────────
         h_half = self._camera.hfov / 2.0 - self.h_fov_margin_rad
@@ -141,8 +144,9 @@ class GuideSelector:
         candidate_count = 0
         best_guide_idx = -1
 
-        for i in range(start_index, min(len(global_path_world),
-                                         start_index + self.path_search_max_points)):
+        candidate_begin = min(start_index + 1, len(global_path_world) - 1)
+        for i in range(candidate_begin, min(len(global_path_world),
+                                             start_index + self.path_search_max_points)):
             pt = np.array(global_path_world[i], dtype=np.float64)
 
             # 1. Range check
@@ -152,7 +156,10 @@ class GuideSelector:
 
             # 2. Camera forward check (FLU)
             delta_world = pt - pos
-            delta_flu = world_vector_to_body_flu(delta_world, float(current_yaw))
+            delta_flu = (world_vector_to_body_flu_quat(
+                delta_world, current_quaternion_xyzw)
+                if current_quaternion_xyzw is not None else
+                world_vector_to_body_flu(delta_world, float(current_yaw)))
             if delta_flu[0] <= 0:  # not in front
                 continue
 
@@ -214,7 +221,10 @@ class GuideSelector:
         sel.guide_distance_m = guide_dist
         sel.guide_distance_norm = min(guide_dist, self.max_range_m) / max(self.max_range_m, 1e-9)
 
-        delta_flu = world_vector_to_body_flu(delta_w, float(current_yaw))
+        delta_flu = (world_vector_to_body_flu_quat(
+            delta_w, current_quaternion_xyzw)
+            if current_quaternion_xyzw is not None else
+            world_vector_to_body_flu(delta_w, float(current_yaw)))
         norm_f = float(np.linalg.norm(delta_flu))
         if norm_f > 1e-9:
             sel.guide_direction_flu = delta_flu / norm_f
@@ -283,8 +293,17 @@ class GuideSelector:
                     best_idx = i
             return best_idx
 
-        # Ensure monotonic progress
-        return max(0, prev_progress_idx)
+        # Re-localise in a bounded forward window without ever regressing.
+        begin = max(0, int(prev_progress_idx))
+        end = min(len(global_path), begin + self.path_search_max_points)
+        best_idx = begin
+        best_dist = float('inf')
+        for i in range(begin, end):
+            d = float(np.linalg.norm(np.asarray(global_path[i]) - pos))
+            if d < best_dist:
+                best_dist = d
+                best_idx = i
+        return best_idx
 
     def _check_depth_visibility(self, point_world, delta_flu, depth_m, dist):
         """Check if a world point is visible in the current depth image.
@@ -343,7 +362,8 @@ class GuideSelector:
             return False
 
         # Point is visible if closer than or equal to depth + tolerance
-        return dist <= max_depth + self.depth_visibility_tol_m
+        # Flightmare depth is camera-axis (z) depth, not Euclidean range.
+        return cam_z <= max_depth + self.depth_visibility_tol_m
 
     def get_reference_segment(self, global_path_world, start_index, end_index):
         """Extract A* sub-path from start_index to end_index for planner init.

@@ -437,13 +437,21 @@ class CylinderSceneValidator:
         if dt is not None:
             navigable = (free_mask & visited)
             if np.any(navigable):
-                min_dt = float(np.min(dt[navigable]))
-                result.minimum_navigable_clearance_m = min_dt
                 result.navigable_free_ratio = float(np.sum(navigable)) / max(gx * gy, 1)
-                if 2.0 * min_dt < self.min_corridor_w:
-                    result.valid = False
-                    result.rejection_reason = "SCENE_NARROW_CORRIDOR"
-                    return result
+                # ``occ`` is already inflated by vehicle radius + safety
+                # margin.  Taking min(EDT) over all free cells always selects
+                # a cell adjacent to an obstacle and falsely rejects every
+                # non-empty scene.  The usable corridor width is instead the
+                # surface gap between distinct inflated components.
+                if min_inflated_gap != float('inf'):
+                    result.minimum_navigable_clearance_m = max(
+                        0.0, 0.5 * min_inflated_gap)
+                    if min_inflated_gap + 1e-9 < self.min_corridor_w:
+                        result.valid = False
+                        result.rejection_reason = "SCENE_NARROW_CORRIDOR"
+                        return result
+                else:
+                    result.minimum_navigable_clearance_m = float(np.max(dt[navigable]))
             else:
                 result.valid = False
                 result.rejection_reason = "SCENE_ENCLOSED_FREE_COMPONENT"
@@ -783,6 +791,12 @@ class StartGoalTaskGenerator:
             iz = max(0, min(gz_ - 1, int(math.floor((pt[2] - oz) * inv))))
             return float(esdf[ix, iy, iz])
 
+        def path_length(path):
+            return sum(float(np.linalg.norm(
+                np.asarray(path[i], dtype=np.float64) -
+                np.asarray(path[i - 1], dtype=np.float64)))
+                for i in range(1, len(path)))
+
         if esdf_at(start) < self.start_clearance:
             result.rejection_reason = "TASK_START_OR_GOAL_NOT_FREE"
             return result
@@ -942,6 +956,12 @@ class SideCostEvaluator:
             iz = max(0, min(gz_ - 1, int(math.floor((pt[2] - oz) * inv))))
             return float(esdf[ix, iy, iz])
 
+        def path_length(path):
+            return sum(float(np.linalg.norm(
+                np.asarray(path[i], dtype=np.float64) -
+                np.asarray(path[i - 1], dtype=np.float64)))
+                for i in range(1, len(path)))
+
         min_cl = 0.30  # minimum clearance for portal
 
         # Left path
@@ -955,8 +975,7 @@ class SideCostEvaluator:
                                           pL.tolist(), goal.tolist(), min_cl)
                 if pr_s2l.reached_goal and pr_l2g.reached_goal:
                     result.left_path_valid = True
-                    left_cost = (float(np.linalg.norm(np.array(pr_s2l.path[-1]) - np.array(pr_s2l.path[0]))) +
-                                 float(np.linalg.norm(np.array(pr_l2g.path[-1]) - np.array(pr_l2g.path[0]))))
+                    left_cost = path_length(pr_s2l.path) + path_length(pr_l2g.path)
                     result.left_path_length_m = left_cost
                     result.left_path_cost = left_cost
                     # Compute min clearance along path
@@ -980,8 +999,7 @@ class SideCostEvaluator:
                                           pR.tolist(), goal.tolist(), min_cl)
                 if pr_s2r.reached_goal and pr_r2g.reached_goal:
                     result.right_path_valid = True
-                    right_cost = (float(np.linalg.norm(np.array(pr_s2r.path[-1]) - np.array(pr_s2r.path[0]))) +
-                                  float(np.linalg.norm(np.array(pr_r2g.path[-1]) - np.array(pr_r2g.path[0]))))
+                    right_cost = path_length(pr_s2r.path) + path_length(pr_r2g.path)
                     result.right_path_length_m = right_cost
                     result.right_path_cost = right_cost
                     min_cl_right = float('inf')
@@ -1135,6 +1153,15 @@ class ObstacleVisibilityAuditor:
             obs_cfg.get("maximum_invalid_frames_before_reject", 5))
         self.reject_inconsistent = bool(
             obs_cfg.get("reject_episode_on_inconsistent_side_choice", True))
+        topo = config.get("global", {}).get("scene_generation", {}).get(
+            "topology_validation", {})
+        side_cfg = config.get("global", {}).get("scene_generation", {}).get(
+            "side_cost", {})
+        self.inflation = (float(topo.get("vehicle_radius_m", 0.30)) +
+                          float(topo.get("safety_margin_m", 0.10)))
+        self.portal_clearance = float(
+            side_cfg.get("portal_lateral_clearance_m", 0.60))
+        self.corridor_spacing = float(topo.get("grid_resolution_m", 0.10))
 
     def audit(self, global_lower_cost_side, observed_map, observed_esdf,
               dominant_obstacle, current_position_world, current_yaw,
@@ -1154,26 +1181,82 @@ class ObstacleVisibilityAuditor:
             result.side_choice_consistent = False
             return result
 
-        # Simple check: can we see the dominant obstacle?
-        # Compute whether the dominant obstacle is within FOV and visible
         if dominant_obstacle is not None:
             obs_xy = dominant_obstacle.center_xy()
-            obs_z = dominant_obstacle.center_world[2]
             pos = np.asarray(current_position_world)
-
-            # Check if obstacle center is in observed known-free space
-            # and visible from current position
-            if observed_map.is_known(np.array([obs_xy[0], obs_xy[1], obs_z])):
-                result.observability_check_triggered = True
-                # For now, mark as consistent if we can observe the obstacle
-                result.side_choice_consistent = True
-                result.observable_expert_label = True
-                result.observed_side_cost_valid = False  # simplified: portal path not computed
+            radial = pos[:2] - obs_xy
+            radial_norm = float(np.linalg.norm(radial))
+            if radial_norm > 1e-6:
+                surface_xy = obs_xy + radial / radial_norm * dominant_obstacle.radius_m
             else:
+                surface_xy = obs_xy
+            z_min = dominant_obstacle.center_world[2] - 0.5 * dominant_obstacle.height_m
+            z_max = dominant_obstacle.center_world[2] + 0.5 * dominant_obstacle.height_m
+            surface_z = float(np.clip(pos[2], z_min, z_max))
+            visible_surface = np.array(
+                [surface_xy[0], surface_xy[1], surface_z])
+            surface_observed = any(
+                observed_map.is_known(visible_surface + np.array([dx, dy, dz]))
+                for dx in (-self.corridor_spacing, 0.0, self.corridor_spacing)
+                for dy in (-self.corridor_spacing, 0.0, self.corridor_spacing)
+                for dz in (-self.corridor_spacing, 0.0, self.corridor_spacing))
+
+            if surface_observed:
+                result.observability_check_triggered = True
+                direct = np.asarray(goal_world, dtype=np.float64)[:2] - \
+                    np.asarray(start_world, dtype=np.float64)[:2]
+                direct_norm = float(np.linalg.norm(direct))
+                if direct_norm < 1e-6:
+                    return result
+                e_dir = direct / direct_norm
+                n_dir = np.array([-e_dir[1], e_dir[0]])
+                portal_offset = (dominant_obstacle.radius_m + self.inflation +
+                                 self.portal_clearance)
+                altitude = float(current_position_world[2])
+                left = np.array([obs_xy[0] + n_dir[0] * portal_offset,
+                                 obs_xy[1] + n_dir[1] * portal_offset, altitude])
+                right = np.array([obs_xy[0] - n_dir[0] * portal_offset,
+                                  obs_xy[1] - n_dir[1] * portal_offset, altitude])
+                current = np.asarray(current_position_world, dtype=np.float64)
+                radius = self.inflation
+                left_ratio = observed_map.sample_known_free_ratio_along_corridor(
+                    current, left, radius, self.corridor_spacing)
+                right_ratio = observed_map.sample_known_free_ratio_along_corridor(
+                    current, right, radius, self.corridor_spacing)
+                left_clearance = observed_esdf.value_at(left)
+                right_clearance = observed_esdf.value_at(right)
+                min_ratio = observed_map.min_known_free_ratio
+                left_valid = left_ratio >= min_ratio and left_clearance is not None
+                right_valid = right_ratio >= min_ratio and right_clearance is not None
+                if left_valid and right_valid:
+                    # Cost is based solely on observed path length and observed
+                    # clearance; unknown voxels never receive a global fill-in.
+                    left_cost = (float(np.linalg.norm(left - current)) +
+                                 1.0 / max(left_clearance, 1e-3))
+                    right_cost = (float(np.linalg.norm(right - current)) +
+                                  1.0 / max(right_clearance, 1e-3))
+                    result.left_observed_path_cost = left_cost
+                    result.right_observed_path_cost = right_cost
+                    result.observed_lower_cost_side = (
+                        "LEFT" if left_cost < right_cost else "RIGHT")
+                    result.observed_side_cost_difference_ratio = (
+                        abs(left_cost - right_cost) /
+                        max(min(left_cost, right_cost), 1e-6))
+                    result.observed_side_cost_valid = (
+                        result.observed_side_cost_difference_ratio >=
+                        self.min_obs_diff_ratio)
+                    result.side_choice_consistent = (
+                        result.observed_side_cost_valid and
+                        result.observed_lower_cost_side == global_lower_cost_side)
+                    result.observable_expert_label = result.side_choice_consistent
+                if not result.observable_expert_label:
+                    result.invalid_observability_frame_count = invalid_frame_count + 1
+            else:
+                # Before the dominant obstacle is observed there is no side
+                # decision to audit; do not spend the consecutive-invalid
+                # budget on pre-trigger frames.
                 result.side_choice_consistent = False
-                result.invalid_observability_frame_count = invalid_frame_count + 1
-                if result.invalid_observability_frame_count >= self.max_invalid_frames:
-                    result.observable_expert_label = False
+                result.invalid_observability_frame_count = 0
         else:
             result.observable_expert_label = True
             result.side_choice_consistent = True

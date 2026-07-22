@@ -201,6 +201,7 @@ private:
         const std::vector<Eigen::Vector3d>& control_points,
         const Eigen::Vector3d& start_pos,
         const Eigen::Vector3d& start_vel,
+        const Eigen::Vector3d& start_acc,
         const Eigen::Vector3d& goal_pos,
         double dt,
         int num_samples) const;

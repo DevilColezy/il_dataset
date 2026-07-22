@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # ── Catkin ──────────────────────────────────────────────────────
 find_package(catkin REQUIRED COMPONENTS
+  flightlib
   rospy
   std_msgs
 )
@@ -105,6 +106,7 @@ pybind11_add_module(_il_local_planner
 target_compile_options(_il_local_planner PRIVATE -O3 -Wall -Wextra)
 target_link_libraries(_il_local_planner PRIVATE
   il_local_planner_lib
+  flightlib
   ${catkin_LIBRARIES}
 )
 

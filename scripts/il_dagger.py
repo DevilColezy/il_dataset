@@ -70,6 +70,8 @@ class PolicyProvider:
         self._recurrent = bool(policy_cfg.get("recurrent", True))
         self._inference_timeout_ms = float(
             policy_cfg.get("inference_timeout_ms", 30.0))
+        self._depth_max_m = float(
+            config.get("global", {}).get("depth", {}).get("max_m", 5.0))
 
         self._python_module = str(policy_cfg.get("python_module", ""))
         self._python_class = str(policy_cfg.get("python_class", ""))
@@ -90,8 +92,21 @@ class PolicyProvider:
         return self._backend
 
     @property
+    def model_path(self):
+        return self._model_path
+
+    @property
     def loaded(self):
         return self._loaded
+
+    @property
+    def hidden_state_valid(self):
+        if self._hidden_state is None:
+            return True
+        try:
+            return bool(np.all(np.isfinite(np.asarray(self._hidden_state))))
+        except Exception:
+            return False
 
     def reset(self):
         """Reset hidden state for new episode."""
@@ -228,7 +243,7 @@ class PolicyProvider:
             # Prepare normalized depth
             if depth is not None:
                 d = np.asarray(depth, dtype=np.float32)
-                d = np.clip(d / 5.0, 0.0, 1.0)  # normalize by max range
+                d = np.clip(d / max(self._depth_max_m, 1e-6), 0.0, 1.0)
                 inputs[depth_key] = d[np.newaxis, np.newaxis, :, :]
 
             if global_guide is not None:
@@ -323,14 +338,19 @@ class DaggerController:
             safety_cfg.get("minimum_observed_clearance_m", 0.35))
         self._min_ttc_s = float(safety_cfg.get("minimum_ttc_s", 0.60))
         self._fallback_command = str(safety_cfg.get("fallback_command", "hover"))
+        policy_cfg = dagger_cfg.get("policy", {})
+        self._inference_timeout_ms = float(policy_cfg.get("inference_timeout_ms", 30.0))
+        lp_cfg = config.get("global", {}).get("planning", {}).get("local_planner", {})
+        self._max_velocity = float(lp_cfg.get("max_velocity", 2.5))
+        self._max_yaw_rate = float(lp_cfg.get("max_yaw_rate", 2.0))
 
         # Output root
         agg = dagger_cfg.get("aggregation", {})
-        self._output_root = str(agg.get("output_root",
-                                         os.path.join(
-                                             config.get("global", {}).get("output_dir", "."),
-                                             "dagger")))
-        self._preserve_episode_id = bool(agg.get("preserve_original_episode_id", True))
+        configured_root = str(agg.get("output_root", "dagger"))
+        if not os.path.isabs(configured_root):
+            configured_root = os.path.join(
+                config.get("global", {}).get("output_dir", "."), configured_root)
+        self._output_root = configured_root
 
         # RNG per episode
         self._rng = None
@@ -340,6 +360,8 @@ class DaggerController:
         self.learner_exec_count = 0
         self.safety_override_count = 0
         self.invalid_label_count = 0
+        self.last_random_value = -1.0
+        self.last_initial_actor = "expert"
 
     @property
     def enabled(self):
@@ -371,8 +393,12 @@ class DaggerController:
         self.expert_exec_count = 0
         self.learner_exec_count = 0
         self.safety_override_count = 0
+        self.last_random_value = -1.0
+        self.last_initial_actor = "expert"
 
-    def select_actor(self, expert_action_valid, learner_output):
+    def select_actor(self, expert_action_valid, learner_output,
+                     observed_clearance_m=None, ttc_s=None,
+                     hidden_state_valid=True):
         """Select which actor's command to execute.
 
         Args:
@@ -385,14 +411,18 @@ class DaggerController:
         # Select based on beta
         if self._rollout_mode == "expert" or not self._enabled:
             selected = "expert"
+            self.last_random_value = -1.0
         elif self._rollout_mode == "dagger":
             if self._rng is not None:
                 rv = self._rng.uniform()
             else:
                 rv = 0.5
+            self.last_random_value = float(rv)
             selected = "expert" if rv < self._current_beta else "learner"
         else:
             selected = "expert"
+            self.last_random_value = -1.0
+        self.last_initial_actor = selected
 
         # Safety checks (only use observed information, NOT global ESDF)
         safety_override = False
@@ -405,7 +435,7 @@ class DaggerController:
                 safety_override = True
                 safety_reason = "learner_output_invalid"
             elif (self._override_on_timeout and
-                  learner_output.inference_ms > 30.0):  # hard timeout
+                  learner_output.inference_ms > self._inference_timeout_ms):
                 safety_override = True
                 safety_reason = "learner_inference_timeout"
 
@@ -413,14 +443,34 @@ class DaggerController:
             if not safety_override and learner_output is not None and learner_output.valid:
                 vel = learner_output.velocity_flu
                 speed = float(np.linalg.norm(vel))
-                if speed > 3.0 or abs(learner_output.yaw_rate) > 3.0:
+                if (speed > self._max_velocity or
+                        abs(learner_output.yaw_rate) > self._max_yaw_rate):
                     safety_override = True
                     safety_reason = "learner_command_out_of_bounds"
                 if not np.all(np.isfinite(vel)):
                     safety_override = True
                     safety_reason = "learner_output_nan"
+                elif not np.isfinite(learner_output.yaw_rate):
+                    safety_override = True
+                    safety_reason = "learner_yaw_rate_nan"
+                elif not hidden_state_valid:
+                    safety_override = True
+                    safety_reason = "learner_hidden_state_invalid"
+                elif (self._override_on_collision_risk and
+                      observed_clearance_m is not None and
+                      observed_clearance_m < self._min_obs_clearance):
+                    safety_override = True
+                    safety_reason = "observed_clearance_low"
+                elif (ttc_s is not None and ttc_s < self._min_ttc_s):
+                    safety_override = True
+                    safety_reason = "ttc_low"
 
         # Determine final executed command
+        if selected == "expert" and not expert_action_valid:
+            self.safety_override_count += 1
+            return ("safety", True, "expert_action_invalid",
+                    np.zeros(3, dtype=np.float64), 0.0)
+
         if safety_override:
             self.safety_override_count += 1
             if expert_action_valid:
@@ -460,3 +510,38 @@ class DaggerController:
             "safety_override_count": self.safety_override_count,
             "invalid_label_count": self.invalid_label_count,
         }
+
+    def update_round_manifest(self, model_path, model_hash, episode_id):
+        """Atomically append one episode summary to the round manifest."""
+        round_dir = self.get_output_dir()
+        path = os.path.join(round_dir, "round_manifest.json")
+        manifest = {
+            "round_id": self._round_id,
+            "beta": self._current_beta,
+            "rollout_mode": self._rollout_mode,
+            "model_path": str(model_path),
+            "model_hash": str(model_hash),
+            "episodes": [],
+        }
+        if os.path.isfile(path):
+            try:
+                with open(path, "r") as f:
+                    previous = json.load(f)
+                if (previous.get("round_id") == self._round_id and
+                        previous.get("model_hash", "") == str(model_hash)):
+                    manifest = previous
+            except Exception:
+                pass
+        episodes = [e for e in manifest.get("episodes", [])
+                    if e.get("episode_id") != str(episode_id)]
+        summary = self.stats_summary()
+        summary["episode_id"] = str(episode_id)
+        episodes.append(summary)
+        manifest["episodes"] = episodes
+        tmp_path = path + ".tmp.{}".format(os.getpid())
+        with open(tmp_path, "w") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        return path

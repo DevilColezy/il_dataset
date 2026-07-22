@@ -23,7 +23,9 @@ from dataclasses import dataclass, field
 
 import rospy
 
-from il_common import integrate_velocity_command, world_vector_to_body_flu
+from il_common import (integrate_velocity_command, world_vector_to_body_flu,
+                       world_vector_to_body_flu_quat,
+                       body_flu_to_flightlib_body)
 
 
 # ============================================================================
@@ -92,20 +94,12 @@ class DynamicsBackend:
 # ============================================================================
 
 class FlightmareDynamicsBackend(DynamicsBackend):
-    """Real Flightmare quadrotor dynamics.
+    """Adapter for the repository's real ``flightlib::Quadrotor``.
 
-    Uses the Flightmare/FlightGym quadrotor dynamics engine.  The velocity
-    command is converted to motor thrusts / body rates via a low-level
-    velocity controller.
-
-    NOTE: This class requires the Flightmare Python bindings to be available.
-    If the Flightmare dynamics API is not importable, this backend will
-    raise a clear error on initialization — it will NOT silently fall back
-    to kinematic integration.
-
-    Expected Flightmare API (to be confirmed against actual project):
-      - flightgym.QuadrotorDynamics or similar
-      - Methods: reset(state), step(command, dt), getState()
+    ``_il_local_planner.FlightmareDynamics`` is a deliberately small pybind
+    wrapper around ``Quadrotor.reset(QuadState)``, ``Quadrotor.run(Command,
+    dt)`` and ``Quadrotor.getState``.  Failure to import that compiled bridge
+    is fatal; production collection never falls back to kinematics.
     """
 
     def __init__(self, config):
@@ -117,6 +111,9 @@ class FlightmareDynamicsBackend(DynamicsBackend):
         self._render_hz = float(dyn_cfg.get("render_hz", 20.0))
         self._control_mode = str(dyn_cfg.get("control_mode", "velocity_yaw_rate"))
         self._deterministic = bool(dyn_cfg.get("deterministic_time", True))
+        if not bool(vc_cfg.get("use_existing_flightmare_controller", False)):
+            raise RuntimeError(
+                "The real Flightlib body-rate controller is required")
 
         self._settle_time_s = float(dyn_cfg.get("reset", {}).get("settle_time_s", 0.30))
         self._vel_noise_std = np.array(
@@ -142,67 +139,27 @@ class FlightmareDynamicsBackend(DynamicsBackend):
             vc_cfg.get("integrator_limit", [1.0, 1.0, 0.5]),
             dtype=np.float64)
 
-        # State
-        self._sim_time = 0.0
-        self._pos = np.zeros(3, dtype=np.float64)
-        self._vel = np.zeros(3, dtype=np.float64)
-        self._yaw = 0.0
-        self._vel_integrator = np.zeros(3, dtype=np.float64)
-        self._prev_vel_error = np.zeros(3, dtype=np.float64)
-
-        # Try to import Flightmare dynamics
-        self._flightmare_available = False
-        self._quad_dynamics = None
-        self._flightmare_api_info = ""
-
         try:
-            # Attempt to import known Flightmare/FlightGym interfaces
-            # These imports mirror what may exist in the project's dependencies.
-            # If unavailable, the backend will report the exact error.
-            try:
-                import flightgym
-                self._flightmare_api_info = "flightgym"
-                # Check for QuadrotorDynamics class
-                if hasattr(flightgym, 'QuadrotorDynamics'):
-                    self._quad_dynamics = flightgym.QuadrotorDynamics()
-                    self._flightmare_available = True
-                elif hasattr(flightgym, 'Quadrotor'):
-                    self._quad_dynamics = flightgym.Quadrotor()
-                    self._flightmare_available = True
-            except ImportError:
-                pass
-
-            if not self._flightmare_available:
-                try:
-                    from flightmare_python import QuadrotorDynamics
-                    self._quad_dynamics = QuadrotorDynamics()
-                    self._flightmare_available = True
-                    self._flightmare_api_info = "flightmare_python.QuadrotorDynamics"
-                except ImportError:
-                    pass
-
-            if not self._flightmare_available:
-                raise RuntimeError(
-                    "Flightmare dynamics backend unavailable. "
-                    "Could not import flightgym or flightmare_python. "
-                    "Explicitly select backend: legacy_kinematic only for debugging. "
-                    "Do NOT use legacy_kinematic for production data collection.")
-        except RuntimeError:
-            raise
+            from _il_local_planner import FlightmareDynamics
+            self._quad_dynamics = FlightmareDynamics()
         except Exception as e:
             raise RuntimeError(
-                "Flightmare dynamics initialization failed: {}. "
-                "Explicitly select backend: legacy_kinematic only for debugging.".format(e))
+                "Real flightlib dynamics bridge is unavailable: {}. Rebuild "
+                "il_dataset with flightlib; no production fallback is allowed."
+                .format(e))
 
         # Controller state
         self._controller = VelocityYawRateController(
             self._kp_vel, self._ki_vel, self._kd_vel,
             self._max_accel, self._max_tilt_deg, self._max_yaw_rate,
             self._integrator_limit)
+        self._attitude_gain = float(vc_cfg.get("attitude_gain", 6.0))
+        self._max_body_rate = float(vc_cfg.get("maximum_body_rate_rps", 6.0))
+        self._last_state = None
 
         rospy.loginfo("[Dynamics] Flightmare backend initialized (%s). "
                       "sim=%.0fHz ctrl=%.0fHz render=%.0fHz",
-                      self._flightmare_api_info,
+                      "flightlib::Quadrotor",
                       self._sim_hz, self._control_hz, self._render_hz)
 
     @property
@@ -217,48 +174,68 @@ class FlightmareDynamicsBackend(DynamicsBackend):
         if initial_angular_velocity is None:
             initial_angular_velocity = np.zeros(3, dtype=np.float64)
 
-        self._pos = np.asarray(initial_position, dtype=np.float64)
-        self._yaw = float(initial_yaw)
-        self._vel = np.asarray(initial_velocity, dtype=np.float64)
-        self._sim_time = 0.0
-        self._vel_integrator = np.zeros(3, dtype=np.float64)
-        self._prev_vel_error = np.zeros(3, dtype=np.float64)
         self._controller.reset()
 
         # Apply noise
         if np.any(self._vel_noise_std > 0):
             noise = np.random.randn(3) * self._vel_noise_std
-            self._vel += noise
+            initial_velocity = np.asarray(initial_velocity, dtype=np.float64) + noise
+        initial_angular_velocity = np.asarray(
+            initial_angular_velocity, dtype=np.float64).copy()
         if np.any(self._ang_vel_noise_std > 0):
-            self._yaw += np.random.randn() * self._ang_vel_noise_std[2] * 0.01
+            initial_angular_velocity += np.random.randn(3) * self._ang_vel_noise_std
+
+        half = 0.5 * float(initial_yaw)
+        quaternion_wxyz = np.array(
+            [math.cos(half), 0.0, 0.0, math.sin(half)], dtype=np.float64)
+        ok = self._quad_dynamics.reset(
+            np.asarray(initial_position, dtype=np.float64), quaternion_wxyz,
+            np.asarray(initial_velocity, dtype=np.float64),
+            initial_angular_velocity)
+        if not ok:
+            raise RuntimeError("flightlib::Quadrotor::reset rejected the initial state")
+        self._last_state = self.get_state()
 
         # Settle
-        dt_sim = 1.0 / self._sim_hz
-        n_settle = int(self._settle_time_s / dt_sim)
-        for _ in range(n_settle):
-            self._step_single(dt_sim, np.zeros(3, dtype=np.float64), 0.0)
+        if self._settle_time_s > 0.0 and not self.step_velocity_command(
+                np.zeros(3, dtype=np.float64), 0.0, self._settle_time_s):
+            raise RuntimeError("Flightmare settle step failed")
 
     def get_state(self):
         """Return current DynamicsState."""
-        flu_vel = world_vector_to_body_flu(self._vel, self._yaw)
+        raw = np.asarray(self._quad_dynamics.state(), dtype=np.float64)
+        if raw.shape != (26,) or not np.all(np.isfinite(raw)):
+            raise RuntimeError("Invalid state returned by flightlib::Quadrotor")
+        # raw = [time, p(3), quaternion(wxyz), v(3), w(3), a(3), ...]
+        sim_time = float(raw[0])
+        pos = raw[1:4].copy()
+        q_wxyz = raw[4:8].copy()
+        vel = raw[8:11].copy()
+        angular = raw[11:14].copy()
+        accel = raw[14:17].copy()
+        q_xyzw = np.array(
+            [q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]], dtype=np.float64)
         return DynamicsState(
-            position_world=self._pos.copy(),
-            quaternion_world_body=np.array(
-                [0.0, 0.0, math.sin(self._yaw / 2.0), math.cos(self._yaw / 2.0)],
-                dtype=np.float64),
-            velocity_world=self._vel.copy(),
-            velocity_flu=flu_vel,
-            angular_velocity_body=np.zeros(3, dtype=np.float64),
-            acceleration_world=np.zeros(3, dtype=np.float64),
-            acceleration_flu=np.zeros(3, dtype=np.float64),
-            simulation_time_s=self._sim_time,
-        )
+            position_world=pos,
+            quaternion_world_body=q_xyzw,
+            velocity_world=vel,
+            velocity_flu=world_vector_to_body_flu_quat(vel, q_xyzw),
+            angular_velocity_body=angular,
+            acceleration_world=accel,
+            acceleration_flu=world_vector_to_body_flu_quat(accel, q_xyzw),
+            simulation_time_s=sim_time)
 
     def step_velocity_command(self, velocity_command_flu, yaw_rate_command,
                                duration_s):
         """Apply velocity command for duration_s, stepping dynamics internally."""
         if duration_s <= 0:
             return True
+
+        command = np.asarray(velocity_command_flu, dtype=np.float64)
+        if command.shape != (3,) or not np.all(np.isfinite(command)):
+            return False
+        if not np.isfinite(yaw_rate_command):
+            return False
 
         elapsed = 0.0
         dt_sim = 1.0 / self._sim_hz
@@ -268,47 +245,74 @@ class FlightmareDynamicsBackend(DynamicsBackend):
         while elapsed < duration_s - epsilon:
             ctrl_dur = min(dt_ctrl, duration_s - elapsed)
 
-            # Compute low-level control from velocity command
-            cmd_flu = np.asarray(velocity_command_flu, dtype=np.float64)
-            yaw_cmd = float(yaw_rate_command)
+            state = self.get_state()
+            yaw = self._yaw_from_xyzw(state.quaternion_world_body)
+            accel_command_flu = self._controller.update(
+                command, state.velocity_world, yaw, ctrl_dur,
+                state.quaternion_world_body)
 
-            # Run the velocity controller to get acceleration command
-            accel_cmd_flu = self._controller.update(
-                cmd_flu, self._vel, self._yaw, dt_ctrl)
-
-            # Step simulation at sim_hz within this control interval
             ctrl_elapsed = 0.0
             while ctrl_elapsed < ctrl_dur - epsilon:
                 step_dt = min(dt_sim, ctrl_dur - ctrl_elapsed)
-                self._step_single(step_dt, accel_cmd_flu, yaw_cmd)
+                if not self._run_acceleration_step(
+                        accel_command_flu, float(yaw_rate_command), step_dt):
+                    return False
                 ctrl_elapsed += step_dt
 
             elapsed += ctrl_dur
 
         return True
 
-    def _step_single(self, dt, accel_cmd_flu, yaw_rate_cmd):
-        """Single dynamics integration step."""
-        # Convert FLU acceleration to world frame
-        cos_y = math.cos(self._yaw)
-        sin_y = math.sin(self._yaw)
-        # FLU -> World: rotate by yaw
-        accel_world = np.array([
-            accel_cmd_flu[0] * cos_y - accel_cmd_flu[1] * sin_y,
-            accel_cmd_flu[0] * sin_y + accel_cmd_flu[1] * cos_y,
-            accel_cmd_flu[2]
+    @staticmethod
+    def _yaw_from_wxyz(q):
+        w, x, y, z = q
+        return math.atan2(2.0 * (w * z + x * y),
+                          1.0 - 2.0 * (y * y + z * z))
+
+    @staticmethod
+    def _yaw_from_xyzw(q):
+        return FlightmareDynamicsBackend._yaw_from_wxyz(
+            np.array([q[3], q[0], q[1], q[2]], dtype=np.float64))
+
+    @staticmethod
+    def _rotation_from_wxyz(q):
+        w, x, y, z = q / max(np.linalg.norm(q), 1e-12)
+        return np.array([
+            [1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+            [2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+            [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)],
         ], dtype=np.float64)
 
-        # Simple Euler integration (placeholder for real Flightmare dynamics)
-        self._vel += accel_world * dt
-        self._pos += self._vel * dt
+    def _run_acceleration_step(self, accel_flu, yaw_rate, dt):
+        raw = np.asarray(self._quad_dynamics.state(), dtype=np.float64)
+        q_wxyz = raw[4:8]
+        yaw = self._yaw_from_wxyz(q_wxyz)
 
-        # Yaw integration
-        yr = max(-self._max_yaw_rate, min(self._max_yaw_rate, yaw_rate_cmd))
-        self._yaw += yr * dt
-        self._yaw = math.atan2(math.sin(self._yaw), math.cos(self._yaw))
-
-        self._sim_time += dt
+        rotation = self._rotation_from_wxyz(q_wxyz)
+        accel_world = rotation.dot(body_flu_to_flightlib_body(accel_flu))
+        thrust_world = accel_world + np.array([0.0, 0.0, 9.81])
+        thrust_norm = float(np.linalg.norm(thrust_world))
+        if thrust_norm < 1e-6:
+            return False
+        b3_des = thrust_world / thrust_norm
+        heading = np.array([math.cos(yaw), math.sin(yaw), 0.0])
+        b2_des = np.cross(b3_des, heading)
+        b2_norm = float(np.linalg.norm(b2_des))
+        if b2_norm < 1e-6:
+            return False
+        b2_des /= b2_norm
+        b1_des = np.cross(b2_des, b3_des)
+        desired_rotation = np.column_stack((b1_des, b2_des, b3_des))
+        error_matrix = 0.5 * (
+            desired_rotation.T.dot(rotation) - rotation.T.dot(desired_rotation))
+        attitude_error = np.array([
+            error_matrix[2, 1], error_matrix[0, 2], error_matrix[1, 0]])
+        body_rates = -self._attitude_gain * attitude_error
+        body_rates[2] += float(np.clip(
+            yaw_rate, -self._max_yaw_rate, self._max_yaw_rate))
+        body_rates = np.clip(body_rates, -self._max_body_rate, self._max_body_rate)
+        collective = max(0.0, float(np.dot(thrust_world, rotation[:, 2])))
+        return bool(self._quad_dynamics.run(collective, body_rates, float(dt)))
 
     def close(self):
         pass
@@ -341,7 +345,8 @@ class VelocityYawRateController:
         self._integrator = np.zeros(3, dtype=np.float64)
         self._prev_error = np.zeros(3, dtype=np.float64)
 
-    def update(self, desired_vel_flu, current_vel_world, current_yaw, dt):
+    def update(self, desired_vel_flu, current_vel_world, current_yaw, dt,
+               current_quaternion_xyzw=None):
         """Compute acceleration command from velocity error.
 
         Args:
@@ -354,7 +359,10 @@ class VelocityYawRateController:
             accel_cmd_flu: [ax, ay, az] acceleration command in FLU.
         """
         # Convert current world velocity to FLU
-        current_flu = world_vector_to_body_flu(current_vel_world, current_yaw)
+        current_flu = (world_vector_to_body_flu_quat(
+            current_vel_world, current_quaternion_xyzw)
+            if current_quaternion_xyzw is not None else
+            world_vector_to_body_flu(current_vel_world, current_yaw))
 
         error = np.asarray(desired_vel_flu, dtype=np.float64) - current_flu
 

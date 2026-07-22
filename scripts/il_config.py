@@ -43,19 +43,7 @@ REQUIRED_CONTROL_KEYS = ["control_hz", "record_hz"]
 
 # Keys that exist in the current YAML but are NOT actually used by
 # il_manager.py v5 – we warn about these so the user knows they're dead.
-UNUSED_KEYS = {
-    "control.settle_time": "Defined but not consumed by the FSM.  Drone settle is managed by WAIT_DRONE_STABLE timeout.",
-    "data.save_obstacle_ply": "Defined but PLY is always saved per-scene for ESDF; individual trajectory PLY is not implemented.",
-    "data.save_trajectory_meta": "Metadata is always saved; this flag has no effect.",
-
-    # v5 deprecations: these are superseded by the C++ local planner
-    "planning.esdf_optimize.enabled": "v5: ESDF smoothing is superseded by C++ local planner. This flag is ignored.",
-    "planning.pos_smooth_window": "v5: Position smoothing is superseded by C++ local planner. This parameter is ignored.",
-    "planning.resample_spacing": "v5: Path resampling is superseded by C++ local planner time-sampling. This parameter is ignored.",
-    "planning.control_lookahead": "v5: Control lookahead is superseded by local planner receding horizon. This parameter is ignored.",
-    "planning.control_yaw_smooth": "v5: Yaw smoothing is handled by the local planner. This parameter is ignored.",
-    "planning.time_param": "v5: Time parameterization is handled by the C++ local planner. These parameters are inactive.",
-}
+UNUSED_KEYS = {}
 
 # v1 → v2 migration map (old il_pipeline.py config keys)
 V1_TO_V2_MIGRATION = {
@@ -410,6 +398,8 @@ def _validate_config(cfg):
     sg_cfg = g.get("scene_generation", {})
     if sg_cfg.get("enabled", False):
         # Basic type checks
+        if sg_cfg.get("source", "procedural_yaml") != "procedural_yaml":
+            errors.append("scene_generation.source currently supports only procedural_yaml")
         if sg_cfg.get("obstacle_type", "cylinder") != "cylinder":
             errors.append("Phase 3 only supports obstacle_type='cylinder'")
         if sg_cfg.get("outside_obstacle_region_policy", "free") != "free":
@@ -521,6 +511,8 @@ def _validate_config(cfg):
     # New v5 sections
     gp = planning.get("global_planner", {})
     lp = planning.get("local_planner", {})
+    if lp.get("backend", "cpp_pybind") != "cpp_pybind":
+        errors.append("formal collection requires local_planner.backend=cpp_pybind")
 
     # Keep all geometry parameters on one physical scale.  The point cloud
     # must not be sparser than the ESDF, and obstacle generation must use the
@@ -555,7 +547,8 @@ def _validate_config(cfg):
         errors.append("global.obstacle.scale_weights must be three non-negative values with positive sum")
 
     # Validate global_planner
-    for key in ("min_clearance", "clearance_target", "shortcut_check_spacing"):
+    for key in ("min_clearance", "clearance_target", "shortcut_check_spacing",
+                "reference_resample_spacing_m"):
         if key in gp:
             _validate_positive("global.planning.global_planner.{}".format(key), gp[key])
     for key in ("max_planning_time_coarse_s", "max_planning_time_full_s"):
@@ -742,6 +735,8 @@ def _validate_config(cfg):
         mix_mode = dagger_cfg.get("mixture", {}).get("mode", "stochastic_switch")
         if mix_mode not in ("stochastic_switch",):
             errors.append("dagger.mixture.mode only supports stochastic_switch")
+        if dagger_cfg.get("mixture", {}).get("sample_scope", "frame") != "frame":
+            errors.append("dagger.mixture.sample_scope only supports frame")
         inf_to = dagger_cfg.get("policy", {}).get("inference_timeout_ms", 0)
         if inf_to <= 0:
             errors.append("dagger.policy.inference_timeout_ms must be > 0")
@@ -751,6 +746,8 @@ def _validate_config(cfg):
         obs_cl = dagger_cfg.get("safety", {}).get("minimum_observed_clearance_m", -1)
         if obs_cl < 0:
             errors.append("dagger.safety.minimum_observed_clearance_m must be >= 0")
+        if dagger_cfg.get("safety", {}).get("prediction_horizon_s", 0) <= 0:
+            errors.append("dagger.safety.prediction_horizon_s must be > 0")
         rid = dagger_cfg.get("round_id", -1)
         if rid < 0:
             errors.append("dagger.round_id must be non-negative")
@@ -768,13 +765,22 @@ def _validate_config(cfg):
         render_hz = dyn_cfg.get("render_hz", 0)
         if sim_hz <= 0 or ctrl_hz_dyn <= 0 or render_hz <= 0:
             errors.append("dynamics frequencies must be > 0")
-        if sim_hz < ctrl_hz_dyn:
-            errors.append("dynamics.simulation_hz ({}) < control_hz ({})".format(sim_hz, ctrl_hz_dyn))
+        if sim_hz <= ctrl_hz_dyn:
+            errors.append("dynamics.simulation_hz ({}) must be > control_hz ({})".format(
+                sim_hz, ctrl_hz_dyn))
         if ctrl_hz_dyn < render_hz:
-            errors.append("dynamics.control_hz ({}) < render_hz ({})".format(ctrl_hz_dyn, render_hz))
-        tilt = dyn_cfg.get("velocity_controller", {}).get("maximum_tilt_deg", 0)
+            errors.append("dynamics.control_hz ({}) must be >= render_hz ({})".format(
+                ctrl_hz_dyn, render_hz))
+        vc_cfg = dyn_cfg.get("velocity_controller", {})
+        if not vc_cfg.get("use_existing_flightmare_controller", False):
+            errors.append("Flightmare's body-rate controller must remain enabled")
+        tilt = vc_cfg.get("maximum_tilt_deg", 0)
         if not (0 < tilt <= 90):
             errors.append("maximum_tilt_deg must be in (0, 90]")
+        if vc_cfg.get("attitude_gain", 0) <= 0:
+            errors.append("velocity_controller.attitude_gain must be > 0")
+        if vc_cfg.get("maximum_body_rate_rps", 0) <= 0:
+            errors.append("velocity_controller.maximum_body_rate_rps must be > 0")
         settle = dyn_cfg.get("reset", {}).get("settle_time_s", -1)
         if settle < 0:
             errors.append("dynamics.reset.settle_time_s must be >= 0")

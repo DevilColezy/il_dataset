@@ -10,6 +10,13 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
+
+#include <cmath>
+#include <stdexcept>
+
+#include "flightlib/common/command.hpp"
+#include "flightlib/common/quad_state.hpp"
+#include "flightlib/objects/quadrotor.hpp"
 #include <pybind11/eigen.h>
 
 #include "il_dataset/local_planner/types.hpp"
@@ -17,9 +24,73 @@
 #include "il_dataset/local_planner/local_planner.hpp"
 
 namespace py = pybind11;
+
+namespace {
+
+class FlightmareDynamicsBridge {
+ public:
+  FlightmareDynamicsBridge() = default;
+
+  bool reset(const Eigen::Vector3d& position,
+             const Eigen::Vector4d& quaternion_wxyz,
+             const Eigen::Vector3d& velocity,
+             const Eigen::Vector3d& angular_velocity) {
+    flightlib::QuadState state;
+    state.setZero();
+    state.p = position;
+    state.qx = quaternion_wxyz;
+    state.v = velocity;
+    state.w = angular_velocity;
+    state.t = 0.0;
+    return quadrotor_.reset(state);
+  }
+
+  bool run(double collective_thrust,
+           const Eigen::Vector3d& body_rates,
+           double dt) {
+    if (!std::isfinite(collective_thrust) || !body_rates.allFinite() ||
+        !std::isfinite(dt) || dt <= 0.0) {
+      return false;
+    }
+    flightlib::Command command;
+    command.t = stateTime();
+    command.collective_thrust = collective_thrust;
+    command.omega = body_rates;
+    return quadrotor_.run(command, dt);
+  }
+
+  Eigen::VectorXd state() const {
+    flightlib::QuadState state;
+    if (!quadrotor_.getState(&state)) {
+      throw std::runtime_error("flightlib::Quadrotor::getState failed");
+    }
+    Eigen::VectorXd output(flightlib::QuadState::SIZE + 1);
+    output[0] = state.t;
+    output.tail(flightlib::QuadState::SIZE) = state.x;
+    return output;
+  }
+
+ private:
+  double stateTime() const {
+    flightlib::QuadState state;
+    return quadrotor_.getState(&state) ? state.t : 0.0;
+  }
+
+  flightlib::Quadrotor quadrotor_;
+};
+
+}  // namespace
 using namespace il_dataset;
 
 PYBIND11_MODULE(_il_local_planner, m) {
+  py::class_<FlightmareDynamicsBridge>(m, "FlightmareDynamics")
+    .def(py::init<>())
+    .def("reset", &FlightmareDynamicsBridge::reset,
+         py::arg("position"), py::arg("quaternion_wxyz"),
+         py::arg("velocity"), py::arg("angular_velocity"))
+    .def("run", &FlightmareDynamicsBridge::run,
+         py::arg("collective_thrust"), py::arg("body_rates"), py::arg("dt"))
+    .def("state", &FlightmareDynamicsBridge::state);
     m.doc() = "C++ receding-horizon local planner for IL dataset collection";
 
     // ── Enums ────────────────────────────────────────────────────

@@ -7,12 +7,8 @@ This module is DEPRECATED.  The canonical data-collection entry point is
 
     il_manager.py  (launched via il_dataset_collect.launch)
 
-This wrapper:
-  - Detects old-style v1 configs and prints a migration guide.
-  - Attempts to load the config using the new il_config module and
-    delegates to ILManager if possible.
-  - Falls back to the legacy ILDatasetCollector for v1 configs that
-    cannot be automatically migrated.
+This wrapper delegates to the validated manager. It deliberately has no
+legacy collector fallback: initialization errors stop formal collection.
 
 Migration guide:
   1. Update your config to the v2 schema (see config/il_dataset_config.yaml).
@@ -60,18 +56,13 @@ def main():
         mgr = ILManager(cfg)
         mgr.run()
         return
-    except ImportError as exc:
-        rospy.logwarn("New modules not available (%s). Falling back to legacy.", exc)
     except Exception as exc:
-        rospy.logerr("New manager failed: %s. Falling back to legacy.", exc)
+        rospy.logfatal("Validated IL manager failed: %s", exc)
+        raise
 
     # ── Legacy fallback ────────────────────────────────────────────
     rospy.logwarn("Using LEGACY ILDatasetCollector – this path will be removed.")
-    from il_pipeline_legacy import ILDatasetCollector, load_config as legacy_load_config
-
-    cfg = legacy_load_config()
-    collector = ILDatasetCollector(cfg)
-    collector.run()
+    # No executable legacy path is retained here.
 
 
 if __name__ == "__main__":

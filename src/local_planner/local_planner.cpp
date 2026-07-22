@@ -280,6 +280,7 @@ LocalPlanner::sampleTrajectory(
     const std::vector<Eigen::Vector3d>& control_points,
     const Eigen::Vector3d& start_pos,
     const Eigen::Vector3d& start_vel,
+    const Eigen::Vector3d& start_acc,
     const Eigen::Vector3d& goal_pos,
     double dt,
     int num_samples) const {
@@ -374,7 +375,7 @@ LocalPlanner::sampleTrajectory(
             pt.t = t;
             pt.position = pos;
             pt.velocity = vel;
-            pt.acceleration = (vel - prev_vel) / dt;
+            pt.acceleration = (i == 0) ? start_acc : (vel - prev_vel) / dt;
             pt.yaw = yaw;
             pt.yaw_rate = yaw_rate;
             pt.clearance = esdf_.getValue(pos.x(), pos.y(), pos.z());
@@ -401,44 +402,57 @@ LocalPlanner::sampleTrajectory(
     if (total_cp_len < 1e-6) {
         // Degenerate: straight line
         return sampleTrajectory({start_pos, goal_pos}, start_pos, start_vel,
-                                goal_pos, dt, num_samples);
+                                start_acc, goal_pos, dt, num_samples);
     }
 
-    double total_time = num_samples * dt;
+    double total_time = std::max(dt, (num_samples - 1) * dt);
     Eigen::Vector3d prev_pos = start_pos;
     Eigen::Vector3d prev_vel = start_vel;
     double prev_yaw = initial_state_.yaw;
 
+    // Clamped uniform cubic B-spline.  Clamping makes the first and last
+    // control points exact curve endpoints; de Boor evaluation preserves all
+    // bends supplied by the observed-known-free A* reference segment.
+    const int degree = std::min(3, n_cp - 1);
+    std::vector<double> knots(n_cp + degree + 1, 0.0);
+    const int internal_spans = n_cp - degree;
+    for (int i = degree + 1; i < n_cp; ++i) {
+        knots[i] = static_cast<double>(i - degree) / internal_spans;
+    }
+    for (int i = n_cp; i < static_cast<int>(knots.size()); ++i) {
+        knots[i] = 1.0;
+    }
+    auto evaluate_bspline = [&](double u) {
+        u = std::max(0.0, std::min(1.0, u));
+        int span = n_cp - 1;
+        if (u < 1.0) {
+            auto upper = std::upper_bound(knots.begin() + degree,
+                                          knots.begin() + n_cp + 1, u);
+            span = std::max(degree,
+                std::min(n_cp - 1, static_cast<int>(upper - knots.begin()) - 1));
+        }
+        std::vector<Eigen::Vector3d> d(degree + 1);
+        for (int j = 0; j <= degree; ++j) d[j] = control_points[span - degree + j];
+        for (int r = 1; r <= degree; ++r) {
+            for (int j = degree; j >= r; --j) {
+                const int idx = span - degree + j;
+                const double denom = knots[idx + degree - r + 1] - knots[idx];
+                const double alpha = denom > 1e-12 ? (u - knots[idx]) / denom : 0.0;
+                d[j] = (1.0 - alpha) * d[j - 1] + alpha * d[j];
+            }
+        }
+        return d[degree];
+    };
+
     for (int i = 0; i < num_samples; ++i) {
         double t = i * dt;
-        double frac = t / total_time;  // [0, 1]
-        double target_s = frac * total_cp_len;
-
-        // Find segment in control points
-        auto it = std::lower_bound(cp_s.begin(), cp_s.end(), target_s);
-        int seg = static_cast<int>(it - cp_s.begin());
-        if (seg == 0) seg = 1;
-        if (seg >= n_cp) seg = n_cp - 1;
-
-        double s0 = cp_s[seg - 1];
-        double s1 = cp_s[seg];
-        double alpha = (target_s - s0) / std::max(s1 - s0, 1e-12);
-        alpha = std::max(0.0, std::min(1.0, alpha));
-
-        Eigen::Vector3d pos = control_points[seg - 1] * (1.0 - alpha) + control_points[seg] * alpha;
-
-        // Velocity: approximate with finite difference along control-point path
-        double ds = 0.05 * total_cp_len;  // step for velocity estimation
-        double s_fwd = std::min(target_s + ds, total_cp_len);
-
-        auto it_fwd = std::lower_bound(cp_s.begin(), cp_s.end(), s_fwd);
-        int seg_fwd = std::min(static_cast<int>(it_fwd - cp_s.begin()), n_cp - 1);
-        if (seg_fwd == 0) seg_fwd = 1;
-        double a_fwd = (s_fwd - cp_s[seg_fwd - 1]) / std::max(cp_s[seg_fwd] - cp_s[seg_fwd - 1], 1e-12);
-        a_fwd = std::max(0.0, std::min(1.0, a_fwd));
-        Eigen::Vector3d pos_fwd = control_points[seg_fwd - 1] * (1.0 - a_fwd) + control_points[seg_fwd] * a_fwd;
-
-        Eigen::Vector3d vel = (pos_fwd - pos) / std::max(ds / config_.nominal_speed, dt);
+        double frac = static_cast<double>(i) / (num_samples - 1);  // [0, 1]
+        Eigen::Vector3d pos = evaluate_bspline(frac);
+        const double du = std::max(1e-5, std::min(0.01, dt / total_time));
+        const double u0 = std::max(0.0, frac - du);
+        const double u1 = std::min(1.0, frac + du);
+        Eigen::Vector3d vel = (evaluate_bspline(u1) - evaluate_bspline(u0)) /
+                              std::max((u1 - u0) * total_time, dt);
         double speed = vel.norm();
         if (speed > config_.max_velocity) {
             vel = vel / speed * config_.max_velocity;
@@ -472,7 +486,7 @@ LocalPlanner::sampleTrajectory(
             }
         }
 
-        Eigen::Vector3d acc = (vel - prev_vel) / dt;
+        Eigen::Vector3d acc = (i == 0) ? start_acc : (vel - prev_vel) / dt;
 
         TrajectoryPoint pt;
         pt.t = t;
@@ -1028,7 +1042,8 @@ LocalPlanner::generateGlobalPathFallback(const VehicleState& current_state,
 
     int n_samples = static_cast<int>(config_.horizon_time / config_.trajectory_dt);
     return sampleTrajectory(segment, current_state.position, current_state.velocity,
-                            segment.back(), config_.trajectory_dt, n_samples);
+                            current_state.acceleration, segment.back(),
+                            config_.trajectory_dt, n_samples);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1114,7 +1129,8 @@ LocalPlanResult LocalPlanner::planLocal(
         int n_samples = static_cast<int>(config_.horizon_time / config_.trajectory_dt);
         std::vector<Eigen::Vector3d> cp = {current_state.position, local_goal.position};
         traj = sampleTrajectory(cp, current_state.position, current_state.velocity,
-                                local_goal.position, config_.trajectory_dt, n_samples);
+                                current_state.acceleration, local_goal.position,
+                                config_.trajectory_dt, n_samples);
         optimized = true;
     } else {
         // ── Initialize control points ──────────────────────────
@@ -1188,6 +1204,7 @@ LocalPlanResult LocalPlanner::planLocal(
         traj = sampleTrajectory(control_points,
                                 current_state.position,
                                 current_state.velocity,
+                                current_state.acceleration,
                                 local_goal.position,
                                 config_.trajectory_dt,
                                 n_samples);
@@ -1341,12 +1358,13 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
     bool optimized = false;
     bool used_global_fallback = false;
 
-    if (direct_clear) {
+    if (direct_clear && request.reference_path_segment.size() < 2) {
         int n_samples = static_cast<int>(
             config_.horizon_time / config_.trajectory_dt);
         std::vector<Eigen::Vector3d> cp = {cs.position, terminal};
         traj = sampleTrajectory(cp, cs.position, cs.velocity,
-                                terminal, config_.trajectory_dt, n_samples);
+                                cs.acceleration, terminal,
+                                config_.trajectory_dt, n_samples);
         optimized = true;
     } else {
         // ── Initialize control points from reference path segment ──
@@ -1433,7 +1451,8 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
         int n_samples = static_cast<int>(
             config_.horizon_time / config_.trajectory_dt);
         traj = sampleTrajectory(control_points, cs.position, cs.velocity,
-                                terminal, config_.trajectory_dt, n_samples);
+                                cs.acceleration, terminal,
+                                config_.trajectory_dt, n_samples);
 
         if (!optimized) {
             auto val = validateTrajectory(traj);

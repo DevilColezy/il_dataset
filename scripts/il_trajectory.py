@@ -598,6 +598,8 @@ class GlobalPathPlanner:
         self.min_clearance = gp_cfg.get("min_clearance", 0.10)
         self.shortcut_enabled = gp_cfg.get("shortcut_enabled", True)
         self.shortcut_check_spacing = gp_cfg.get("shortcut_check_spacing", 0.05)
+        self.reference_spacing = float(
+            gp_cfg.get("reference_resample_spacing_m", 0.20))
         
         # Ensure check spacing <= resolution / 2
         self.shortcut_check_spacing = min(
@@ -670,6 +672,9 @@ class GlobalPathPlanner:
                 self.min_clearance, self.shortcut_check_spacing)
         else:
             global_path = list(raw_path)
+        # Guide indexing and local reference extraction require a stable,
+        # fixed arc-length discretisation, independent of A* grid resolution.
+        global_path = resample_path(global_path, self.reference_spacing)
         
         # ── Compute path length ─────────────────────────────────
         global_path_length = 0.0
@@ -928,7 +933,7 @@ def resample_path(path, spacing=0.2):
     for i in range(1, len(path)):
         a, b = np.array(path[i - 1]), np.array(path[i])
         L = np.linalg.norm(b - a)
-        n = max(1, int(L / spacing))
+        n = max(1, int(math.ceil(L / spacing)))
         for j in range(1, n + 1):
             out.append(tuple(a + (b - a) * j / n))
     out[-1] = path[-1]

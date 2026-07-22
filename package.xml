@@ -15,12 +15,14 @@
   <buildtool_depend>catkin</buildtool_depend>
 
   <build_depend>rospy</build_depend>
+  <build_depend>flightlib</build_depend>
   <build_depend>std_msgs</build_depend>
   <build_depend>eigen</build_depend>
   <!-- Optional but recommended: sudo apt install libnlopt-cxx-dev -->
   <build_depend>nlopt</build_depend>
 
   <exec_depend>rospy</exec_depend>
+  <exec_depend>flightlib</exec_depend>
   <exec_depend>rospkg</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>flightmare_dataset_tools</exec_depend>

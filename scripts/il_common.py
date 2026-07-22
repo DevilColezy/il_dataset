@@ -63,6 +63,59 @@ def yaw_to_unity_quat(yaw):
     return [0.0, math.sin(half), 0.0, math.cos(half)]
 
 
+def ros_quat_to_unity_quat(quaternion_xyzw):
+    """Convert a full ROS-world body quaternion to Unity coordinates.
+
+    The world-coordinate basis change is ``(x, y, z) -> (x, z, y)``.
+    Applying it on both sides of the rotation matrix preserves a proper
+    rotation even though the basis conversion itself is a reflection.
+    """
+    q = np.asarray(quaternion_xyzw, dtype=np.float64)
+    if q.shape != (4,) or not np.all(np.isfinite(q)):
+        raise ValueError("quaternion_xyzw must contain four finite values")
+    q /= max(float(np.linalg.norm(q)), 1e-12)
+    x, y, z, w = q
+    r_ros = np.array([
+        [1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+        [2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+        [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)],
+    ], dtype=np.float64)
+    basis = np.array([[1.0, 0.0, 0.0],
+                      [0.0, 0.0, 1.0],
+                      [0.0, 1.0, 0.0]], dtype=np.float64)
+    r = basis.dot(r_ros).dot(basis.T)
+    trace = float(np.trace(r))
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (r[2, 1] - r[1, 2]) / s
+        qy = (r[0, 2] - r[2, 0]) / s
+        qz = (r[1, 0] - r[0, 1]) / s
+    else:
+        i = int(np.argmax(np.diag(r)))
+        if i == 0:
+            s = math.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2]) * 2.0
+            qw = (r[2, 1] - r[1, 2]) / s
+            qx = 0.25 * s
+            qy = (r[0, 1] + r[1, 0]) / s
+            qz = (r[0, 2] + r[2, 0]) / s
+        elif i == 1:
+            s = math.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2]) * 2.0
+            qw = (r[0, 2] - r[2, 0]) / s
+            qx = (r[0, 1] + r[1, 0]) / s
+            qy = 0.25 * s
+            qz = (r[1, 2] + r[2, 1]) / s
+        else:
+            s = math.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1]) * 2.0
+            qw = (r[1, 0] - r[0, 1]) / s
+            qx = (r[0, 2] + r[2, 0]) / s
+            qy = (r[1, 2] + r[2, 1]) / s
+            qz = 0.25 * s
+    out = np.array([qx, qy, qz, qw], dtype=np.float64)
+    out /= max(float(np.linalg.norm(out)), 1e-12)
+    return out.tolist()
+
+
 def world_vel_to_body(vx_w, vy_w, vz_w, yaw):
     """Convert velocity from ROS world frame to drone body frame.
 
@@ -181,8 +234,9 @@ def body_flu_to_rfu(vector):
 def world_vector_to_body_flu(vector_world, yaw):
     """ROS world vector -> body/navigation FLU.
 
-    Convenience wrapper: world -> body RFU (via world_vel_to_body)
-    then RFU -> FLU (via body_rfu_to_flu).
+    The training/navigation FLU frame follows the Unity camera: forward is
+    Flightlib body +Y and left is Flightlib body -X.  This fixed camera/body
+    extrinsic is intentionally preserved for dataset compatibility.
 
     Args:
         vector_world: 3-vector in ROS world frame (X-fwd, Y-left, Z-up).
@@ -192,19 +246,51 @@ def world_vector_to_body_flu(vector_world, yaw):
         np.array of shape (3,) in FLU: [forward, left, up].
     """
     right, forward, up = world_vel_to_body(
-        float(vector_world[0]),
-        float(vector_world[1]),
-        float(vector_world[2]),
-        float(yaw),
-    )
+        float(vector_world[0]), float(vector_world[1]),
+        float(vector_world[2]), float(yaw))
     return body_rfu_to_flu([right, forward, up])
+
+
+def quaternion_xyzw_to_rotation(quaternion_xyzw):
+    """Return the body-to-world rotation for a ROS ``[x,y,z,w]`` quaternion."""
+    q = np.asarray(quaternion_xyzw, dtype=np.float64)
+    if q.shape != (4,) or not np.all(np.isfinite(q)):
+        raise ValueError("quaternion_xyzw must contain four finite values")
+    q = q / max(float(np.linalg.norm(q)), 1e-12)
+    x, y, z, w = q
+    return np.array([
+        [1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+        [2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+        [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)],
+    ], dtype=np.float64)
+
+
+def world_vector_to_body_flu_quat(vector_world, quaternion_xyzw):
+    """Transform a world vector to attitude-aware camera/navigation FLU."""
+    vector_flightlib_body = quaternion_xyzw_to_rotation(
+        quaternion_xyzw).T.dot(np.asarray(vector_world, dtype=np.float64))
+    return np.array([vector_flightlib_body[1],
+                     -vector_flightlib_body[0],
+                     vector_flightlib_body[2]], dtype=np.float64)
+
+
+def body_flu_to_flightlib_body(vector_flu):
+    """Navigation FLU ``[forward,left,up]`` to Flightlib body axes."""
+    v = np.asarray(vector_flu, dtype=np.float64)
+    return np.array([-v[1], v[0], v[2]], dtype=np.float64)
+
+
+def body_flu_to_world_quat(vector_flu, quaternion_xyzw):
+    """Transform camera/navigation FLU into ROS world coordinates."""
+    return quaternion_xyzw_to_rotation(quaternion_xyzw).dot(
+        body_flu_to_flightlib_body(vector_flu))
 
 
 # ============================================================================
 #  Vehicle / camera builders  (KEPT EXACTLY AS ORIGINAL – compatibility)
 # ============================================================================
 
-def make_depth_vehicle(ros_pos, yaw, depth_cfg):
+def make_depth_vehicle(ros_pos, yaw, depth_cfg, quaternion_xyzw=None):
     """Return a Unity vehicle dict with a depth camera.
 
     **DO NOT MODIFY** the camera configuration, T_BC, depthScale,
@@ -214,7 +300,8 @@ def make_depth_vehicle(ros_pos, yaw, depth_cfg):
     return {
         "ID": "quadrotor0",
         "position": ros_pos_to_unity(ros_pos),
-        "rotation": yaw_to_unity_quat(yaw),
+        "rotation": (ros_quat_to_unity_quat(quaternion_xyzw)
+                     if quaternion_xyzw is not None else yaw_to_unity_quat(yaw)),
         "size": [0.5, 0.5, 0.5],
         "cameras": [{
             "ID": "quadrotor0_0", "channels": 3,

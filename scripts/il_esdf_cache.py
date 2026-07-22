@@ -101,12 +101,9 @@ class GlobalESDFCache:
             cfg.get("cache_root", os.path.join(
                 config.get("global", {}).get("output_dir", "."),
                 "cache", "esdf")))
-        self._format = g_cfg.get("format", "npz")
         self._compression = bool(g_cfg.get("compression", True))
         self._validate_hash = bool(g_cfg.get("validate_hash", True))
         self._validate_meta = bool(g_cfg.get("validate_metadata", True))
-        self._rebuild_on_mismatch = bool(g_cfg.get("rebuild_on_mismatch", True))
-        self._atomic_write = bool(g_cfg.get("atomic_write", True))
         self._lock_timeout = float(g_cfg.get("lock_timeout_s", 120.0))
         self._builder_version = int(g_cfg.get("builder_version", 1))
 
@@ -121,6 +118,7 @@ class GlobalESDFCache:
         self.total_build_ms = 0.0
         self.total_load_ms = 0.0
         self.total_write_ms = 0.0
+        self._key_metadata = {}
 
     @property
     def enabled(self):
@@ -144,20 +142,33 @@ class GlobalESDFCache:
         # Hash the point cloud file
         ply_hash = _sha256_hex(open(ply_path, "rb").read())
 
+        pc_range = list(self._pointcloud_cfg.get("range", [30, 50, 8]))
+        pc_origin = list(self._pointcloud_cfg.get("origin", [0, 20, 3.5]))
+        esdf_resolution = float(self._esdf_cfg.get("resolution", 0.1))
+        grid_shape = [int(math.floor(v / esdf_resolution)) + 1
+                      for v in pc_range]
+        grid_origin = [pc_origin[i] - pc_range[i] / 2.0 for i in range(3)]
+
         # Build metadata dict for hashing
         meta = collections.OrderedDict([
             ("scene", scene_manifest_dict),
             ("ply_hash", ply_hash),
-            ("esdf_resolution", float(self._esdf_cfg.get("resolution", 0.1))),
+            ("esdf_resolution", esdf_resolution),
             ("esdf_drone_radius", float(self._esdf_cfg.get("drone_radius", 0.2))),
-            ("pc_range", list(self._pointcloud_cfg.get("range", [30, 50, 8]))),
-            ("pc_origin", list(self._pointcloud_cfg.get("origin", [0, 20, 3.5]))),
+            ("obstacle_safety_margin", float(self._obs_cfg.get("safety_margin", 0.2))),
+            ("obstacle_min_gap", float(self._obs_cfg.get("min_gap", 0.0))),
+            ("pc_range", pc_range),
+            ("pc_origin", pc_origin),
+            ("grid_origin", grid_origin),
+            ("grid_shape", grid_shape),
             ("pc_resolution", float(self._pointcloud_cfg.get("resolution", 0.1))),
             ("builder_version", self._builder_version),
         ])
 
         meta_json = _stable_json_dumps(meta)
-        return _sha256_hex(meta_json.encode("utf-8"))
+        cache_key = _sha256_hex(meta_json.encode("utf-8"))
+        self._key_metadata[cache_key] = meta
+        return cache_key
 
     def get_cache_dir(self, cache_key):
         return os.path.join(self.cache_root, "global", cache_key)
@@ -197,16 +208,30 @@ class GlobalESDFCache:
                     return None
 
             # Load ESDF
-            data = np.load(esdf_path)
-            esdf = data["esdf"]
-            origin = data["origin"]
-            resolution = float(data["resolution"])
+            with np.load(esdf_path, allow_pickle=False) as data:
+                esdf = data["esdf"]
+                origin = data["origin"]
+                resolution = float(data["resolution"])
 
             # Validation
             if self._validate_meta:
                 expected_shape = tuple(meta.get("shape", []))
                 if esdf.shape != expected_shape:
                     rospy.logwarn("[ESDFCache] Shape mismatch in cache %s", cache_key)
+                    self.cache_misses += 1
+                    return None
+                if str(esdf.dtype) != str(meta.get("dtype", "")):
+                    rospy.logwarn("[ESDFCache] Dtype mismatch in cache %s", cache_key)
+                    self.cache_misses += 1
+                    return None
+                if (origin.shape != (3,) or not np.allclose(
+                        origin, np.asarray(meta.get("origin", []), dtype=np.float64),
+                        atol=1e-12, rtol=0.0)):
+                    rospy.logwarn("[ESDFCache] Origin mismatch in cache %s", cache_key)
+                    self.cache_misses += 1
+                    return None
+                if abs(resolution - float(meta.get("resolution", -1.0))) > 1e-12:
+                    rospy.logwarn("[ESDFCache] Resolution mismatch in cache %s", cache_key)
                     self.cache_misses += 1
                     return None
             if not np.all(np.isfinite(esdf)):
@@ -283,6 +308,7 @@ class GlobalESDFCache:
                     ("sign_convention", "positive_is_free_negative_is_obstacle"),
                     ("vehicle_radius_m", float(self._esdf_cfg.get("drone_radius", 0.2))),
                     ("safety_margin_m", float(self._obs_cfg.get("safety_margin", 0.2))),
+                    ("cache_inputs", self._key_metadata.get(cache_key, {})),
                     ("created_at", time.strftime("%Y-%m-%dT%H:%M:%S")),
                     ("complete", True),
                 ])
@@ -333,11 +359,8 @@ class ObservedESDFCache:
             cfg.get("rebuild_only_on_map_change", True))
         self._upload_only_on_change = bool(
             cfg.get("upload_only_on_revision_change", True))
-        self._occ_change_threshold = int(
-            cfg.get("occupancy_change_threshold_voxels", 1))
         self._max_cached_revisions = int(
             cfg.get("maximum_cached_revisions", 2))
-        self._persist = bool(cfg.get("persist_across_episodes", False))
 
         # State per episode
         self._last_map_revision = -1
@@ -367,7 +390,7 @@ class ObservedESDFCache:
 
     def should_rebuild(self, current_map_revision):
         """Return True if ESDF should be rebuilt based on map revision."""
-        if not self._enabled:
+        if not self._enabled or not self._rebuild_only_on_change:
             return True
         if current_map_revision == self._last_map_revision:
             self.rebuild_skip_count += 1

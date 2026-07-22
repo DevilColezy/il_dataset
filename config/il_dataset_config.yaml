@@ -65,7 +65,6 @@ global:
     # discarded and produced mixed 20/40/60/80 ms frame intervals.
     control_hz: 50.0
     record_hz:  25.0
-    settle_time: 3.0
 
   # ── Obstacle generation shared defaults ──────────────────────────────
   obstacle:
@@ -220,16 +219,10 @@ global:
     cache_root: "cache/esdf"
 
     global:
-      enabled: true
-      format: "npz"
       compression: true
-      memory_map: false
 
       validate_hash: true
       validate_metadata: true
-      rebuild_on_mismatch: true
-
-      atomic_write: true
       lock_timeout_s: 120.0
 
       builder_version: 1
@@ -237,11 +230,8 @@ global:
     observed:
       enabled: true
 
-      persist_across_episodes: false
       rebuild_only_on_map_change: true
       upload_only_on_revision_change: true
-
-      occupancy_change_threshold_voxels: 1
       maximum_cached_revisions: 2
 
   # ── Phase 4: DAgger ────────────────────────────────────────────────
@@ -283,17 +273,15 @@ global:
       override_on_invalid_policy_output: true
       override_on_policy_timeout: true
       override_on_observed_collision_risk: true
-      override_on_expert_failure: false
 
       minimum_observed_clearance_m: 0.35
       minimum_ttc_s: 0.60
+      prediction_horizon_s: 1.00
 
       fallback_command: "hover"
 
     aggregation:
       output_root: "dataset/dagger"
-      append_manifest_atomically: true
-      preserve_original_episode_id: true
 
   # ── Phase 4: Dynamics ──────────────────────────────────────────────
   dynamics:
@@ -320,6 +308,8 @@ global:
       maximum_acceleration_mps2: [4.0, 4.0, 2.0]
       maximum_tilt_deg: 35.0
       maximum_yaw_rate_rps: 1.5
+      attitude_gain: 6.0
+      maximum_body_rate_rps: 6.0
 
       integrator_limit: [1.0, 1.0, 0.5]
 
@@ -363,6 +353,7 @@ global:
       min_clearance: 0.15              # 0.20 m body radius + 0.15 m hard surface margin
       shortcut_enabled: true
       shortcut_check_spacing: 0.05
+      reference_resample_spacing_m: 0.20
 
     # ═══════════════════════════════════════════════════════════════════
     #  Local receding-horizon planner (C++ pybind11 backend)
@@ -441,30 +432,6 @@ global:
     # control_lookahead, control_yaw_smooth — these have been superseded
     # by the local planner.  They remain in the file only so old config
     # loaders do not crash; il_config.py will emit deprecation warnings.
-    esdf_optimize:
-      enabled: false
-      smooth_iterations: 250
-      smooth_step: 0.35
-      push_iterations: 25
-      push_step: 0.02
-      min_clearance: 0.10
-      target_clearance: 0.20
-      final_smooth_iterations: 80
-
-    time_param:
-      nominal_speed: 1.8
-      max_velocity: 2.5
-      max_acceleration: 3.5
-      max_jerk: 15.0
-      max_yaw_rate: 2.0
-      min_obstacle_clearance: 0.10
-      curvature_slowdown: true
-      curvature_gain: 1.2
-
-    resample_spacing: 0.10
-    pos_smooth_window: 10
-    control_lookahead: 8
-    control_yaw_smooth: 0.92
 
   # ── Data format ──────────────────────────────────────────────────────
   data:
@@ -475,10 +442,6 @@ global:
     trend_horizontal_bins: 11
     trend_vertical_bins: 7
     trend_soft_sigma_bins: 0.75
-    # NOTE: The following keys are declared but NOT currently consumed by
-    # the pipeline.  They are reserved for future use:
-    save_obstacle_ply:  true          # (future) per-trajectory PLY export
-    save_trajectory_meta: true        # (always saved; this flag is ignored)
 
   # ── Observed local occupancy map (Phase 2) ───────────────────────────
   observed_map:
