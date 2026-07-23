@@ -591,7 +591,7 @@ global:
   # ── Data format ──────────────────────────────────────────────────────
   data:
     coordinate_frame: "CAMERA_FLU"
-    schema_version: 14
+    schema_version: 15
     collection_mode: "deterministic_lockstep"
     image_write_queue_size: 16
     label_lookahead_time_s: 0.08

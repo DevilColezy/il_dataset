@@ -325,10 +325,11 @@ class State(Enum):
 class ILManager:
     """State-machine orchestrator for IL dataset collection."""
 
-    # ── Schema v14 ordered field list ────────────────────────────────
-    DATA_SCHEMA_V14_FIELDS = [
+    # ── Schema v15 ordered field list ────────────────────────────────
+    DATA_SCHEMA_V15_FIELDS = [
         # -- time & matching --
-        "timestamp_ns", "receive_timestamp_ns", "frame_id",
+        "timestamp_ns", "receive_timestamp_ns", "episode_id", "frame_id",
+        "episode_frame_index", "sequence_reset", "control_dt_s",
         "trajectory_time_s", "latency_ms", "match_method",
         "frame_valid", "frame_invalid_reason",
         # -- current state (x_t, before executing expert command) --
@@ -387,7 +388,10 @@ class ILManager:
         # -- v11: runtime mode enums --
         "planner_mode", "control_mode", "trend_mode",
         # -- temporary trend labels (v11: 13-class horizontal) --
-        "trend_label_valid", "guide_source",
+        "trend_label_valid", "guide_source", "guide_mode",
+        "guide_mode_changed", "recovery_entered", "recovery_exited",
+        "trend_horizontal_loss_valid", "trend_vertical_loss_valid",
+        "trend_value_loss_valid", "control_loss_valid",
         "guide_x_world", "guide_y_world", "guide_z_world",
         "guide_dir_x_flu_exact", "guide_dir_y_flu_exact", "guide_dir_z_flu_exact",
         "guide_distance_m", "guide_distance_norm",
@@ -421,6 +425,8 @@ class ILManager:
         "recovery_direction",
         "recovery_target_x_world", "recovery_target_y_world",
         "recovery_target_z_world", "recovery_target_path_index",
+        "recovery_target_distance_m",
+        "recovery_target_distance_norm_debug",
         "recovery_elapsed_s", "recovery_azimuth_rad",
         # -- v12: trajectory reference fields --
         "trajectory_reference_vx_flu", "trajectory_reference_vy_flu",
@@ -2106,6 +2112,7 @@ class ILManager:
         depth_float_len = img_w * img_h * 4
 
         data_cfg = self.g.get("data", {})
+        online_rt = self.g.get("online_runtime", {})
         label_lookahead_time_s = float(data_cfg.get("label_lookahead_time_s", 0.08))
         max_guide_range = float(self._depth_cfg["max_m"])
 
@@ -2154,7 +2161,7 @@ class ILManager:
         v_bin_edges = np.linspace(-v_fov_rad / 2.0, v_fov_rad / 2.0, trend_v_bins)
 
         # ── Build dynamic field list with 13-class soft label columns ──
-        schema_fields = list(self.DATA_SCHEMA_V14_FIELDS)
+        schema_fields = list(self.DATA_SCHEMA_V15_FIELDS)
         # Insert soft label columns before depth_file
         depth_idx = schema_fields.index("depth_file")
         azi_soft_names = []
@@ -2244,6 +2251,7 @@ class ILManager:
         previous_command_actor = "episode_start"
         previous_command_velocity_flu = np.zeros(3, dtype=np.float64)
         previous_command_yaw_rate = 0.0
+        previous_guide_mode = None
 
         # ── v11: online runtime state ────────────────────────────────
         # v13: planner runs every record tick (30 Hz = record rate)
@@ -2300,6 +2308,14 @@ class ILManager:
         self._max_guide_cache_age_s = 0.0
         self._recover_left_frame_count = 0
         self._recover_right_frame_count = 0
+        self._normal_guide_frame_count = 0
+        self._recovery_exit_count = 0
+        self._horizontal_class_counts = [0] * TREND_HORIZONTAL_CLASS_COUNT
+        self._vertical_class_counts = [0] * trend_v_bins
+        self._guide_value_zero_count = 0
+        self._guide_value_saturated_count = 0
+        self._global_direction_invalid_count = 0
+        self._sequence_reset_count = 0
 
         rospy.loginfo("[ONLINE-LOCKSTEP] Starting. runtime_loop=%.0fHz dt_sample=%.3fs",
                       runtime_loop_hz, dt_sample)
@@ -2833,6 +2849,16 @@ class ILManager:
                 recovery_elapsed_s,
                 self._guide_progress_index, global_path,
             )
+            current_guide_mode = row["guide_mode"]
+            if previous_guide_mode is not None:
+                mode_changed = current_guide_mode != previous_guide_mode
+                row["guide_mode_changed"] = int(mode_changed)
+                row["recovery_entered"] = int(
+                    mode_changed and previous_guide_mode == "NORMAL" and
+                    current_guide_mode != "NORMAL")
+                row["recovery_exited"] = int(
+                    mode_changed and previous_guide_mode != "NORMAL" and
+                    current_guide_mode == "NORMAL")
             for axis, value in zip(
                     ("x", "y", "z"), dynamics_state.angular_velocity_body):
                 row["state_angular_velocity_{}_body".format(axis)] = round(
@@ -3114,6 +3140,8 @@ class ILManager:
             if not np.all(np.isfinite(cur_pos)) or \
                     not np.all(np.isfinite(cur_vel)):
                 frame_invalid_reasons.append("invalid_current_state")
+            if not bool(row.get("global_direction_valid", 0)):
+                frame_invalid_reasons.append("invalid_global_guide_input")
             # v11: no longer invalidate on transient planner_failure alone
             if planner_mode == PlannerMode.ABORT:
                 frame_invalid_reasons.append("planner_abort")
@@ -3151,6 +3179,36 @@ class ILManager:
             row["frame_invalid_reason"] = (
                 ";".join(frame_invalid_reasons)
                 if frame_invalid_reasons else "none")
+            training_frame_valid = bool(
+                row["frame_valid"] and row.get("expert_label_valid", 0) and
+                row.get("trend_label_valid", 0) and
+                row.get("global_direction_valid", 0))
+            row["trend_horizontal_loss_valid"] = int(training_frame_valid)
+            row["trend_vertical_loss_valid"] = int(training_frame_valid)
+            row["trend_value_loss_valid"] = int(training_frame_valid)
+            row["control_loss_valid"] = int(training_frame_valid)
+
+            if row["guide_mode"] == "NORMAL":
+                self._normal_guide_frame_count += 1
+            if row["recovery_exited"]:
+                self._recovery_exit_count += 1
+            if row["trend_horizontal_loss_valid"]:
+                h_class = int(row["trend_horizontal_class_13"])
+                if 0 <= h_class < len(self._horizontal_class_counts):
+                    self._horizontal_class_counts[h_class] += 1
+            if row["trend_vertical_loss_valid"]:
+                v_class = int(row["guide_elevation_bin"])
+                if 0 <= v_class < len(self._vertical_class_counts):
+                    self._vertical_class_counts[v_class] += 1
+            guide_value = float(row["guide_distance_norm"])
+            if abs(guide_value) <= 1e-9:
+                self._guide_value_zero_count += 1
+            if guide_value >= 1.0 - 1e-9:
+                self._guide_value_saturated_count += 1
+            if not row["global_direction_valid"]:
+                self._global_direction_invalid_count += 1
+            if row["sequence_reset"]:
+                self._sequence_reset_count += 1
             if frame_invalid_reasons:
                 self._episode_invalid_frame_count += 1
                 for reason in frame_invalid_reasons:
@@ -3171,6 +3229,7 @@ class ILManager:
                     os.path.join(depth_dir, png_name), depth_u16)
             self._csv_writer.writerow(row)
             self._rec_written_rows += 1
+            previous_guide_mode = current_guide_mode
 
             # ── Sync diagnostics ─────────────────────────────────────
             self._sync_file.write("{},{},{:.2f},0.00,frame_id_exact,0,0,{},{}\n".format(
@@ -4293,7 +4352,7 @@ class ILManager:
             guide_progress_index=-1,
             global_path=None,
     ):
-        """Serialize one schema-v14 row from an immutable RuntimeDecision."""
+        """Serialize one schema-v15 row from an immutable RuntimeDecision."""
         snapshot = decision.plan_snapshot
         row = {}
 
@@ -4303,10 +4362,23 @@ class ILManager:
             (t_request_mono - recording_start_mono) * 1e9)
         row["receive_timestamp_ns"] = recording_start_epoch_ns + int(
             (recv_time_mono - recording_start_mono) * 1e9)
+        task_id = plan.get(
+            "task_id", "task_{:03d}".format(self.traj_idx))
+        row["episode_id"] = "{}:{}".format(self.scene_label, task_id)
         row["frame_id"] = frame_id
+        row["episode_frame_index"] = int(sample_index)
+        row["sequence_reset"] = int(sample_index == 0)
+        row["control_dt_s"] = round(float(dt_sample), 9)
         row["trajectory_time_s"] = round(trajectory_time_s, 6)
         row["latency_ms"] = round(latency_ms, 3)
         row["match_method"] = "frame_id_exact"
+        row["guide_mode_changed"] = 0
+        row["recovery_entered"] = 0
+        row["recovery_exited"] = 0
+        row["trend_horizontal_loss_valid"] = 0
+        row["trend_vertical_loss_valid"] = 0
+        row["trend_value_loss_valid"] = 0
+        row["control_loss_valid"] = 0
 
         # ── v11: runtime mode enums ──────────────────────────────
         row["planner_mode"] = decision.planner_mode
@@ -4471,8 +4543,23 @@ class ILManager:
 
         # Always set 13-class count
         row["trend_horizontal_class_count"] = TREND_HORIZONTAL_CLASS_COUNT
+        is_recovery = (
+            decision.trend_mode == TrendMode.RECOVERY.value)
+        if is_recovery:
+            row["guide_mode"] = (
+                "RECOVER_LEFT"
+                if decision.recovery_direction == "left"
+                else "RECOVER_RIGHT")
+        else:
+            row["guide_mode"] = "NORMAL"
+        row["recovery_target_distance_m"] = round(
+            float(np.linalg.norm(
+                decision.recovery_target_world - cur_pos)), 6)
+        row["recovery_target_distance_norm_debug"] = round(
+            min(row["recovery_target_distance_m"], max_guide_range) /
+            max(max_guide_range, 1e-9), 6)
 
-        if guide_distance_m < 1e-9:
+        if guide_distance_m < 1e-9 and not is_recovery:
             row["trend_label_valid"] = 0
             row["guide_dir_x_flu_exact"] = 0.0
             row["guide_dir_y_flu_exact"] = 0.0
@@ -4490,18 +4577,25 @@ class ILManager:
             for name in ele_soft_names:
                 row[name] = 0.0
         else:
-            guide_delta_flu = world_vector_to_body_flu_quat(
-                guide_delta_world, current_quaternion_xyzw)
-            norm_v = float(np.linalg.norm(guide_delta_flu))
-            gdx = float(guide_delta_flu[0]) / norm_v
-            gdy = float(guide_delta_flu[1]) / norm_v
-            gdz = float(guide_delta_flu[2]) / norm_v
+            if is_recovery and guide_distance_m < 1e-9:
+                gdx = math.cos(decision.recovery_azimuth_rad)
+                gdy = math.sin(decision.recovery_azimuth_rad)
+                gdz = 0.0
+            else:
+                guide_delta_flu = world_vector_to_body_flu_quat(
+                    guide_delta_world, current_quaternion_xyzw)
+                norm_v = float(np.linalg.norm(guide_delta_flu))
+                gdx = float(guide_delta_flu[0]) / norm_v
+                gdy = float(guide_delta_flu[1]) / norm_v
+                gdz = float(guide_delta_flu[2]) / norm_v
             row["guide_dir_x_flu_exact"] = round(gdx, 6)
             row["guide_dir_y_flu_exact"] = round(gdy, 6)
             row["guide_dir_z_flu_exact"] = round(gdz, 6)
             row["guide_distance_m"] = round(guide_distance_m, 4)
-            row["guide_distance_norm"] = round(
-                min(guide_distance_m, max_guide_range) / max(max_guide_range, 1e-9), 6)
+            row["guide_distance_norm"] = (
+                0.0 if is_recovery else round(
+                    min(guide_distance_m, max_guide_range) /
+                    max(max_guide_range, 1e-9), 6))
 
             azimuth = math.atan2(gdy, gdx)
             elevation = math.atan2(gdz, math.sqrt(gdx * gdx + gdy * gdy + 1e-12))
@@ -4511,7 +4605,7 @@ class ILManager:
             # ── 13-class Trend horizontal label ──────────────────
             row["trend_label_valid"] = 1
 
-            if decision.trend_mode == TrendMode.RECOVERY.value:
+            if is_recovery:
                 # Recovery: horizontal class = 0 (LEFT) or 12 (RIGHT)
                 # v11 FIX: use pre-computed recovery_direction and
                 # recovery_azimuth_rad from the control tick.
@@ -4522,8 +4616,8 @@ class ILManager:
                 row["trend_horizontal_class_13"] = h_class_13
                 row["trend_normal_horizontal_class_11"] = -1
                 row["guide_azimuth_bin"] = -1
-                row["guide_elevation_bin"] = int(
-                    np.argmin(np.abs(v_bin_edges - elevation)))
+                recovery_vertical_class = trend_v_bins // 2
+                row["guide_elevation_bin"] = recovery_vertical_class
 
                 # Recovery: one-hot, indices 0 or 12 only
                 soft_13 = np.zeros(TREND_HORIZONTAL_CLASS_COUNT, dtype=np.float64)
@@ -4532,16 +4626,8 @@ class ILManager:
                     if i < len(azi_soft_names):
                         row[azi_soft_names[i]] = round(float(soft_13[i]), 6)
 
-                # Vertical soft labels
-                v_soft = np.zeros(trend_v_bins, dtype=np.float64)
-                for i in range(trend_v_bins):
-                    bin_err = (elevation - v_bin_edges[i]) / (
-                        (v_fov_rad / (trend_v_bins - 1)) + 1e-12)
-                    v_soft[i] = math.exp(
-                        -0.5 * (bin_err / trend_sigma_bins) ** 2)
-                v_soft /= max(v_soft.sum(), 1e-12)
                 for i, name in enumerate(ele_soft_names):
-                    row[name] = round(float(v_soft[i]), 6)
+                    row[name] = float(i == recovery_vertical_class)
             else:
                 # Normal TRACK_GUIDE mode: 11 FOV bins → 13 classes
                 # v11 FIX: FOV edges computed for 11 bins only
@@ -5332,12 +5418,18 @@ class ILManager:
             "valid": plan.get("valid", False),
             "validation_report": plan.get("validation_report", {}),
             "esdf_stats": self.current_esdf_stats if hasattr(self, "current_esdf_stats") else {},
-            # ── Schema v8 metadata ──
+            # ── Schema v15 metadata ──
             "schema_version": schema_version,
             "collection_mode": collection_mode,
             "sample_semantics": (
                 "depth_t,state_t -> guide_t,expert_command_t; selected command "
                 "is executed through Flightmare dynamics"),
+            "sequence_semantics": {
+                "episode_id": "stable within one recorded trajectory",
+                "episode_frame_index": "zero-based contiguous row index",
+                "sequence_reset": "1 only on the first row of an episode",
+                "control_dt_s": "actual fixed record-control interval",
+            },
             "image_time_angular_velocity_semantics": (
                 "state_angular_velocity_*_body belongs to depth_t/state_t"),
             "previous_executed_command_semantics": (
@@ -5375,12 +5467,34 @@ class ILManager:
                 "recover_left_class": TREND_RECOVER_LEFT_CLASS,
                 "normal_class_offset": TREND_NORMAL_CLASS_OFFSET,
                 "recover_right_class": TREND_RECOVER_RIGHT_CLASS,
+                "guide_mode_mapping": {
+                    "NORMAL": "horizontal=1..11,vertical=0..6",
+                    "RECOVER_LEFT": "horizontal=0,vertical=3,value=0",
+                    "RECOVER_RIGHT": "horizontal=12,vertical=3,value=0",
+                },
+            },
+            "loss_mask_semantics": {
+                "valid_normal": [1, 1, 1, 1],
+                "valid_recovery": [1, 1, 1, 1],
+                "invalid_or_audit": [0, 0, 0, 0],
+                "field_order": [
+                    "trend_horizontal_loss_valid",
+                    "trend_vertical_loss_valid",
+                    "trend_value_loss_valid",
+                    "control_loss_valid",
+                ],
             },
             "trend_vertical_bins": int(
-                data_cfg.get("trend_vertical_bins", 7)),
+                data_cfg.get("trend", {}).get(
+                    "vertical_bins",
+                    data_cfg.get("trend_vertical_bins", 7))),
             "trend_soft_sigma_bins": float(
-                data_cfg.get("trend_soft_sigma_bins", 0.75)),
+                data_cfg.get("trend", {}).get(
+                    "soft_sigma_bins",
+                    data_cfg.get("trend_soft_sigma_bins", 0.75))),
             "max_guide_range_m": float(self._depth_cfg["max_m"]),
+            "maximum_global_guidance_distance_m": float(
+                self._depth_cfg["max_m"]),
             "depth_all_valid_in_simulation": True,
             # ── Phase 2: observed map metadata ──
             "local_planner_map_source": "global_esdf",
@@ -5573,6 +5687,18 @@ class ILManager:
                 self, "_recover_left_frame_count", 0),
             "recover_right_frame_count": getattr(
                 self, "_recover_right_frame_count", 0),
+            "normal_guide_frame_count": getattr(
+                self, "_normal_guide_frame_count", 0),
+            "recovery_exit_count": getattr(
+                self, "_recovery_exit_count", 0),
+            "guide_value_zero_count": getattr(
+                self, "_guide_value_zero_count", 0),
+            "guide_value_saturated_count": getattr(
+                self, "_guide_value_saturated_count", 0),
+            "global_direction_invalid_count": getattr(
+                self, "_global_direction_invalid_count", 0),
+            "sequence_reset_count": getattr(
+                self, "_sequence_reset_count", 0),
             "trend_horizontal_class_count": TREND_HORIZONTAL_CLASS_COUNT,
             "ESDF_clearance_semantics": (
                 "ESDF values already have drone_radius subtracted by ESDFBuilder. "
@@ -5580,6 +5706,14 @@ class ILManager:
             ),
             "status": "inprogress",
         }
+        for class_index, count in enumerate(getattr(
+                self, "_horizontal_class_counts", [])):
+            meta["horizontal_class_count_{:02d}".format(
+                class_index)] = int(count)
+        for class_index, count in enumerate(getattr(
+                self, "_vertical_class_counts", [])):
+            meta["vertical_class_count_{:02d}".format(
+                class_index)] = int(count)
         if self._dagger_ctrl is not None:
             meta["dagger"]["round_manifest_path"] = os.path.join(
                 self._dagger_ctrl.get_output_dir(), "round_manifest.json")
@@ -5910,21 +6044,21 @@ class ILManager:
             validation_passed = False
             failure_reasons.append("metadata_missing")
 
-        # 8. Schema v14 command and row-integrity checks
+        # 8. Schema v15 command and row-integrity checks
         data_cfg = self.g.get("data", {})
         schema_version = int(data_cfg.get("schema_version", 7))
-        if schema_version != 14:
+        if schema_version != 15:
             validation_passed = False
             failure_reasons.append(
                 "unsupported_current_schema_version:{}".format(
                     schema_version))
         elif os.path.isfile(data_path) and col_map:
-            v14_issues = self._validate_schema_v14(
+            v15_issues = self._validate_schema_v15(
                 data_path, col_map, data_cfg)
-            if v14_issues:
-                rospy.logwarn("[Validate] Schema v14 issues: %s",
-                              "; ".join(v14_issues[:10]))
-                failure_reasons.extend(v14_issues)
+            if v15_issues:
+                rospy.logwarn("[Validate] Schema v15 issues: %s",
+                              "; ".join(v15_issues[:10]))
+                failure_reasons.extend(v15_issues)
                 validation_passed = False
 
         # ── Commit or reject ──────────────────────────────────────
@@ -5937,8 +6071,8 @@ class ILManager:
         self._final_dir = None
         self._route_next()
 
-    def _validate_schema_v14(self, data_path, col_map, data_cfg):
-        """Validate schema-v14 data invariants. Returns issue strings."""
+    def _validate_schema_v15(self, data_path, col_map, data_cfg):
+        """Validate schema-v15 data invariants. Returns issue strings."""
         issues = []
         trend_cfg_v = data_cfg.get("trend", {})
         trend_normal_h_bins = int(trend_cfg_v.get(
@@ -5953,6 +6087,9 @@ class ILManager:
             self.g.get("planning", {}).get("validation", {}).get(
                 "command_compare_atol", 1.0e-5))
         required_fields = (
+            "timestamp_ns", "receive_timestamp_ns",
+            "episode_id", "frame_id", "episode_frame_index",
+            "sequence_reset", "control_dt_s",
             "frame_valid", "frame_invalid_reason",
             "state_angular_velocity_x_body",
             "state_angular_velocity_y_body",
@@ -5963,6 +6100,7 @@ class ILManager:
             "gravity_direction_x_flu",
             "gravity_direction_y_flu",
             "gravity_direction_z_flu",
+            "state_vx_flu", "state_vy_flu", "state_vz_flu",
             "previous_executed_command_valid",
             "previous_executed_command_frame_id", "previous_executed_actor",
             "previous_executed_command_vx_flu",
@@ -5973,6 +6111,11 @@ class ILManager:
             "expert_vx_flu", "expert_vy_flu", "expert_vz_flu",
             "expert_yaw_rate",
             "trend_label_valid", "match_method",
+            "guide_mode",
+            "guide_mode_changed", "recovery_entered", "recovery_exited",
+            "trend_horizontal_loss_valid",
+            "trend_vertical_loss_valid",
+            "trend_value_loss_valid", "control_loss_valid",
             "learner_output_valid", "selected_command_vx_flu",
             "selected_command_vy_flu", "selected_command_vz_flu",
             "selected_command_yaw_rate", "final_executed_actor",
@@ -5987,6 +6130,12 @@ class ILManager:
             "trajectory_feedback_vz_flu",
             "trajectory_sample_time_s",
             "recovery_azimuth_rad",
+            "recovery_target_distance_m",
+            "recovery_target_distance_norm_debug",
+            "global_direction_valid",
+            "global_dir_x_flu", "global_dir_y_flu",
+            "global_dir_z_flu", "global_distance_m",
+            "global_distance_norm",
             "actual_next_vx_flu", "actual_next_vy_flu",
             "actual_next_vz_flu", "scene_id", "task_id",
             "guide_source", "guide_visible", "guide_depth_visible",
@@ -6003,6 +6152,10 @@ class ILManager:
                 prev_frame_id = -1
                 previous_applied_command = None
                 previous_applied_frame_id = -1
+                previous_episode_frame_index = -1
+                previous_timestamp_ns = -1
+                episode_id = None
+                previous_schema_guide_mode = None
                 row_idx = 0
                 for row in reader:
                     row_idx += 1
@@ -6027,6 +6180,18 @@ class ILManager:
                             issues.append(
                                 "CRITICAL: invalid image-time angular velocity at row {}".format(
                                     row_idx))
+                        control_input_state = np.array([
+                            float(row["gravity_direction_x_flu"]),
+                            float(row["gravity_direction_y_flu"]),
+                            float(row["gravity_direction_z_flu"]),
+                            float(row["state_vx_flu"]),
+                            float(row["state_vy_flu"]),
+                            float(row["state_vz_flu"]),
+                            float(row["state_angular_velocity_z_flu"])])
+                        if not np.all(np.isfinite(control_input_state)):
+                            issues.append(
+                                "CRITICAL: invalid_control_input_state at row "
+                                "{}".format(row_idx))
                         previous_command_valid = str(row.get(
                             "previous_executed_command_valid", "0")) == "1"
                         if row_idx > 1 and not previous_command_valid:
@@ -6063,8 +6228,51 @@ class ILManager:
                             issues.append("CRITICAL: non-consecutive frame_id {} -> {} at row {}".format(
                                 prev_frame_id, fid, row_idx))
                         prev_frame_id = fid
-                    except (ValueError, TypeError):
+                    except (KeyError, ValueError, TypeError):
                         pass
+
+                    try:
+                        current_episode_id = row["episode_id"]
+                        episode_frame_index = int(row["episode_frame_index"])
+                        sequence_reset = int(row["sequence_reset"])
+                        control_dt_s = float(row["control_dt_s"])
+                        timestamp_ns = int(row["timestamp_ns"])
+                        expected_dt_s = 1.0 / float(self._record_hz)
+                        if row_idx == 1:
+                            episode_id = current_episode_id
+                            if (episode_frame_index != 0 or
+                                    sequence_reset != 1):
+                                issues.append(
+                                    "CRITICAL: invalid_sequence_reset at row "
+                                    "{}".format(row_idx))
+                        else:
+                            if (current_episode_id != episode_id or
+                                    episode_frame_index !=
+                                    previous_episode_frame_index + 1):
+                                issues.append(
+                                    "CRITICAL: episode_frame_index_discontinuity "
+                                    "at row {}".format(row_idx))
+                            if sequence_reset != 0:
+                                issues.append(
+                                    "CRITICAL: invalid_sequence_reset at row "
+                                    "{}".format(row_idx))
+                            if timestamp_ns <= previous_timestamp_ns:
+                                issues.append(
+                                    "CRITICAL: timestamp_discontinuity at row "
+                                    "{}".format(row_idx))
+                        if (not np.isfinite(control_dt_s) or
+                                control_dt_s <= 0.0 or
+                                abs(control_dt_s - expected_dt_s) >
+                                max(1.0e-6, 0.05 * expected_dt_s)):
+                            issues.append(
+                                "CRITICAL: invalid_control_dt at row {}".format(
+                                    row_idx))
+                        previous_episode_frame_index = episode_frame_index
+                        previous_timestamp_ns = timestamp_ns
+                    except (KeyError, ValueError, TypeError, ZeroDivisionError):
+                        issues.append(
+                            "CRITICAL: episode_frame_index_discontinuity at row "
+                            "{}".format(row_idx))
 
                     # Check normalized distances in [0, 1]
                     for fname in ("global_distance_norm", "guide_distance_norm"):
@@ -6193,16 +6401,194 @@ class ILManager:
 
                     # Valid global direction should have norm ~1
                     gdv = row.get("global_direction_valid")
-                    if gdv is not None and str(gdv) == "1":
-                        try:
-                            gdx = float(row.get("global_dir_x_flu", 0))
-                            gdy = float(row.get("global_dir_y_flu", 0))
-                            gdz = float(row.get("global_dir_z_flu", 0))
-                            norm = math.sqrt(gdx*gdx + gdy*gdy + gdz*gdz)
-                            if abs(norm - 1.0) > 0.01:
-                                issues.append("global_dir norm={:.4f} != 1 at row {}".format(norm, row_idx))
-                        except (ValueError, TypeError):
-                            pass
+                    try:
+                        gdx = float(row["global_dir_x_flu"])
+                        gdy = float(row["global_dir_y_flu"])
+                        gdz = float(row["global_dir_z_flu"])
+                        global_distance_m = float(row["global_distance_m"])
+                        global_distance_norm = float(
+                            row["global_distance_norm"])
+                        global_norm = math.sqrt(
+                            gdx * gdx + gdy * gdy + gdz * gdz)
+                        if (str(row.get("frame_valid", "0")) == "1" and
+                                str(gdv) != "1"):
+                            issues.append(
+                                "CRITICAL: missing_global_guide_input at row "
+                                "{}".format(row_idx))
+                        if str(gdv) == "1" and (
+                                not np.isfinite(global_norm) or
+                                abs(global_norm - 1.0) > 1.0e-4):
+                            issues.append(
+                                "CRITICAL: invalid_global_direction_norm at row "
+                                "{}".format(row_idx))
+                        if (not np.isfinite(global_distance_m) or
+                                global_distance_m < 0.0):
+                            issues.append(
+                                "CRITICAL: invalid_global_distance at row "
+                                "{}".format(row_idx))
+                        if (not np.isfinite(global_distance_norm) or
+                                global_distance_norm < 0.0 or
+                                global_distance_norm > 1.0):
+                            issues.append(
+                                "CRITICAL: invalid_global_distance_norm at row "
+                                "{}".format(row_idx))
+                    except (KeyError, ValueError, TypeError):
+                        issues.append(
+                            "CRITICAL: missing_global_guide_input at row "
+                            "{}".format(row_idx))
+
+                    try:
+                        guide_mode = row["guide_mode"]
+                        mode_changed = int(row["guide_mode_changed"])
+                        recovery_entered = int(row["recovery_entered"])
+                        recovery_exited = int(row["recovery_exited"])
+                        horizontal_class = int(
+                            row["trend_horizontal_class_13"])
+                        vertical_class = int(row["guide_elevation_bin"])
+                        guide_value = float(row["guide_distance_norm"])
+                        horizontal_soft = np.array([
+                            float(row[
+                                "trend_horizontal_soft_{:02d}".format(i)])
+                            for i in range(TREND_HORIZONTAL_CLASS_COUNT)])
+                        vertical_soft = np.array([
+                            float(row[
+                                "guide_elevation_soft_{}".format(i)])
+                            for i in range(trend_v_bins)])
+                        expert_translation = np.array([
+                            float(row["expert_vx_flu"]),
+                            float(row["expert_vy_flu"]),
+                            float(row["expert_vz_flu"])])
+                        expert_yaw_rate = float(row["expert_yaw_rate"])
+                        masks = (
+                            int(row["trend_horizontal_loss_valid"]),
+                            int(row["trend_vertical_loss_valid"]),
+                            int(row["trend_value_loss_valid"]),
+                            int(row["control_loss_valid"]))
+                        frame_valid = int(row["frame_valid"]) == 1
+                        expert_valid = int(row["expert_label_valid"]) == 1
+                        training_valid = (
+                            frame_valid and expert_valid and
+                            int(row["trend_label_valid"]) == 1 and
+                            int(row["global_direction_valid"]) == 1)
+                        if previous_schema_guide_mode is None:
+                            expected_transition = (0, 0, 0)
+                        else:
+                            changed = int(
+                                guide_mode != previous_schema_guide_mode)
+                            expected_transition = (
+                                changed,
+                                int(changed and
+                                    previous_schema_guide_mode == "NORMAL" and
+                                    guide_mode != "NORMAL"),
+                                int(changed and
+                                    previous_schema_guide_mode != "NORMAL" and
+                                    guide_mode == "NORMAL"))
+                        if ((mode_changed, recovery_entered, recovery_exited) !=
+                                expected_transition):
+                            issues.append(
+                                "CRITICAL: invalid_guide_mode_transition at row "
+                                "{}".format(row_idx))
+                        previous_schema_guide_mode = guide_mode
+
+                        if guide_mode in ("RECOVER_LEFT", "RECOVER_RIGHT"):
+                            expected_class = (
+                                TREND_RECOVER_LEFT_CLASS
+                                if guide_mode == "RECOVER_LEFT"
+                                else TREND_RECOVER_RIGHT_CLASS)
+                            if abs(guide_value) > command_compare_atol:
+                                issues.append(
+                                    "CRITICAL: recovery_guide_value_not_zero "
+                                    "at row {}".format(row_idx))
+                            recovery_vertical_class = trend_v_bins // 2
+                            if vertical_class != recovery_vertical_class:
+                                issues.append(
+                                    "CRITICAL: recovery_vertical_class_not_center "
+                                    "at row {}".format(row_idx))
+                            expected_vertical_soft = np.zeros(
+                                trend_v_bins, dtype=np.float64)
+                            expected_vertical_soft[
+                                recovery_vertical_class] = 1.0
+                            if not np.allclose(
+                                    vertical_soft, expected_vertical_soft,
+                                    atol=command_compare_atol, rtol=0.0):
+                                issues.append(
+                                    "CRITICAL: recovery_vertical_soft_mismatch "
+                                    "at row {}".format(row_idx))
+                            if (np.linalg.norm(expert_translation) >
+                                    command_compare_atol):
+                                issues.append(
+                                    "CRITICAL: recovery_translation_command_nonzero "
+                                    "at row {}".format(row_idx))
+                            if horizontal_class != expected_class:
+                                issues.append(
+                                    "CRITICAL: recovery_horizontal_class_mismatch "
+                                    "at row {}".format(row_idx))
+                            expected_horizontal_soft = np.zeros(
+                                TREND_HORIZONTAL_CLASS_COUNT,
+                                dtype=np.float64)
+                            expected_horizontal_soft[expected_class] = 1.0
+                            if not np.allclose(
+                                    horizontal_soft,
+                                    expected_horizontal_soft,
+                                    atol=command_compare_atol, rtol=0.0):
+                                issues.append(
+                                    "CRITICAL: recovery_horizontal_soft_mismatch "
+                                    "at row {}".format(row_idx))
+                            yaw_deadband = float(
+                                self.g.get("online_runtime", {}).get(
+                                    "recovery", {}).get(
+                                    "yaw_deadband_rad", 0.05))
+                            if abs(expert_yaw_rate) > yaw_deadband:
+                                yaw_sign_valid = (
+                                    expert_yaw_rate > 0.0
+                                    if guide_mode == "RECOVER_LEFT"
+                                    else expert_yaw_rate < 0.0)
+                                if not yaw_sign_valid:
+                                    issues.append(
+                                        "CRITICAL: recovery_yaw_direction_mismatch "
+                                        "at row {}".format(row_idx))
+                            expected_masks = (
+                                (1, 1, 1, 1) if training_valid
+                                else (0, 0, 0, 0))
+                        elif guide_mode == "NORMAL":
+                            if horizontal_class < 1 or horizontal_class > 11:
+                                issues.append(
+                                    "CRITICAL: normal_horizontal_class_out_of_range "
+                                    "at row {}".format(row_idx))
+                            if (abs(horizontal_soft[0]) >
+                                    command_compare_atol or
+                                    abs(horizontal_soft[-1]) >
+                                    command_compare_atol):
+                                issues.append(
+                                    "CRITICAL: normal_horizontal_soft_endpoint_nonzero "
+                                    "at row {}".format(row_idx))
+                            if training_valid and (
+                                    vertical_class < 0 or
+                                    vertical_class >= trend_v_bins):
+                                issues.append(
+                                    "CRITICAL: normal_vertical_class_out_of_range "
+                                    "at row {}".format(row_idx))
+                            if (not np.isfinite(guide_value) or
+                                    guide_value < 0.0 or guide_value > 1.0):
+                                issues.append(
+                                    "CRITICAL: normal_guide_value_out_of_range "
+                                    "at row {}".format(row_idx))
+                            expected_masks = (
+                                (1, 1, 1, 1) if training_valid
+                                else (0, 0, 0, 0))
+                        else:
+                            issues.append(
+                                "CRITICAL: invalid_guide_mode at row {}".format(
+                                    row_idx))
+                            expected_masks = (0, 0, 0, 0)
+                        if masks != expected_masks:
+                            issues.append(
+                                "CRITICAL: invalid_loss_mask_combination at row "
+                                    "{}".format(row_idx))
+                    except (KeyError, ValueError, TypeError):
+                        issues.append(
+                            "CRITICAL: invalid_guide_mode at row {}".format(
+                                row_idx))
 
                     # Valid trend direction should have norm ~1
                     tlv = row.get("trend_label_valid")
@@ -6237,7 +6623,9 @@ class ILManager:
                             except (ValueError, TypeError):
                                 pass
                         if abs(v_sum - 1.0) > 0.02:
-                            issues.append("elevation soft sum={:.4f} != 1 at row {}".format(v_sum, row_idx))
+                            issues.append(
+                                "elevation soft sum={:.4f} != 1 at row {}"
+                                .format(v_sum, row_idx))
 
                     # Invalid trend: bin should be -1, soft labels all zero
                     if tlv is not None and str(tlv) == "0":
@@ -6271,7 +6659,8 @@ class ILManager:
                             pass
 
         except Exception as exc:
-            issues.append("CRITICAL: schema_v7_validation_exception: {}".format(exc))
+            issues.append(
+                "CRITICAL: schema_v15_validation_exception: {}".format(exc))
 
         return issues
 
