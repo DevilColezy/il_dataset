@@ -590,7 +590,7 @@ global:
   # ── Data format ──────────────────────────────────────────────────────
   data:
     coordinate_frame: "CAMERA_FLU"
-    schema_version: 11
+    schema_version: 12
     collection_mode: "deterministic_lockstep"
     image_write_queue_size: 16
     label_lookahead_time_s: 0.08
@@ -671,7 +671,7 @@ global:
       minimum_remaining_time_s: 0.10
       maximum_position_error_m: 0.50
       maximum_velocity_error_mps: 1.00
-      revalidate_current_suffix_with_esdf: true
+      revalidate_current_suffix_with_esdf: false  # v12: not yet implemented, must be false
 
     guide_cache:
       max_age_s: 0.50

@@ -324,10 +324,8 @@ class State(Enum):
 class ILManager:
     """State-machine orchestrator for IL dataset collection."""
 
-    # ── Schema v11 ordered field list for csv.DictWriter ───────────────
-    # v11 adds: planner/control/trend modes, guide/trajectory cache fields,
-    # 13-class trend horizontal labels, recovery fields, planner retry stats.
-    DATA_SCHEMA_V11_FIELDS = [
+    # ── Schema v12 ordered field list ────────────────────────────────
+    DATA_SCHEMA_V12_FIELDS = [
         # -- time & matching --
         "timestamp_ns", "receive_timestamp_ns", "frame_id",
         "trajectory_time_s", "latency_ms", "match_method",
@@ -338,6 +336,12 @@ class ILManager:
         "state_vx_flu", "state_vy_flu", "state_vz_flu",
         "state_angular_velocity_x_body", "state_angular_velocity_y_body",
         "state_angular_velocity_z_body",
+        # -- v12: FLU angular velocity (current frame, before action) --
+        "state_angular_velocity_x_flu", "state_angular_velocity_y_flu",
+        "state_angular_velocity_z_flu",
+        # -- v12: FLU gravity direction --
+        "gravity_direction_x_flu", "gravity_direction_y_flu",
+        "gravity_direction_z_flu",
         # -- last upper-level command actually executed before depth_t --
         "previous_executed_command_valid",
         "previous_executed_command_frame_id", "previous_executed_actor",
@@ -359,6 +363,10 @@ class ILManager:
         "selected_command_vx_flu", "selected_command_vy_flu",
         "selected_command_vz_flu", "selected_command_yaw_rate",
         "final_executed_actor",
+        # -- v12: applied command (current control interval) --
+        "applied_command_vx_flu", "applied_command_vy_flu",
+        "applied_command_vz_flu", "applied_command_yaw_rate",
+        "applied_command_actor", "applied_command_valid",
         # -- executed next state (x_(t+1), after dt_sample integration) --
         "executed_next_x", "executed_next_y", "executed_next_z",
         "executed_next_vx_world", "executed_next_vy_world", "executed_next_vz_world",
@@ -412,7 +420,11 @@ class ILManager:
         "recovery_direction",
         "recovery_target_x_world", "recovery_target_y_world",
         "recovery_target_z_world", "recovery_target_path_index",
-        "recovery_elapsed_s",
+        "recovery_elapsed_s", "recovery_azimuth_rad",
+        # -- v12: trajectory reference fields --
+        "trajectory_reference_vx_flu", "trajectory_reference_vy_flu",
+        "trajectory_reference_vz_flu",
+        "trajectory_sample_time_s",
         # -- legacy compatibility --
         "legacy_state_vx_rfu", "legacy_state_vy_rfu", "legacy_state_vz_rfu",
         "legacy_plan_age_ms",
@@ -2139,7 +2151,7 @@ class ILManager:
         v_bin_edges = np.linspace(-v_fov_rad / 2.0, v_fov_rad / 2.0, trend_v_bins)
 
         # ── Build dynamic field list with 13-class soft label columns ──
-        schema_fields = list(self.DATA_SCHEMA_V11_FIELDS)
+        schema_fields = list(self.DATA_SCHEMA_V12_FIELDS)
         # Insert soft label columns before depth_file
         depth_idx = schema_fields.index("depth_file")
         azi_soft_names = []
@@ -2496,7 +2508,13 @@ class ILManager:
                 # v11: Guide visible → plan trajectory; not visible → recovery (no plan needed)
                 if guide_sel.valid and len(ref_segment) >= 2:
                     # ── Normal: visible Guide → plan trajectory ──────
-                    for ts in terminal_scales:
+                    # v12: if coming out of RECOVERY, use short terminals first
+                    if planner_mode == PlannerMode.RECOVERY:
+                        scales_for_plan = recovery_initial_scales
+                    else:
+                        scales_for_plan = terminal_scales
+
+                    for ts in scales_for_plan:
                         planner_retry_count += 1
                         if planner_retry_count > 1:
                             self._planner_retry_success_count += 1
@@ -2694,6 +2712,15 @@ class ILManager:
             if planner_mode == PlannerMode.RECOVERY:
                 trend_mode = TrendMode.RECOVERY
                 control_mode = ControlMode.ROTATE_IN_PLACE
+                # v12: compute recovery direction BEFORE row build
+                # so Trend label and yaw-rate use the same azimuth
+                recovery_direction, recovery_azimuth_rad = \
+                    self._compute_recovery_direction(
+                        recovery_target_world, cur_pos,
+                        dynamics_state.quaternion_world_body,
+                        recovery_yaw_deadband,
+                        recovery_last_direction, recovery_tie_break)
+                recovery_last_direction = recovery_direction
             elif planner_mode in (PlannerMode.FRESH_PLAN, PlannerMode.CACHED_PLAN):
                 trend_mode = TrendMode.TRACK_GUIDE
                 control_mode = ControlMode.TRACK_TRAJECTORY
@@ -2848,18 +2875,9 @@ class ILManager:
             # ── Step 5: Execute dt_sample (v11: recovery / trajectory / hover) ──
             if planner_mode == PlannerMode.RECOVERY:
                 # Recovery: zero translation + yaw rotation toward recovery target
-                # (trend_mode and control_mode already set before row construction)
+                # (trend_mode, control_mode, recovery_direction already set before row construction)
 
-                # v11 FIX: use atan2-based azimuth (radians), not meter-vs-radian comparison
-                recovery_direction, recovery_azimuth_rad = \
-                    self._compute_recovery_direction(
-                        recovery_target_world, cur_pos,
-                        dynamics_state.quaternion_world_body,
-                        recovery_yaw_deadband,
-                        recovery_last_direction, recovery_tie_break)
-                recovery_last_direction = recovery_direction
-
-                # v11 FIX: yaw-rate from azimuth directly (already in FLU radians)
+                # v12: yaw-rate from pre-computed azimuth (already in FLU radians)
                 recovery_yaw_rate_cmd = max(
                     -recovery_max_yaw_rate,
                     min(recovery_max_yaw_rate,
@@ -2981,6 +2999,37 @@ class ILManager:
                 exec_next_vel_flu - selected_velocity_flu)), 6)
             row["yaw_rate_tracking_error"] = round(
                 abs(float(exec_next_yaw_rate) - selected_yaw_rate), 6)
+
+            # ── v12: applied command (current frame) ─────────────────
+            row["applied_command_vx_flu"] = round(
+                float(executed_command_velocity_flu[0]), 6)
+            row["applied_command_vy_flu"] = round(
+                float(executed_command_velocity_flu[1]), 6)
+            row["applied_command_vz_flu"] = round(
+                float(executed_command_velocity_flu[2]), 6)
+            row["applied_command_yaw_rate"] = round(
+                float(executed_command_yaw_rate), 6)
+            row["applied_command_actor"] = final_actor
+            row["applied_command_valid"] = int(
+                np.all(np.isfinite(executed_command_velocity_flu)) and
+                np.isfinite(executed_command_yaw_rate))
+
+            # ── v12: FLU angular velocity (current frame, before action) ──
+            omega_body = dynamics_state.angular_velocity_body
+            omega_flu = np.array([
+                omega_body[1], -omega_body[0], omega_body[2]
+            ], dtype=np.float64)
+            row["state_angular_velocity_x_flu"] = round(float(omega_flu[0]), 6)
+            row["state_angular_velocity_y_flu"] = round(float(omega_flu[1]), 6)
+            row["state_angular_velocity_z_flu"] = round(float(omega_flu[2]), 6)
+
+            # ── v12: FLU gravity direction (world [0,0,-1] → FLU) ──
+            g_world = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+            g_flu = world_vector_to_body_flu_quat(
+                g_world, dynamics_state.quaternion_world_body)
+            row["gravity_direction_x_flu"] = round(float(g_flu[0]), 6)
+            row["gravity_direction_y_flu"] = round(float(g_flu[1]), 6)
+            row["gravity_direction_z_flu"] = round(float(g_flu[2]), 6)
 
             # v11: A frame is only invalid when it truly cannot produce
             # safe, finite, semantically clear Trend and Control labels.
@@ -3182,17 +3231,21 @@ class ILManager:
             velocity_tracking_gain=2.0,
             yaw_tracking_gain=3.0,
             yaw_speed_threshold=0.10):
-        """Execute dt_sample using a cached LocalPlanSnapshot.
+        """Execute dt_sample using unified tracking command computation (v12).
 
-        Uses trajectory_relative_time = current_time - plan_timestamp
-        to index into the cached trajectory.
+        Returns (next_pos, next_vel, next_yaw, avg_yaw_rate,
+                 applied_command_flu, applied_command_yaw_rate).
+        The applied command is the last command actually sent to Flightmare
+        during this control interval.
         """
         pos = np.asarray(cur_pos, dtype=np.float64).copy()
         vel = np.asarray(cur_vel, dtype=np.float64).copy()
         yaw = float(cur_yaw)
         total_yaw_change = 0.0
+        last_command_flu = np.zeros(3, dtype=np.float64)
+        last_command_yaw_rate = 0.0
 
-        if snapshot is None:
+        if snapshot is None or snapshot.trajectory is None or len(snapshot.trajectory) == 0:
             # Hover
             elapsed = 0.0
             epsilon = 1e-9
@@ -3218,39 +3271,29 @@ class ILManager:
             return (pos, vel, yaw, avg_yaw_rate,
                     np.zeros(3, dtype=np.float64), 0.0)
 
-        traj = snapshot.trajectory
-        traj_duration = snapshot.trajectory_duration_s
-        rel_time = current_time_s - snapshot.plan_timestamp_s
         elapsed = 0.0
         epsilon = 1e-9
-        last_command_flu = np.zeros(3, dtype=np.float64)
-        last_command_yaw_rate = 0.0
+        step_time_s = current_time_s
 
         while elapsed < dt_sample - epsilon:
             step_dt = min(dt_ctrl, dt_sample - elapsed)
-            exec_time = rel_time + elapsed + max(0.0, command_lookahead_time)
-            clamped_time = min(exec_time, traj_duration)
-            best_idx = min(range(len(traj)),
-                           key=lambda i: abs(float(traj[i].t) - clamped_time))
-            tp = traj[best_idx]
-            reference_pos = np.array(tp.position, dtype=np.float64)
-            feedforward_vel = np.array(tp.velocity, dtype=np.float64)
-            desired_vel_world = (feedforward_vel +
-                                 velocity_tracking_gain *
-                                 (reference_pos - pos))
-            desired_speed = float(np.linalg.norm(desired_vel_world))
-            if desired_speed > max_velocity:
-                desired_vel_world *= max_velocity / max(desired_speed, 1e-9)
-            yaw_rate_cmd = yaw_rate_for_world_velocity(
-                yaw, desired_vel_world, yaw_tracking_gain,
-                max_yaw_rate, yaw_speed_threshold)
+
+            # v12: use unified tracking command computation
+            cmd = self._compute_trajectory_tracking_command(
+                snapshot, step_time_s, pos, vel, yaw,
+                label_lookahead_time_s=0.0,
+                command_lookahead_time=command_lookahead_time)
+            if cmd["valid"]:
+                desired_vel_flu = cmd["final_velocity_flu"]
+                yaw_rate_cmd = cmd["final_yaw_rate"]
+            else:
+                desired_vel_flu = np.zeros(3, dtype=np.float64)
+                yaw_rate_cmd = 0.0
+
+            last_command_flu = desired_vel_flu.copy()
+            last_command_yaw_rate = float(yaw_rate_cmd)
+
             if self._dynamics.backend_name == "flightmare":
-                command_state = self._dynamics.get_state()
-                desired_vel_flu = world_vector_to_body_flu_quat(
-                    desired_vel_world,
-                    command_state.quaternion_world_body)
-                last_command_flu = desired_vel_flu.copy()
-                last_command_yaw_rate = float(yaw_rate_cmd)
                 if not self._dynamics.step_velocity_command(
                         desired_vel_flu, yaw_rate_cmd, step_dt):
                     raise RuntimeError("Flightmare trajectory step failed")
@@ -3261,14 +3304,16 @@ class ILManager:
                                  1.0 - 2.0 * (qy*qy + qz*qz))
                 yr = float(ds.angular_velocity_body[2])
             else:
-                last_command_flu = world_vector_to_body_flu(
-                    desired_vel_world, yaw)
-                last_command_yaw_rate = float(yaw_rate_cmd)
+                desired_vel_world = body_flu_to_world_quat(
+                    desired_vel_flu,
+                    self._dynamics.get_state().quaternion_world_body)
                 pos, vel, yaw, yr = integrate_velocity_command(
                     pos, vel, yaw, desired_vel_world, step_dt,
                     max_velocity, max_acceleration, max_yaw_rate)
+
             total_yaw_change += yr * step_dt
             elapsed += step_dt
+            step_time_s += step_dt
 
         avg_yaw_rate = total_yaw_change / max(dt_sample, 1e-9)
         return (pos, vel, yaw, avg_yaw_rate,
@@ -3507,42 +3552,119 @@ class ILManager:
             return last_direction, azimuth_rad
         return tie_break, azimuth_rad
 
-    def _sample_expert_command_from_snapshot(self, snapshot,
-                                              label_lookahead_time_s,
-                                              current_time_s, current_yaw):
-        """Sample expert velocity command from a cached LocalPlanSnapshot.
+    def _compute_trajectory_tracking_command(self, snapshot, current_time_s,
+                                              cur_pos, cur_vel, cur_yaw,
+                                              label_lookahead_time_s=0.08,
+                                              command_lookahead_time=0.08):
+        """Unified trajectory tracking command computation (v12).
 
-        Uses trajectory_relative_time = current_time - plan_timestamp.
+        Used by BOTH the expert label generation AND the execution step.
+        Returns the final upper-level FLU velocity + yaw-rate command
+        that should be sent to Flightmare, including position feedback,
+        velocity limiting, and closed-loop yaw control.
+
+        Returns dict with keys:
+            reference_position_world, reference_velocity_world,
+            reference_velocity_flu, reference_yaw_rate,
+            feedback_velocity_flu,
+            final_velocity_flu, final_yaw_rate,
+            trajectory_sample_time_s, valid
         """
+        result = {
+            "reference_position_world": np.zeros(3, dtype=np.float64),
+            "reference_velocity_world": np.zeros(3, dtype=np.float64),
+            "reference_velocity_flu": np.zeros(3, dtype=np.float64),
+            "reference_yaw_rate": 0.0,
+            "feedback_velocity_flu": np.zeros(3, dtype=np.float64),
+            "final_velocity_flu": np.zeros(3, dtype=np.float64),
+            "final_yaw_rate": 0.0,
+            "trajectory_sample_time_s": 0.0,
+            "valid": False,
+        }
         if snapshot is None:
-            return np.zeros(3, dtype=np.float64), 0.0
+            return result
         traj = snapshot.trajectory
         if traj is None or len(traj) == 0:
-            return np.zeros(3, dtype=np.float64), 0.0
-
-        rel_time = current_time_s - snapshot.plan_timestamp_s
-        sample_time = rel_time + label_lookahead_time_s
-        traj_dur = snapshot.trajectory_duration_s
-        clamped = max(0.0, min(sample_time, traj_dur))
-        best_idx = min(range(len(traj)),
-                       key=lambda i: abs(float(traj[i].t) - clamped))
-        tp = traj[best_idx]
-        expert_vel_world = np.array(tp.velocity, dtype=np.float64)
+            return result
 
         lp_cfg = self.g.get("planning", {}).get("local_planner", {})
         max_velocity = float(lp_cfg.get("max_velocity", 2.5))
         max_yaw_rate = float(lp_cfg.get("max_yaw_rate", 2.0))
         yaw_tracking_gain = float(lp_cfg.get("yaw_tracking_gain", 3.0))
         yaw_speed_threshold = float(lp_cfg.get("yaw_speed_threshold", 0.10))
+        velocity_tracking_gain = float(
+            lp_cfg.get("velocity_tracking_gain", 2.0))
 
-        expert_speed = float(np.linalg.norm(expert_vel_world))
-        if expert_speed > max_velocity:
-            expert_vel_world *= max_velocity / max(expert_speed, 1e-9)
+        rel_time = current_time_s - snapshot.plan_timestamp_s
+        sample_time = rel_time + max(0.0, command_lookahead_time)
+        traj_dur = snapshot.trajectory_duration_s
+        clamped = max(0.0, min(sample_time, traj_dur))
+        best_idx = min(range(len(traj)),
+                       key=lambda i: abs(float(traj[i].t) - clamped))
+        tp = traj[best_idx]
 
-        expert_yaw_rate = yaw_rate_for_world_velocity(
-            current_yaw, expert_vel_world, yaw_tracking_gain,
+        ref_pos = np.array(tp.position, dtype=np.float64)
+        feedforward_vel = np.array(tp.velocity, dtype=np.float64)
+
+        result["reference_position_world"] = ref_pos
+        result["reference_velocity_world"] = feedforward_vel
+        result["trajectory_sample_time_s"] = float(tp.t)
+
+        # Position feedback
+        desired_vel_world = (feedforward_vel +
+                             velocity_tracking_gain * (ref_pos - cur_pos))
+
+        # Velocity limit
+        desired_speed = float(np.linalg.norm(desired_vel_world))
+        if desired_speed > max_velocity:
+            desired_vel_world *= max_velocity / max(desired_speed, 1e-9)
+
+        # Convert to FLU
+        ds = self._dynamics.get_state()
+        desired_vel_flu = world_vector_to_body_flu_quat(
+            desired_vel_world, ds.quaternion_world_body)
+        feedforward_vel_flu = world_vector_to_body_flu_quat(
+            feedforward_vel, ds.quaternion_world_body)
+
+        result["reference_velocity_flu"] = feedforward_vel_flu
+        result["feedback_velocity_flu"] = (
+            desired_vel_flu - feedforward_vel_flu)
+        result["final_velocity_flu"] = quantize_bounded_vector(
+            desired_vel_flu, max_velocity, decimals=6)
+
+        # Closed-loop yaw rate
+        yaw_rate_cmd = yaw_rate_for_world_velocity(
+            cur_yaw, desired_vel_world, yaw_tracking_gain,
             max_yaw_rate, yaw_speed_threshold)
-        return expert_vel_world, expert_yaw_rate
+        result["final_yaw_rate"] = float(yaw_rate_cmd)
+        result["reference_yaw_rate"] = float(yaw_rate_cmd)
+        result["valid"] = True
+
+        return result
+
+    def _sample_expert_command_from_snapshot(self, snapshot,
+                                              label_lookahead_time_s,
+                                              current_time_s, current_yaw):
+        """v12: delegates to unified tracking command computation.
+
+        Returns (expert_velocity_world, expert_yaw_rate).
+        The expert command is the FINAL upper-level command including
+        position feedback, matching what _execute_trajectory_segment
+        actually sends to Flightmare.
+        """
+        cmd = self._compute_trajectory_tracking_command(
+            snapshot, current_time_s,
+            cur_pos=np.zeros(3), cur_vel=np.zeros(3), cur_yaw=current_yaw,
+            label_lookahead_time_s=label_lookahead_time_s,
+            command_lookahead_time=0.08)
+        if not cmd["valid"]:
+            return np.zeros(3, dtype=np.float64), 0.0
+        # Convert FLU final command back to world for the row builder
+        # (row builder will convert to FLU again via quaternion)
+        ds = self._dynamics.get_state()
+        final_vel_world = body_flu_to_world_quat(
+            cmd["final_velocity_flu"], ds.quaternion_world_body)
+        return final_vel_world, cmd["final_yaw_rate"]
 
     def _execute_rotate_in_place(self, cur_pos, cur_vel, cur_yaw,
                                   yaw_rate_command, dt_sample, dt_ctrl,
@@ -5907,11 +6029,14 @@ class ILManager:
                     if mm and mm != "frame_id_exact":
                         issues.append("CRITICAL: non-exact match_method='{}' at row {}".format(mm, row_idx))
 
-                    # frame_id monotonically increasing
+                    # v12: frame_id must be strictly consecutive (fid == prev_fid + 1)
                     try:
                         fid = int(row.get("frame_id", -1))
                         if fid <= prev_frame_id:
                             issues.append("CRITICAL: non-monotonic frame_id {} -> {} at row {}".format(
+                                prev_frame_id, fid, row_idx))
+                        elif prev_frame_id >= 0 and fid != prev_frame_id + 1:
+                            issues.append("CRITICAL: non-consecutive frame_id {} -> {} at row {}".format(
                                 prev_frame_id, fid, row_idx))
                         prev_frame_id = fid
                     except (ValueError, TypeError):
