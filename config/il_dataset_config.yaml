@@ -483,6 +483,10 @@ global:
     min_start_goal_distance: 15.0
     max_attempts: 200
     min_esdf_clearance_at_endpoints: 0.20
+    # v11: random yaw offset applied to initial drone heading.
+    # 0 = always face along the first global-path segment.
+    # e.g. 30 = uniformly random offset in [-30°, +30°].
+    initial_yaw_randomization_deg: 100.0
 
   # ── Trajectory planning & dynamics constraints ───────────────────────
   planning:
@@ -590,9 +594,15 @@ global:
     collection_mode: "deterministic_lockstep"
     image_write_queue_size: 16
     label_lookahead_time_s: 0.08
-    trend_horizontal_bins: 13
-    trend_vertical_bins: 7
-    trend_soft_sigma_bins: 0.75
+    # ── Trend label configuration (v11: 11 normal FOV bins + 2 recovery classes = 13) ──
+    trend:
+      normal_horizontal_bins: 11
+      horizontal_class_count: 13
+      vertical_bins: 7
+      soft_sigma_bins: 0.75
+      recover_left_class: 0
+      normal_class_offset: 1
+      recover_right_class: 12
 
   # ── Observed local occupancy map (Phase 2) ───────────────────────────
   observed_map:
@@ -649,7 +659,7 @@ global:
   online_runtime:
     control_rate_hz: 30.0
     record_rate_hz: 30.0
-    planner_rate_hz: 20.0
+    planner_rate_hz: 30.0
 
     planner_retry:
       terminal_scale_sequence: [1.0, 0.75, 0.50, 0.30]

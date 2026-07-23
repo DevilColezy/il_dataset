@@ -378,9 +378,10 @@ class TrendMode(Enum):
 
 
 # ── Trend horizontal class constants (13 classes) ───────────────────
-TREND_HORIZONTAL_CLASS_COUNT = 13
+TREND_NORMAL_HORIZONTAL_BIN_COUNT = 11   # number of normal FOV bins (unchanged)
+TREND_HORIZONTAL_CLASS_COUNT = 13        # total classes: recover_left + 11 normal + recover_right
 TREND_RECOVER_LEFT_CLASS = 0
-TREND_NORMAL_CLASS_OFFSET = 1       # old 0–10  →  new 1–11
+TREND_NORMAL_CLASS_OFFSET = 1            # old 0–10  →  new 1–11
 TREND_RECOVER_RIGHT_CLASS = 12
 
 # Vertical bins unchanged
@@ -439,6 +440,40 @@ class LocalPlanSnapshot:
             raise ValueError(
                 "speed_scale must be in (0, 1], got {}".format(
                     self.speed_scale))
+
+
+@dataclass(frozen=True)
+class RuntimeDecision:
+    """Immutable per-frame decision computed before row construction.
+
+    All modes, labels, and commands for a single control/record tick
+    are finalized here so that data rows never contain mixed state.
+    """
+    planner_mode: str      # PlannerMode value
+    trend_mode: str         # TrendMode value
+    control_mode: str       # ControlMode value
+
+    guide_source: str
+    guide_target_world: np.ndarray
+    guide_target_path_index: int
+
+    recovery_direction: str
+    recovery_azimuth_rad: float
+
+    expert_command_flu: np.ndarray
+    expert_yaw_rate: float
+
+    plan_snapshot: object   # Optional[LocalPlanSnapshot]
+
+    def __post_init__(self):
+        if not np.all(np.isfinite(self.guide_target_world)):
+            raise ValueError("guide_target_world must be finite")
+        if not np.all(np.isfinite(self.expert_command_flu)):
+            raise ValueError("expert_command_flu must be finite")
+        if not np.isfinite(self.expert_yaw_rate):
+            raise ValueError("expert_yaw_rate must be finite")
+        if not np.isfinite(self.recovery_azimuth_rad):
+            raise ValueError("recovery_azimuth_rad must be finite")
 
 
 # ============================================================================

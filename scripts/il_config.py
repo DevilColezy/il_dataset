@@ -24,12 +24,14 @@ except ImportError:
 # Trend class constants (imported for validation)
 try:
     from il_common import (
+        TREND_NORMAL_HORIZONTAL_BIN_COUNT,
         TREND_HORIZONTAL_CLASS_COUNT,
         TREND_RECOVER_LEFT_CLASS,
         TREND_RECOVER_RIGHT_CLASS,
         TREND_NORMAL_CLASS_OFFSET,
     )
 except ImportError:
+    TREND_NORMAL_HORIZONTAL_BIN_COUNT = 11
     TREND_HORIZONTAL_CLASS_COUNT = 13
     TREND_RECOVER_LEFT_CLASS = 0
     TREND_RECOVER_RIGHT_CLASS = 12
@@ -330,18 +332,59 @@ def _validate_config(cfg):
             errors.append(
                 "global.data.label_lookahead_time_s must be > 0, got {}".format(lookahead))
 
-        # trend soft sigma
-        sigma = data.get("trend_soft_sigma_bins", 0.75)
+        # trend config (v11: nested under data.trend)
+        trend_cfg = data.get("trend", {})
+        normal_h_bins = int(trend_cfg.get("normal_horizontal_bins",
+                              data.get("trend_horizontal_bins", 11)))
+        h_class_count = int(trend_cfg.get("horizontal_class_count",
+                              TREND_HORIZONTAL_CLASS_COUNT))
+        v_bins = int(trend_cfg.get("vertical_bins",
+                       data.get("trend_vertical_bins", 7)))
+        sigma = float(trend_cfg.get("soft_sigma_bins",
+                       data.get("trend_soft_sigma_bins", 0.75)))
+
+        if normal_h_bins != TREND_NORMAL_HORIZONTAL_BIN_COUNT:
+            errors.append(
+                "data.trend.normal_horizontal_bins must be {}, got {}".format(
+                    TREND_NORMAL_HORIZONTAL_BIN_COUNT, normal_h_bins))
+        if h_class_count != TREND_HORIZONTAL_CLASS_COUNT:
+            errors.append(
+                "data.trend.horizontal_class_count must be {}, got {}".format(
+                    TREND_HORIZONTAL_CLASS_COUNT, h_class_count))
+        if normal_h_bins < 3 or normal_h_bins % 2 == 0:
+            errors.append(
+                "data.trend.normal_horizontal_bins must be odd > 1")
+        if v_bins < 3 or v_bins % 2 == 0:
+            errors.append(
+                "data.trend.vertical_bins must be odd > 1")
         if sigma <= 0:
             errors.append(
-                "global.data.trend_soft_sigma_bins must be > 0, got {}".format(sigma))
-
-        # trend bins must be odd > 1
-        for bin_name in ("trend_horizontal_bins", "trend_vertical_bins"):
-            nb = data.get(bin_name, 1)
-            if not isinstance(nb, int) or nb < 3 or nb % 2 == 0:
-                errors.append(
-                    "global.data.{} must be an odd integer > 1, got {}".format(bin_name, nb))
+                "data.trend.soft_sigma_bins must be > 0, got {}".format(sigma))
+        # Validate class constants match config
+        rlc = int(trend_cfg.get("recover_left_class", TREND_RECOVER_LEFT_CLASS))
+        rrc = int(trend_cfg.get("recover_right_class", TREND_RECOVER_RIGHT_CLASS))
+        nco = int(trend_cfg.get("normal_class_offset", TREND_NORMAL_CLASS_OFFSET))
+        if rlc != 0:
+            errors.append("data.trend.recover_left_class must be 0")
+        if rrc != h_class_count - 1:
+            errors.append(
+                "data.trend.recover_right_class must be {}, got {}".format(
+                    h_class_count - 1, rrc))
+        if nco != 1:
+            errors.append("data.trend.normal_class_offset must be 1")
+        # Warn about deprecated flat config keys
+        if "trend_horizontal_bins" in data:
+            rospy.logwarn(
+                "[Config] DEPRECATED: global.data.trend_horizontal_bins – "
+                "use global.data.trend.normal_horizontal_bins instead")
+        if "trend_vertical_bins" in data:
+            rospy.logwarn(
+                "[Config] DEPRECATED: global.data.trend_vertical_bins – "
+                "use global.data.trend.vertical_bins instead")
+        if "trend_soft_sigma_bins" in data:
+            rospy.logwarn(
+                "[Config] DEPRECATED: global.data.trend_soft_sigma_bins – "
+                "use global.data.trend.soft_sigma_bins instead")
 
         # collection_mode validation
         mode = data.get("collection_mode", "deterministic_lockstep")
