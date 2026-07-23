@@ -21,6 +21,20 @@ try:
 except ImportError:
     yaml = None
 
+# Trend class constants (imported for validation)
+try:
+    from il_common import (
+        TREND_HORIZONTAL_CLASS_COUNT,
+        TREND_RECOVER_LEFT_CLASS,
+        TREND_RECOVER_RIGHT_CLASS,
+        TREND_NORMAL_CLASS_OFFSET,
+    )
+except ImportError:
+    TREND_HORIZONTAL_CLASS_COUNT = 13
+    TREND_RECOVER_LEFT_CLASS = 0
+    TREND_RECOVER_RIGHT_CLASS = 12
+    TREND_NORMAL_CLASS_OFFSET = 1
+
 
 # ── Expected config schema (v2) ──────────────────────────────────────────────
 REQUIRED_GLOBAL_KEYS = [
@@ -408,12 +422,15 @@ def _validate_config(cfg):
     sg_cfg = g.get("scene_generation", {})
     if sg_cfg.get("enabled", False):
         # Basic type checks
-        if sg_cfg.get("source", "procedural_yaml") != "procedural_yaml":
-            errors.append("scene_generation.source currently supports only procedural_yaml")
+        source = sg_cfg.get("source", "procedural_yaml")
+        if source not in ("procedural_yaml", "procedural_profiles"):
+            errors.append("scene_generation.source must be 'procedural_yaml' or 'procedural_profiles', got '{}'".format(source))
         if sg_cfg.get("obstacle_type", "cylinder") != "cylinder":
             errors.append("Phase 3 only supports obstacle_type='cylinder'")
-        if sg_cfg.get("outside_obstacle_region_policy", "free") != "free":
-            errors.append("outside_obstacle_region_policy must be 'free'")
+        outside_policy = sg_cfg.get("outside_region_policy",
+                                     sg_cfg.get("outside_obstacle_region_policy", "free"))
+        if outside_policy != "free":
+            errors.append("outside_region_policy must be 'free'")
 
         # Obstacle region
         oreg = sg_cfg.get("obstacle_region", {})
@@ -489,6 +506,107 @@ def _validate_config(cfg):
                 errors.append("explicit_yaml mode requires layout_file")
             elif not os.path.isfile(layout):
                 errors.append("layout_file not found: {}".format(layout))
+
+        # ── Profile validation (v9 multi-profile) ─────────────────
+        if sg_cfg.get("source") == "procedural_profiles":
+            _validate_profiles(sg_cfg, errors)
+
+        # ── Prevent both profile and legacy pipeline ──────────────
+        scenes_list = cfg.get("scenes", [])
+        if sg_cfg.get("source") == "procedural_profiles" and scenes_list:
+            errors.append(
+                "Both procedural_profiles (scene_generation.profiles) and legacy "
+                "scenes: list are configured. Only one pipeline may be enabled.")
+
+    # ── Online runtime (v11) ───────────────────────────────────
+    online_rt = g.get("online_runtime", {})
+    if online_rt:
+        ctrl_rate = float(online_rt.get("control_rate_hz", 30.0))
+        planner_rate = float(online_rt.get("planner_rate_hz", 20.0))
+        rec_rate = float(online_rt.get("record_rate_hz", 30.0))
+        if ctrl_rate <= 0:
+            errors.append("online_runtime.control_rate_hz must be > 0")
+        if planner_rate <= 0:
+            errors.append("online_runtime.planner_rate_hz must be > 0")
+        if rec_rate <= 0:
+            errors.append("online_runtime.record_rate_hz must be > 0")
+        if planner_rate > ctrl_rate + 1e-9:
+            errors.append(
+                "online_runtime.planner_rate_hz ({}) must be <= "
+                "control_rate_hz ({})".format(planner_rate, ctrl_rate))
+
+        # Planner retry
+        retry_cfg = online_rt.get("planner_retry", {})
+        tss = retry_cfg.get("terminal_scale_sequence", [1.0])
+        if not tss or not isinstance(tss, list):
+            errors.append("planner_retry.terminal_scale_sequence must be non-empty list")
+        else:
+            prev = 2.0
+            for s in tss:
+                if not (0.0 < s <= 1.0):
+                    errors.append(
+                        "terminal_scale_sequence values must be in (0, 1], "
+                        "got {}".format(s))
+                if s > prev + 1e-9:
+                    errors.append(
+                        "terminal_scale_sequence must be non-increasing, "
+                        "got {} > {}".format(s, prev))
+                prev = s
+
+        sss = retry_cfg.get("speed_scale_sequence", [1.0])
+        if sss and isinstance(sss, list):
+            prev_s = 2.0
+            for s in sss:
+                if not (0.0 < s <= 1.0):
+                    errors.append(
+                        "speed_scale_sequence values must be in (0, 1], "
+                        "got {}".format(s))
+                if s > prev_s + 1e-9:
+                    errors.append(
+                        "speed_scale_sequence must be non-increasing")
+                prev_s = s
+
+        # Trajectory cache
+        tc = online_rt.get("trajectory_cache", {})
+        for k in ("max_plan_age_s", "minimum_remaining_time_s",
+                   "maximum_position_error_m", "maximum_velocity_error_mps"):
+            v = tc.get(k, 0)
+            if not isinstance(v, (int, float)) or v < 0:
+                errors.append(
+                    "trajectory_cache.{} must be >= 0, got {}".format(k, v))
+
+        # Guide cache
+        gc = online_rt.get("guide_cache", {})
+        for k in ("max_age_s", "maximum_distance_m", "maximum_path_deviation_m"):
+            v = gc.get(k, 0)
+            if not isinstance(v, (int, float)) or v < 0:
+                errors.append(
+                    "guide_cache.{} must be >= 0, got {}".format(k, v))
+
+        # Recovery
+        rec = online_rt.get("recovery", {})
+        if rec.get("enabled", True):
+            if float(rec.get("max_yaw_rate_rps", 0.80)) <= 0:
+                errors.append("recovery.max_yaw_rate_rps must be > 0")
+            if float(rec.get("maximum_recovery_duration_s", 3.0)) <= 0:
+                errors.append("recovery.maximum_recovery_duration_s must be > 0")
+            td = rec.get("tie_break_direction", "right")
+            if td not in ("left", "right"):
+                errors.append(
+                    "recovery.tie_break_direction must be 'left' or 'right', "
+                    "got '{}'".format(td))
+
+        # Trend class constants
+        if TREND_HORIZONTAL_CLASS_COUNT != 13:
+            errors.append(
+                "TREND_HORIZONTAL_CLASS_COUNT must be 13, got {}".format(
+                    TREND_HORIZONTAL_CLASS_COUNT))
+        if TREND_RECOVER_LEFT_CLASS != 0:
+            errors.append("TREND_RECOVER_LEFT_CLASS must be 0")
+        if TREND_RECOVER_RIGHT_CLASS != 12:
+            errors.append("TREND_RECOVER_RIGHT_CLASS must be 12")
+        if TREND_NORMAL_CLASS_OFFSET != 1:
+            errors.append("TREND_NORMAL_CLASS_OFFSET must be 1")
 
     # ── Obstacle ────────────────────────────────────────────────
     obs = g.get("obstacle", {})
@@ -686,7 +804,9 @@ def _validate_config(cfg):
 
     # ── Scenes ──────────────────────────────────────────────────
     scenes = cfg.get("scenes", [])
-    if not scenes:
+    # Legacy scenes are only required when NOT using procedural_profiles
+    source = g.get("scene_generation", {}).get("source", "procedural_yaml")
+    if source != "procedural_profiles" and not scenes:
         errors.append("No scenes defined")
     for i, s in enumerate(scenes):
         if "name" not in s:
@@ -808,6 +928,133 @@ def _validate_config(cfg):
         msg = "Config validation failed with {} error(s):\n  • ".format(len(errors))
         msg += "\n  • ".join(errors)
         raise ValueError(msg)
+
+
+def _validate_profiles(sg_cfg, errors):
+    """Validate the profiles list in a procedural_profiles config.
+
+    Checks: name uniqueness, positive counts, radius/height ranges,
+    density mode validity, gap requirements, task params.
+    """
+    profiles = sg_cfg.get("profiles", [])
+    if not profiles:
+        errors.append("procedural_profiles source requires non-empty profiles list")
+        return
+
+    seen_names = set()
+    any_enabled = False
+    vehicle_cfg = sg_cfg.get("vehicle", {})
+    vehicle_r = float(vehicle_cfg.get("radius_m",
+        sg_cfg.get("topology_validation", {}).get("vehicle_radius_m", 0.30)))
+    safety_m = float(vehicle_cfg.get("safety_margin_m",
+        sg_cfg.get("topology_validation", {}).get("safety_margin_m", 0.10)))
+
+    for i, p in enumerate(profiles):
+        name = str(p.get("name", ""))
+        if not name:
+            errors.append("profiles[{}]: name must be non-empty".format(i))
+        elif name in seen_names:
+            errors.append("profiles[{}]: duplicate name '{}'".format(i, name))
+        else:
+            seen_names.add(name)
+
+        enabled = bool(p.get("enabled", True))
+        if enabled:
+            any_enabled = True
+
+        scene_count = int(p.get("scene_count", 0))
+        if scene_count <= 0:
+            errors.append("profiles[{}] ('{}'): scene_count must be > 0, got {}".format(
+                i, name, scene_count))
+
+        seed_offset = p.get("seed_offset", 0)
+        if not isinstance(seed_offset, int):
+            errors.append("profiles[{}] ('{}'): seed_offset must be an integer".format(i, name))
+
+        # Cylinder params
+        cyl = p.get("cylinder", {})
+        r_min = float(cyl.get("radius_min_m", -1))
+        r_max = float(cyl.get("radius_max_m", -1))
+        if r_min <= 0:
+            errors.append("profiles[{}] ('{}'): cylinder.radius_min_m must be > 0".format(i, name))
+        if r_max < r_min:
+            errors.append("profiles[{}] ('{}'): radius_max_m ({}) < radius_min_m ({})".format(
+                i, name, r_max, r_min))
+
+        c_min = int(cyl.get("count_min", -1))
+        c_max = int(cyl.get("count_max", -1))
+        if c_min <= 0:
+            errors.append("profiles[{}] ('{}'): cylinder.count_min must be > 0".format(i, name))
+        if c_max < c_min:
+            errors.append("profiles[{}] ('{}'): count_max ({}) < count_min ({})".format(
+                i, name, c_max, c_min))
+
+        # Density params
+        density = p.get("density", {})
+        d_enabled = bool(density.get("enabled", True))
+        d_mode = str(density.get("mode", "inflated_occupancy"))
+        supported_modes = ["inflated_occupancy", "raw_occupancy",
+                           "obstacles_per_100m2", "fixed_count"]
+        if d_mode not in supported_modes:
+            errors.append("profiles[{}] ('{}'): density.mode '{}' not in {}".format(
+                i, name, d_mode, supported_modes))
+
+        if d_enabled:
+            d_min = float(density.get("target_min", -1))
+            d_max = float(density.get("target_max", -1))
+            if d_min < 0:
+                errors.append("profiles[{}] ('{}'): density.target_min must be >= 0".format(i, name))
+            if d_max < d_min:
+                errors.append("profiles[{}] ('{}'): density.target_max ({}) < target_min ({})".format(
+                    i, name, d_max, d_min))
+            if d_mode in ("inflated_occupancy", "raw_occupancy") and d_max >= 1.0:
+                errors.append("profiles[{}] ('{}'): occupancy density target_max ({}) must be < 1.0".format(
+                    i, name, d_max))
+
+    if not any_enabled:
+        errors.append("No profiles are enabled (all have enabled: false)")
+
+    # Vehicle params validation
+    if vehicle_r <= 0:
+        errors.append("vehicle.radius_m must be > 0, got {}".format(vehicle_r))
+    if safety_m < 0:
+        errors.append("vehicle.safety_margin_m must be >= 0, got {}".format(safety_m))
+
+    # Common cylinder gap validation
+    common_cyl = sg_cfg.get("common_cylinder", {})
+    min_sg = float(common_cyl.get("minimum_surface_gap_m", -1))
+    min_pg = float(common_cyl.get("minimum_post_inflation_gap_m", -1))
+    if min_sg < 0:
+        errors.append("common_cylinder.minimum_surface_gap_m must be >= 0")
+    if min_pg < 0:
+        errors.append("common_cylinder.minimum_post_inflation_gap_m must be >= 0")
+
+    # Common task generation validation
+    common_task = sg_cfg.get("common_task_generation", {})
+    tasks_per = int(common_task.get("tasks_per_scene", 0))
+    if tasks_per <= 0:
+        errors.append("common_task_generation.tasks_per_scene must be > 0")
+
+    min_dist = float(common_task.get("minimum_start_goal_distance_m", -1))
+    max_dist = float(common_task.get("maximum_start_goal_distance_m", -1))
+    if min_dist <= 0:
+        errors.append("common_task_generation.minimum_start_goal_distance_m must be > 0")
+    if max_dist < min_dist:
+        errors.append("common_task_generation.maximum_start_goal_distance_m < minimum")
+
+    min_ht = float(common_task.get("start_height_min_m", -1))
+    max_ht = float(common_task.get("start_height_max_m", -1))
+    if min_ht <= 0:
+        errors.append("common_task_generation.start_height_min_m must be > 0")
+    if max_ht < min_ht:
+        errors.append("common_task_generation.start_height_max_m < start_height_min_m")
+
+    min_detour = float(common_task.get("minimum_detour_ratio", 0))
+    max_detour = float(common_task.get("maximum_detour_ratio", 0))
+    if min_detour < 1.0:
+        errors.append("common_task_generation.minimum_detour_ratio must be >= 1.0")
+    if max_detour < min_detour:
+        errors.append("common_task_generation.maximum_detour_ratio < minimum_detour_ratio")
 
 
 def _warn_unused_keys(cfg):

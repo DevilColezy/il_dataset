@@ -94,13 +94,21 @@ global:
   scene_generation:
     enabled: true
 
-    source: "procedural_yaml"
+    source: "procedural_profiles"
     obstacle_type: "cylinder"
 
     seed: 12345
-    max_scene_generation_attempts: 500
-    max_obstacle_sampling_attempts: 5000
 
+    # ── Execution control ──────────────────────────────────────────
+    execution:
+      profile_order: "sequential"
+      stop_after_all_profiles: true
+
+      max_generation_attempts_per_scene: 500
+      max_obstacle_sampling_attempts: 5000
+      max_task_sampling_attempts_per_scene: 500
+
+    # ── Obstacle region ────────────────────────────────────────────
     obstacle_region:
       x_min: -9.0
       x_max: 11.0
@@ -109,8 +117,66 @@ global:
       z_min: 0.0
       z_max: 8.0
 
-    outside_obstacle_region_policy: "free"
+    outside_region_policy: "free"
 
+    # ── Vehicle & inflation ────────────────────────────────────────
+    vehicle:
+      radius_m: 0.30
+      safety_margin_m: 0.10
+
+    # ── Common cylinder parameters ─────────────────────────────────
+    common_cylinder:
+      height_min_m: 8.0
+      height_max_m: 8.0
+
+      require_full_vertical_blocking: true
+      region_boundary_margin_m: 0.30
+
+      minimum_surface_gap_m: 0.0
+      minimum_post_inflation_gap_m: 0.15
+
+      allow_overlap: false
+
+    # ── Common task generation ─────────────────────────────────────
+    common_task_generation:
+      tasks_per_scene: 3
+
+      start_sampling_region:
+        x_min: -8.0
+        x_max: 10.0
+        y_min: -2.0
+        y_max: -1.0
+
+      goal_sampling_region:
+        x_min: -8.0
+        x_max: 10.0
+        y_min: 30.0
+        y_max: 32.0
+
+      start_height_min_m: 1.8
+      start_height_max_m: 2.2
+
+      goal_height_min_m: 1.8
+      goal_height_max_m: 2.2
+
+      maximum_start_goal_height_difference_m: 0.20
+
+      minimum_start_goal_distance_m: 28.0
+      maximum_start_goal_distance_m: 40.0
+
+      require_direct_path_blocked: true
+      minimum_direct_blocker_count: 1
+      maximum_direct_blocker_count: 3
+
+      require_astar_reachable: true
+
+      minimum_detour_ratio: 1.03
+      maximum_detour_ratio: 2.00
+
+    # ── Legacy single-profile compatibility (unchanged for reference) ──
+    # When source == "procedural_yaml" the fields below are still read by
+    # YamlCylinderSceneGenerator for backward compatibility.  They are
+    # ignored when source == "procedural_profiles".
     cylinder:
       count_min: 6
       count_max: 10
@@ -125,8 +191,8 @@ global:
 
       region_boundary_margin_m: 0.30
 
-      minimum_surface_gap_m: 0.80
-      minimum_inflated_gap_m: 0.40
+      minimum_surface_gap_m: 0.80      # deprecated — use common_cylinder version
+      minimum_inflated_gap_m: 0.40     # deprecated — use minimum_post_inflation_gap_m
 
       allow_overlap: false
       allow_inflated_component_merging: false
@@ -144,7 +210,7 @@ global:
       forbid_dead_ends: false
       forbid_u_shapes: false
 
-      minimum_navigable_corridor_width_m: 0.60
+      minimum_navigable_corridor_width_m: 0.60   # deprecated — replaced by post_inflation_gap
 
       escape_ray_count: 24
       minimum_escape_sector_width_deg: 35.0
@@ -190,7 +256,7 @@ global:
         y_max: -1.0
 
       goal_sampling_region:
-        x_min: 8.0
+        x_min: -8.0
         x_max: 10.0
         y_min: 30.0
         y_max: 32.0
@@ -213,6 +279,86 @@ global:
 
       maximum_invalid_frames_before_reject: 5
       reject_episode_on_inconsistent_side_choice: true
+
+    # ═══════════════════════════════════════════════════════════════
+    #  Scene generation profiles  (v9 multi-profile)
+    # ═══════════════════════════════════════════════════════════════
+    profiles:
+      - name: "small_sparse"
+        enabled: true
+        scene_count: 60
+        seed_offset: 1000
+
+        cylinder:
+          radius_min_m: 0.30
+          radius_max_m: 0.80
+
+          count_min: 8
+          count_max: 24
+
+        density:
+          enabled: true
+          mode: "inflated_occupancy"
+
+          target_min: 0.06
+          target_max: 0.10
+
+      - name: "medium"
+        enabled: true
+        scene_count: 60
+        seed_offset: 2000
+
+        cylinder:
+          radius_min_m: 0.80
+          radius_max_m: 1.60
+
+          count_min: 5
+          count_max: 14
+
+        density:
+          enabled: true
+          mode: "inflated_occupancy"
+
+          target_min: 0.08
+          target_max: 0.14
+
+      - name: "mixed"
+        enabled: true
+        scene_count: 50
+        seed_offset: 3000
+
+        cylinder:
+          radius_min_m: 0.30
+          radius_max_m: 2.20
+
+          count_min: 5
+          count_max: 14
+
+        density:
+          enabled: true
+          mode: "inflated_occupancy"
+
+          target_min: 0.08
+          target_max: 0.15
+
+      - name: "large"
+        enabled: true
+        scene_count: 30
+        seed_offset: 4000
+
+        cylinder:
+          radius_min_m: 1.60
+          radius_max_m: 3.00
+
+          count_min: 2
+          count_max: 7
+
+        density:
+          enabled: true
+          mode: "inflated_occupancy"
+
+          target_min: 0.07
+          target_max: 0.14
 
   # ── Phase 4: ESDF Cache ────────────────────────────────────────────
   esdf_cache:
@@ -352,7 +498,7 @@ global:
       max_planning_time_full_s: 45.0   # bounded guard sized for the 0.10 m grid
       cost_weight: 0.0                 # geometric shortest feasible path, no perimeter bias
       clearance_target: 0.25           # preserve tracking reserve around the global guide
-      min_clearance: 0.15              # 0.20 m body radius + 0.15 m hard surface margin
+      min_clearance: 0.20              # 0.20 m body radius + 0.15 m hard surface margin
       shortcut_enabled: true
       shortcut_check_spacing: 0.05
       reference_resample_spacing_m: 0.20
@@ -440,11 +586,11 @@ global:
   # ── Data format ──────────────────────────────────────────────────────
   data:
     coordinate_frame: "CAMERA_FLU"
-    schema_version: 10
+    schema_version: 11
     collection_mode: "deterministic_lockstep"
     image_write_queue_size: 16
     label_lookahead_time_s: 0.08
-    trend_horizontal_bins: 11
+    trend_horizontal_bins: 13
     trend_vertical_bins: 7
     trend_soft_sigma_bins: 0.75
 
@@ -499,6 +645,45 @@ global:
     use_depth_projection_visibility: true
     use_known_free_corridor: false
 
+  # ── Online runtime scheduling & recovery (v11) ──────────────────────
+  online_runtime:
+    control_rate_hz: 30.0
+    record_rate_hz: 30.0
+    planner_rate_hz: 20.0
+
+    planner_retry:
+      terminal_scale_sequence: [1.0, 0.75, 0.50, 0.30]
+      recovery_initial_terminal_scales: [0.30, 0.50]
+      speed_scale_sequence: [1.0, 0.75, 0.50, 0.35]
+
+    trajectory_cache:
+      max_plan_age_s: 0.20
+      minimum_remaining_time_s: 0.10
+      maximum_position_error_m: 0.50
+      maximum_velocity_error_mps: 1.00
+      revalidate_current_suffix_with_esdf: true
+
+    guide_cache:
+      max_age_s: 0.50
+      maximum_distance_m: 7.0
+      maximum_path_deviation_m: 1.5
+      maximum_indices_behind_progress: 0
+
+    recovery:
+      enabled: true
+
+      path_lookahead_distance_m: 2.0
+      path_projection_backtrack_points: 5
+
+      yaw_deadband_rad: 0.05
+      max_yaw_rate_rps: 0.80
+      yaw_gain: 1.50
+
+      maximum_recovery_duration_s: 3.0
+      maximum_recovery_control_steps: 90
+
+      tie_break_direction: "right"
+
   # ── Sync & commit thresholds ─────────────────────────────────────────
   sync:
     max_acceptable_sync_error_ms: 100.0   # reject trajectory if any frame exceeds this
@@ -514,31 +699,7 @@ global:
     strict_collision_policy: true          # reject trajectory on ANY collision
     atomic_rename:           true          # use .inprogress → rename commit
 
-# ── Scene definitions ────────────────────────────────────────────────────────
-scenes:
-  # ── 1. Small only – very sparse ──────────────────────────────────────────
-  - name: "small_only"
-    target_occupancy: 0.03               # challenging but leaves repeatable local corridors
-    radius_min: 0.15
-    radius_max: 1.0
-    obstacle_count_min: 8
-    obstacle_count_max: 14
-    seeds: [100]
-
-  # ── 2. Small + Medium – moderate ─────────────────────────────────────────
-  - name: "small_medium"
-    target_occupancy: 0.04               # avoid the previous 36-obstacle overload
-    radius_min: 0.15
-    radius_max: 2.5
-    obstacle_count_min: 10
-    obstacle_count_max: 18
-    seeds: [400]
-
-  # ── 3. Full range – slightly denser ──────────────────────────────────────
-  - name: "large_medium_small"
-    target_occupancy: 0.05               # dense evaluation scene without saturating A*
-    radius_min: 0.15
-    radius_max: 4.0
-    obstacle_count_min: 12
-    obstacle_count_max: 20
-    seeds: [700]
+# ── Scene definitions (legacy — superseded by scene_generation.profiles) ────
+# The legacy scenes: list is disabled when source == "procedural_profiles".
+# To use legacy mode, set scene_generation.source to "procedural_yaml".
+scenes: []

@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-il_scenario.py  —  Scene & Task Generation for IL Dataset  v8 (Phase 3)
+il_scenario.py  —  Scene & Task Generation for IL Dataset  v9 (Phase 3 + Profiles)
 
 Provides:
   - CylinderObstacleSpec dataclass
   - ObstacleRegion definition
+  - SceneGenerationProfile dataclass
+  - DensityMode enum
   - SceneValidationResult / TaskValidationResult dataclasses
   - YamlCylinderSceneGenerator: procedural cylinder scene generation
   - CylinderSceneValidator: 2D topology, U-shape, dead-end checks
   - StartGoalTaskGenerator: task sampling with constraint enforcement
   - SideCostEvaluator: left/right portal path cost comparison
-  - SceneManifestWriter: YAML manifest for reproducibility
+  - SceneManifestWriter: YAML/JSON manifest for reproducibility
+  - SceneGenerationFailureManifestWriter: failure manifest
   - ObstacleVisibilityAuditor: runtime observability audit
 
 Conventions:
@@ -27,12 +30,350 @@ Space outside the obstacle generation region remains traversable.
 
 from __future__ import print_function, division
 
-import math, os, time, random, copy, yaml
+import math, os, time, random, copy, yaml, json
 import numpy as np
 from dataclasses import dataclass, field
 from collections import OrderedDict
+from enum import Enum
 
 import rospy
+
+
+# ============================================================================
+#  Density modes and helpers
+# ============================================================================
+
+class DensityMode(Enum):
+    INFLATED_OCCUPANCY = "inflated_occupancy"
+    RAW_OCCUPANCY = "raw_occupancy"
+    OBSTACLES_PER_100M2 = "obstacles_per_100m2"
+    FIXED_COUNT = "fixed_count"
+
+    @staticmethod
+    def from_string(s):
+        for mode in DensityMode:
+            if mode.value == s:
+                return mode
+        raise ValueError("Unknown density mode: '{}'. Supported: {}".format(
+            s, [m.value for m in DensityMode]))
+
+
+def compute_region_area(region):
+    """Compute area of an ObstacleRegion in the XY plane (m²)."""
+    return (region.x_max - region.x_min) * (region.y_max - region.y_min)
+
+
+def compute_raw_occupancy(obstacles, region_area):
+    """Σ π r_i² / region_area."""
+    if region_area <= 0.0:
+        return 0.0
+    total = sum(math.pi * o.radius_m ** 2 for o in obstacles)
+    return total / region_area
+
+
+def compute_inflated_occupancy(obstacles, region_area, vehicle_r, safety_m):
+    """Σ π (r_i + vehicle_r + safety_m)² / region_area.
+
+    Note: Overlap is double-counted.  Current profiles forbid inflated
+    overlap, so this approximation is acceptable.
+    """
+    if region_area <= 0.0:
+        return 0.0
+    infl = vehicle_r + safety_m
+    total = sum(math.pi * (o.radius_m + infl) ** 2 for o in obstacles)
+    return total / region_area
+
+
+def compute_obstacles_per_100m2(obstacles, region_area):
+    """obstacle_count / region_area × 100."""
+    if region_area <= 0.0:
+        return 0.0
+    return len(obstacles) / region_area * 100.0
+
+
+def compute_density(obstacles, region_area, mode, vehicle_r=0.30, safety_m=0.10):
+    """Compute the requested density metric for a set of obstacles."""
+    if mode == DensityMode.RAW_OCCUPANCY:
+        return compute_raw_occupancy(obstacles, region_area)
+    elif mode == DensityMode.INFLATED_OCCUPANCY:
+        return compute_inflated_occupancy(obstacles, region_area, vehicle_r, safety_m)
+    elif mode == DensityMode.OBSTACLES_PER_100M2:
+        return compute_obstacles_per_100m2(obstacles, region_area)
+    elif mode == DensityMode.FIXED_COUNT:
+        return float(len(obstacles))
+    else:
+        raise ValueError("Unsupported density mode: {}".format(mode))
+
+
+def compute_pairwise_min_gaps(obstacles, vehicle_r, safety_m):
+    """Compute min surface gap and min post-inflation gap across all pairs.
+
+    Returns:
+        (min_surface_gap_m, min_post_inflation_gap_m)
+    """
+    min_surface = float('inf')
+    min_post = float('inf')
+    if len(obstacles) < 2:
+        return (0.0, 0.0)
+    infl = vehicle_r + safety_m
+    for i in range(len(obstacles)):
+        for j in range(i + 1, len(obstacles)):
+            a, b = obstacles[i], obstacles[j]
+            d = float(np.linalg.norm(a.center_xy() - b.center_xy()))
+            sg = d - a.radius_m - b.radius_m
+            pg = sg - 2.0 * infl
+            if sg < min_surface:
+                min_surface = sg
+            if pg < min_post:
+                min_post = pg
+    if min_surface == float('inf'):
+        min_surface = 0.0
+    if min_post == float('inf'):
+        min_post = 0.0
+    return (min_surface, min_post)
+
+
+# ============================================================================
+#  SceneGenerationProfile dataclass
+# ============================================================================
+
+@dataclass
+class SceneGenerationProfile:
+    """A single scene generation profile parsed from YAML."""
+    name: str
+    enabled: bool
+    scene_count: int
+    seed_offset: int
+
+    # Cylinder params
+    radius_min_m: float
+    radius_max_m: float
+    count_min: int
+    count_max: int
+
+    # Density params
+    density_enabled: bool
+    density_mode: str  # "inflated_occupancy" etc.
+    density_target_min: float
+    density_target_max: float
+
+    # Resolved common params (merged from common_cylinder / common_task_generation)
+    height_min_m: float
+    height_max_m: float
+    require_full_vertical_blocking: bool
+    region_boundary_margin_m: float
+    minimum_surface_gap_m: float
+    minimum_post_inflation_gap_m: float
+    allow_overlap: bool
+
+    # Vehicle
+    vehicle_radius_m: float
+    safety_margin_m: float
+
+    # Task params
+    tasks_per_scene: int
+    start_sampling_region: dict
+    goal_sampling_region: dict
+    start_height_min_m: float
+    start_height_max_m: float
+    goal_height_min_m: float
+    goal_height_max_m: float
+    maximum_start_goal_height_difference_m: float
+    minimum_start_goal_distance_m: float
+    maximum_start_goal_distance_m: float
+    require_direct_path_blocked: bool
+    minimum_direct_blocker_count: int
+    maximum_direct_blocker_count: int
+    require_astar_reachable: bool
+    minimum_detour_ratio: float
+    maximum_detour_ratio: float
+
+    # Overrides (any profile-level overrides dict, kept for metadata)
+    overrides: dict = field(default_factory=dict)
+
+    @property
+    def inflation_radius_m(self):
+        return self.vehicle_radius_m + self.safety_margin_m
+
+    @staticmethod
+    def from_yaml_dict(profile_dict, common_cfg):
+        """Parse a single profile dict with common config fallback.
+
+        Profile fields override common_cfg fields.
+        """
+        name = str(profile_dict.get("name", "unnamed"))
+        enabled = bool(profile_dict.get("enabled", True))
+        scene_count = int(profile_dict.get("scene_count", 10))
+        seed_offset = int(profile_dict.get("seed_offset", 0))
+
+        # Cylinder params (profile overrides common_cylinder)
+        cyl_cfg = profile_dict.get("cylinder", {})
+        common_cyl = common_cfg.get("common_cylinder", {})
+
+        radius_min_m = float(cyl_cfg.get("radius_min_m",
+            common_cyl.get("radius_min_m", 0.30)))
+        radius_max_m = float(cyl_cfg.get("radius_max_m",
+            common_cyl.get("radius_max_m", 1.20)))
+        count_min = int(cyl_cfg.get("count_min",
+            common_cyl.get("count_min", 4)))
+        count_max = int(cyl_cfg.get("count_max",
+            common_cyl.get("count_max", 12)))
+
+        # Density params
+        density_cfg = profile_dict.get("density", {})
+        density_enabled = bool(density_cfg.get("enabled", True))
+        density_mode = str(density_cfg.get("mode", "inflated_occupancy"))
+        density_target_min = float(density_cfg.get("target_min", 0.05))
+        density_target_max = float(density_cfg.get("target_max", 0.15))
+
+        # Resolved common cylinder params
+        height_min_m = float(common_cyl.get("height_min_m", 8.0))
+        height_max_m = float(common_cyl.get("height_max_m", 8.0))
+        require_full_vertical_blocking = bool(common_cyl.get(
+            "require_full_vertical_blocking", True))
+        region_boundary_margin_m = float(common_cyl.get(
+            "region_boundary_margin_m", 0.30))
+        minimum_surface_gap_m = float(common_cyl.get(
+            "minimum_surface_gap_m", 0.0))
+        minimum_post_inflation_gap_m = float(common_cyl.get(
+            "minimum_post_inflation_gap_m", 0.15))
+        allow_overlap = bool(common_cyl.get("allow_overlap", False))
+
+        # Vehicle params
+        vehicle_cfg = common_cfg.get("vehicle", {})
+        vehicle_radius_m = float(vehicle_cfg.get("radius_m",
+            common_cfg.get("topology_validation", {}).get("vehicle_radius_m", 0.30)))
+        safety_margin_m = float(vehicle_cfg.get("safety_margin_m",
+            common_cfg.get("topology_validation", {}).get("safety_margin_m", 0.10)))
+
+        # Task params (profile overrides common_task_generation)
+        task_cfg = profile_dict.get("task_generation", {})
+        common_task = common_cfg.get("common_task_generation", {})
+
+        tasks_per_scene = int(task_cfg.get("tasks_per_scene",
+            common_task.get("tasks_per_scene", 3)))
+
+        start_sampling_region = task_cfg.get("start_sampling_region",
+            common_task.get("start_sampling_region", {
+                "x_min": -8.0, "x_max": 10.0, "y_min": -2.0, "y_max": -1.0}))
+        goal_sampling_region = task_cfg.get("goal_sampling_region",
+            common_task.get("goal_sampling_region", {
+                "x_min": -8.0, "x_max": 10.0, "y_min": 30.0, "y_max": 32.0}))
+
+        start_height_min_m = float(task_cfg.get("start_height_min_m",
+            common_task.get("start_height_min_m", 1.8)))
+        start_height_max_m = float(task_cfg.get("start_height_max_m",
+            common_task.get("start_height_max_m", 2.2)))
+        goal_height_min_m = float(task_cfg.get("goal_height_min_m",
+            common_task.get("goal_height_min_m", 1.8)))
+        goal_height_max_m = float(task_cfg.get("goal_height_max_m",
+            common_task.get("goal_height_max_m", 2.2)))
+        maximum_start_goal_height_difference_m = float(
+            task_cfg.get("maximum_start_goal_height_difference_m",
+                common_task.get("maximum_start_goal_height_difference_m", 0.20)))
+        minimum_start_goal_distance_m = float(
+            task_cfg.get("minimum_start_goal_distance_m",
+                common_task.get("minimum_start_goal_distance_m", 28.0)))
+        maximum_start_goal_distance_m = float(
+            task_cfg.get("maximum_start_goal_distance_m",
+                common_task.get("maximum_start_goal_distance_m", 40.0)))
+        require_direct_path_blocked = bool(
+            task_cfg.get("require_direct_path_blocked",
+                common_task.get("require_direct_path_blocked", True)))
+        minimum_direct_blocker_count = int(
+            task_cfg.get("minimum_direct_blocker_count",
+                common_task.get("minimum_direct_blocker_count", 1)))
+        maximum_direct_blocker_count = int(
+            task_cfg.get("maximum_direct_blocker_count",
+                common_task.get("maximum_direct_blocker_count", 3)))
+        require_astar_reachable = bool(
+            task_cfg.get("require_astar_reachable",
+                common_task.get("require_astar_reachable", True)))
+        minimum_detour_ratio = float(
+            task_cfg.get("minimum_detour_ratio",
+                common_task.get("minimum_detour_ratio", 1.03)))
+        maximum_detour_ratio = float(
+            task_cfg.get("maximum_detour_ratio",
+                common_task.get("maximum_detour_ratio", 2.00)))
+
+        # Explicit overrides
+        overrides = profile_dict.get("overrides", {})
+
+        return SceneGenerationProfile(
+            name=name,
+            enabled=enabled,
+            scene_count=scene_count,
+            seed_offset=seed_offset,
+            radius_min_m=radius_min_m,
+            radius_max_m=radius_max_m,
+            count_min=count_min,
+            count_max=count_max,
+            density_enabled=density_enabled,
+            density_mode=density_mode,
+            density_target_min=density_target_min,
+            density_target_max=density_target_max,
+            height_min_m=height_min_m,
+            height_max_m=height_max_m,
+            require_full_vertical_blocking=require_full_vertical_blocking,
+            region_boundary_margin_m=region_boundary_margin_m,
+            minimum_surface_gap_m=minimum_surface_gap_m,
+            minimum_post_inflation_gap_m=minimum_post_inflation_gap_m,
+            allow_overlap=allow_overlap,
+            vehicle_radius_m=vehicle_radius_m,
+            safety_margin_m=safety_margin_m,
+            tasks_per_scene=tasks_per_scene,
+            start_sampling_region=start_sampling_region,
+            goal_sampling_region=goal_sampling_region,
+            start_height_min_m=start_height_min_m,
+            start_height_max_m=start_height_max_m,
+            goal_height_min_m=goal_height_min_m,
+            goal_height_max_m=goal_height_max_m,
+            maximum_start_goal_height_difference_m=maximum_start_goal_height_difference_m,
+            minimum_start_goal_distance_m=minimum_start_goal_distance_m,
+            maximum_start_goal_distance_m=maximum_start_goal_distance_m,
+            require_direct_path_blocked=require_direct_path_blocked,
+            minimum_direct_blocker_count=minimum_direct_blocker_count,
+            maximum_direct_blocker_count=maximum_direct_blocker_count,
+            require_astar_reachable=require_astar_reachable,
+            minimum_detour_ratio=minimum_detour_ratio,
+            maximum_detour_ratio=maximum_detour_ratio,
+            overrides=overrides,
+        )
+
+
+def load_scene_profiles(config):
+    """Load enabled scene generation profiles from config.
+
+    Returns:
+        list of SceneGenerationProfile (only enabled profiles, in YAML order).
+    """
+    sg_cfg = config.get("global", {}).get("scene_generation", {})
+    source = sg_cfg.get("source", "procedural_yaml")
+
+    if source != "procedural_profiles":
+        # Legacy mode: no profiles
+        return []
+
+    profiles_raw = sg_cfg.get("profiles", [])
+    if not profiles_raw:
+        rospy.logwarn("[Profiles] source='procedural_profiles' but profiles list is empty.")
+        return []
+
+    profiles = []
+    seen_names = set()
+    for p in profiles_raw:
+        profile = SceneGenerationProfile.from_yaml_dict(p, sg_cfg)
+        if not profile.enabled:
+            rospy.loginfo("[Profiles] Skipping disabled profile '%s'.", profile.name)
+            continue
+        if profile.name in seen_names:
+            raise ValueError("Duplicate profile name: '{}'".format(profile.name))
+        seen_names.add(profile.name)
+        profiles.append(profile)
+
+    rospy.loginfo("[Profiles] Loaded %d enabled profiles: %s",
+                  len(profiles), [p.name for p in profiles])
+    return profiles
 
 
 # ============================================================================
@@ -167,6 +508,10 @@ class ObservabilityAuditResult:
 class YamlCylinderSceneGenerator:
     """Generate random cylinder obstacle scenes from YAML configuration.
 
+    Supports two modes:
+      - Legacy (source="procedural_yaml"): single flat cylinder config.
+      - Profile (source="procedural_profiles"): density-driven per-profile generation.
+
     Only cylinder obstacles are generated.
     The obstacle generation region is not treated as a wall or flight boundary.
     Space outside the obstacle generation region remains traversable.
@@ -175,7 +520,8 @@ class YamlCylinderSceneGenerator:
     def __init__(self, config):
         cfg = config.get("global", {}).get("scene_generation", {})
         self._cfg = cfg
-        self._cyl_cfg = cfg.get("cylinder", {})
+        self._source = cfg.get("source", "procedural_yaml")
+        self._legacy_cyl_cfg = cfg.get("cylinder", {})
         self._topo_cfg = cfg.get("topology_validation", {})
 
         self.obstacle_region = ObstacleRegion(
@@ -187,13 +533,20 @@ class YamlCylinderSceneGenerator:
             z_max=float(cfg.get("obstacle_region", {}).get("z_max", 6.0)),
         )
 
-        self.max_scene_attempts = int(cfg.get("max_scene_generation_attempts", 200))
-        self.max_obs_attempts = int(cfg.get("max_obstacle_sampling_attempts", 5000))
-        self.region_margin = float(self._cyl_cfg.get("region_boundary_margin_m", 0.30))
-        self.min_surface_gap = float(self._cyl_cfg.get("minimum_surface_gap_m", 1.20))
-        self.min_inflated_gap = float(self._cyl_cfg.get("minimum_inflated_gap_m", 0.60))
-        self.allow_overlap = bool(self._cyl_cfg.get("allow_overlap", False))
-        self.allow_inflated_merge = bool(self._cyl_cfg.get("allow_inflated_component_merging", False))
+        exec_cfg = cfg.get("execution", {})
+        self.max_scene_attempts = int(exec_cfg.get(
+            "max_generation_attempts_per_scene",
+            cfg.get("max_scene_generation_attempts", 500)))
+        self.max_obs_attempts = int(exec_cfg.get(
+            "max_obstacle_sampling_attempts",
+            cfg.get("max_obstacle_sampling_attempts", 5000)))
+
+        # Legacy params (used when source != "procedural_profiles")
+        self.region_margin = float(self._legacy_cyl_cfg.get("region_boundary_margin_m", 0.30))
+        self.min_surface_gap = float(self._legacy_cyl_cfg.get("minimum_surface_gap_m", 1.20))
+        self.min_inflated_gap = float(self._legacy_cyl_cfg.get("minimum_inflated_gap_m", 0.60))
+        self.allow_overlap = bool(self._legacy_cyl_cfg.get("allow_overlap", False))
+        self.allow_inflated_merge = bool(self._legacy_cyl_cfg.get("allow_inflated_component_merging", False))
 
         self.vehicle_r = float(self._topo_cfg.get("vehicle_radius_m", 0.30))
         self.safety_m = float(self._topo_cfg.get("safety_margin_m", 0.10))
@@ -202,36 +555,54 @@ class YamlCylinderSceneGenerator:
         self.base_seed = int(cfg.get("seed", 12345))
         self._rng = None
 
+        # Profile mode: loaded profiles
+        self._profiles = []
+        if self._source == "procedural_profiles":
+            self._profiles = load_scene_profiles(config)
+
+    @property
+    def is_profile_mode(self):
+        return self._source == "procedural_profiles" and len(self._profiles) > 0
+
+    def get_profiles(self):
+        return list(self._profiles)
+
     def set_seed(self, seed):
         self.base_seed = int(seed)
-        self._rng = random.Random(self.base_seed)
+        self._rng = np.random.Generator(np.random.PCG64(self.base_seed))
+
+    def _make_np_rng(self, seed):
+        """Create a numpy Generator for reproducible randomness."""
+        return np.random.Generator(np.random.PCG64(int(seed)))
 
     def _make_rng(self, sub_seed):
+        """Legacy random.Random (for backward compat)."""
         return random.Random(self.base_seed + int(sub_seed))
 
-    def generate_scene(self, attempt_sub_seed=0):
-        """Generate one obstacle layout. Returns (obstacles, rejection).
+    # ── Legacy generation ────────────────────────────────────────────
 
-        On failure, returns ([], reason_string). Caller should retry with
-        a different sub_seed.
+    def generate_scene(self, attempt_sub_seed=0):
+        """Legacy generate one obstacle layout. Returns (obstacles, rejection).
+
+        Used when source != "procedural_profiles".
+        On failure, returns ([], reason_string).
         """
         rng = self._make_rng(attempt_sub_seed)
 
-        count_min = int(self._cyl_cfg.get("count_min", 4))
-        count_max = int(self._cyl_cfg.get("count_max", 12))
+        count_min = int(self._legacy_cyl_cfg.get("count_min", 4))
+        count_max = int(self._legacy_cyl_cfg.get("count_max", 12))
         n_obs = rng.randint(count_min, count_max)
 
-        radius_min = float(self._cyl_cfg.get("radius_min_m", 0.40))
-        radius_max = float(self._cyl_cfg.get("radius_max_m", 1.20))
-        height_min = float(self._cyl_cfg.get("height_min_m", 5.0))
-        height_max = float(self._cyl_cfg.get("height_max_m", 6.0))
+        radius_min = float(self._legacy_cyl_cfg.get("radius_min_m", 0.40))
+        radius_max = float(self._legacy_cyl_cfg.get("radius_max_m", 1.20))
+        height_min = float(self._legacy_cyl_cfg.get("height_min_m", 5.0))
+        height_max = float(self._legacy_cyl_cfg.get("height_max_m", 6.0))
 
         obstacles = []
-        sampling_failures = 0
 
         for i in range(n_obs):
             placed = False
-            for attempt in range(self.max_obs_attempts):
+            for _attempt in range(self.max_obs_attempts):
                 radius = rng.uniform(radius_min, radius_max)
                 height = rng.uniform(height_min, height_max)
                 z = rng.uniform(self.obstacle_region.z_min + height / 2.0,
@@ -239,7 +610,6 @@ class YamlCylinderSceneGenerator:
                 if height / 2.0 >= z - self.obstacle_region.z_min:
                     z = self.obstacle_region.z_min + height / 2.0 + 0.01
 
-                # Random centre within region, accounting for radius + margin
                 cx = rng.uniform(
                     self.obstacle_region.x_min + radius + self.region_margin,
                     self.obstacle_region.x_max - radius - self.region_margin)
@@ -247,18 +617,15 @@ class YamlCylinderSceneGenerator:
                     self.obstacle_region.y_min + radius + self.region_margin,
                     self.obstacle_region.y_max - radius - self.region_margin)
 
-                # Check against existing obstacles
                 valid = True
                 center_xy = np.array([cx, cy])
                 for prev in obstacles:
                     prev_xy = prev.center_xy()
                     d = float(np.linalg.norm(center_xy - prev_xy))
-                    # Surface gap
                     surface_gap = d - radius - prev.radius_m
                     if surface_gap < self.min_surface_gap:
                         valid = False
                         break
-                    # Inflated gap
                     infl_r_i = radius + self.inflated_extra
                     infl_r_j = prev.radius_m + self.inflated_extra
                     inflated_gap = d - infl_r_i - infl_r_j
@@ -277,8 +644,6 @@ class YamlCylinderSceneGenerator:
                     obstacles.append(obs)
                     placed = True
                     break
-                else:
-                    sampling_failures += 1
 
             if not placed:
                 return [], "SCENE_OBSTACLE_SAMPLING_EXHAUSTED"
@@ -287,6 +652,170 @@ class YamlCylinderSceneGenerator:
             return [], "SCENE_OBSTACLE_SAMPLING_EXHAUSTED"
 
         return obstacles, ""
+
+    # ── Profile-based generation ─────────────────────────────────────
+
+    def generate_scene_from_profile(self, profile, effective_scene_seed,
+                                     scene_index_in_profile, attempt_index=0):
+        """Generate one scene using a specific profile.
+
+        Density-driven algorithm:
+          1. Sample target_density from [density_target_min, density_target_max]
+          2. Iteratively sample candidate cylinders
+          3. Check region boundary and pairwise passable gap
+          4. Accept if conditions satisfied
+          5. Stop when count >= count_min AND actual density >= target_density
+
+        Args:
+            profile: SceneGenerationProfile.
+            effective_scene_seed: seed for this scene (= base_seed + seed_offset + scene_index).
+            scene_index_in_profile: 0-based index within the profile.
+            attempt_index: generation retry index (0 for first attempt).
+
+        Returns:
+            (obstacles, rejection_reason, actual_target_density, density_mode)
+        """
+        rng = self._make_np_rng(effective_scene_seed + attempt_index * 10007)
+
+        region_area = compute_region_area(self.obstacle_region)
+        density_mode = DensityMode.from_string(profile.density_mode)
+
+        # Sample target density
+        if profile.density_enabled:
+            target_density = float(rng.uniform(
+                profile.density_target_min, profile.density_target_max))
+        else:
+            # Fixed count mode: no density target
+            target_density = None
+
+        obstacles = []
+        count_min = profile.count_min
+        count_max = profile.count_max
+        radius_min = profile.radius_min_m
+        radius_max = profile.radius_max_m
+        height_min = profile.height_min_m
+        height_max = profile.height_max_m
+        boundary_margin = profile.region_boundary_margin_m
+        min_surface_gap = profile.minimum_surface_gap_m
+        min_post_inflation_gap = profile.minimum_post_inflation_gap_m
+        infl_radius = profile.inflation_radius_m
+
+        # For fixed-count (density disabled): pick a target count
+        if not profile.density_enabled:
+            target_count = int(rng.integers(count_min, count_max + 1))
+        else:
+            target_count = None
+
+        obstacle_id_counter = 0
+        sampling_attempts_used = 0
+
+        while sampling_attempts_used < self.max_obs_attempts:
+            # Check count limit
+            if len(obstacles) >= count_max:
+                if profile.density_enabled:
+                    # Reached count_max but density may not be reached
+                    actual_density = compute_density(
+                        obstacles, region_area, density_mode,
+                        profile.vehicle_radius_m, profile.safety_margin_m)
+                    if actual_density < target_density:
+                        return ([], "SCENE_COUNT_LIMIT_REACHED_BEFORE_DENSITY",
+                                target_density, density_mode.value)
+                break
+
+            # Sample radius
+            radius = float(rng.uniform(radius_min, radius_max))
+            height = float(rng.uniform(height_min, height_max))
+
+            # Sample z
+            z_min_bound = self.obstacle_region.z_min + height / 2.0
+            z_max_bound = self.obstacle_region.z_max - height / 2.0
+            if z_min_bound >= z_max_bound:
+                z = self.obstacle_region.z_min + height / 2.0 + 0.01
+            else:
+                z = float(rng.uniform(z_min_bound, z_max_bound))
+
+            # Sample center (x, y) within region accounting for radius + margin
+            eff_margin = radius + boundary_margin
+            x_min_bound = self.obstacle_region.x_min + eff_margin
+            x_max_bound = self.obstacle_region.x_max - eff_margin
+            y_min_bound = self.obstacle_region.y_min + eff_margin
+            y_max_bound = self.obstacle_region.y_max - eff_margin
+
+            if x_min_bound >= x_max_bound or y_min_bound >= y_max_bound:
+                sampling_attempts_used += 1
+                continue
+
+            cx = float(rng.uniform(x_min_bound, x_max_bound))
+            cy = float(rng.uniform(y_min_bound, y_max_bound))
+
+            center_xy = np.array([cx, cy])
+
+            # Check region boundary
+            if not self.obstacle_region.contains_cylinder(center_xy, radius, boundary_margin):
+                sampling_attempts_used += 1
+                continue
+
+            # Check pairwise passable gap against all existing obstacles
+            pairwise_ok = True
+            for prev in obstacles:
+                prev_xy = prev.center_xy()
+                d = float(np.linalg.norm(center_xy - prev_xy))
+
+                # Surface gap
+                surface_gap = d - radius - prev.radius_m
+                if surface_gap < min_surface_gap:
+                    pairwise_ok = False
+                    break
+
+                # Post-inflation gap
+                # post_inflation_gap = surface_gap - 2 * (vehicle_r + safety_m)
+                post_inflation_gap = d - (radius + infl_radius) - (prev.radius_m + infl_radius)
+                if post_inflation_gap < min_post_inflation_gap:
+                    pairwise_ok = False
+                    break
+
+            if not pairwise_ok:
+                sampling_attempts_used += 1
+                continue
+
+            # Accept candidate
+            obs_id = "cylinder_{:04d}".format(obstacle_id_counter)
+            obstacle_id_counter += 1
+            obs = CylinderObstacleSpec(
+                obstacle_id=obs_id,
+                center_world=np.array([cx, cy, z]),
+                radius_m=radius,
+                height_m=height,
+            )
+            obstacles.append(obs)
+
+            # Check stopping condition
+            if profile.density_enabled and target_density is not None:
+                if len(obstacles) >= count_min:
+                    actual_density = compute_density(
+                        obstacles, region_area, density_mode,
+                        profile.vehicle_radius_m, profile.safety_margin_m)
+                    if actual_density >= target_density:
+                        # Success: density target reached with at least count_min obstacles
+                        break
+            elif target_count is not None:
+                if len(obstacles) >= target_count:
+                    break
+
+        # Post-generation checks
+        if len(obstacles) < count_min:
+            return ([], "SCENE_OBSTACLE_SAMPLING_EXHAUSTED",
+                    target_density, density_mode.value)
+
+        if profile.density_enabled and target_density is not None:
+            actual_density = compute_density(
+                obstacles, region_area, density_mode,
+                profile.vehicle_radius_m, profile.safety_margin_m)
+            if actual_density < target_density:
+                return ([], "SCENE_TARGET_DENSITY_UNREACHABLE",
+                        target_density, density_mode.value)
+
+        return (obstacles, "", target_density, density_mode.value)
 
     def generate_unity_objects(self, obstacles):
         """Convert CylinderObstacleSpec list to Unity Object_t dicts."""
@@ -712,6 +1241,13 @@ class StartGoalTaskGenerator:
             z_max=float(cfg.get("goal_height_max_m", 2.2)),
         )
 
+    def set_tasks_per_scene(self, n):
+        """Override the number of tasks to generate per scene.
+
+        Used by profile mode to apply profile-specific tasks_per_scene.
+        """
+        self.tasks_per_scene = int(n)
+
     def generate_tasks(self, obstacles, esdf, esdf_origin, esdf_res,
                        astar_planner_fn, seed=0):
         """Generate validated start-goal task pairs.
@@ -1050,22 +1586,38 @@ class SideCostEvaluator:
 # ============================================================================
 
 class SceneManifestWriter:
-    """Write scene and task manifests as YAML for reproducibility."""
+    """Write scene and task manifests as JSON for reproducibility.
+
+    v9: extended with profile, density, seed, and gap metadata fields.
+    """
 
     def __init__(self, output_dir):
         self.output_dir = output_dir
 
-    def write_scene_manifest(self, scene_id, base_seed, attempt, sub_seed,
+    def write_scene_manifest(self, scene_id, base_seed, profile_name,
+                              profile_index, scene_index_in_profile,
+                              effective_scene_seed, generation_attempt,
                               obstacles, validation, task_results,
-                              obstacle_region):
-        """Write scene.yaml manifest."""
-        import yaml as _yaml
+                              obstacle_region,
+                              target_density_mode, target_density,
+                              actual_raw_occupancy, actual_inflated_occupancy,
+                              actual_obstacles_per_100m2,
+                              vehicle_radius_m, safety_margin_m,
+                              min_surface_gap_required_m,
+                              min_post_inflation_gap_required_m,
+                              min_surface_gap_actual_m,
+                              min_post_inflation_gap_actual_m,
+                              generation_status="accepted"):
+        """Write scene_manifest.json with full metadata."""
+        radius_list = [o.radius_m for o in obstacles] if obstacles else [0.0]
         manifest = OrderedDict([
             ("scene_id", scene_id),
+            ("scene_profile_name", profile_name),
+            ("scene_profile_index", profile_index),
+            ("scene_index_in_profile", scene_index_in_profile),
             ("base_seed", base_seed),
-            ("generation_attempt", attempt),
-            ("accepted_subseed", sub_seed),
-            ("source", "procedural_yaml"),
+            ("profile_seed_offset", 0),  # filled by caller
+            ("effective_scene_seed", effective_scene_seed),
             ("obstacle_type", "cylinder"),
             ("obstacle_region", OrderedDict([
                 ("x_min", obstacle_region.x_min),
@@ -1075,10 +1627,27 @@ class SceneManifestWriter:
                 ("z_min", obstacle_region.z_min),
                 ("z_max", obstacle_region.z_max),
             ])),
-            ("outside_obstacle_region_policy", "free"),
+            ("target_density_mode", target_density_mode),
+            ("target_density", target_density),
+            ("actual_raw_occupancy_ratio", actual_raw_occupancy),
+            ("actual_inflated_occupancy_ratio", actual_inflated_occupancy),
+            ("actual_obstacles_per_100m2", actual_obstacles_per_100m2),
+            ("obstacle_count", len(obstacles)),
+            ("radius_min_actual_m", min(radius_list) if radius_list else 0.0),
+            ("radius_max_actual_m", max(radius_list) if radius_list else 0.0),
+            ("radius_mean_actual_m", sum(radius_list) / max(len(radius_list), 1)),
+            ("vehicle_radius_m", vehicle_radius_m),
+            ("safety_margin_m", safety_margin_m),
+            ("minimum_surface_gap_required_m", min_surface_gap_required_m),
+            ("minimum_post_inflation_gap_required_m", min_post_inflation_gap_required_m),
+            ("minimum_surface_gap_actual_m", min_surface_gap_actual_m),
+            ("minimum_post_inflation_gap_actual_m", min_post_inflation_gap_actual_m),
+            ("generation_attempt_index", generation_attempt),
+            ("generation_status", generation_status),
             ("obstacles", [o.to_dict() for o in obstacles]),
             ("validation", OrderedDict([
                 ("valid", validation.valid),
+                ("rejection_reason", validation.rejection_reason),
                 ("minimum_surface_gap_m", validation.minimum_surface_gap_m),
                 ("minimum_inflated_gap_m", validation.minimum_inflated_gap_m),
                 ("inflated_components", validation.inflated_components),
@@ -1090,20 +1659,25 @@ class SceneManifestWriter:
             ])),
         ])
 
-        scene_dir = os.path.join(self.output_dir, "generated_scenes", scene_id)
+        scene_dir = os.path.join(self.output_dir, "scenes", profile_name, scene_id)
         os.makedirs(scene_dir, exist_ok=True)
-        path = os.path.join(scene_dir, "scene.yaml")
+        path = os.path.join(scene_dir, "scene_manifest.json")
         with open(path, "w") as f:
-            _yaml.dump(manifest, f, default_flow_style=False, allow_unicode=True,
+            json.dump(manifest, f, indent=2, sort_keys=False)
+        # Also write a YAML copy for readability
+        yaml_path = os.path.join(scene_dir, "scene_manifest.yaml")
+        with open(yaml_path, "w") as f:
+            yaml.dump(manifest, f, default_flow_style=False, allow_unicode=True,
                        sort_keys=False)
         return path
 
-    def write_task_manifest(self, scene_id, task_id, start, goal, validation):
-        """Write task_{task_id}.yaml manifest."""
-        import yaml as _yaml
+    def write_task_manifest(self, scene_id, task_id, start, goal, validation,
+                             profile_name=""):
+        """Write task manifest as JSON."""
         manifest = OrderedDict([
             ("task_id", task_id),
             ("scene_id", scene_id),
+            ("scene_profile_name", profile_name),
             ("start", [float(v) for v in start]),
             ("goal", [float(v) for v in goal]),
             ("direct_distance_m", validation.direct_distance_m),
@@ -1126,11 +1700,40 @@ class SceneManifestWriter:
             ("side_cost_difference_ratio", validation.side_cost_difference_ratio),
             ("global_side_choice_valid", validation.global_side_choice_valid),
         ])
-        scene_dir = os.path.join(self.output_dir, "generated_scenes", scene_id)
-        path = os.path.join(scene_dir, "task_{}.yaml".format(task_id))
+        scene_dir = os.path.join(self.output_dir, "scenes", profile_name, scene_id)
+        os.makedirs(scene_dir, exist_ok=True)
+        path = os.path.join(scene_dir, "task_{}.json".format(task_id))
         with open(path, "w") as f:
-            _yaml.dump(manifest, f, default_flow_style=False, allow_unicode=True,
-                       sort_keys=False)
+            json.dump(manifest, f, indent=2, sort_keys=False)
+        return path
+
+
+class SceneGenerationFailureManifestWriter:
+    """Write failure manifests when scene generation is exhausted."""
+
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+
+    def write_failure_manifest(self, profile_name, profile_index,
+                                scene_index_in_profile, effective_scene_seed,
+                                failure_reason, num_attempts):
+        """Write a generation failure manifest."""
+        failed_dir = os.path.join(self.output_dir, "_failed", "scene_generation")
+        os.makedirs(failed_dir, exist_ok=True)
+        manifest = OrderedDict([
+            ("profile_name", profile_name),
+            ("profile_index", profile_index),
+            ("scene_index_in_profile", scene_index_in_profile),
+            ("effective_scene_seed", effective_scene_seed),
+            ("failure_reason", failure_reason),
+            ("generation_attempts_exhausted", num_attempts),
+            ("timestamp_utc", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+        ])
+        fname = "failure_{}_scene_{:06d}.json".format(
+            profile_name, scene_index_in_profile)
+        path = os.path.join(failed_dir, fname)
+        with open(path, "w") as f:
+            json.dump(manifest, f, indent=2, sort_keys=False)
         return path
 
 

@@ -349,6 +349,99 @@ def body_flu_to_world_quat(vector_flu, quaternion_xyzw):
 
 
 # ============================================================================
+#  Runtime enums, constants & plan snapshot  (v11)
+# ============================================================================
+
+from enum import Enum
+from dataclasses import dataclass, field
+
+
+class PlannerMode(Enum):
+    """Online planner operational mode."""
+    FRESH_PLAN = "FRESH_PLAN"
+    CACHED_PLAN = "CACHED_PLAN"
+    RECOVERY = "RECOVERY"
+    ABORT = "ABORT"
+
+
+class ControlMode(Enum):
+    """Per-step control generation mode."""
+    TRACK_TRAJECTORY = "TRACK_TRAJECTORY"
+    ROTATE_IN_PLACE = "ROTATE_IN_PLACE"
+    EMERGENCY_STOP = "EMERGENCY_STOP"
+
+
+class TrendMode(Enum):
+    """Trend label generation mode."""
+    TRACK_GUIDE = "TRACK_GUIDE"
+    RECOVERY = "RECOVERY"
+
+
+# ── Trend horizontal class constants (13 classes) ───────────────────
+TREND_HORIZONTAL_CLASS_COUNT = 13
+TREND_RECOVER_LEFT_CLASS = 0
+TREND_NORMAL_CLASS_OFFSET = 1       # old 0–10  →  new 1–11
+TREND_RECOVER_RIGHT_CLASS = 12
+
+# Vertical bins unchanged
+TREND_VERTICAL_CLASS_COUNT = 7
+
+
+@dataclass(frozen=True)
+class LocalPlanSnapshot:
+    """Immutable snapshot of the most recent successful local plan.
+
+    The snapshot is created once when planning succeeds and is never
+    mutated in-place.  Control and Trend labels read from it but do
+    not modify it.
+    """
+    plan_id: int
+    plan_timestamp_s: float
+
+    source_frame_id: int
+    source_state_timestamp_s: float
+
+    guide_world: np.ndarray
+    guide_path_index: int
+
+    terminal_world: np.ndarray
+    terminal_path_index: int
+
+    reference_path_start_index: int
+    reference_path_end_index: int
+
+    trajectory: object               # list of _TrajectoryPoint or compatible
+    trajectory_duration_s: float
+
+    planner_status: str
+    minimum_clearance_m: float
+
+    terminal_scale: float
+    speed_scale: float
+
+    def __post_init__(self):
+        """Validate invariants after construction (frozen dataclass)."""
+        if not isinstance(self.plan_id, int) or self.plan_id < 0:
+            raise ValueError("plan_id must be a non-negative int")
+        if self.plan_timestamp_s < 0.0:
+            raise ValueError("plan_timestamp_s must be >= 0")
+        if not np.all(np.isfinite(self.guide_world)):
+            raise ValueError("guide_world must be finite")
+        if not np.all(np.isfinite(self.terminal_world)):
+            raise ValueError("terminal_world must be finite")
+        if self.trajectory_duration_s < 0.0:
+            raise ValueError("trajectory_duration_s must be >= 0")
+        if not (0.0 < self.terminal_scale <= 1.0):
+            raise ValueError(
+                "terminal_scale must be in (0, 1], got {}".format(
+                    self.terminal_scale))
+        if not (0.0 < self.speed_scale <= 1.0):
+            raise ValueError(
+                "speed_scale must be in (0, 1], got {}".format(
+                    self.speed_scale))
+
+
+# ============================================================================
 #  Vehicle / camera builders  (KEPT EXACTLY AS ORIGINAL – compatibility)
 # ============================================================================
 

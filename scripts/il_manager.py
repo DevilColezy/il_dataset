@@ -75,6 +75,14 @@ from il_common import (
     body_rfu_to_flu, body_flu_to_rfu, world_vector_to_body_flu,
     world_vector_to_body_flu_quat,
     body_flu_to_world_quat,
+    # v11: runtime enums, constants & plan snapshot
+    PlannerMode, ControlMode, TrendMode,
+    LocalPlanSnapshot,
+    TREND_HORIZONTAL_CLASS_COUNT,
+    TREND_RECOVER_LEFT_CLASS,
+    TREND_NORMAL_CLASS_OFFSET,
+    TREND_RECOVER_RIGHT_CLASS,
+    TREND_VERTICAL_CLASS_COUNT,
 )
 
 # Phase 2: observed map and guide selector
@@ -98,7 +106,12 @@ try:
         SceneValidationResult, TaskValidationResult, ObservabilityAuditResult,
         YamlCylinderSceneGenerator, CylinderSceneValidator,
         StartGoalTaskGenerator, SideCostEvaluator,
-        SceneManifestWriter, ObstacleVisibilityAuditor,
+        SceneManifestWriter, SceneGenerationFailureManifestWriter,
+        ObstacleVisibilityAuditor,
+        SceneGenerationProfile, load_scene_profiles,
+        compute_density, compute_raw_occupancy, compute_inflated_occupancy,
+        compute_obstacles_per_100m2, compute_region_area,
+        compute_pairwise_min_gaps, DensityMode,
     )
     _SCENARIO_AVAILABLE = True
 except ImportError:
@@ -310,9 +323,10 @@ class State(Enum):
 class ILManager:
     """State-machine orchestrator for IL dataset collection."""
 
-    # ── Schema v8 ordered field list for csv.DictWriter ───────────────
-    # Phase 2 adds observed map, guide selection, and planner diagnostics.
-    DATA_SCHEMA_V10_FIELDS = [
+    # ── Schema v11 ordered field list for csv.DictWriter ───────────────
+    # v11 adds: planner/control/trend modes, guide/trajectory cache fields,
+    # 13-class trend horizontal labels, recovery fields, planner retry stats.
+    DATA_SCHEMA_V11_FIELDS = [
         # -- time & matching --
         "timestamp_ns", "receive_timestamp_ns", "frame_id",
         "trajectory_time_s", "latency_ms", "match_method",
@@ -360,14 +374,24 @@ class ILManager:
         "global_direction_valid",
         "global_dir_x_flu", "global_dir_y_flu", "global_dir_z_flu",
         "global_distance_m", "global_distance_norm",
-        # -- temporary trend labels (stage 2: farthest_visible_astar_waypoint) --
+        # -- v11: runtime mode enums --
+        "planner_mode", "control_mode", "trend_mode",
+        # -- temporary trend labels (v11: 13-class horizontal) --
         "trend_label_valid", "guide_source",
         "guide_x_world", "guide_y_world", "guide_z_world",
         "guide_dir_x_flu_exact", "guide_dir_y_flu_exact", "guide_dir_z_flu_exact",
         "guide_distance_m", "guide_distance_norm",
         "guide_azimuth_rad", "guide_elevation_rad",
         "guide_azimuth_bin", "guide_elevation_bin",
-        # guide_azimuth_soft_0 ... guide_elevation_soft_{V-1} (appended dynamically)
+        # v11: 13-class trend horizontal
+        "trend_horizontal_class_13", "trend_horizontal_class_count",
+        "trend_normal_horizontal_class_11",
+        # guide_azimuth_soft_0 ... guide_azimuth_soft_12 (appended dynamically)
+        # guide_elevation_soft_0 ... guide_elevation_soft_{V-1} (appended dynamically)
+        # -- v11: guide cache fields --
+        "guide_plan_id", "guide_cache_age_s", "guide_cache_valid",
+        "guide_target_x_world", "guide_target_y_world", "guide_target_z_world",
+        "guide_target_path_index",
         # -- depth & collision --
         "depth_file", "collision",
         # -- start/goal --
@@ -378,6 +402,16 @@ class ILManager:
         "local_goal_index", "plan_id", "plan_time_from_start_s",
         "planner_status", "planner_success", "planner_compute_ms",
         "planner_min_clearance", "distance_to_final_goal",
+        # -- v11: planner scheduling & retry --
+        "plan_source_frame_id", "plan_age_s", "plan_is_fresh",
+        "plan_cache_valid",
+        "planner_due", "planner_attempted", "planner_retry_count",
+        "terminal_scale_used", "speed_scale_used",
+        # -- v11: recovery fields --
+        "recovery_direction",
+        "recovery_target_x_world", "recovery_target_y_world",
+        "recovery_target_z_world", "recovery_target_path_index",
+        "recovery_elapsed_s",
         # -- legacy compatibility --
         "legacy_state_vx_rfu", "legacy_state_vy_rfu", "legacy_state_vz_rfu",
         "legacy_plan_age_ms",
@@ -516,6 +550,7 @@ class ILManager:
         self._task_generator = None
         self._side_cost_eval = None
         self._manifest_writer = None
+        self._failure_manifest_writer = None
         self._obs_auditor = None
 
         if self._use_scene_gen and _SCENARIO_AVAILABLE:
@@ -524,8 +559,24 @@ class ILManager:
             self._task_generator = StartGoalTaskGenerator(config)
             self._side_cost_eval = SideCostEvaluator(config)
             self._manifest_writer = SceneManifestWriter(self.output_root)
+            self._failure_manifest_writer = SceneGenerationFailureManifestWriter(self.output_root)
             self._obs_auditor = ObstacleVisibilityAuditor(config)
             rospy.loginfo("[Manager] Phase 3: scene + task generation + observability audit enabled.")
+
+            # ── Load profiles if in procedural_profiles mode ────────
+            if sg_cfg.get("source", "") == "procedural_profiles":
+                self._enabled_scene_profiles = load_scene_profiles(config)
+                if self._enabled_scene_profiles:
+                    self._use_profile_mode = True
+                    self._scene_profile_index = 0
+                    self._scene_index_in_profile = 0
+                    self._task_index_in_scene = 0
+                    self._current_profile = self._enabled_scene_profiles[0]
+                    self._current_profile_name = self._current_profile.name
+                    rospy.loginfo("[Manager] Profile mode: %d profiles loaded. Starting with '%s'.",
+                                  len(self._enabled_scene_profiles), self._current_profile_name)
+                else:
+                    rospy.logwarn("[Manager] procedural_profiles source but no enabled profiles found.")
         elif self._use_scene_gen:
             rospy.logwarn("[Manager] Phase 3 modules not available.")
             self._use_scene_gen = False
@@ -575,6 +626,19 @@ class ILManager:
         self._invalid_obs_frame_count = 0
         self._observability_trigger_count = 0
         self._observability_consistent_count = 0
+
+        # ── Profile scheduling state (v9 multi-profile) ─────────
+        self._use_profile_mode = False
+        self._enabled_scene_profiles = []     # list of SceneGenerationProfile
+        self._scene_profile_index = 0         # which profile we're on
+        self._scene_index_in_profile = 0      # which scene within current profile
+        self._task_index_in_scene = 0         # which task within current scene
+        self._current_profile = None          # SceneGenerationProfile or None
+        self._current_profile_name = ""
+        self._current_effective_scene_seed = 0
+        self._current_target_density = None
+        self._current_target_density_mode = ""
+        self._failure_manifest_writer = None
 
         # State machine
         self.state = State.BOOT
@@ -734,9 +798,19 @@ class ILManager:
     def run(self):
         """Main entry point with full cleanup guarantee."""
         rospy.loginfo("=" * 60)
-        rospy.loginfo("  IL Manager v3 – FSM starting")
+        rospy.loginfo("  IL Manager v9 – FSM starting")
         rospy.loginfo("  Output: %s", self.output_root)
-        rospy.loginfo("  Scenes: %d", len(self.cfg["scenes"]))
+        if self._use_profile_mode:
+            total_scenes = sum(p.scene_count for p in self._enabled_scene_profiles)
+            rospy.loginfo("  Profiles: %d  |  Total scenes: %d",
+                          len(self._enabled_scene_profiles), total_scenes)
+            for p in self._enabled_scene_profiles:
+                rospy.loginfo("    • %s: %d scenes (density=%s r=%.2f–%.2f m count=%d–%d)",
+                              p.name, p.scene_count, p.density_mode,
+                              p.radius_min_m, p.radius_max_m,
+                              p.count_min, p.count_max)
+        else:
+            rospy.loginfo("  Scenes: %d", len(self.cfg["scenes"]))
         rospy.loginfo("=" * 60)
 
         # ── Clean output directories before starting ──────────
@@ -1015,7 +1089,130 @@ class ILManager:
             time.sleep(0.2)
 
     def _st_generate_obstacle_config(self):
-        # Phase 3: new scene generation pipeline
+        # ── Profile mode: multi-profile scene generation ────────────
+        if (self._use_profile_mode and self._scene_generator is not None
+                and len(self._enabled_scene_profiles) > 0):
+            # Check if all profiles are done
+            if self._scene_profile_index >= len(self._enabled_scene_profiles):
+                rospy.loginfo("[FSM] All profiles complete. Entering DONE.")
+                self._enter_state(State.DONE)
+                return
+
+            self._current_profile = self._enabled_scene_profiles[self._scene_profile_index]
+            self._current_profile_name = self._current_profile.name
+
+            # Check if current profile scene count is done
+            if self._scene_index_in_profile >= self._current_profile.scene_count:
+                rospy.loginfo("[FSM] Profile '%s' complete (%d scenes). Advancing to next profile.",
+                              self._current_profile_name, self._scene_index_in_profile)
+                self._scene_profile_index += 1
+                self._scene_index_in_profile = 0
+                self._task_index_in_scene = 0
+                if self._scene_profile_index >= len(self._enabled_scene_profiles):
+                    rospy.loginfo("[FSM] All profiles complete. Entering DONE.")
+                    self._enter_state(State.DONE)
+                    return
+                self._current_profile = self._enabled_scene_profiles[self._scene_profile_index]
+                self._current_profile_name = self._current_profile.name
+
+            profile = self._current_profile
+            rospy.loginfo("=" * 60)
+            rospy.loginfo("  PROFILE '%s' [%d/%d]  scene %d/%d",
+                          profile.name,
+                          self._scene_profile_index + 1,
+                          len(self._enabled_scene_profiles),
+                          self._scene_index_in_profile + 1,
+                          profile.scene_count)
+            rospy.loginfo("=" * 60)
+
+            # Compute effective scene seed
+            base_seed = self._scene_generator.base_seed
+            effective_scene_seed = (base_seed
+                                    + profile.seed_offset
+                                    + self._scene_index_in_profile)
+            self._current_effective_scene_seed = effective_scene_seed
+
+            max_attempts = self._scene_generator.max_scene_attempts
+
+            obstacles = []
+            validation = None
+            target_density = None
+            density_mode_str = profile.density_mode
+            final_attempt_index = 0
+
+            for attempt in range(max_attempts):
+                (obstacles, rejection,
+                 target_density, density_mode_str) = \
+                    self._scene_generator.generate_scene_from_profile(
+                        profile, effective_scene_seed,
+                        self._scene_index_in_profile, attempt)
+
+                if not obstacles:
+                    rospy.logwarn("[SceneGen] Profile '%s' scene %d attempt %d: %s",
+                                  profile.name, self._scene_index_in_profile,
+                                  attempt + 1, rejection)
+                    continue
+
+                # Validate topology
+                validation = self._scene_validator.validate(
+                    obstacles, self._scene_generator.obstacle_region)
+                if validation.valid:
+                    self._current_scene_obstacles = obstacles
+                    self._current_scene_validation = validation
+                    self._current_scene_subseed = effective_scene_seed
+                    self._current_scene_attempt = attempt + 1
+                    self._current_target_density = target_density
+                    self._current_target_density_mode = density_mode_str
+                    final_attempt_index = attempt
+
+                    # Convert to Unity object format
+                    self.current_obstacles = [
+                        {"id": o.obstacle_id, "x": float(o.center_world[0]),
+                         "y": float(o.center_world[1]), "z": float(o.center_world[2]),
+                         "radius": o.radius_m, "diameter": o.diameter_m(),
+                         "height": o.height_m}
+                        for o in obstacles]
+                    self.current_obj_list = self._scene_generator.generate_unity_objects(obstacles)
+
+                    self.scene_label = "{}_{:06d}".format(
+                        profile.name, self._scene_index_in_profile)
+                    rospy.loginfo("[SceneGen] ACCEPTED: profile='%s' scene=%d obstacles=%d "
+                                  "attempt=%d/%d target_density=%.3f mode=%s",
+                                  profile.name, self._scene_index_in_profile,
+                                  len(obstacles), attempt + 1, max_attempts,
+                                  target_density if target_density is not None else -1.0,
+                                  density_mode_str)
+                    break
+                else:
+                    rospy.logwarn("[SceneGen] Profile '%s' scene %d attempt %d REJECTED: %s",
+                                  profile.name, self._scene_index_in_profile,
+                                  attempt + 1, validation.rejection_reason)
+
+            if not obstacles or (validation is not None and not validation.valid):
+                # Generation exhausted — write failure manifest and terminate
+                failure_reason = (validation.rejection_reason if validation is not None
+                                  else "SCENE_OBSTACLE_SAMPLING_EXHAUSTED")
+                rospy.logerr("[SceneGen] Profile '%s' scene %d: exhausted all %d attempts. "
+                             "Reason: %s. Terminating collection.",
+                             profile.name, self._scene_index_in_profile,
+                             max_attempts, failure_reason)
+                if self._failure_manifest_writer is not None:
+                    self._failure_manifest_writer.write_failure_manifest(
+                        profile.name,
+                        self._scene_profile_index,
+                        self._scene_index_in_profile,
+                        effective_scene_seed,
+                        failure_reason,
+                        max_attempts)
+                # Do NOT silently skip — terminate with ERROR
+                self._enter_state(State.ERROR)
+                return
+
+            self._enter_state(State.WAIT_SCENE_READY,
+                              self.g["fsm"]["scene_settle_timeout"])
+            return
+
+        # ── Legacy: Phase 3 single-profile scene generation ─────────
         if self._use_scene_gen and self._scene_generator is not None:
             if self.scene_idx >= int(self.g.get("scene_generation", {}).get(
                     "max_scene_generation_attempts", 200)):
@@ -1314,6 +1511,11 @@ class ILManager:
                 len(self._current_scene_obstacles) > 0):
             rospy.loginfo("[FSM] Phase 3: generating tasks via StartGoalTaskGenerator...")
 
+            # Apply profile-specific tasks_per_scene
+            if self._use_profile_mode and self._current_profile is not None:
+                self._task_generator.set_tasks_per_scene(
+                    self._current_profile.tasks_per_scene)
+
             # Use the il_trajectory module already loaded via importlib at
             # module level (line ~133), which is guaranteed to come from
             # THIS package regardless of devel-space symlink resolution.
@@ -1382,19 +1584,68 @@ class ILManager:
 
             # Write scene manifest
             if self._manifest_writer is not None and self._current_scene_validation is not None:
-                scene_id = "scene_{:04d}".format(self.scene_idx - 1)
+                if self._use_profile_mode and self._current_profile is not None:
+                    scene_id = "{}_{:06d}".format(
+                        self._current_profile_name, self._scene_index_in_profile)
+                else:
+                    scene_id = "scene_{:04d}".format(self.scene_idx - 1)
+
                 task_results_for_manifest = [
                     pair.get("_task_validation") for pair in self.current_pairs
                     if pair.get("_task_validation") is not None]
+
+                # Compute density metrics
+                obstacles = self._current_scene_obstacles
+                region = self._scene_generator.obstacle_region
+                region_area = (region.x_max - region.x_min) * (region.y_max - region.y_min)
+                actual_raw = compute_raw_occupancy(obstacles, region_area) if obstacles else 0.0
+                vehicle_r = float(self._scene_generator.vehicle_r)
+                safety_m = float(self._scene_generator.safety_m)
+                actual_inflated = compute_inflated_occupancy(obstacles, region_area, vehicle_r, safety_m)
+                actual_per_100m2 = compute_obstacles_per_100m2(obstacles, region_area)
+
+                # Compute gap stats
+                min_sg, min_pg = compute_pairwise_min_gaps(obstacles, vehicle_r, safety_m)
+
+                # Profile-aware gap requirements
+                if self._use_profile_mode and self._current_profile is not None:
+                    req_sg = self._current_profile.minimum_surface_gap_m
+                    req_pg = self._current_profile.minimum_post_inflation_gap_m
+                    profile_index = self._scene_profile_index
+                    profile_name = self._current_profile_name
+                    seed_offset = self._current_profile.seed_offset
+                else:
+                    req_sg = float(self._scene_generator.min_surface_gap)
+                    req_pg = float(self._scene_generator.min_inflated_gap)
+                    profile_index = 0
+                    profile_name = "legacy"
+                    seed_offset = 0
+
                 self._current_scene_manifest_path = self._manifest_writer.write_scene_manifest(
                     scene_id,
                     self._scene_generator.base_seed,
+                    profile_name,
+                    profile_index,
+                    self._scene_index_in_profile,
+                    self._current_effective_scene_seed,
                     self._current_scene_attempt,
-                    self._current_scene_subseed,
-                    self._current_scene_obstacles,
+                    obstacles,
                     self._current_scene_validation,
                     task_results_for_manifest,
-                    self._scene_generator.obstacle_region)
+                    self._scene_generator.obstacle_region,
+                    self._current_target_density_mode,
+                    self._current_target_density,
+                    actual_raw,
+                    actual_inflated,
+                    actual_per_100m2,
+                    vehicle_r,
+                    safety_m,
+                    req_sg,
+                    req_pg,
+                    min_sg,
+                    min_pg,
+                    generation_status="accepted")
+
                 # Write task manifests
                 self._current_task_manifest_paths = []
                 for ti, pair in enumerate(self.current_pairs):
@@ -1403,7 +1654,8 @@ class ILManager:
                         task_manifest_path = self._manifest_writer.write_task_manifest(
                             scene_id,
                             "task_{:03d}".format(ti),
-                            pair["start"], pair["goal"], tv)
+                            pair["start"], pair["goal"], tv,
+                            profile_name=profile_name)
                         self._current_task_manifest_paths.append(task_manifest_path)
 
             self._enter_state(State.PLAN_GLOBAL_PATHS)
@@ -1809,7 +2061,7 @@ class ILManager:
         v_bin_edges = np.linspace(-v_fov_rad / 2.0, v_fov_rad / 2.0, trend_v_bins)
 
         # ── Build dynamic field list with soft label columns ──────────
-        schema_fields = list(self.DATA_SCHEMA_V10_FIELDS)
+        schema_fields = list(self.DATA_SCHEMA_V11_FIELDS)
         # Insert soft label columns before depth_file
         depth_idx = schema_fields.index("depth_file")
         azi_soft_names = []
@@ -1897,8 +2149,65 @@ class ILManager:
         previous_command_velocity_flu = np.zeros(3, dtype=np.float64)
         previous_command_yaw_rate = 0.0
 
-        rospy.loginfo("[ONLINE-LOCKSTEP] Starting. ctrl=%.0fHz rec=%.0fHz dt_sample=%.3fs",
-                      ctrl_hz, rec_hz, dt_sample)
+        # ── v11: online runtime state ────────────────────────────────
+        online_rt = self.g.get("online_runtime", {})
+        planner_rate_hz = float(online_rt.get("planner_rate_hz", 20.0))
+        planner_phase = 0.0
+
+        retry_cfg = online_rt.get("planner_retry", {})
+        terminal_scales = list(retry_cfg.get(
+            "terminal_scale_sequence", [1.0, 0.75, 0.50, 0.30]))
+        speed_scales = list(retry_cfg.get(
+            "speed_scale_sequence", [1.0, 0.75, 0.50, 0.35]))
+        recovery_initial_scales = list(retry_cfg.get(
+            "recovery_initial_terminal_scales", [0.30, 0.50]))
+
+        rec_cfg = online_rt.get("recovery", {})
+        recovery_enabled = bool(rec_cfg.get("enabled", True))
+        recovery_lookahead_m = float(rec_cfg.get(
+            "path_lookahead_distance_m", 2.0))
+        recovery_yaw_deadband = float(rec_cfg.get("yaw_deadband_rad", 0.05))
+        recovery_max_yaw_rate = float(rec_cfg.get("max_yaw_rate_rps", 0.80))
+        recovery_yaw_gain = float(rec_cfg.get("yaw_gain", 1.50))
+        recovery_max_duration_s = float(rec_cfg.get(
+            "maximum_recovery_duration_s", 3.0))
+        recovery_max_steps = int(rec_cfg.get(
+            "maximum_recovery_control_steps", 90))
+        recovery_tie_break = str(rec_cfg.get("tie_break_direction", "right"))
+
+        # v11: cached plan state
+        self._latest_plan_snapshot = None  # LocalPlanSnapshot or None
+        planner_mode = PlannerMode.FRESH_PLAN  # current mode
+        control_mode = ControlMode.TRACK_TRAJECTORY
+        trend_mode = TrendMode.TRACK_GUIDE
+        plan_id_counter = 0
+
+        # v11: recovery state
+        recovery_elapsed_s = 0.0
+        recovery_step_count = 0
+        recovery_last_direction = ""  # "left" or "right"
+        recovery_target_world = np.zeros(3, dtype=np.float64)
+        recovery_target_path_index = -1
+
+        # v11: episode stats
+        self._fresh_plan_frame_count = 0
+        self._cached_plan_frame_count = 0
+        self._recovery_frame_count = 0
+        self._planner_attempt_count = 0
+        self._planner_success_count = 0
+        self._planner_failure_count = 0
+        self._planner_retry_success_count = 0
+        self._recovery_entry_count = 0
+        self._recovery_success_count = 0
+        self._recovery_timeout_count = 0
+        self._max_plan_age_s = 0.0
+        self._max_guide_cache_age_s = 0.0
+        self._recover_left_frame_count = 0
+        self._recover_right_frame_count = 0
+
+        rospy.loginfo("[ONLINE-LOCKSTEP] Starting. ctrl=%.0fHz rec=%.0fHz "
+                      "planner=%.0fHz dt_sample=%.3fs",
+                      ctrl_hz, rec_hz, planner_rate_hz, dt_sample)
 
         while not rospy.is_shutdown():
             if self._timed_out():
@@ -2069,154 +2378,244 @@ class ILManager:
                              self._invalid_obs_frame_count)
                 break
 
-            # ── Step 3: Plan from current state (x_t) ───────────────
-            # The expert command is sampled from a plan generated from x_t.
-            # Phase 2: uses observed ESDF and explicit guide/terminal.
+            # ── Step 3: Dual-frequency planner scheduling (v11) ──────
+            # Planner runs at planner_rate_hz; control at control_rate_hz.
+            # Phase accumulator determines if this is a planner tick.
+            planner_phase += planner_rate_hz / ctrl_hz
+            planner_due = False
+            if planner_phase >= 1.0:
+                planner_due = True
+                planner_phase -= 1.0
+
             result = None
             plan_success = False
             planner_compute_ms = 0.0
             planner_status_str = "NO_PLAN"
             planner_used_obs = 0
             planner_used_fallback = 0
+            plan_is_fresh = 0
+            plan_cache_valid_int = 0
+            plan_age_s = 0.0
+            plan_source_frame_id = -1
+            terminal_scale_used = 1.0
+            speed_scale_used = 1.0
+            planner_retry_count = 0
+            planner_attempted_int = 0
 
-            if self._cpp_planner is not None:
-                # ── ESDF selection ────────────────────────────────
-                if (self._use_observed_esdf and self._observed_esdf is not None and
-                        self._observed_esdf.is_built()):
-                    # Phase 2: upload observed ESDF every frame.
-                    esdf_arr = self._observed_esdf.get_esdf()
-                    known_arr = self._observed_esdf.get_known_mask()
-                    origin = self._observed_esdf.get_origin()
-                    res = self._observed_esdf.get_resolution()
-                    esdf_arr = np.ascontiguousarray(esdf_arr, dtype=np.float32)
-                    known_arr = np.ascontiguousarray(known_arr.astype(np.uint8))
-                    should_upload = (
-                        self._observed_esdf_cache is None or
-                        self._observed_esdf_cache.should_upload_to_cpp())
-                    if should_upload:
-                        upload_ok = self._cpp_planner.set_observed_esdf(
-                            esdf_arr, known_arr,
-                            np.array(origin, dtype=np.float64),
-                            float(res), False)
-                        if not upload_ok:
-                            raise RuntimeError("C++ rejected observed ESDF upload")
-                        if self._observed_esdf_cache is not None:
-                            self._observed_esdf_cache.on_uploaded()
-                    planner_used_obs = 1
-                elif not self._use_observed_esdf:
-                    # Global ESDF already uploaded once at init; no per-frame
-                    # upload needed.  planner_used_obs stays 0.
-                    pass
+            trajectory_time_s = sample_index * dt_sample
+
+            if planner_due and self._cpp_planner is not None:
+                planner_attempted_int = 1
+                self._planner_attempt_count += 1
+
+                # Project state to global path for progress tracking
+                prog_idx, prog_s = self._project_to_global_path(
+                    cur_pos, global_path, self._guide_progress_index)
+                if prog_idx >= 0:
+                    self._guide_progress_index = max(
+                        self._guide_progress_index, prog_idx)
+
+                if guide_sel.valid and len(ref_segment) >= 2:
+                    # Try planning with terminal/speed scale retry sequence
+                    for ts in terminal_scales:
+                        for ss in speed_scales:
+                            planner_retry_count += 1
+                            # Scale terminal
+                            scaled_terminal, scaled_terminal_idx = \
+                                self._scale_terminal(
+                                    guide_sel, global_path, ts,
+                                    self._guide_progress_index)
+                            if scaled_terminal is None:
+                                continue
+                            # Scale reference segment
+                            scaled_ref = self._scale_reference_segment(
+                                ref_segment, global_path,
+                                self._guide_progress_index,
+                                scaled_terminal_idx)
+
+                            # Call C++ planner
+                            t_plan_start = time.monotonic()
+                            try:
+                                state = _VehicleState()
+                                state.position = (
+                                    float(cur_pos[0]), float(cur_pos[1]),
+                                    float(cur_pos[2]))
+                                state.velocity = (
+                                    float(cur_vel[0]), float(cur_vel[1]),
+                                    float(cur_vel[2]))
+                                state.acceleration = (
+                                    float(dynamics_state.acceleration_world[0]),
+                                    float(dynamics_state.acceleration_world[1]),
+                                    float(dynamics_state.acceleration_world[2]))
+                                state.yaw = float(cur_yaw)
+                                state.yaw_rate = 0.0
+
+                                req = _LocalPlanningRequest()
+                                req.state = state
+                                req.previous_progress_s = previous_progress_s
+                                req.guide_waypoint = (
+                                    float(guide_sel.guide_position_world[0]),
+                                    float(guide_sel.guide_position_world[1]),
+                                    float(guide_sel.guide_position_world[2]))
+                                req.guide_waypoint_index = guide_sel.guide_path_index
+                                req.trajectory_terminal = (
+                                    float(scaled_terminal[0]),
+                                    float(scaled_terminal[1]),
+                                    float(scaled_terminal[2]))
+                                req.trajectory_terminal_index = scaled_terminal_idx
+                                for pt in scaled_ref:
+                                    req.reference_path_segment.append(
+                                        (float(pt[0]), float(pt[1]), float(pt[2])))
+                                req.forbid_unknown_space = False
+                                req.allow_global_map_fallback = False
+                                # Apply speed scale if C++ supports it
+                                if hasattr(req, 'speed_scale'):
+                                    req.speed_scale = ss
+                                result = self._cpp_planner.plan_local_with_request(req)
+
+                                t_plan_end = time.monotonic()
+                                planner_compute_ms = (t_plan_end - t_plan_start) * 1000.0
+                                self._total_replans += 1
+                                self._planning_times_ms.append(
+                                    result.planning_time_ms
+                                    if hasattr(result, 'planning_time_ms')
+                                    else planner_compute_ms)
+
+                                if result is not None and result.success:
+                                    plan_success = True
+                                    terminal_scale_used = ts
+                                    speed_scale_used = ss
+                                    planner_status_str = str(result.status)
+                                    break
+                                else:
+                                    planner_status_str = (
+                                        str(result.status)
+                                        if result is not None
+                                        else "PLAN_FAILED")
+                            except Exception as exc:
+                                rospy.logerr(
+                                    "[ONLINE-LOCKSTEP] Planner exception: %s", exc)
+                                planner_status_str = "PLANNER_EXCEPTION"
+
+                        if plan_success:
+                            break
+
+                if plan_success:
+                    # Build snapshot and update cache
+                    self._successful_replans += 1
+                    self._planner_success_count += 1
+                    consecutive_failures = 0
+                    plan_is_fresh = 1
+                    plan_source_frame_id = frame_id
+
+                    snapshot = LocalPlanSnapshot(
+                        plan_id=plan_id_counter,
+                        plan_timestamp_s=trajectory_time_s,
+                        source_frame_id=frame_id,
+                        source_state_timestamp_s=trajectory_time_s,
+                        guide_world=guide_sel.guide_position_world.copy(),
+                        guide_path_index=guide_sel.guide_path_index,
+                        terminal_world=np.array(
+                            [float(result.local_goal[0]),
+                             float(result.local_goal[1]),
+                             float(result.local_goal[2])],
+                            dtype=np.float64),
+                        terminal_path_index=result.local_goal_index,
+                        reference_path_start_index=self._guide_progress_index,
+                        reference_path_end_index=guide_sel.terminal_path_index,
+                        trajectory=result.trajectory,
+                        trajectory_duration_s=float(
+                            result.trajectory[-1].t)
+                        if len(result.trajectory) > 0 else 0.0,
+                        planner_status=planner_status_str,
+                        minimum_clearance_m=float(result.min_clearance),
+                        terminal_scale=terminal_scale_used,
+                        speed_scale=speed_scale_used,
+                    )
+                    self._latest_plan_snapshot = snapshot
+                    plan_id_counter += 1
+                    planner_mode = PlannerMode.FRESH_PLAN
+                    previous_progress_s = max(
+                        previous_progress_s, result.progress_s)
+                    self._executed_clearances.append(result.min_clearance)
+
+                    # Write local plan to CSV
+                    self._local_plans_file.write(
+                        "{},{},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},"
+                        "{:.4f},{:.4f},{:.4f},{:.4f},{},{},{},{},{},{:.2f},{:.4f}\n"
+                        .format(result.plan_id,
+                                int(t_request_mono * 1e9),
+                                state.position[0], state.position[1],
+                                state.position[2],
+                                state.velocity[0], state.velocity[1],
+                                state.velocity[2],
+                                state.yaw,
+                                result.local_goal[0], result.local_goal[1],
+                                result.local_goal[2],
+                                result.progress_s, result.progress_index,
+                                result.local_goal_index,
+                                int(result.status), result.success,
+                                result.planning_time_ms, result.min_clearance,
+                                len(result.trajectory)))
+                    self._local_plans_file.flush()
                 else:
-                    rospy.logwarn_throttle(
-                        1.0, "[ONLINE-LOCKSTEP] Observed ESDF unavailable; holding.")
-
-                t_plan_start = time.monotonic()
-                try:
-                    state = _VehicleState()
-                    state.position = (float(cur_pos[0]), float(cur_pos[1]),
-                                      float(cur_pos[2]))
-                    state.velocity = (float(cur_vel[0]), float(cur_vel[1]),
-                                      float(cur_vel[2]))
-                    state.acceleration = (
-                        float(dynamics_state.acceleration_world[0]),
-                        float(dynamics_state.acceleration_world[1]),
-                        float(dynamics_state.acceleration_world[2]))
-                    state.yaw = float(cur_yaw)
-                    state.yaw_rate = 0.0
-
-                    lp_cfg_local = self.g.get("planning", {}).get("local_planner", {})
-                    forbid_unknown = bool(lp_cfg_local.get("forbid_unknown_space", False))
-                    allow_fb = bool(lp_cfg_local.get("allow_global_map_fallback", False))
-
-                    if guide_sel.valid and len(ref_segment) >= 2:
-                        # Always preserve the explicit Guide/Terminal contract,
-                        # regardless of whether the planner map is global or
-                        # observed ESDF.
-                        _has_new_types = _LocalPlanningRequest is not None
-                        if _has_new_types:
-                            req = _LocalPlanningRequest()
-                            req.state = state
-                            req.previous_progress_s = previous_progress_s
-                            req.guide_waypoint = (
-                                float(guide_sel.guide_position_world[0]),
-                                float(guide_sel.guide_position_world[1]),
-                                float(guide_sel.guide_position_world[2]))
-                            req.guide_waypoint_index = guide_sel.guide_path_index
-                            req.trajectory_terminal = (
-                                float(guide_sel.terminal_position_world[0]),
-                                float(guide_sel.terminal_position_world[1]),
-                                float(guide_sel.terminal_position_world[2]))
-                            req.trajectory_terminal_index = guide_sel.terminal_path_index
-                            for pt in ref_segment:
-                                req.reference_path_segment.append(
-                                    (float(pt[0]), float(pt[1]), float(pt[2])))
-                            req.forbid_unknown_space = forbid_unknown
-                            req.allow_global_map_fallback = allow_fb
-                            result = self._cpp_planner.plan_local_with_request(req)
-                        else:
-                            raise RuntimeError(
-                                "C++ binding lacks LocalPlanningRequest; legacy online planning is forbidden")
-                    else:
-                        result = None
-
-                    t_plan_end = time.monotonic()
-                    planner_compute_ms = (t_plan_end - t_plan_start) * 1000.0
-                    self._total_replans += 1
-                    self._planning_times_ms.append(
-                        result.planning_time_ms if hasattr(result, 'planning_time_ms') else planner_compute_ms)
-
-                    if result is None:
-                        planner_status_str = (
-                            guide_sel.rejection_reason or
-                            "INVALID_GUIDE_OR_REFERENCE_SEGMENT")
-                        plan_success = False
-                        consecutive_failures += 1
-                    else:
-                        planner_status_str = str(result.status)
-                        plan_success = result.success
-                    # Check Phase 2 flags
-                    if result is not None and hasattr(result, 'used_global_fallback'):
-                        planner_used_fallback = 1 if result.used_global_fallback else 0
-                    if result is not None and hasattr(result, 'used_observed_esdf'):
-                        planner_used_obs = 1 if result.used_observed_esdf else planner_used_obs
-
-                    if result is not None and result.success:
-                        self._successful_replans += 1
-                        self._executed_clearances.append(result.min_clearance)
-                        previous_progress_s = max(previous_progress_s,
-                                                  result.progress_s)
-                        consecutive_failures = 0
-                        # Write local plan to CSV
-                        self._local_plans_file.write(
-                            "{},{},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},"
-                            "{:.4f},{:.4f},{:.4f},{:.4f},{},{},{},{},{},{:.2f},{:.4f}\n"
-                            .format(result.plan_id,
-                                    int(t_request_mono * 1e9),
-                                    state.position[0], state.position[1], state.position[2],
-                                    state.velocity[0], state.velocity[1], state.velocity[2],
-                                    state.yaw,
-                                    result.local_goal[0], result.local_goal[1], result.local_goal[2],
-                                    result.progress_s, result.progress_index, result.local_goal_index,
-                                    int(result.status), result.success,
-                                    result.planning_time_ms, result.min_clearance,
-                                    len(result.trajectory)))
-                        self._local_plans_file.flush()
-                    elif result is not None:
-                        self._failed_replans += 1
-                        consecutive_failures += 1
-                        if (int(result.status) == 5 or  # COLLISION
-                            (hasattr(_PlannerStatus, 'COLLISION') and
-                             result.status == _PlannerStatus.COLLISION)):
-                            self._emergency_hold_count += 1
-                except Exception as exc:
-                    rospy.logerr("[ONLINE-LOCKSTEP] Planner exception: %s", exc)
+                    self._failed_replans += 1
+                    self._planner_failure_count += 1
+                    if self._planner_retry_success_count < planner_retry_count:
+                        self._planner_retry_success_count = 0
                     consecutive_failures += 1
 
-            # ── Step 4: Build training row from x_t, plan result, depth ──
-            row = self._build_training_row_v8(
+                    # Check if cached trajectory is still valid
+                    if self._is_trajectory_cache_valid(
+                            self._latest_plan_snapshot,
+                            trajectory_time_s, cur_pos, cur_vel,
+                            planner_mode):
+                        planner_mode = PlannerMode.CACHED_PLAN
+                        plan_cache_valid_int = 1
+                    elif recovery_enabled:
+                        planner_mode = PlannerMode.RECOVERY
+                        self._recovery_entry_count += 1
+                        recovery_elapsed_s = 0.0
+                        recovery_step_count = 0
+                        # Compute recovery target from global A*
+                        recovery_target_world, recovery_target_path_index = \
+                            self._compute_recovery_target(
+                                global_path, self._guide_progress_index,
+                                recovery_lookahead_m)
+                    else:
+                        planner_mode = PlannerMode.ABORT
+            else:
+                # Not a planner tick: use cached plan or recovery
+                if self._is_trajectory_cache_valid(
+                        self._latest_plan_snapshot,
+                        trajectory_time_s, cur_pos, cur_vel,
+                        planner_mode):
+                    planner_mode = PlannerMode.CACHED_PLAN
+                    plan_cache_valid_int = 1
+                elif planner_mode == PlannerMode.RECOVERY:
+                    pass  # stay in recovery
+                elif recovery_enabled and self._latest_plan_snapshot is None:
+                    planner_mode = PlannerMode.RECOVERY
+                    self._recovery_entry_count += 1
+                    recovery_elapsed_s = 0.0
+                    recovery_step_count = 0
+                    recovery_target_world, recovery_target_path_index = \
+                        self._compute_recovery_target(
+                            global_path, self._guide_progress_index,
+                            recovery_lookahead_m)
+
+            # Compute plan age
+            if self._latest_plan_snapshot is not None:
+                plan_age_s = trajectory_time_s - \
+                    self._latest_plan_snapshot.plan_timestamp_s
+                self._max_plan_age_s = max(
+                    self._max_plan_age_s, plan_age_s)
+
+            # ── Step 4: Build training row (v11) ────────────────────
+            row = self._build_training_row_v9(
                 cur_pos, cur_vel, cur_yaw,
-                result, plan_success, planner_compute_ms,
+                self._latest_plan_snapshot,
+                plan_success, planner_compute_ms,
                 planner_status_str,
                 goal_np, goal_pt, global_path_length,
                 label_lookahead_time_s, max_guide_range,
@@ -2228,11 +2627,19 @@ class ILManager:
                 trend_sigma_bins, h_bin_edges, v_bin_edges,
                 azi_soft_names, ele_soft_names,
                 previous_progress_s,
-                # Phase 2 extras
                 guide_sel, ref_segment,
                 self._observed_map, self._observed_esdf,
                 planner_used_obs, planner_used_fallback,
                 dynamics_state.quaternion_world_body,
+                # v11 extras
+                planner_mode, control_mode, trend_mode,
+                plan_is_fresh, plan_cache_valid_int,
+                plan_source_frame_id, plan_age_s,
+                planner_due, planner_attempted_int,
+                planner_retry_count, terminal_scale_used, speed_scale_used,
+                recovery_target_world, recovery_target_path_index,
+                recovery_elapsed_s, recovery_last_direction,
+                self._guide_progress_index, global_path,
             )
             for axis, value in zip(
                     ("x", "y", "z"), dynamics_state.angular_velocity_body):
@@ -2346,18 +2753,187 @@ class ILManager:
             })
 
             # ── Step 5: Execute dt_sample to advance to x_(t+1) ──────
-            # The executed_next fields belong to x_(t+1).
-            if (final_actor == "expert" and result is not None and result.success and
-                    len(result.trajectory) > 0):
+            # v11: supports fresh-plan, cached-plan, recovery, and hover.
+            if planner_mode == PlannerMode.RECOVERY:
+                # Recovery: zero translation + yaw rotation toward recovery target
+                control_mode = ControlMode.ROTATE_IN_PLACE
+                trend_mode = TrendMode.RECOVERY
+
+                # Compute recovery yaw-rate command
+                recovery_direction = self._compute_recovery_direction(
+                    recovery_target_world, cur_pos, cur_yaw,
+                    recovery_yaw_deadband,
+                    recovery_last_direction, recovery_tie_break)
+                recovery_last_direction = recovery_direction
+
+                # Determine yaw-rate sign from direction
+                # FLU: left = positive y → positive yaw-rate (check convention)
+                # Current convention: yaw_rate_for_world_velocity uses
+                # tracking_gain * yaw_error. Let's compute yaw error directly.
+                delta_w = np.asarray(recovery_target_world) - cur_pos
+                target_yaw = math.atan2(
+                    float(delta_w[1]), float(delta_w[0])) - math.pi / 2.0
+                yaw_error = math.atan2(
+                    math.sin(target_yaw - cur_yaw),
+                    math.cos(target_yaw - cur_yaw))
+                recovery_yaw_rate_cmd = max(
+                    -recovery_max_yaw_rate,
+                    min(recovery_max_yaw_rate,
+                        recovery_yaw_gain * yaw_error))
+
                 (exec_next_pos, exec_next_vel, exec_next_yaw,
                  exec_next_yaw_rate, executed_command_velocity_flu,
                  executed_command_yaw_rate) = \
-                    self._execute_trajectory_segment(
-                        result, cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
-                        dt_sample, dt_ctrl, sample_index,
+                    self._execute_rotate_in_place(
+                        cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
+                        recovery_yaw_rate_cmd,
+                        dt_sample, dt_ctrl,
+                        max_velocity, max_acceleration, max_yaw_rate)
+
+                recovery_elapsed_s += dt_sample
+                recovery_step_count += 1
+                self._recovery_frame_count += 1
+                if recovery_direction == "left":
+                    self._recover_left_frame_count += 1
+                else:
+                    self._recover_right_frame_count += 1
+
+                # Set expert labels for recovery
+                row["expert_label_valid"] = 1
+                row["expert_vx_world"] = 0.0
+                row["expert_vy_world"] = 0.0
+                row["expert_vz_world"] = 0.0
+                row["expert_vx_flu"] = 0.0
+                row["expert_vy_flu"] = 0.0
+                row["expert_vz_flu"] = 0.0
+                row["expert_yaw_rate"] = round(recovery_yaw_rate_cmd, 6)
+                selected_velocity_flu = np.zeros(3, dtype=np.float64)
+                selected_yaw_rate = recovery_yaw_rate_cmd
+
+                # Check recovery timeout
+                if (recovery_elapsed_s >= recovery_max_duration_s or
+                        recovery_step_count >= recovery_max_steps):
+                    self._recovery_timeout_count += 1
+                    self._trajectory_exit_reason = "RECOVERY_TIMEOUT"
+                    rospy.logerr("[ONLINE-LOCKSTEP] Recovery timeout after "
+                                 "%.2fs / %d steps.",
+                                 recovery_elapsed_s, recovery_step_count)
+                    # Write final row and break
+                    if self._image_writer is not None and depth_u16 is not None:
+                        self._image_writer.submit(
+                            os.path.join(depth_dir, png_name), depth_u16)
+                    self._csv_writer.writerow(row)
+                    self._rec_written_rows += 1
+                    break
+
+                # Try to exit recovery if guide became visible
+                if guide_sel.valid and len(ref_segment) >= 2:
+                    # Attempt short-terminal re-planning from recovery
+                    for rts in recovery_initial_scales:
+                        scaled_term, scaled_term_idx = self._scale_terminal(
+                            guide_sel, global_path, rts,
+                            self._guide_progress_index)
+                        if scaled_term is None:
+                            continue
+                        scaled_ref = self._scale_reference_segment(
+                            ref_segment, global_path,
+                            self._guide_progress_index, scaled_term_idx)
+                        if len(scaled_ref) < 2:
+                            continue
+                        try:
+                            state_r = _VehicleState()
+                            state_r.position = (
+                                float(cur_pos[0]), float(cur_pos[1]),
+                                float(cur_pos[2]))
+                            state_r.velocity = (
+                                float(cur_vel[0]), float(cur_vel[1]),
+                                float(cur_vel[2]))
+                            state_r.acceleration = (0.0, 0.0, 0.0)
+                            state_r.yaw = float(cur_yaw)
+                            state_r.yaw_rate = 0.0
+                            req = _LocalPlanningRequest()
+                            req.state = state_r
+                            req.previous_progress_s = previous_progress_s
+                            req.guide_waypoint = (
+                                float(guide_sel.guide_position_world[0]),
+                                float(guide_sel.guide_position_world[1]),
+                                float(guide_sel.guide_position_world[2]))
+                            req.guide_waypoint_index = guide_sel.guide_path_index
+                            req.trajectory_terminal = (
+                                float(scaled_term[0]),
+                                float(scaled_term[1]),
+                                float(scaled_term[2]))
+                            req.trajectory_terminal_index = scaled_term_idx
+                            for pt in scaled_ref:
+                                req.reference_path_segment.append(
+                                    (float(pt[0]), float(pt[1]),
+                                     float(pt[2])))
+                            req.forbid_unknown_space = False
+                            req.allow_global_map_fallback = False
+                            recovery_result = \
+                                self._cpp_planner.plan_local_with_request(req)
+                            if (recovery_result is not None and
+                                    recovery_result.success):
+                                # Exit recovery
+                                planner_mode = PlannerMode.FRESH_PLAN
+                                control_mode = ControlMode.TRACK_TRAJECTORY
+                                trend_mode = TrendMode.TRACK_GUIDE
+                                self._recovery_success_count += 1
+                                recovery_elapsed_s = 0.0
+                                recovery_step_count = 0
+
+                                snapshot = LocalPlanSnapshot(
+                                    plan_id=plan_id_counter,
+                                    plan_timestamp_s=trajectory_time_s,
+                                    source_frame_id=frame_id,
+                                    source_state_timestamp_s=trajectory_time_s,
+                                    guide_world=guide_sel.guide_position_world.copy(),
+                                    guide_path_index=guide_sel.guide_path_index,
+                                    terminal_world=scaled_term.copy(),
+                                    terminal_path_index=scaled_term_idx,
+                                    reference_path_start_index=self._guide_progress_index,
+                                    reference_path_end_index=scaled_term_idx,
+                                    trajectory=recovery_result.trajectory,
+                                    trajectory_duration_s=float(
+                                        recovery_result.trajectory[-1].t)
+                                    if len(recovery_result.trajectory) > 0
+                                    else 0.0,
+                                    planner_status=str(recovery_result.status),
+                                    minimum_clearance_m=float(
+                                        recovery_result.min_clearance),
+                                    terminal_scale=rts,
+                                    speed_scale=1.0,
+                                )
+                                self._latest_plan_snapshot = snapshot
+                                plan_id_counter += 1
+                                self._successful_replans += 1
+                                self._planner_success_count += 1
+                                consecutive_failures = 0
+                                break
+                        except Exception:
+                            pass
+
+            if planner_mode == PlannerMode.RECOVERY:
+                # Execution already done above; skip normal execution
+                pass
+            elif (planner_mode in (PlannerMode.FRESH_PLAN, PlannerMode.CACHED_PLAN)
+                  and self._latest_plan_snapshot is not None):
+                control_mode = ControlMode.TRACK_TRAJECTORY
+                (exec_next_pos, exec_next_vel, exec_next_yaw,
+                 exec_next_yaw_rate, executed_command_velocity_flu,
+                 executed_command_yaw_rate) = \
+                    self._execute_trajectory_segment_from_snapshot(
+                        self._latest_plan_snapshot,
+                        trajectory_time_s,
+                        cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
+                        dt_sample, dt_ctrl,
                         max_velocity, max_acceleration, max_yaw_rate,
                         command_lookahead_time, velocity_tracking_gain,
                         yaw_tracking_gain, yaw_speed_threshold)
+                if planner_mode == PlannerMode.FRESH_PLAN:
+                    self._fresh_plan_frame_count += 1
+                else:
+                    self._cached_plan_frame_count += 1
             elif final_actor == "learner":
                 (exec_next_pos, exec_next_vel, exec_next_yaw,
                  exec_next_yaw_rate, executed_command_velocity_flu,
@@ -2365,7 +2941,8 @@ class ILManager:
                     self._execute_velocity_command(
                         selected_velocity_flu, selected_yaw_rate, dt_sample)
             else:
-                # A safety actor or invalid expert holds position.
+                # Safety actor or no valid plan: hover
+                control_mode = ControlMode.EMERGENCY_STOP
                 (exec_next_pos, exec_next_vel, exec_next_yaw,
                  exec_next_yaw_rate, executed_command_velocity_flu,
                  executed_command_yaw_rate) = \
@@ -2404,11 +2981,10 @@ class ILManager:
             row["yaw_rate_tracking_error"] = round(
                 abs(float(exec_next_yaw_rate) - selected_yaw_rate), 6)
 
-            # A frame is valid only when the image-time state, perception
-            # labels, plan, and the command/state transition are all usable.
-            # Count invalid frames even though the episode will later be moved
-            # to _failed; this prevents filtering bad rows from hiding a bad
-            # episode during commit validation.
+            # v11: A frame is only invalid when it truly cannot produce
+            # safe, finite, semantically clear Trend and Control labels.
+            # Transient planner failures are NOT automatically invalid when
+            # a valid cached trajectory or recovery command exists.
             frame_invalid_reasons = []
             if depth_m is None or png_name == "none":
                 frame_invalid_reasons.append("missing_depth")
@@ -2417,22 +2993,27 @@ class ILManager:
             if not np.all(np.isfinite(
                     dynamics_state.angular_velocity_body)):
                 frame_invalid_reasons.append("invalid_image_time_angular_velocity")
-            if sample_index > 0 and not previous_command_valid:
-                frame_invalid_reasons.append("missing_previous_executed_command")
-            if guide_sel is None or not guide_sel.valid:
-                frame_invalid_reasons.append("invalid_guide")
-            if len(ref_segment) < 2:
-                frame_invalid_reasons.append("invalid_reference_segment")
-            if not bool(plan_success):
-                frame_invalid_reasons.append("planner_failure")
-            if not bool(row.get("expert_label_valid", 0)):
-                frame_invalid_reasons.append("invalid_expert_label")
+            if not np.all(np.isfinite(cur_pos)) or \
+                    not np.all(np.isfinite(cur_vel)):
+                frame_invalid_reasons.append("invalid_current_state")
+            # v11: no longer invalidate on transient planner_failure alone
+            if planner_mode == PlannerMode.ABORT:
+                frame_invalid_reasons.append("planner_abort")
+            if planner_mode == PlannerMode.RECOVERY:
+                # Recovery frames are valid IF we have a finite recovery target
+                if not np.all(np.isfinite(recovery_target_world)):
+                    frame_invalid_reasons.append("invalid_recovery_target")
+                if not np.isfinite(recovery_yaw_rate_cmd
+                                   if 'recovery_yaw_rate_cmd' in dir()
+                                   else True):
+                    frame_invalid_reasons.append("invalid_recovery_command")
+            elif planner_mode not in (PlannerMode.FRESH_PLAN,
+                                       PlannerMode.CACHED_PLAN):
+                # Unknown planner mode
+                frame_invalid_reasons.append("unknown_planner_mode")
+            # Check that trend label can be generated
             if not bool(row.get("trend_label_valid", 0)):
                 frame_invalid_reasons.append("invalid_trend_label")
-            if planner_used_obs:
-                frame_invalid_reasons.append("unexpected_observed_esdf")
-            if planner_used_fallback:
-                frame_invalid_reasons.append("planner_global_fallback")
             if (not np.all(np.isfinite(executed_command_velocity_flu)) or
                     not np.isfinite(executed_command_yaw_rate)):
                 frame_invalid_reasons.append("invalid_executed_command")
@@ -2585,6 +3166,385 @@ class ILManager:
             return depth_u16, collision, _fid, recv_time_mono
 
         return None, 0, None, None
+
+    # ═══════════════════════════════════════════════════════════════
+    #  v11: Dual-frequency scheduler, cache, recovery helpers
+    # ═══════════════════════════════════════════════════════════════
+
+    def _execute_trajectory_segment_from_snapshot(
+            self, snapshot, current_time_s,
+            cur_pos, cur_vel, cur_yaw,
+            dt_sample, dt_ctrl,
+            max_velocity, max_acceleration, max_yaw_rate,
+            command_lookahead_time=0.08,
+            velocity_tracking_gain=2.0,
+            yaw_tracking_gain=3.0,
+            yaw_speed_threshold=0.10):
+        """Execute dt_sample using a cached LocalPlanSnapshot.
+
+        Uses trajectory_relative_time = current_time - plan_timestamp
+        to index into the cached trajectory.
+        """
+        pos = np.asarray(cur_pos, dtype=np.float64).copy()
+        vel = np.asarray(cur_vel, dtype=np.float64).copy()
+        yaw = float(cur_yaw)
+        total_yaw_change = 0.0
+
+        if snapshot is None:
+            # Hover
+            elapsed = 0.0
+            epsilon = 1e-9
+            while elapsed < dt_sample - epsilon:
+                step_dt = min(dt_ctrl, dt_sample - elapsed)
+                if self._dynamics.backend_name == "flightmare":
+                    if not self._dynamics.step_velocity_command(
+                            np.zeros(3, dtype=np.float64), 0.0, step_dt):
+                        raise RuntimeError("Flightmare hover step failed")
+                    ds = self._dynamics.get_state()
+                    pos, vel = ds.position_world.copy(), ds.velocity_world.copy()
+                    qx, qy, qz, qw = ds.quaternion_world_body
+                    yaw = math.atan2(2.0 * (qw*qz + qx*qy),
+                                     1.0 - 2.0 * (qy*qy + qz*qz))
+                    yr = float(ds.angular_velocity_body[2])
+                else:
+                    pos, vel, yaw, yr = integrate_velocity_command(
+                        pos, vel, yaw, np.zeros(3, dtype=np.float64), step_dt,
+                        max_velocity, max_acceleration, max_yaw_rate)
+                total_yaw_change += yr * step_dt
+                elapsed += step_dt
+            avg_yaw_rate = total_yaw_change / max(dt_sample, 1e-9)
+            return (pos, vel, yaw, avg_yaw_rate,
+                    np.zeros(3, dtype=np.float64), 0.0)
+
+        traj = snapshot.trajectory
+        traj_duration = snapshot.trajectory_duration_s
+        rel_time = current_time_s - snapshot.plan_timestamp_s
+        elapsed = 0.0
+        epsilon = 1e-9
+        last_command_flu = np.zeros(3, dtype=np.float64)
+        last_command_yaw_rate = 0.0
+
+        while elapsed < dt_sample - epsilon:
+            step_dt = min(dt_ctrl, dt_sample - elapsed)
+            exec_time = rel_time + elapsed + max(0.0, command_lookahead_time)
+            clamped_time = min(exec_time, traj_duration)
+            best_idx = min(range(len(traj)),
+                           key=lambda i: abs(float(traj[i].t) - clamped_time))
+            tp = traj[best_idx]
+            reference_pos = np.array(tp.position, dtype=np.float64)
+            feedforward_vel = np.array(tp.velocity, dtype=np.float64)
+            desired_vel_world = (feedforward_vel +
+                                 velocity_tracking_gain *
+                                 (reference_pos - pos))
+            desired_speed = float(np.linalg.norm(desired_vel_world))
+            if desired_speed > max_velocity:
+                desired_vel_world *= max_velocity / max(desired_speed, 1e-9)
+            yaw_rate_cmd = yaw_rate_for_world_velocity(
+                yaw, desired_vel_world, yaw_tracking_gain,
+                max_yaw_rate, yaw_speed_threshold)
+            if self._dynamics.backend_name == "flightmare":
+                command_state = self._dynamics.get_state()
+                desired_vel_flu = world_vector_to_body_flu_quat(
+                    desired_vel_world,
+                    command_state.quaternion_world_body)
+                last_command_flu = desired_vel_flu.copy()
+                last_command_yaw_rate = float(yaw_rate_cmd)
+                if not self._dynamics.step_velocity_command(
+                        desired_vel_flu, yaw_rate_cmd, step_dt):
+                    raise RuntimeError("Flightmare trajectory step failed")
+                ds = self._dynamics.get_state()
+                pos, vel = ds.position_world.copy(), ds.velocity_world.copy()
+                qx, qy, qz, qw = ds.quaternion_world_body
+                yaw = math.atan2(2.0 * (qw*qz + qx*qy),
+                                 1.0 - 2.0 * (qy*qy + qz*qz))
+                yr = float(ds.angular_velocity_body[2])
+            else:
+                last_command_flu = world_vector_to_body_flu(
+                    desired_vel_world, yaw)
+                last_command_yaw_rate = float(yaw_rate_cmd)
+                pos, vel, yaw, yr = integrate_velocity_command(
+                    pos, vel, yaw, desired_vel_world, step_dt,
+                    max_velocity, max_acceleration, max_yaw_rate)
+            total_yaw_change += yr * step_dt
+            elapsed += step_dt
+
+        avg_yaw_rate = total_yaw_change / max(dt_sample, 1e-9)
+        return (pos, vel, yaw, avg_yaw_rate,
+                last_command_flu, last_command_yaw_rate)
+
+    def _scale_terminal(self, guide_sel, global_path, scale,
+                         progress_index):
+        """Scale the Terminal closer to the drone by the given factor.
+
+        Terminal must remain between progress_index and guide_path_index.
+
+        Returns (scaled_terminal_world, scaled_terminal_path_index)
+        or (None, -1) if scaling is not possible.
+        """
+        if not (0.0 < scale <= 1.0):
+            return None, -1
+        if scale >= 1.0 - 1e-9:
+            return (guide_sel.terminal_position_world.copy(),
+                    guide_sel.terminal_path_index)
+
+        guide_idx = guide_sel.guide_path_index
+        term_idx = guide_sel.terminal_path_index
+        # Interpolate between progress and terminal
+        if term_idx <= progress_index:
+            return None, -1
+        scaled_idx = progress_index + max(
+            1, int(round((term_idx - progress_index) * scale)))
+        scaled_idx = min(scaled_idx, guide_idx)
+        if scaled_idx <= progress_index:
+            scaled_idx = progress_index + 1
+        if scaled_idx >= len(global_path):
+            scaled_idx = len(global_path) - 1
+        return (np.array(global_path[scaled_idx], dtype=np.float64),
+                scaled_idx)
+
+    def _scale_reference_segment(self, ref_segment, global_path,
+                                  progress_index, terminal_idx):
+        """Truncate reference segment to match a shortened terminal."""
+        if not ref_segment or len(ref_segment) < 2:
+            return ref_segment
+        # Keep points from progress_index to terminal_idx (inclusive)
+        result = []
+        for pt in ref_segment:
+            # Find closest index in global_path
+            pt_arr = np.array(pt[:3], dtype=np.float64)
+            best_idx = -1
+            best_dist = float("inf")
+            for i in range(max(0, progress_index),
+                           min(len(global_path), terminal_idx + 5)):
+                d = float(np.linalg.norm(
+                    np.array(global_path[i]) - pt_arr))
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = i
+            if best_idx >= 0 and progress_index <= best_idx <= terminal_idx:
+                result.append(pt)
+        if len(result) < 2:
+            return ref_segment[:2]  # fallback to first two points
+        return result
+
+    def _project_to_global_path(self, position_world, global_path,
+                                 prev_progress_index):
+        """Project current position onto the global A* path.
+
+        Searches from ``prev_progress_index - 5`` forward to find the
+        closest path point.  Returns (progress_index, progress_s).
+
+        Returns (-1, -1.0) if projection fails.
+        """
+        if not global_path or len(global_path) < 2:
+            return -1, -1.0
+        pos = np.asarray(position_world, dtype=np.float64)
+        search_start = max(0, prev_progress_index - 5)
+        best_idx = search_start
+        best_dist = float("inf")
+        for i in range(search_start, len(global_path)):
+            d = float(np.linalg.norm(np.array(global_path[i]) - pos))
+            if d < best_dist:
+                best_dist = d
+                best_idx = i
+        # Compute cumulative arc length
+        cum_s = 0.0
+        for i in range(1, best_idx + 1):
+            cum_s += float(np.linalg.norm(
+                np.array(global_path[i]) - np.array(global_path[i - 1])))
+        return best_idx, cum_s
+
+    def _is_guide_cache_valid(self, snapshot, current_time_s,
+                               progress_index, global_path):
+        """Check whether the cached Guide from the last successful plan
+        is still usable for Trend labels."""
+        if snapshot is None:
+            return False
+        online_rt = self.g.get("online_runtime", {})
+        gc_cfg = online_rt.get("guide_cache", {})
+        max_age = float(gc_cfg.get("max_age_s", 0.50))
+        max_dist = float(gc_cfg.get("maximum_distance_m", 7.0))
+        max_dev = float(gc_cfg.get("maximum_path_deviation_m", 1.5))
+        max_behind = int(gc_cfg.get("maximum_indices_behind_progress", 0))
+
+        age = current_time_s - snapshot.plan_timestamp_s
+        if age > max_age:
+            return False
+        # Guide path index must not be behind current progress
+        if snapshot.guide_path_index < progress_index - max_behind:
+            return False
+        # Guide world coords must be finite
+        if not np.all(np.isfinite(snapshot.guide_world)):
+            return False
+        # Guide distance must not exceed max
+        gp = np.asarray(global_path[snapshot.guide_path_index])
+        guide_dist = float(np.linalg.norm(snapshot.guide_world - gp))
+        if guide_dist > max_dev:
+            return False
+        return True
+
+    def _is_trajectory_cache_valid(self, snapshot, current_time_s,
+                                    cur_pos, cur_vel, planner_mode):
+        """Check whether the cached local trajectory is still usable
+        for Control labels."""
+        if snapshot is None:
+            return False
+        online_rt = self.g.get("online_runtime", {})
+        tc_cfg = online_rt.get("trajectory_cache", {})
+        max_age = float(tc_cfg.get("max_plan_age_s", 0.20))
+        min_remaining = float(tc_cfg.get("minimum_remaining_time_s", 0.10))
+        max_pos_err = float(tc_cfg.get("maximum_position_error_m", 0.50))
+        max_vel_err = float(tc_cfg.get("maximum_velocity_error_mps", 1.00))
+
+        age = current_time_s - snapshot.plan_timestamp_s
+        if age > max_age:
+            return False
+
+        # Trajectory time still within range
+        traj_dur = snapshot.trajectory_duration_s
+        if traj_dur <= 0 or age >= traj_dur - min_remaining:
+            return False
+
+        # Position error check against traj[0] position
+        traj = snapshot.trajectory
+        if traj is None or len(traj) == 0:
+            return False
+        ref_pos = np.array(traj[0].position, dtype=np.float64)
+        pos_err = float(np.linalg.norm(cur_pos - ref_pos))
+        if pos_err > max_pos_err:
+            return False
+
+        return True
+
+    def _compute_recovery_target(self, global_path, progress_index,
+                                  lookahead_distance_m):
+        """Extract a recovery target from the global A* path at a fixed
+        arc-length lookahead from the current progress index.
+
+        Returns (target_world, target_path_index).
+        If the remaining path is too short, returns the goal point.
+        """
+        if not global_path or progress_index < 0:
+            goal_pt = global_path[-1] if global_path else np.zeros(3)
+            return np.array(goal_pt, dtype=np.float64), len(global_path) - 1
+
+        cum = 0.0
+        for i in range(progress_index, len(global_path) - 1):
+            seg_len = float(np.linalg.norm(
+                np.array(global_path[i + 1]) - np.array(global_path[i])))
+            if cum + seg_len >= lookahead_distance_m:
+                # Interpolate within this segment
+                frac = (lookahead_distance_m - cum) / max(seg_len, 1e-9)
+                pt = (np.array(global_path[i]) +
+                      frac * (np.array(global_path[i + 1]) -
+                              np.array(global_path[i])))
+                return pt, i
+            cum += seg_len
+
+        # Fall back to goal
+        return np.array(global_path[-1], dtype=np.float64), len(global_path) - 1
+
+    def _compute_recovery_direction(self, recovery_target_world, cur_pos,
+                                     cur_yaw, yaw_deadband_rad,
+                                     last_direction, tie_break):
+        """Classify recovery direction as 'left' or 'right'.
+
+        Uses FLU convention: y > 0 is left, y < 0 is right.
+        """
+        delta_world = np.asarray(recovery_target_world) - np.asarray(cur_pos)
+        # Convert world delta to FLU
+        c = math.cos(cur_yaw)
+        s = math.sin(cur_yaw)
+        # world->body RFU
+        dx_b = delta_world[0] * c + delta_world[1] * s   # right
+        dy_b = -delta_world[0] * s + delta_world[1] * c  # forward
+        # body RFU -> FLU: [forward, -right, up]
+        d_flu_y = -dx_b   # FLU y: positive = left
+
+        if d_flu_y > yaw_deadband_rad:
+            return "left"
+        elif d_flu_y < -yaw_deadband_rad:
+            return "right"
+        # Deadband: use last direction or tie-break
+        if last_direction in ("left", "right"):
+            return last_direction
+        return tie_break
+
+    def _sample_expert_command_from_snapshot(self, snapshot,
+                                              label_lookahead_time_s,
+                                              current_time_s, current_yaw):
+        """Sample expert velocity command from a cached LocalPlanSnapshot.
+
+        Uses trajectory_relative_time = current_time - plan_timestamp.
+        """
+        if snapshot is None:
+            return np.zeros(3, dtype=np.float64), 0.0
+        traj = snapshot.trajectory
+        if traj is None or len(traj) == 0:
+            return np.zeros(3, dtype=np.float64), 0.0
+
+        rel_time = current_time_s - snapshot.plan_timestamp_s
+        sample_time = rel_time + label_lookahead_time_s
+        traj_dur = snapshot.trajectory_duration_s
+        clamped = max(0.0, min(sample_time, traj_dur))
+        best_idx = min(range(len(traj)),
+                       key=lambda i: abs(float(traj[i].t) - clamped))
+        tp = traj[best_idx]
+        expert_vel_world = np.array(tp.velocity, dtype=np.float64)
+
+        lp_cfg = self.g.get("planning", {}).get("local_planner", {})
+        max_velocity = float(lp_cfg.get("max_velocity", 2.5))
+        max_yaw_rate = float(lp_cfg.get("max_yaw_rate", 2.0))
+        yaw_tracking_gain = float(lp_cfg.get("yaw_tracking_gain", 3.0))
+        yaw_speed_threshold = float(lp_cfg.get("yaw_speed_threshold", 0.10))
+
+        expert_speed = float(np.linalg.norm(expert_vel_world))
+        if expert_speed > max_velocity:
+            expert_vel_world *= max_velocity / max(expert_speed, 1e-9)
+
+        expert_yaw_rate = yaw_rate_for_world_velocity(
+            current_yaw, expert_vel_world, yaw_tracking_gain,
+            max_yaw_rate, yaw_speed_threshold)
+        return expert_vel_world, expert_yaw_rate
+
+    def _execute_rotate_in_place(self, cur_pos, cur_vel, cur_yaw,
+                                  yaw_rate_command, dt_sample, dt_ctrl,
+                                  max_velocity, max_acceleration, max_yaw_rate):
+        """Execute a pure rotation for dt_sample with zero translational velocity.
+
+        Returns (next_pos, next_vel, next_yaw, avg_yaw_rate,
+                 executed_command_flu, executed_command_yaw_rate).
+        """
+        pos = np.asarray(cur_pos, dtype=np.float64).copy()
+        vel = np.asarray(cur_vel, dtype=np.float64).copy()
+        yaw = float(cur_yaw)
+        total_yaw_change = 0.0
+        elapsed = 0.0
+        epsilon = 1e-9
+        yr_cmd = float(yaw_rate_command)
+
+        while elapsed < dt_sample - epsilon:
+            step_dt = min(dt_ctrl, dt_sample - elapsed)
+            if self._dynamics.backend_name == "flightmare":
+                if not self._dynamics.step_velocity_command(
+                        np.zeros(3, dtype=np.float64), yr_cmd, step_dt):
+                    raise RuntimeError("Flightmare rotate step failed")
+                ds = self._dynamics.get_state()
+                pos, vel = ds.position_world.copy(), ds.velocity_world.copy()
+                qx, qy, qz, qw = ds.quaternion_world_body
+                yaw = math.atan2(2.0 * (qw * qz + qx * qy),
+                                 1.0 - 2.0 * (qy * qy + qz * qz))
+                yr = float(ds.angular_velocity_body[2])
+            else:
+                pos, vel, yaw, yr = integrate_velocity_command(
+                    pos, vel, yaw, np.zeros(3, dtype=np.float64), step_dt,
+                    max_velocity, max_acceleration, max_yaw_rate)
+            total_yaw_change += yr * step_dt
+            elapsed += step_dt
+
+        avg_yaw_rate = total_yaw_change / max(dt_sample, 1e-9)
+        return (pos, vel, yaw, avg_yaw_rate,
+                np.zeros(3, dtype=np.float64), yr_cmd)
 
     def _sample_expert_command(self, result, label_lookahead_time_s,
                                current_yaw):
@@ -3141,6 +4101,532 @@ class ILManager:
             len(ref_segment) if ref_segment else 0)
         row["scene_id"] = self.scene_label
         row["task_id"] = plan.get("task_id", "task_{:03d}".format(self.traj_idx))
+
+        return row
+
+    # ═══════════════════════════════════════════════════════════════
+    #  v11: Training row builder (13-class Trend, cache, recovery)
+    # ═══════════════════════════════════════════════════════════════
+
+    def _build_training_row_v9(
+            self, cur_pos, cur_vel, cur_yaw,
+            plan_snapshot,
+            plan_success, planner_compute_ms,
+            planner_status_str,
+            goal_np, goal_pt, global_path_length,
+            label_lookahead_time_s, max_guide_range,
+            png_name, collision,
+            plan, sample_index, dt_sample,
+            frame_id, recording_start_mono, recording_start_epoch_ns,
+            t_request_mono, recv_time_mono, latency_ms,
+            h_fov_rad, v_fov_rad, trend_h_bins, trend_v_bins,
+            trend_sigma_bins, h_bin_edges, v_bin_edges,
+            azi_soft_names, ele_soft_names,
+            previous_progress_s,
+            guide_sel=None, ref_segment=None,
+            observed_map=None, observed_esdf=None,
+            planner_used_obs=0, planner_used_fallback=0,
+            current_quaternion_xyzw=None,
+            # v11 extras
+            planner_mode=None, control_mode=None, trend_mode=None,
+            plan_is_fresh=0, plan_cache_valid=0,
+            plan_source_frame_id=-1, plan_age_s=0.0,
+            planner_due=False, planner_attempted=0,
+            planner_retry_count=0, terminal_scale_used=1.0,
+            speed_scale_used=1.0,
+            recovery_target_world=None,
+            recovery_target_path_index=-1,
+            recovery_elapsed_s=0.0,
+            recovery_last_direction="",
+            guide_progress_index=-1,
+            global_path=None,
+    ):
+        """Build one schema-v11 training row with 13-class Trend labels."""
+        row = {}
+
+        # ── Time & matching ──────────────────────────────────────
+        trajectory_time_s = sample_index * dt_sample
+        row["timestamp_ns"] = recording_start_epoch_ns + int(
+            (t_request_mono - recording_start_mono) * 1e9)
+        row["receive_timestamp_ns"] = recording_start_epoch_ns + int(
+            (recv_time_mono - recording_start_mono) * 1e9)
+        row["frame_id"] = frame_id
+        row["trajectory_time_s"] = round(trajectory_time_s, 6)
+        row["latency_ms"] = round(latency_ms, 3)
+        row["match_method"] = "frame_id_exact"
+
+        # ── v11: runtime mode enums ──────────────────────────────
+        row["planner_mode"] = (
+            planner_mode.value if planner_mode is not None else "UNKNOWN")
+        row["control_mode"] = (
+            control_mode.value if control_mode is not None else "UNKNOWN")
+        row["trend_mode"] = (
+            trend_mode.value if trend_mode is not None else "UNKNOWN")
+
+        # ── Current state (x_t) ──────────────────────────────────
+        row["x"] = round(float(cur_pos[0]), 4)
+        row["y"] = round(float(cur_pos[1]), 4)
+        row["z"] = round(float(cur_pos[2]), 4)
+        if current_quaternion_xyzw is None:
+            half = 0.5 * float(cur_yaw)
+            current_quaternion_xyzw = np.array(
+                [0.0, 0.0, math.sin(half), math.cos(half)])
+        qx, qy, qz, qw = np.asarray(current_quaternion_xyzw)
+        row["qx"] = round(float(qx), 6)
+        row["qy"] = round(float(qy), 6)
+        row["qz"] = round(float(qz), 6)
+        row["qw"] = round(float(qw), 6)
+
+        row["state_vx_world"] = round(float(cur_vel[0]), 4)
+        row["state_vy_world"] = round(float(cur_vel[1]), 4)
+        row["state_vz_world"] = round(float(cur_vel[2]), 4)
+
+        state_vel_flu = world_vector_to_body_flu_quat(
+            cur_vel, current_quaternion_xyzw)
+        row["state_vx_flu"] = round(float(state_vel_flu[0]), 4)
+        row["state_vy_flu"] = round(float(state_vel_flu[1]), 4)
+        row["state_vz_flu"] = round(float(state_vel_flu[2]), 4)
+
+        vx_rfu, vy_rfu, vz_rfu = world_vel_to_body(
+            float(cur_vel[0]), float(cur_vel[1]), float(cur_vel[2]),
+            float(cur_yaw))
+        row["legacy_state_vx_rfu"] = round(vx_rfu, 4)
+        row["legacy_state_vy_rfu"] = round(vy_rfu, 4)
+        row["legacy_state_vz_rfu"] = round(vz_rfu, 4)
+
+        # ── Expert supervision (v11: from snapshot) ──────────────
+        if plan_snapshot is not None:
+            expert_vel_world, expert_yaw_rate = \
+                self._sample_expert_command_from_snapshot(
+                    plan_snapshot, label_lookahead_time_s,
+                    trajectory_time_s, cur_yaw)
+        else:
+            expert_vel_world = np.zeros(3, dtype=np.float64)
+            expert_yaw_rate = 0.0
+
+        row["expert_label_valid"] = (
+            1 if (plan_snapshot is not None and
+                  plan_snapshot.trajectory is not None and
+                  len(plan_snapshot.trajectory) > 0)
+            else 0)
+
+        row["expert_vx_world"] = round(float(expert_vel_world[0]), 6)
+        row["expert_vy_world"] = round(float(expert_vel_world[1]), 6)
+        row["expert_vz_world"] = round(float(expert_vel_world[2]), 6)
+
+        expert_vel_flu = world_vector_to_body_flu_quat(
+            expert_vel_world, current_quaternion_xyzw)
+        expert_vel_flu = quantize_bounded_vector(
+            expert_vel_flu,
+            float(self.g.get("planning", {}).get(
+                "local_planner", {}).get("max_velocity", 2.5)),
+            decimals=6)
+        row["expert_vx_flu"] = float(expert_vel_flu[0])
+        row["expert_vy_flu"] = float(expert_vel_flu[1])
+        row["expert_vz_flu"] = float(expert_vel_flu[2])
+        row["expert_yaw_rate"] = round(float(expert_yaw_rate), 6)
+
+        # ── Executed next state placeholders ─────────────────────
+        row["executed_next_x"] = round(float(cur_pos[0]), 4)
+        row["executed_next_y"] = round(float(cur_pos[1]), 4)
+        row["executed_next_z"] = round(float(cur_pos[2]), 4)
+        row["executed_next_vx_world"] = round(float(cur_vel[0]), 4)
+        row["executed_next_vy_world"] = round(float(cur_vel[1]), 4)
+        row["executed_next_vz_world"] = round(float(cur_vel[2]), 4)
+        row["executed_next_vx_flu"] = round(float(state_vel_flu[0]), 4)
+        row["executed_next_vy_flu"] = round(float(state_vel_flu[1]), 4)
+        row["executed_next_vz_flu"] = round(float(state_vel_flu[2]), 4)
+        row["actual_next_vx_flu"] = round(float(state_vel_flu[0]), 4)
+        row["actual_next_vy_flu"] = round(float(state_vel_flu[1]), 4)
+        row["actual_next_vz_flu"] = round(float(state_vel_flu[2]), 4)
+        row["executed_next_yaw"] = round(float(cur_yaw), 6)
+        row["executed_next_yaw_rate"] = 0.0
+
+        # ── Global navigation labels ─────────────────────────────
+        global_delta_world = goal_np - cur_pos
+        global_distance_m = float(np.linalg.norm(global_delta_world))
+        if global_distance_m < 1e-9:
+            row["global_direction_valid"] = 0
+            row["global_dir_x_flu"] = 0.0
+            row["global_dir_y_flu"] = 0.0
+            row["global_dir_z_flu"] = 0.0
+        else:
+            global_delta_flu = world_vector_to_body_flu_quat(
+                global_delta_world, current_quaternion_xyzw)
+            norm = float(np.linalg.norm(global_delta_flu))
+            row["global_direction_valid"] = 1
+            row["global_dir_x_flu"] = round(float(global_delta_flu[0]) / norm, 6)
+            row["global_dir_y_flu"] = round(float(global_delta_flu[1]) / norm, 6)
+            row["global_dir_z_flu"] = round(float(global_delta_flu[2]) / norm, 6)
+        row["global_distance_m"] = round(global_distance_m, 4)
+        row["global_distance_norm"] = round(
+            min(global_distance_m, max_guide_range) / max(max_guide_range, 1e-9), 6)
+
+        # ── v11: Trend labels (13-class horizontal) ──────────────
+        # Determine guide source: cached Guide world coords or recovery target
+        if trend_mode == TrendMode.RECOVERY:
+            guide_source = "recovery_global_astar_target"
+            guide_target_world = recovery_target_world
+            guide_path_idx_target = recovery_target_path_index
+            guide_cache_valid_int = 0
+            guide_cache_age = 0.0
+            guide_plan_id_val = -1
+        elif (plan_snapshot is not None and
+              self._is_guide_cache_valid(
+                  plan_snapshot, trajectory_time_s,
+                  guide_progress_index, global_path or [])):
+            guide_source = "latest_successful_plan_guide"
+            guide_target_world = plan_snapshot.guide_world
+            guide_path_idx_target = plan_snapshot.guide_path_index
+            guide_cache_valid_int = 1
+            guide_cache_age = trajectory_time_s - plan_snapshot.plan_timestamp_s
+            guide_plan_id_val = plan_snapshot.plan_id
+            self._max_guide_cache_age_s = max(
+                self._max_guide_cache_age_s, guide_cache_age)
+        elif guide_sel is not None and guide_sel.valid:
+            guide_source = "current_guide_selector"
+            guide_target_world = guide_sel.guide_position_world
+            guide_path_idx_target = guide_sel.guide_path_index
+            guide_cache_valid_int = 0
+            guide_cache_age = 0.0
+            guide_plan_id_val = -1
+        else:
+            guide_source = "invalid_no_visible_guide"
+            guide_target_world = cur_pos
+            guide_path_idx_target = -1
+            guide_cache_valid_int = 0
+            guide_cache_age = 0.0
+            guide_plan_id_val = -1
+
+        row["guide_source"] = guide_source
+        row["guide_plan_id"] = guide_plan_id_val
+        row["guide_cache_age_s"] = round(guide_cache_age, 6)
+        row["guide_cache_valid"] = guide_cache_valid_int
+        row["guide_target_x_world"] = round(float(guide_target_world[0]), 4)
+        row["guide_target_y_world"] = round(float(guide_target_world[1]), 4)
+        row["guide_target_z_world"] = round(float(guide_target_world[2]), 4)
+        row["guide_target_path_index"] = guide_path_idx_target
+
+        # Compute FLU vector from current state to guide target
+        guide_delta_world = np.asarray(guide_target_world) - cur_pos
+        guide_distance_m = float(np.linalg.norm(guide_delta_world))
+        row["guide_x_world"] = round(float(guide_target_world[0]), 4)
+        row["guide_y_world"] = round(float(guide_target_world[1]), 4)
+        row["guide_z_world"] = round(float(guide_target_world[2]), 4)
+
+        if guide_distance_m < 1e-9:
+            row["trend_label_valid"] = 0
+            row["guide_dir_x_flu_exact"] = 0.0
+            row["guide_dir_y_flu_exact"] = 0.0
+            row["guide_dir_z_flu_exact"] = 0.0
+            row["guide_distance_m"] = 0.0
+            row["guide_distance_norm"] = 0.0
+            row["guide_azimuth_rad"] = 0.0
+            row["guide_elevation_rad"] = 0.0
+            row["guide_azimuth_bin"] = -1
+            row["guide_elevation_bin"] = -1
+            row["trend_horizontal_class_13"] = -1
+            row["trend_horizontal_class_count"] = TREND_HORIZONTAL_CLASS_COUNT
+            row["trend_normal_horizontal_class_11"] = -1
+            for name in azi_soft_names:
+                row[name] = 0.0
+            for name in ele_soft_names:
+                row[name] = 0.0
+        else:
+            guide_delta_flu_v9 = world_vector_to_body_flu_quat(
+                guide_delta_world, current_quaternion_xyzw)
+            norm_v9 = float(np.linalg.norm(guide_delta_flu_v9))
+            gdx = float(guide_delta_flu_v9[0]) / norm_v9
+            gdy = float(guide_delta_flu_v9[1]) / norm_v9
+            gdz = float(guide_delta_flu_v9[2]) / norm_v9
+            row["guide_dir_x_flu_exact"] = round(gdx, 6)
+            row["guide_dir_y_flu_exact"] = round(gdy, 6)
+            row["guide_dir_z_flu_exact"] = round(gdz, 6)
+            row["guide_distance_m"] = round(guide_distance_m, 4)
+            row["guide_distance_norm"] = round(
+                min(guide_distance_m, max_guide_range) / max(max_guide_range, 1e-9), 6)
+
+            azimuth = math.atan2(gdy, gdx)
+            elevation = math.atan2(gdz, math.sqrt(gdx * gdx + gdy * gdy + 1e-12))
+            row["guide_azimuth_rad"] = round(azimuth, 6)
+            row["guide_elevation_rad"] = round(elevation, 6)
+
+            # ── 13-class Trend horizontal label ──────────────────
+            row["trend_horizontal_class_count"] = TREND_HORIZONTAL_CLASS_COUNT
+            row["trend_label_valid"] = 1
+
+            if trend_mode == TrendMode.RECOVERY:
+                # Recovery: left=0 or right=12
+                if guide_source == "recovery_global_astar_target":
+                    rec_dir = self._compute_recovery_direction(
+                        guide_target_world, cur_pos, cur_yaw,
+                        0.05, "", "right")
+                    if rec_dir == "left":
+                        h_class_13 = TREND_RECOVER_LEFT_CLASS
+                    else:
+                        h_class_13 = TREND_RECOVER_RIGHT_CLASS
+                else:
+                    h_class_13 = TREND_RECOVER_RIGHT_CLASS
+                row["trend_horizontal_class_13"] = h_class_13
+                row["trend_normal_horizontal_class_11"] = -1
+                row["guide_azimuth_bin"] = -1
+                row["guide_elevation_bin"] = v_bin = int(
+                    np.argmin(np.abs(v_bin_edges - elevation)))
+
+                # Recovery: one-hot horizontal soft label
+                for i in range(TREND_HORIZONTAL_CLASS_COUNT):
+                    name = "guide_azimuth_soft_{}".format(i)
+                    if name in azi_soft_names or i < len(azi_soft_names):
+                        if 0 <= i < len(azi_soft_names):
+                            row[azi_soft_names[i]] = (
+                                1.0 if i == h_class_13 else 0.0)
+                # Normal soft: zero on bins 0 and 12
+                if TREND_HORIZONTAL_CLASS_COUNT > trend_h_bins:
+                    for i in range(TREND_HORIZONTAL_CLASS_COUNT):
+                        name = "guide_azimuth_soft_{}".format(i)
+                        if i < len(azi_soft_names):
+                            if i == TREND_RECOVER_LEFT_CLASS:
+                                row[azi_soft_names[i]] = round(
+                                    1.0 if h_class_13 == 0 else 0.0, 6)
+                            elif i == TREND_RECOVER_RIGHT_CLASS:
+                                row[azi_soft_names[i]] = round(
+                                    1.0 if h_class_13 == 12 else 0.0, 6)
+                            else:
+                                row[azi_soft_names[i]] = 0.0
+                else:
+                    # Fallback: fill all azi soft with zeros, set correct one
+                    for i, name in enumerate(azi_soft_names):
+                        row[name] = 0.0
+                    if h_class_13 < len(azi_soft_names):
+                        row[azi_soft_names[h_class_13]] = 1.0
+
+                # Vertical soft labels (same as normal)
+                v_soft = np.zeros(trend_v_bins, dtype=np.float64)
+                for i in range(trend_v_bins):
+                    bin_err = (elevation - v_bin_edges[i]) / (
+                        (v_fov_rad / (trend_v_bins - 1)) + 1e-12)
+                    v_soft[i] = math.exp(
+                        -0.5 * (bin_err / trend_sigma_bins) ** 2)
+                v_soft /= max(v_soft.sum(), 1e-12)
+                for i, name in enumerate(ele_soft_names):
+                    row[name] = round(float(v_soft[i]), 6)
+            else:
+                # Normal TRACK_GUIDE mode: 11-class → 13-class
+                in_h_fov = (-h_fov_rad / 2.0 - 1e-9 <= azimuth <=
+                             h_fov_rad / 2.0 + 1e-9)
+                in_v_fov = (-v_fov_rad / 2.0 - 1e-9 <= elevation <=
+                             v_fov_rad / 2.0 + 1e-9)
+
+                if in_h_fov and in_v_fov:
+                    # Old 11-class hard bin
+                    h_bin_11 = int(np.argmin(np.abs(h_bin_edges - azimuth)))
+                    v_bin = int(np.argmin(np.abs(v_bin_edges - elevation)))
+                    row["guide_azimuth_bin"] = h_bin_11
+                    row["guide_elevation_bin"] = v_bin
+                    row["trend_normal_horizontal_class_11"] = h_bin_11
+
+                    # Map: old 0–10 → new 1–11
+                    h_class_13 = h_bin_11 + TREND_NORMAL_CLASS_OFFSET
+                    h_class_13 = max(1, min(11, h_class_13))
+                    row["trend_horizontal_class_13"] = h_class_13
+
+                    # Soft labels for 13-class: indices 0 and 12 are zero
+                    # Normal 11-bin soft label centered on old bin
+                    if TREND_HORIZONTAL_CLASS_COUNT > trend_h_bins:
+                        for i in range(TREND_HORIZONTAL_CLASS_COUNT):
+                            name = "guide_azimuth_soft_{}".format(i)
+                            if i < len(azi_soft_names):
+                                if i == TREND_RECOVER_LEFT_CLASS or \
+                                   i == TREND_RECOVER_RIGHT_CLASS:
+                                    row[azi_soft_names[i]] = 0.0
+                                else:
+                                    # Map to old soft
+                                    old_i = i - TREND_NORMAL_CLASS_OFFSET
+                                    if 0 <= old_i < trend_h_bins:
+                                        bin_err = (
+                                            azimuth - h_bin_edges[old_i]) / (
+                                            (h_fov_rad / (trend_h_bins - 1)) + 1e-12)
+                                        row[azi_soft_names[i]] = round(
+                                            float(math.exp(
+                                                -0.5 * (bin_err / trend_sigma_bins) ** 2)), 6)
+                                    else:
+                                        row[azi_soft_names[i]] = 0.0
+                        # Normalize the 11 middle bins
+                        mid_vals = [row[azi_soft_names[i]]
+                                    for i in range(1, 12)
+                                    if i < len(azi_soft_names)]
+                        mid_sum = sum(mid_vals)
+                        if mid_sum > 1e-12:
+                            for i in range(1, 12):
+                                if i < len(azi_soft_names):
+                                    row[azi_soft_names[i]] = round(
+                                        float(row[azi_soft_names[i]]) / mid_sum, 6)
+                    else:
+                        # Old-style soft labels
+                        h_soft = np.zeros(trend_h_bins, dtype=np.float64)
+                        for i in range(trend_h_bins):
+                            bin_err = (azimuth - h_bin_edges[i]) / (
+                                (h_fov_rad / (trend_h_bins - 1)) + 1e-12)
+                            h_soft[i] = math.exp(
+                                -0.5 * (bin_err / trend_sigma_bins) ** 2)
+                        h_soft /= max(h_soft.sum(), 1e-12)
+                        for i, name in enumerate(azi_soft_names):
+                            row[name] = round(float(h_soft[i]), 6)
+
+                    # Vertical soft labels
+                    v_soft = np.zeros(trend_v_bins, dtype=np.float64)
+                    for i in range(trend_v_bins):
+                        bin_err = (elevation - v_bin_edges[i]) / (
+                            (v_fov_rad / (trend_v_bins - 1)) + 1e-12)
+                        v_soft[i] = math.exp(
+                            -0.5 * (bin_err / trend_sigma_bins) ** 2)
+                    v_soft /= max(v_soft.sum(), 1e-12)
+                    for i, name in enumerate(ele_soft_names):
+                        row[name] = round(float(v_soft[i]), 6)
+                else:
+                    row["trend_label_valid"] = 0
+                    row["guide_azimuth_bin"] = -1
+                    row["guide_elevation_bin"] = -1
+                    row["trend_horizontal_class_13"] = -1
+                    row["trend_normal_horizontal_class_11"] = -1
+                    for name in azi_soft_names:
+                        row[name] = 0.0
+                    for name in ele_soft_names:
+                        row[name] = 0.0
+
+        # ── v11: planner scheduling & retry fields ────────────────
+        row["plan_source_frame_id"] = plan_source_frame_id
+        row["plan_age_s"] = round(plan_age_s, 6)
+        row["plan_is_fresh"] = plan_is_fresh
+        row["plan_cache_valid"] = plan_cache_valid
+        row["planner_due"] = 1 if planner_due else 0
+        row["planner_attempted"] = planner_attempted
+        row["planner_retry_count"] = planner_retry_count
+        row["terminal_scale_used"] = round(terminal_scale_used, 4)
+        row["speed_scale_used"] = round(speed_scale_used, 4)
+
+        # ── v11: recovery fields ─────────────────────────────────
+        if recovery_target_world is not None:
+            row["recovery_target_x_world"] = round(
+                float(recovery_target_world[0]), 4)
+            row["recovery_target_y_world"] = round(
+                float(recovery_target_world[1]), 4)
+            row["recovery_target_z_world"] = round(
+                float(recovery_target_world[2]), 4)
+        else:
+            row["recovery_target_x_world"] = 0.0
+            row["recovery_target_y_world"] = 0.0
+            row["recovery_target_z_world"] = 0.0
+        row["recovery_target_path_index"] = recovery_target_path_index
+        row["recovery_elapsed_s"] = round(recovery_elapsed_s, 6)
+        row["recovery_direction"] = recovery_last_direction
+
+        # ── Depth & collision ────────────────────────────────────
+        row["depth_file"] = png_name
+        row["collision"] = collision
+
+        # ── Start / goal ─────────────────────────────────────────
+        row["start_x"] = round(plan["start"][0], 4)
+        row["start_y"] = round(plan["start"][1], 4)
+        row["start_z"] = round(plan["start"][2], 4)
+        row["goal_x"] = round(goal_pt[0], 4)
+        row["goal_y"] = round(goal_pt[1], 4)
+        row["goal_z"] = round(goal_pt[2], 4)
+
+        # ── Planner & debug fields ───────────────────────────────
+        if plan_snapshot is not None:
+            row["global_progress_s"] = round(
+                float(plan_snapshot.reference_path_start_index), 4)
+            row["global_progress_index"] = plan_snapshot.guide_path_index
+            row["local_goal_index"] = plan_snapshot.terminal_path_index
+            row["plan_id"] = plan_snapshot.plan_id
+            row["plan_time_from_start_s"] = 0.0
+            row["planner_min_clearance"] = round(
+                plan_snapshot.minimum_clearance_m, 4)
+        else:
+            row["global_progress_s"] = round(previous_progress_s, 4)
+            row["global_progress_index"] = -1
+            row["local_goal_index"] = -1
+            row["plan_id"] = -1
+            row["plan_time_from_start_s"] = 0.0
+            row["planner_min_clearance"] = 0.0
+
+        row["global_progress_ratio"] = round(
+            row["global_progress_s"] / max(global_path_length, 1e-6), 6)
+        row["planner_status"] = planner_status_str
+        row["planner_success"] = plan_success
+        row["planner_compute_ms"] = round(planner_compute_ms, 3)
+        row["distance_to_final_goal"] = round(
+            float(np.linalg.norm(cur_pos - goal_np)), 4)
+        row["legacy_plan_age_ms"] = 0.0
+
+        # ── Phase 2: observed map diagnostics ────────────────────
+        if observed_map is not None:
+            row["observed_map_revision"] = observed_map.get_revision()
+            row["observed_esdf_revision"] = (
+                self._observed_esdf_cache.stats_summary()["current_revision"]
+                if self._observed_esdf_cache is not None else
+                observed_map.get_revision())
+            row["observed_known_voxel_count"] = observed_map.known_voxel_count()
+            row["observed_occupied_voxel_count"] = observed_map.occupied_voxel_count()
+            row["observed_free_voxel_count"] = observed_map.free_voxel_count()
+        else:
+            row["observed_map_revision"] = -1
+            row["observed_esdf_revision"] = -1
+            row["observed_known_voxel_count"] = 0
+            row["observed_occupied_voxel_count"] = 0
+            row["observed_free_voxel_count"] = 0
+
+        # ── Phase 2: guide selection diagnostics ─────────────────
+        if guide_sel is not None:
+            row["guide_candidate_count"] = guide_sel.candidate_count
+            row["guide_visible"] = 1 if guide_sel.visible else 0
+            row["guide_depth_visible"] = 1 if guide_sel.depth_visible else 0
+            row["guide_corridor_check_enabled"] = (
+                1 if guide_sel.corridor_check_enabled else 0)
+            row["guide_corridor_known_free_ratio"] = round(
+                guide_sel.corridor_known_free_ratio, 4)
+            row["guide_path_index"] = guide_sel.guide_path_index
+            row["guide_rejection_reason"] = (
+                guide_sel.rejection_reason[:80]
+                if guide_sel.rejection_reason else "")
+            row["terminal_path_index"] = guide_sel.terminal_path_index
+            row["terminal_x_world"] = round(
+                float(guide_sel.terminal_position_world[0]), 4)
+            row["terminal_y_world"] = round(
+                float(guide_sel.terminal_position_world[1]), 4)
+            row["terminal_z_world"] = round(
+                float(guide_sel.terminal_position_world[2]), 4)
+            row["terminal_distance_m"] = round(
+                guide_sel.terminal_distance_m, 4)
+            row["terminal_path_arc_length_m"] = round(
+                guide_sel.terminal_path_arc_length_m, 4)
+        else:
+            row["guide_candidate_count"] = 0
+            row["guide_visible"] = 0
+            row["guide_depth_visible"] = 0
+            row["guide_corridor_check_enabled"] = 0
+            row["guide_corridor_known_free_ratio"] = -1.0
+            row["guide_path_index"] = -1
+            row["guide_rejection_reason"] = "no_selector"
+            row["terminal_path_index"] = -1
+            row["terminal_x_world"] = 0.0
+            row["terminal_y_world"] = 0.0
+            row["terminal_z_world"] = 0.0
+            row["terminal_distance_m"] = 0.0
+            row["terminal_path_arc_length_m"] = 0.0
+
+        # ── Phase 2: planner flags ───────────────────────────────
+        row["planner_used_observed_esdf"] = planner_used_obs
+        row["planner_map_source"] = (
+            "observed_esdf" if planner_used_obs else "global_esdf")
+        row["planner_unknown_is_free"] = 0
+        row["planner_used_global_fallback"] = planner_used_fallback
+        row["reference_segment_point_count"] = (
+            len(ref_segment) if ref_segment else 0)
+        row["scene_id"] = self.scene_label
+        row["task_id"] = plan.get("task_id",
+                                   "task_{:03d}".format(self.traj_idx))
 
         return row
 
@@ -3853,7 +5339,29 @@ class ILManager:
                 self, "_consecutive_guide_failures", 0),
             # ── Phase 3: scene & task metadata ──
             "scene_generation_enabled": self._use_scene_gen,
+            "scene_generation_source": self.g.get("scene_generation", {}).get(
+                "source", "procedural_yaml"),
+            "scene_profile_mode": self._use_profile_mode,
+            "scene_profile_name": self._current_profile_name,
+            "scene_profile_index": self._scene_profile_index if self._use_profile_mode else -1,
+            "scene_index_in_profile": self._scene_index_in_profile if self._use_profile_mode else -1,
+            "scene_id": self.scene_label,
+            "scene_target_density_mode": self._current_target_density_mode,
+            "scene_target_density": (self._current_target_density
+                                     if self._current_target_density is not None else -1.0),
             "scene_obstacle_count": len(getattr(self, "_current_scene_obstacles", [])),
+            "scene_obstacle_radius_min_actual_m": (
+                min(o.radius_m for o in self._current_scene_obstacles)
+                if self._current_scene_obstacles else 0.0),
+            "scene_obstacle_radius_max_actual_m": (
+                max(o.radius_m for o in self._current_scene_obstacles)
+                if self._current_scene_obstacles else 0.0),
+            "scene_obstacle_radius_mean_actual_m": (
+                sum(o.radius_m for o in self._current_scene_obstacles) /
+                max(len(self._current_scene_obstacles), 1)
+                if self._current_scene_obstacles else 0.0),
+            "task_index_in_scene": (self._task_index_in_scene
+                                    if self._use_profile_mode else -1),
             "scene_topology_valid": (
                 self._current_scene_validation.valid
                 if self._current_scene_validation is not None else None),
@@ -3869,6 +5377,27 @@ class ILManager:
             "scene_dead_end_detected": (
                 self._current_scene_validation.dead_end_detected
                 if self._current_scene_validation is not None else False),
+            # ── Phase 3: density metrics (v9) ──
+            "scene_actual_raw_occupancy_ratio": (
+                compute_raw_occupancy(
+                    self._current_scene_obstacles,
+                    compute_region_area(self._scene_generator.obstacle_region)
+                    if self._scene_generator is not None else 1.0)
+                if self._current_scene_obstacles else 0.0),
+            "scene_actual_inflated_occupancy_ratio": (
+                compute_inflated_occupancy(
+                    self._current_scene_obstacles,
+                    compute_region_area(self._scene_generator.obstacle_region)
+                    if self._scene_generator is not None else 1.0,
+                    float(self._scene_generator.vehicle_r) if self._scene_generator is not None else 0.30,
+                    float(self._scene_generator.safety_m) if self._scene_generator is not None else 0.10)
+                if self._current_scene_obstacles else 0.0),
+            "scene_actual_obstacles_per_100m2": (
+                compute_obstacles_per_100m2(
+                    self._current_scene_obstacles,
+                    compute_region_area(self._scene_generator.obstacle_region)
+                    if self._scene_generator is not None else 1.0)
+                if self._current_scene_obstacles else 0.0),
             "task_direct_path_blocked": (
                 self._current_task_validation.direct_path_blocked
                 if self._current_task_validation is not None else None),
@@ -3914,6 +5443,37 @@ class ILManager:
             "final_executed_position": final_pos,
             "final_executed_velocity": self._final_executed_velocity,
             "exit_reason": self._trajectory_exit_reason,
+            # ── v11: online runtime stats ──
+            "online_runtime_config": self.g.get("online_runtime", {}),
+            "fresh_plan_control_frame_count": getattr(
+                self, "_fresh_plan_frame_count", 0),
+            "cached_plan_control_frame_count": getattr(
+                self, "_cached_plan_frame_count", 0),
+            "recovery_control_frame_count": getattr(
+                self, "_recovery_frame_count", 0),
+            "planner_attempt_count": getattr(
+                self, "_planner_attempt_count", 0),
+            "planner_success_count": getattr(
+                self, "_planner_success_count", 0),
+            "planner_failure_count": getattr(
+                self, "_planner_failure_count", 0),
+            "planner_retry_success_count": getattr(
+                self, "_planner_retry_success_count", 0),
+            "recovery_entry_count": getattr(
+                self, "_recovery_entry_count", 0),
+            "recovery_success_count": getattr(
+                self, "_recovery_success_count", 0),
+            "recovery_timeout_count": getattr(
+                self, "_recovery_timeout_count", 0),
+            "maximum_plan_age_s": getattr(
+                self, "_max_plan_age_s", 0.0),
+            "maximum_guide_cache_age_s": getattr(
+                self, "_max_guide_cache_age_s", 0.0),
+            "recover_left_frame_count": getattr(
+                self, "_recover_left_frame_count", 0),
+            "recover_right_frame_count": getattr(
+                self, "_recover_right_frame_count", 0),
+            "trend_horizontal_class_count": TREND_HORIZONTAL_CLASS_COUNT,
             "ESDF_clearance_semantics": (
                 "ESDF values already have drone_radius subtracted by ESDFBuilder. "
                 "Local planner min_clearance is additional safety margin on top."
@@ -4559,11 +6119,26 @@ class ILManager:
             rospy.logerr("[Commit] Could not move failed data: %s", exc)
 
     def _route_next(self):
-        """Route to next trajectory, next config, or done."""
+        """Route to next trajectory, next scene, next profile, or done."""
         if self.traj_idx >= len(self.current_planned):
-            self.seed_idx += 1
-            self._enter_state(State.NEXT_CONFIG)
+            # All tasks for current scene are done
+            if self._use_profile_mode and self._current_profile is not None:
+                # Profile mode: advance to next scene in profile
+                self._task_index_in_scene = 0
+                self._scene_index_in_profile += 1
+                self.seed_idx += 1
+                rospy.loginfo("[FSM] Profile '%s': scene %d complete. Advancing to scene %d/%d.",
+                              self._current_profile_name,
+                              self._scene_index_in_profile - 1,
+                              self._scene_index_in_profile,
+                              self._current_profile.scene_count)
+                self._enter_state(State.NEXT_CONFIG)
+            else:
+                # Legacy mode
+                self.seed_idx += 1
+                self._enter_state(State.NEXT_CONFIG)
         else:
+            # More tasks remain in current scene
             self._enter_state(State.RESET_DRONE)
 
     def _st_next_config(self):
