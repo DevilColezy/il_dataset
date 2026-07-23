@@ -561,24 +561,22 @@ def _validate_config(cfg):
                 "Both procedural_profiles (scene_generation.profiles) and legacy "
                 "scenes: list are configured. Only one pipeline may be enabled.")
 
-    # ── Online runtime (v11) ───────────────────────────────────
+    # ── Online runtime (v13) ───────────────────────────────────
     online_rt = g.get("online_runtime", {})
     if online_rt:
         ctrl_rate = float(online_rt.get("control_rate_hz", 30.0))
-        planner_rate = float(online_rt.get("planner_rate_hz", 20.0))
         rec_rate = float(online_rt.get("record_rate_hz", 30.0))
         if ctrl_rate <= 0:
             errors.append("online_runtime.control_rate_hz must be > 0")
-        if planner_rate <= 0:
-            errors.append("online_runtime.planner_rate_hz must be > 0")
         if rec_rate <= 0:
             errors.append("online_runtime.record_rate_hz must be > 0")
-        if planner_rate > ctrl_rate + 1e-9:
+        # v13: planner runs at record rate; planner_rate_hz removed
+        if abs(ctrl_rate - rec_rate) > 1e-6:
             errors.append(
-                "online_runtime.planner_rate_hz ({}) must be <= "
-                "control_rate_hz ({})".format(planner_rate, ctrl_rate))
+                "online_runtime.control_rate_hz ({}) must equal "
+                "record_rate_hz ({})".format(ctrl_rate, rec_rate))
 
-        # Planner retry
+        # Planner retry (terminal scale only — speed_scale removed)
         retry_cfg = online_rt.get("planner_retry", {})
         tss = retry_cfg.get("terminal_scale_sequence", [1.0])
         if not tss or not isinstance(tss, list):
@@ -595,19 +593,6 @@ def _validate_config(cfg):
                         "terminal_scale_sequence must be non-increasing, "
                         "got {} > {}".format(s, prev))
                 prev = s
-
-        sss = retry_cfg.get("speed_scale_sequence", [1.0])
-        if sss and isinstance(sss, list):
-            prev_s = 2.0
-            for s in sss:
-                if not (0.0 < s <= 1.0):
-                    errors.append(
-                        "speed_scale_sequence values must be in (0, 1], "
-                        "got {}".format(s))
-                if s > prev_s + 1e-9:
-                    errors.append(
-                        "speed_scale_sequence must be non-increasing")
-                prev_s = s
 
         # Trajectory cache
         tc = online_rt.get("trajectory_cache", {})

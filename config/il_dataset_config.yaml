@@ -590,7 +590,7 @@ global:
   # ── Data format ──────────────────────────────────────────────────────
   data:
     coordinate_frame: "CAMERA_FLU"
-    schema_version: 12
+    schema_version: 13
     collection_mode: "deterministic_lockstep"
     image_write_queue_size: 16
     label_lookahead_time_s: 0.08
@@ -659,12 +659,12 @@ global:
   online_runtime:
     control_rate_hz: 30.0
     record_rate_hz: 30.0
-    planner_rate_hz: 30.0
+    # v13: planner runs at record rate (30 Hz). planner_rate_hz removed.
 
     planner_retry:
       terminal_scale_sequence: [1.0, 0.75, 0.50, 0.30]
       recovery_initial_terminal_scales: [0.30, 0.50]
-      speed_scale_sequence: [1.0, 0.75, 0.50, 0.35]
+      # speed_scale_sequence removed — C++ pybind does not export speed_scale
 
     trajectory_cache:
       max_plan_age_s: 0.20

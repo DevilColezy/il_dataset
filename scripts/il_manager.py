@@ -2245,10 +2245,7 @@ class ILManager:
         previous_command_yaw_rate = 0.0
 
         # ── v11: online runtime state ────────────────────────────────
-        online_rt = self.g.get("online_runtime", {})
-        planner_rate_hz = float(online_rt.get("planner_rate_hz", 30.0))
-        # v11: planner runs at same rate as control (30 Hz). Every frame is a planner tick.
-        # No phase accumulator needed.
+        # v13: planner runs every record tick (30 Hz = record rate)
         runtime_loop_hz = rec_hz
 
         retry_cfg = online_rt.get("planner_retry", {})
@@ -2304,9 +2301,8 @@ class ILManager:
         self._recover_left_frame_count = 0
         self._recover_right_frame_count = 0
 
-        rospy.loginfo("[ONLINE-LOCKSTEP] Starting. runtime_loop=%.0fHz planner=%.0fHz "
-                      "dt_sample=%.3fs",
-                      runtime_loop_hz, planner_rate_hz, dt_sample)
+        rospy.loginfo("[ONLINE-LOCKSTEP] Starting. runtime_loop=%.0fHz dt_sample=%.3fs",
+                      runtime_loop_hz, dt_sample)
 
         while not rospy.is_shutdown():
             if self._timed_out():
@@ -2730,8 +2726,8 @@ class ILManager:
                 trend_mode = TrendMode.TRACK_GUIDE
                 control_mode = ControlMode.EMERGENCY_STOP
 
-            # ── v12: Build RuntimeDecision BEFORE row construction ──
-            # Compute the unified tracking command now (reused by execution)
+            # ── v13: Compute control ONCE, build RuntimeDecision ────
+            # Normal tracking: compute trajectory tracking command
             tracking_cmd = None
             if (self._latest_plan_snapshot is not None and
                     planner_mode in (PlannerMode.FRESH_PLAN, PlannerMode.CACHED_PLAN)):
@@ -2745,40 +2741,56 @@ class ILManager:
                 recovery_yaw_rate = max(-recovery_max_yaw_rate,
                                         min(recovery_max_yaw_rate,
                                             recovery_yaw_gain * recovery_azimuth_rad))
-                expert_vel_flu = np.zeros(3, dtype=np.float64)
-                expert_yr = recovery_yaw_rate
-                selected_actor = "recovery_controller"
+                ref_vel_flu = np.zeros(3, dtype=np.float64)
+                fb_vel_flu = np.zeros(3, dtype=np.float64)
+                final_vel_flu = np.zeros(3, dtype=np.float64)
+                final_yr = recovery_yaw_rate
+                traj_sample_t = -1.0
+                sel_actor = "recovery_controller"
             elif tracking_cmd is not None and tracking_cmd.get("valid"):
-                expert_vel_flu = tracking_cmd["final_velocity_flu"]
-                expert_yr = tracking_cmd["final_yaw_rate"]
-                selected_actor = "expert"
+                ref_vel_flu = tracking_cmd["reference_velocity_flu"].copy()
+                fb_vel_flu = tracking_cmd["feedback_velocity_flu"].copy()
+                final_vel_flu = tracking_cmd["final_velocity_flu"].copy()
+                final_yr = tracking_cmd["final_yaw_rate"]
+                traj_sample_t = tracking_cmd["trajectory_sample_time_s"]
+                sel_actor = "expert"
             else:
-                expert_vel_flu = np.zeros(3, dtype=np.float64)
-                expert_yr = 0.0
-                selected_actor = "safety"
+                ref_vel_flu = np.zeros(3, dtype=np.float64)
+                fb_vel_flu = np.zeros(3, dtype=np.float64)
+                final_vel_flu = np.zeros(3, dtype=np.float64)
+                final_yr = 0.0
+                traj_sample_t = -1.0
+                sel_actor = "safety"
 
             decision = RuntimeDecision(
                 planner_mode=planner_mode.value,
                 trend_mode=trend_mode.value,
                 control_mode=control_mode.value,
-                guide_source="latest_successful_plan_guide"
-                if self._latest_plan_snapshot is not None else "no_valid_cached_guide",
-                guide_target_world=(self._latest_plan_snapshot.guide_world
+                guide_source=("latest_successful_plan_guide"
+                              if self._latest_plan_snapshot is not None
+                              else "no_valid_cached_guide"),
+                guide_target_world=(self._latest_plan_snapshot.guide_world.copy()
                                     if self._latest_plan_snapshot is not None
-                                    else cur_pos),
+                                    else cur_pos.copy()),
                 guide_target_path_index=(self._latest_plan_snapshot.guide_path_index
                                          if self._latest_plan_snapshot is not None else -1),
                 recovery_direction=recovery_last_direction,
                 recovery_azimuth_rad=recovery_azimuth_rad,
-                expert_command_flu=expert_vel_flu.copy(),
-                expert_yaw_rate=expert_yr,
                 plan_snapshot=self._latest_plan_snapshot,
+                trajectory_sample_time_s=traj_sample_t,
+                trajectory_reference_velocity_flu=ref_vel_flu.copy(),
+                trajectory_feedback_velocity_flu=fb_vel_flu.copy(),
+                expert_velocity_flu=final_vel_flu.copy(),
+                expert_yaw_rate=final_yr,
+                selected_velocity_flu=final_vel_flu.copy(),
+                selected_yaw_rate=final_yr,
+                selected_actor=sel_actor,
             )
 
-            # ── Step 4: Build training row (v12) ────────────────────
+            # ── Step 4: Build training row (v13) ────────────────────
             row = self._build_training_row_v9(
                 cur_pos, cur_vel, cur_yaw,
-                self._latest_plan_snapshot,
+                decision,
                 plan_success, planner_compute_ms,
                 planner_status_str,
                 goal_np, goal_pt, global_path_length,
@@ -2844,40 +2856,30 @@ class ILManager:
                 observability_result.side_choice_consistent)
 
             learner_output = PolicyOutput() if PolicyOutput is not None else None
-            # v12: selected command = expert command (pure expert mode)
-            # Uses the RuntimeDecision computed before row construction
-            final_actor = selected_actor
+            # v13: selected command = expert command = from RuntimeDecision
+            final_actor = decision.selected_actor
             safety_override = False
             override_reason = ""
-            selected_velocity_flu = decision.expert_command_flu.copy()
-            selected_yaw_rate = decision.expert_yaw_rate
+            selected_velocity_flu = decision.selected_velocity_flu.copy()
+            selected_yaw_rate = decision.selected_yaw_rate
 
-            # v12: populate trajectory reference/feedback fields
-            if tracking_cmd is not None and tracking_cmd.get("valid"):
-                row["trajectory_reference_vx_flu"] = round(
-                    float(tracking_cmd["reference_velocity_flu"][0]), 6)
-                row["trajectory_reference_vy_flu"] = round(
-                    float(tracking_cmd["reference_velocity_flu"][1]), 6)
-                row["trajectory_reference_vz_flu"] = round(
-                    float(tracking_cmd["reference_velocity_flu"][2]), 6)
-                row["trajectory_feedback_vx_flu"] = round(
-                    float(tracking_cmd["feedback_velocity_flu"][0]), 6)
-                row["trajectory_feedback_vy_flu"] = round(
-                    float(tracking_cmd["feedback_velocity_flu"][1]), 6)
-                row["trajectory_feedback_vz_flu"] = round(
-                    float(tracking_cmd["feedback_velocity_flu"][2]), 6)
-                row["trajectory_sample_time_s"] = round(
-                    tracking_cmd["trajectory_sample_time_s"], 6)
-            else:
-                row["trajectory_reference_vx_flu"] = 0.0
-                row["trajectory_reference_vy_flu"] = 0.0
-                row["trajectory_reference_vz_flu"] = 0.0
-                row["trajectory_feedback_vx_flu"] = 0.0
-                row["trajectory_feedback_vy_flu"] = 0.0
-                row["trajectory_feedback_vz_flu"] = 0.0
-                row["trajectory_sample_time_s"] = -1.0
+            # v13: populate trajectory reference/feedback from decision
+            row["trajectory_reference_vx_flu"] = round(
+                float(decision.trajectory_reference_velocity_flu[0]), 6)
+            row["trajectory_reference_vy_flu"] = round(
+                float(decision.trajectory_reference_velocity_flu[1]), 6)
+            row["trajectory_reference_vz_flu"] = round(
+                float(decision.trajectory_reference_velocity_flu[2]), 6)
+            row["trajectory_feedback_vx_flu"] = round(
+                float(decision.trajectory_feedback_velocity_flu[0]), 6)
+            row["trajectory_feedback_vy_flu"] = round(
+                float(decision.trajectory_feedback_velocity_flu[1]), 6)
+            row["trajectory_feedback_vz_flu"] = round(
+                float(decision.trajectory_feedback_velocity_flu[2]), 6)
+            row["trajectory_sample_time_s"] = round(
+                decision.trajectory_sample_time_s, 6)
 
-            # v12: recovery_azimuth_rad
+            # v13: recovery_azimuth_rad
             row["recovery_azimuth_rad"] = round(
                 decision.recovery_azimuth_rad, 6)
 
@@ -2955,7 +2957,7 @@ class ILManager:
                 # (trend_mode, control_mode, recovery_direction, yaw-rate already set
                 #  in RuntimeDecision before row construction)
 
-                recovery_yaw_rate_cmd = decision.expert_yaw_rate
+                recovery_yaw_rate_cmd = decision.selected_yaw_rate
 
                 (exec_next_pos, exec_next_vel, exec_next_yaw,
                  exec_next_yaw_rate, executed_command_velocity_flu,
@@ -3004,10 +3006,7 @@ class ILManager:
                     self._rec_written_rows += 1
                     break
 
-                # v11 FIX: if Guide became visible, set force_replan for NEXT
-                # planner tick; do NOT call planner directly in this control tick.
-                if guide_sel.valid and len(ref_segment) >= 2:
-                    force_replan = True
+                # v13: if Guide became visible, the next planner tick will use
 
             elif (planner_mode in (PlannerMode.FRESH_PLAN, PlannerMode.CACHED_PLAN)
                   and self._latest_plan_snapshot is not None):
@@ -4390,37 +4389,27 @@ class ILManager:
         row["legacy_state_vy_rfu"] = round(vy_rfu, 4)
         row["legacy_state_vz_rfu"] = round(vz_rfu, 4)
 
-        # ── Expert supervision (v12: from snapshot with REAL current state) ──
-        if plan_snapshot is not None:
-            expert_vel_world, expert_yaw_rate = \
-                self._sample_expert_command_from_snapshot(
-                    plan_snapshot, label_lookahead_time_s,
-                    trajectory_time_s, cur_yaw,
-                    cur_pos, cur_vel)
-        else:
-            expert_vel_world = np.zeros(3, dtype=np.float64)
-            expert_yaw_rate = 0.0
+        # ── Expert supervision (v13: from RuntimeDecision, NO recomputation) ──
+        expert_vel_flu = decision.expert_velocity_flu.copy()
+        expert_yaw_rate = decision.expert_yaw_rate
 
         row["expert_label_valid"] = (
-            1 if (plan_snapshot is not None and
-                  plan_snapshot.trajectory is not None and
-                  len(plan_snapshot.trajectory) > 0)
-            else 0)
+            1 if (decision.plan_snapshot is not None and
+                  decision.plan_snapshot.trajectory is not None and
+                  len(decision.plan_snapshot.trajectory) > 0
+                  and decision.control_mode != "EMERGENCY_STOP")
+            else (1 if decision.control_mode == "ROTATE_IN_PLACE" else 0))
 
+        # Convert FLU expert back to world for the world-velocity columns
+        expert_vel_world = body_flu_to_world_quat(
+            expert_vel_flu, current_quaternion_xyzw)
         row["expert_vx_world"] = round(float(expert_vel_world[0]), 6)
         row["expert_vy_world"] = round(float(expert_vel_world[1]), 6)
         row["expert_vz_world"] = round(float(expert_vel_world[2]), 6)
 
-        expert_vel_flu = world_vector_to_body_flu_quat(
-            expert_vel_world, current_quaternion_xyzw)
-        expert_vel_flu = quantize_bounded_vector(
-            expert_vel_flu,
-            float(self.g.get("planning", {}).get(
-                "local_planner", {}).get("max_velocity", 2.5)),
-            decimals=6)
-        row["expert_vx_flu"] = float(expert_vel_flu[0])
-        row["expert_vy_flu"] = float(expert_vel_flu[1])
-        row["expert_vz_flu"] = float(expert_vel_flu[2])
+        row["expert_vx_flu"] = round(float(expert_vel_flu[0]), 6)
+        row["expert_vy_flu"] = round(float(expert_vel_flu[1]), 6)
+        row["expert_vz_flu"] = round(float(expert_vel_flu[2]), 6)
         row["expert_yaw_rate"] = round(float(expert_yaw_rate), 6)
 
         # ── Executed next state placeholders ─────────────────────

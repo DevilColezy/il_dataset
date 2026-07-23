@@ -444,10 +444,11 @@ class LocalPlanSnapshot:
 
 @dataclass(frozen=True)
 class RuntimeDecision:
-    """Immutable per-frame decision computed before row construction.
+    """Immutable per-frame decision — single source of truth (v13).
 
-    All modes, labels, and commands for a single control/record tick
-    are finalized here so that data rows never contain mixed state.
+    All modes, labels, and commands for a single 30 Hz record tick
+    are finalized here.  The row builder and executor both read from
+    this object; neither recomputes any control logic.
     """
     planner_mode: str      # PlannerMode value
     trend_mode: str         # TrendMode value
@@ -460,20 +461,38 @@ class RuntimeDecision:
     recovery_direction: str
     recovery_azimuth_rad: float
 
-    expert_command_flu: np.ndarray
+    plan_snapshot: object   # Optional[LocalPlanSnapshot]
+
+    # ── trajectory decomposition ──
+    trajectory_sample_time_s: float
+    trajectory_reference_velocity_flu: np.ndarray
+    trajectory_feedback_velocity_flu: np.ndarray
+
+    # ── final commands ──
+    expert_velocity_flu: np.ndarray
     expert_yaw_rate: float
 
-    plan_snapshot: object   # Optional[LocalPlanSnapshot]
+    selected_velocity_flu: np.ndarray
+    selected_yaw_rate: float
+    selected_actor: str
 
     def __post_init__(self):
         if not np.all(np.isfinite(self.guide_target_world)):
             raise ValueError("guide_target_world must be finite")
-        if not np.all(np.isfinite(self.expert_command_flu)):
-            raise ValueError("expert_command_flu must be finite")
+        if not np.all(np.isfinite(self.expert_velocity_flu)):
+            raise ValueError("expert_velocity_flu must be finite")
         if not np.isfinite(self.expert_yaw_rate):
             raise ValueError("expert_yaw_rate must be finite")
         if not np.isfinite(self.recovery_azimuth_rad):
             raise ValueError("recovery_azimuth_rad must be finite")
+        if not np.all(np.isfinite(self.selected_velocity_flu)):
+            raise ValueError("selected_velocity_flu must be finite")
+        if not np.isfinite(self.selected_yaw_rate):
+            raise ValueError("selected_yaw_rate must be finite")
+        if not np.all(np.isfinite(self.trajectory_reference_velocity_flu)):
+            raise ValueError("trajectory_reference_velocity_flu must be finite")
+        if not np.all(np.isfinite(self.trajectory_feedback_velocity_flu)):
+            raise ValueError("trajectory_feedback_velocity_flu must be finite")
 
 
 # ============================================================================
