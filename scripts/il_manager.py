@@ -2688,6 +2688,19 @@ class ILManager:
                 self._latest_plan_snapshot is not None
                 and planner_mode in (PlannerMode.FRESH_PLAN, PlannerMode.CACHED_PLAN))
 
+            # v11 FIX: determine trend_mode and control_mode BEFORE building
+            # the training row. Recovery mode changes trend labels to
+            # one-hot recovery classes, which must be reflected in the row.
+            if planner_mode == PlannerMode.RECOVERY:
+                trend_mode = TrendMode.RECOVERY
+                control_mode = ControlMode.ROTATE_IN_PLACE
+            elif planner_mode in (PlannerMode.FRESH_PLAN, PlannerMode.CACHED_PLAN):
+                trend_mode = TrendMode.TRACK_GUIDE
+                control_mode = ControlMode.TRACK_TRAJECTORY
+            else:
+                trend_mode = TrendMode.TRACK_GUIDE
+                control_mode = ControlMode.EMERGENCY_STOP
+
             # ── Step 4: Build training row (v11) ────────────────────
             row = self._build_training_row_v9(
                 cur_pos, cur_vel, cur_yaw,
@@ -2835,8 +2848,7 @@ class ILManager:
             # ── Step 5: Execute dt_sample (v11: recovery / trajectory / hover) ──
             if planner_mode == PlannerMode.RECOVERY:
                 # Recovery: zero translation + yaw rotation toward recovery target
-                control_mode = ControlMode.ROTATE_IN_PLACE
-                trend_mode = TrendMode.RECOVERY
+                # (trend_mode and control_mode already set before row construction)
 
                 # v11 FIX: use atan2-based azimuth (radians), not meter-vs-radian comparison
                 recovery_direction, recovery_azimuth_rad = \
