@@ -17,6 +17,7 @@ from __future__ import print_function, division
 
 import json, math, os, sys, time, random, struct, hashlib, threading
 import numpy as np
+from typing import Optional
 
 import rospy
 import rospkg
@@ -418,10 +419,18 @@ class LocalPlanSnapshot:
     minimum_clearance_m: float
 
     terminal_scale: float
-    speed_scale: float
 
     def __post_init__(self):
         """Validate invariants after construction (frozen dataclass)."""
+        guide_world = np.asarray(self.guide_world, dtype=np.float64).copy()
+        terminal_world = np.asarray(
+            self.terminal_world, dtype=np.float64).copy()
+        if guide_world.shape != (3,) or terminal_world.shape != (3,):
+            raise ValueError("plan guide and terminal must have shape (3,)")
+        guide_world.setflags(write=False)
+        terminal_world.setflags(write=False)
+        object.__setattr__(self, "guide_world", guide_world)
+        object.__setattr__(self, "terminal_world", terminal_world)
         if not isinstance(self.plan_id, int) or self.plan_id < 0:
             raise ValueError("plan_id must be a non-negative int")
         if self.plan_timestamp_s < 0.0:
@@ -436,10 +445,6 @@ class LocalPlanSnapshot:
             raise ValueError(
                 "terminal_scale must be in (0, 1], got {}".format(
                     self.terminal_scale))
-        if not (0.0 < self.speed_scale <= 1.0):
-            raise ValueError(
-                "speed_scale must be in (0, 1], got {}".format(
-                    self.speed_scale))
 
 
 @dataclass(frozen=True)
@@ -461,7 +466,10 @@ class RuntimeDecision:
     recovery_direction: str
     recovery_azimuth_rad: float
 
-    plan_snapshot: object   # Optional[LocalPlanSnapshot]
+    plan_snapshot: Optional[LocalPlanSnapshot]
+
+    recovery_target_world: np.ndarray
+    recovery_target_path_index: int
 
     # ── trajectory decomposition ──
     trajectory_sample_time_s: float
@@ -477,14 +485,39 @@ class RuntimeDecision:
     selected_actor: str
 
     def __post_init__(self):
+        array_fields = (
+            "guide_target_world",
+            "recovery_target_world",
+            "trajectory_reference_velocity_flu",
+            "trajectory_feedback_velocity_flu",
+            "expert_velocity_flu",
+            "selected_velocity_flu",
+        )
+        for field_name in array_fields:
+            value = np.asarray(
+                getattr(self, field_name), dtype=np.float64).copy()
+            if value.shape != (3,):
+                raise ValueError("{} must have shape (3,)".format(field_name))
+            value.setflags(write=False)
+            object.__setattr__(self, field_name, value)
+        if (self.plan_snapshot is not None and
+                not isinstance(self.plan_snapshot, LocalPlanSnapshot)):
+            raise TypeError(
+                "plan_snapshot must be LocalPlanSnapshot or None")
+        if not self.selected_actor:
+            raise ValueError("selected_actor must be non-empty")
         if not np.all(np.isfinite(self.guide_target_world)):
             raise ValueError("guide_target_world must be finite")
+        if not np.all(np.isfinite(self.recovery_target_world)):
+            raise ValueError("recovery_target_world must be finite")
         if not np.all(np.isfinite(self.expert_velocity_flu)):
             raise ValueError("expert_velocity_flu must be finite")
         if not np.isfinite(self.expert_yaw_rate):
             raise ValueError("expert_yaw_rate must be finite")
         if not np.isfinite(self.recovery_azimuth_rad):
             raise ValueError("recovery_azimuth_rad must be finite")
+        if not np.isfinite(self.trajectory_sample_time_s):
+            raise ValueError("trajectory_sample_time_s must be finite")
         if not np.all(np.isfinite(self.selected_velocity_flu)):
             raise ValueError("selected_velocity_flu must be finite")
         if not np.isfinite(self.selected_yaw_rate):

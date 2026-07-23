@@ -663,6 +663,10 @@ def _validate_config(cfg):
 
     # ── Planning (v5: new local_planner validation) ──────────────
     planning = g.get("planning", {})
+    validation_cfg = planning.get("validation", {})
+    _validate_positive(
+        "global.planning.validation.command_compare_atol",
+        validation_cfg.get("command_compare_atol", 1.0e-5))
 
     # New v5 sections
     gp = planning.get("global_planner", {})

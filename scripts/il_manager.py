@@ -24,6 +24,7 @@ from __future__ import print_function, division
 
 import json, math, os, sys, time, random, copy, threading, shutil, traceback, csv, inspect, queue
 import numpy as np
+from dataclasses import replace
 
 import rospy
 import rospkg
@@ -324,8 +325,8 @@ class State(Enum):
 class ILManager:
     """State-machine orchestrator for IL dataset collection."""
 
-    # ── Schema v12 ordered field list ────────────────────────────────
-    DATA_SCHEMA_V12_FIELDS = [
+    # ── Schema v14 ordered field list ────────────────────────────────
+    DATA_SCHEMA_V14_FIELDS = [
         # -- time & matching --
         "timestamp_ns", "receive_timestamp_ns", "frame_id",
         "trajectory_time_s", "latency_ms", "match_method",
@@ -415,7 +416,7 @@ class ILManager:
         "plan_source_frame_id", "plan_age_s", "plan_is_fresh",
         "plan_cache_valid",
         "planner_due", "planner_attempted", "planner_retry_count",
-        "terminal_scale_used", "speed_scale_used",
+        "terminal_scale_used",
         # -- v11: recovery fields --
         "recovery_direction",
         "recovery_target_x_world", "recovery_target_y_world",
@@ -2153,7 +2154,7 @@ class ILManager:
         v_bin_edges = np.linspace(-v_fov_rad / 2.0, v_fov_rad / 2.0, trend_v_bins)
 
         # ── Build dynamic field list with 13-class soft label columns ──
-        schema_fields = list(self.DATA_SCHEMA_V12_FIELDS)
+        schema_fields = list(self.DATA_SCHEMA_V14_FIELDS)
         # Insert soft label columns before depth_file
         depth_idx = schema_fields.index("depth_file")
         azi_soft_names = []
@@ -2252,7 +2253,6 @@ class ILManager:
         terminal_scales = list(retry_cfg.get(
             "terminal_scale_sequence", [1.0, 0.75, 0.50, 0.30]))
         # v11 FIX: speed_scale removed — C++ pybind does not export it.
-        # Keeping config field for future use but only terminal_scale retries are active.
         recovery_initial_scales = list(retry_cfg.get(
             "recovery_initial_terminal_scales", [0.30, 0.50]))
 
@@ -2484,7 +2484,6 @@ class ILManager:
             plan_age_s = 0.0
             plan_source_frame_id = -1
             terminal_scale_used = 1.0
-            speed_scale_used = 1.0  # v11: speed_scale not active, always 1.0
             planner_retry_count = 0
             planner_attempted_int = 0
 
@@ -2622,7 +2621,6 @@ class ILManager:
                             planner_status=planner_status_str,
                             minimum_clearance_m=float(result.min_clearance),
                             terminal_scale=terminal_scale_used,
-                            speed_scale=1.0,
                         )
                         self._latest_plan_snapshot = snapshot
                         plan_id_counter += 1
@@ -2707,6 +2705,7 @@ class ILManager:
             # v11 FIX: determine trend_mode and control_mode BEFORE building
             # the training row. Recovery mode changes trend labels to
             # one-hot recovery classes, which must be reflected in the row.
+            recovery_timed_out = False
             if planner_mode == PlannerMode.RECOVERY:
                 trend_mode = TrendMode.RECOVERY
                 control_mode = ControlMode.ROTATE_IN_PLACE
@@ -2728,13 +2727,17 @@ class ILManager:
 
             # ── v13: Compute control ONCE, build RuntimeDecision ────
             # Normal tracking: compute trajectory tracking command
+            recovery_timeout_pending = (
+                planner_mode == PlannerMode.RECOVERY and
+                (recovery_elapsed_s + dt_sample >= recovery_max_duration_s or
+                 recovery_step_count + 1 >= recovery_max_steps))
             tracking_cmd = None
             if (self._latest_plan_snapshot is not None and
                     planner_mode in (PlannerMode.FRESH_PLAN, PlannerMode.CACHED_PLAN)):
                 tracking_cmd = self._compute_trajectory_tracking_command(
                     self._latest_plan_snapshot, trajectory_time_s,
                     cur_pos, cur_vel, cur_yaw,
-                    label_lookahead_time_s=label_lookahead_time_s,
+                    dynamics_state.quaternion_world_body,
                     command_lookahead_time=command_lookahead_time)
 
             if planner_mode == PlannerMode.RECOVERY:
@@ -2744,9 +2747,12 @@ class ILManager:
                 ref_vel_flu = np.zeros(3, dtype=np.float64)
                 fb_vel_flu = np.zeros(3, dtype=np.float64)
                 final_vel_flu = np.zeros(3, dtype=np.float64)
-                final_yr = recovery_yaw_rate
+                final_yr = (
+                    0.0 if recovery_timeout_pending else recovery_yaw_rate)
                 traj_sample_t = -1.0
-                sel_actor = "recovery_controller"
+                sel_actor = (
+                    "recovery_timeout_stop"
+                    if recovery_timeout_pending else "recovery_controller")
             elif tracking_cmd is not None and tracking_cmd.get("valid"):
                 ref_vel_flu = tracking_cmd["reference_velocity_flu"].copy()
                 fb_vel_flu = tracking_cmd["feedback_velocity_flu"].copy()
@@ -2766,17 +2772,28 @@ class ILManager:
                 planner_mode=planner_mode.value,
                 trend_mode=trend_mode.value,
                 control_mode=control_mode.value,
-                guide_source=("latest_successful_plan_guide"
-                              if self._latest_plan_snapshot is not None
-                              else "no_valid_cached_guide"),
-                guide_target_world=(self._latest_plan_snapshot.guide_world.copy()
-                                    if self._latest_plan_snapshot is not None
-                                    else cur_pos.copy()),
-                guide_target_path_index=(self._latest_plan_snapshot.guide_path_index
-                                         if self._latest_plan_snapshot is not None else -1),
+                guide_source=(
+                    "recovery_global_astar_target"
+                    if planner_mode == PlannerMode.RECOVERY
+                    else ("latest_successful_plan_guide"
+                          if self._latest_plan_snapshot is not None
+                          else "no_valid_cached_guide")),
+                guide_target_world=(
+                    recovery_target_world.copy()
+                    if planner_mode == PlannerMode.RECOVERY
+                    else (self._latest_plan_snapshot.guide_world.copy()
+                          if self._latest_plan_snapshot is not None
+                          else cur_pos.copy())),
+                guide_target_path_index=(
+                    recovery_target_path_index
+                    if planner_mode == PlannerMode.RECOVERY
+                    else (self._latest_plan_snapshot.guide_path_index
+                          if self._latest_plan_snapshot is not None else -1)),
                 recovery_direction=recovery_last_direction,
                 recovery_azimuth_rad=recovery_azimuth_rad,
                 plan_snapshot=self._latest_plan_snapshot,
+                recovery_target_world=recovery_target_world.copy(),
+                recovery_target_path_index=recovery_target_path_index,
                 trajectory_sample_time_s=traj_sample_t,
                 trajectory_reference_velocity_flu=ref_vel_flu.copy(),
                 trajectory_feedback_velocity_flu=fb_vel_flu.copy(),
@@ -2794,7 +2811,7 @@ class ILManager:
                 plan_success, planner_compute_ms,
                 planner_status_str,
                 goal_np, goal_pt, global_path_length,
-                label_lookahead_time_s, max_guide_range,
+                max_guide_range,
                 png_name, collision,
                 plan, sample_index, dt_sample,
                 frame_id, recording_start_mono, recording_start_epoch_ns,
@@ -2809,14 +2826,11 @@ class ILManager:
                 planner_used_obs, planner_used_fallback,
                 dynamics_state.quaternion_world_body,
                 # v11 extras
-                planner_mode, control_mode, trend_mode,
                 plan_is_fresh, plan_cache_valid_int,
                 plan_source_frame_id, plan_age_s,
                 True, planner_attempted_int,
-                planner_retry_count, terminal_scale_used, speed_scale_used,
-                recovery_target_world, recovery_target_path_index,
-                recovery_elapsed_s, recovery_last_direction,
-                recovery_azimuth_rad,
+                planner_retry_count, terminal_scale_used,
+                recovery_elapsed_s,
                 self._guide_progress_index, global_path,
             )
             for axis, value in zip(
@@ -2857,31 +2871,11 @@ class ILManager:
 
             learner_output = PolicyOutput() if PolicyOutput is not None else None
             # v13: selected command = expert command = from RuntimeDecision
-            final_actor = decision.selected_actor
+            candidate_actor = decision.selected_actor
             safety_override = False
             override_reason = ""
-            selected_velocity_flu = decision.selected_velocity_flu.copy()
-            selected_yaw_rate = decision.selected_yaw_rate
-
-            # v13: populate trajectory reference/feedback from decision
-            row["trajectory_reference_vx_flu"] = round(
-                float(decision.trajectory_reference_velocity_flu[0]), 6)
-            row["trajectory_reference_vy_flu"] = round(
-                float(decision.trajectory_reference_velocity_flu[1]), 6)
-            row["trajectory_reference_vz_flu"] = round(
-                float(decision.trajectory_reference_velocity_flu[2]), 6)
-            row["trajectory_feedback_vx_flu"] = round(
-                float(decision.trajectory_feedback_velocity_flu[0]), 6)
-            row["trajectory_feedback_vy_flu"] = round(
-                float(decision.trajectory_feedback_velocity_flu[1]), 6)
-            row["trajectory_feedback_vz_flu"] = round(
-                float(decision.trajectory_feedback_velocity_flu[2]), 6)
-            row["trajectory_sample_time_s"] = round(
-                decision.trajectory_sample_time_s, 6)
-
-            # v13: recovery_azimuth_rad
-            row["recovery_azimuth_rad"] = round(
-                decision.recovery_azimuth_rad, 6)
+            candidate_velocity_flu = decision.selected_velocity_flu.copy()
+            candidate_yaw_rate = decision.selected_yaw_rate
 
             if self._dagger_ctrl is not None:
                 learner_output = self._policy_provider.infer(
@@ -2913,23 +2907,34 @@ class ILManager:
                         clearance = 0.0 if clearance is None else float(clearance)
                         if clearance < min_safe and not np.isfinite(ttc):
                             ttc = float(prediction_t)
-                (final_actor, safety_override, override_reason,
+                (candidate_actor, safety_override, override_reason,
                  learner_command, learner_yaw_rate) = self._dagger_ctrl.select_actor(
                     bool(row["expert_label_valid"]), learner_output,
                     observed_clearance, ttc,
                     self._policy_provider.hidden_state_valid)
                 if learner_command is not None:
-                    selected_velocity_flu = np.asarray(learner_command, dtype=np.float64)
-                    selected_yaw_rate = float(learner_yaw_rate)
+                    candidate_velocity_flu = np.asarray(
+                        learner_command, dtype=np.float64)
+                    candidate_yaw_rate = float(learner_yaw_rate)
             elif not bool(row["expert_label_valid"]):
-                final_actor = "safety"
+                candidate_actor = "safety"
                 safety_override = True
                 override_reason = "expert_action_invalid"
-                selected_velocity_flu = np.zeros(3, dtype=np.float64)
-                selected_yaw_rate = 0.0
+                candidate_velocity_flu = np.zeros(3, dtype=np.float64)
+                candidate_yaw_rate = 0.0
 
             learner_velocity = (learner_output.velocity_flu
                                 if learner_output is not None else np.zeros(3))
+            if (candidate_actor != decision.selected_actor or
+                    not np.array_equal(
+                        candidate_velocity_flu,
+                        decision.selected_velocity_flu) or
+                    candidate_yaw_rate != decision.selected_yaw_rate):
+                decision = replace(
+                    decision,
+                    selected_velocity_flu=candidate_velocity_flu,
+                    selected_yaw_rate=candidate_yaw_rate,
+                    selected_actor=candidate_actor)
             row.update({
                 "learner_output_valid": int(learner_output is not None and learner_output.valid),
                 "learner_vx_flu": round(float(learner_velocity[0]), 6),
@@ -2943,11 +2948,15 @@ class ILManager:
                 "initial_selected_actor": self._dagger_ctrl.last_initial_actor if self._dagger_ctrl is not None else "expert",
                 "safety_override": int(safety_override),
                 "override_reason": override_reason,
-                "selected_command_vx_flu": round(float(selected_velocity_flu[0]), 6),
-                "selected_command_vy_flu": round(float(selected_velocity_flu[1]), 6),
-                "selected_command_vz_flu": round(float(selected_velocity_flu[2]), 6),
-                "selected_command_yaw_rate": round(float(selected_yaw_rate), 6),
-                "final_executed_actor": final_actor,
+                "selected_command_vx_flu": round(
+                    float(decision.selected_velocity_flu[0]), 6),
+                "selected_command_vy_flu": round(
+                    float(decision.selected_velocity_flu[1]), 6),
+                "selected_command_vz_flu": round(
+                    float(decision.selected_velocity_flu[2]), 6),
+                "selected_command_yaw_rate": round(
+                    float(decision.selected_yaw_rate), 6),
+                "final_executed_actor": decision.selected_actor,
             })
 
             # ── Step 5: Execute dt_sample to advance to x_(t+1) ──────
@@ -2957,90 +2966,77 @@ class ILManager:
                 # (trend_mode, control_mode, recovery_direction, yaw-rate already set
                 #  in RuntimeDecision before row construction)
 
-                recovery_yaw_rate_cmd = decision.selected_yaw_rate
-
                 (exec_next_pos, exec_next_vel, exec_next_yaw,
                  exec_next_yaw_rate, executed_command_velocity_flu,
-                 executed_command_yaw_rate) = \
-                    self._execute_rotate_in_place(
-                        cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
-                        recovery_yaw_rate_cmd,
+                 executed_command_yaw_rate, executed_command_actor) = \
+                    self._execute_fixed_velocity_command_segment(
+                        decision.selected_velocity_flu,
+                        decision.selected_yaw_rate,
                         dt_sample, dt_ctrl,
-                        max_velocity, max_acceleration, max_yaw_rate)
+                        cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
+                        max_velocity, max_acceleration, max_yaw_rate,
+                        decision.selected_actor)
 
                 recovery_elapsed_s += dt_sample
                 recovery_step_count += 1
+                row["recovery_elapsed_s"] = round(recovery_elapsed_s, 6)
                 self._recovery_frame_count += 1
-                if recovery_direction == "left":
+                if decision.recovery_direction == "left":
                     self._recover_left_frame_count += 1
                 else:
                     self._recover_right_frame_count += 1
 
-                # v11 FIX: recovery expert/selected/executed commands are consistent
-                row["expert_label_valid"] = 1
-                row["expert_vx_world"] = 0.0
-                row["expert_vy_world"] = 0.0
-                row["expert_vz_world"] = 0.0
-                row["expert_vx_flu"] = 0.0
-                row["expert_vy_flu"] = 0.0
-                row["expert_vz_flu"] = 0.0
-                row["expert_yaw_rate"] = round(recovery_yaw_rate_cmd, 6)
-                selected_velocity_flu = np.zeros(3, dtype=np.float64)
-                selected_yaw_rate = recovery_yaw_rate_cmd
-                final_actor = "recovery_controller"
-
                 # v11 FIX: check recovery timeout (timers accumulate across ticks)
                 if (recovery_elapsed_s >= recovery_max_duration_s or
                         recovery_step_count >= recovery_max_steps):
+                    recovery_timed_out = True
                     self._recovery_timeout_count += 1
                     self._trajectory_exit_reason = "RECOVERY_TIMEOUT"
                     rospy.logerr("[ONLINE-LOCKSTEP] Recovery timeout after "
                                  "%.2fs / %d steps.",
                                  recovery_elapsed_s, recovery_step_count)
-                    if self._depth_buffer_enabled and depth_u16 is not None:
-                        self._depth_buffer.append((png_name, depth_u16))
-                    elif self._image_writer is not None and depth_u16 is not None:
-                        self._image_writer.submit(
-                            os.path.join(depth_dir, png_name), depth_u16)
-                    self._csv_writer.writerow(row)
-                    self._rec_written_rows += 1
-                    break
 
                 # v13: if Guide became visible, the next planner tick will use
 
             elif (planner_mode in (PlannerMode.FRESH_PLAN, PlannerMode.CACHED_PLAN)
                   and self._latest_plan_snapshot is not None):
-                control_mode = ControlMode.TRACK_TRAJECTORY
                 (exec_next_pos, exec_next_vel, exec_next_yaw,
                  exec_next_yaw_rate, executed_command_velocity_flu,
-                 executed_command_yaw_rate) = \
-                    self._execute_trajectory_segment_from_snapshot(
-                        self._latest_plan_snapshot,
-                        trajectory_time_s,
-                        cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
+                 executed_command_yaw_rate, executed_command_actor) = \
+                    self._execute_fixed_velocity_command_segment(
+                        decision.selected_velocity_flu,
+                        decision.selected_yaw_rate,
                         dt_sample, dt_ctrl,
+                        cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
                         max_velocity, max_acceleration, max_yaw_rate,
-                        command_lookahead_time)
+                        decision.selected_actor)
                 if planner_mode == PlannerMode.FRESH_PLAN:
                     self._fresh_plan_frame_count += 1
                 else:
                     self._cached_plan_frame_count += 1
-            elif final_actor == "learner":
+            elif decision.selected_actor == "learner":
                 (exec_next_pos, exec_next_vel, exec_next_yaw,
                  exec_next_yaw_rate, executed_command_velocity_flu,
-                 executed_command_yaw_rate) = \
-                    self._execute_velocity_command(
-                        selected_velocity_flu, selected_yaw_rate, dt_sample)
+                 executed_command_yaw_rate, executed_command_actor) = \
+                    self._execute_fixed_velocity_command_segment(
+                        decision.selected_velocity_flu,
+                        decision.selected_yaw_rate,
+                        dt_sample, dt_ctrl,
+                        cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
+                        max_velocity, max_acceleration, max_yaw_rate,
+                        decision.selected_actor)
             else:
                 # Safety actor or no valid plan: hover
-                control_mode = ControlMode.EMERGENCY_STOP
                 (exec_next_pos, exec_next_vel, exec_next_yaw,
                  exec_next_yaw_rate, executed_command_velocity_flu,
-                 executed_command_yaw_rate) = \
-                    self._execute_hover(
-                        cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
+                 executed_command_yaw_rate, executed_command_actor) = \
+                    self._execute_fixed_velocity_command_segment(
+                        decision.selected_velocity_flu,
+                        decision.selected_yaw_rate,
                         dt_sample, dt_ctrl,
-                        max_velocity, max_acceleration, max_yaw_rate)
+                        cur_pos.copy(), cur_vel.copy(), float(cur_yaw),
+                        max_velocity, max_acceleration, max_yaw_rate,
+                        decision.selected_actor)
 
             # Patch executed_next fields with post-execution values
             row["executed_next_x"] = round(float(exec_next_pos[0]), 4)
@@ -3068,9 +3064,9 @@ class ILManager:
             for axis, value in zip(("x", "y", "z"), actual_state.angular_velocity_body):
                 row["actual_angular_velocity_{}".format(axis)] = round(float(value), 6)
             row["velocity_tracking_error"] = round(float(np.linalg.norm(
-                exec_next_vel_flu - selected_velocity_flu)), 6)
+                exec_next_vel_flu - decision.selected_velocity_flu)), 6)
             row["yaw_rate_tracking_error"] = round(
-                abs(float(exec_next_yaw_rate) - selected_yaw_rate), 6)
+                abs(float(exec_next_yaw_rate) - decision.selected_yaw_rate), 6)
 
             # ── v12: applied command (current frame) ─────────────────
             row["applied_command_vx_flu"] = round(
@@ -3081,7 +3077,7 @@ class ILManager:
                 float(executed_command_velocity_flu[2]), 6)
             row["applied_command_yaw_rate"] = round(
                 float(executed_command_yaw_rate), 6)
-            row["applied_command_actor"] = final_actor
+            row["applied_command_actor"] = executed_command_actor
             row["applied_command_valid"] = int(
                 np.all(np.isfinite(executed_command_velocity_flu)) and
                 np.isfinite(executed_command_yaw_rate))
@@ -3125,10 +3121,10 @@ class ILManager:
                 # Recovery frames are valid IF we have a finite recovery target
                 if not np.all(np.isfinite(recovery_target_world)):
                     frame_invalid_reasons.append("invalid_recovery_target")
-                if not np.isfinite(recovery_yaw_rate_cmd
-                                   if 'recovery_yaw_rate_cmd' in dir()
-                                   else True):
+                if not np.isfinite(decision.selected_yaw_rate):
                     frame_invalid_reasons.append("invalid_recovery_command")
+                if recovery_timed_out:
+                    frame_invalid_reasons.append("recovery_timeout")
             elif planner_mode not in (PlannerMode.FRESH_PLAN,
                                        PlannerMode.CACHED_PLAN):
                 # Unknown planner mode
@@ -3152,7 +3148,9 @@ class ILManager:
             # Preserve order while avoiding duplicate reasons.
             frame_invalid_reasons = list(dict.fromkeys(frame_invalid_reasons))
             row["frame_valid"] = int(not frame_invalid_reasons)
-            row["frame_invalid_reason"] = ";".join(frame_invalid_reasons)
+            row["frame_invalid_reason"] = (
+                ";".join(frame_invalid_reasons)
+                if frame_invalid_reasons else "none")
             if frame_invalid_reasons:
                 self._episode_invalid_frame_count += 1
                 for reason in frame_invalid_reasons:
@@ -3187,10 +3185,12 @@ class ILManager:
                 np.all(np.isfinite(executed_command_velocity_flu)) and
                 np.isfinite(executed_command_yaw_rate))
             previous_command_frame_id = frame_id
-            previous_command_actor = final_actor
+            previous_command_actor = executed_command_actor
             previous_command_velocity_flu = np.asarray(
                 executed_command_velocity_flu, dtype=np.float64).copy()
             previous_command_yaw_rate = float(executed_command_yaw_rate)
+            if recovery_timed_out:
+                break
 
             # ── Goal check ───────────────────────────────────────────
             dist_to_goal = float(np.linalg.norm(cur_pos - goal_np))
@@ -3294,45 +3294,29 @@ class ILManager:
     #  v11: Dual-frequency scheduler, cache, recovery helpers
     # ═══════════════════════════════════════════════════════════════
 
-    def _execute_trajectory_segment_from_snapshot(
-            self, snapshot, current_time_s,
+    def _execute_fixed_velocity_command_segment(
+            self, command_velocity_flu, command_yaw_rate,
+            duration_s, dt_ctrl,
             cur_pos, cur_vel, cur_yaw,
-            dt_sample, dt_ctrl,
             max_velocity, max_acceleration, max_yaw_rate,
-            command_lookahead_time=0.08):
-        """Execute dt_sample with a SINGLE pre-computed command (v12 fix).
-
-        The upper-level command is computed ONCE at the start and reused
-        for all Flightmare sub-steps within this 30 Hz interval.
-        Returns (next_pos, next_vel, next_yaw, avg_yaw_rate,
-                 applied_command_flu, applied_command_yaw_rate).
-        """
+            actor):
+        """Execute one immutable upper-level command for a record interval."""
         pos = np.asarray(cur_pos, dtype=np.float64).copy()
         vel = np.asarray(cur_vel, dtype=np.float64).copy()
         yaw = float(cur_yaw)
         total_yaw_change = 0.0
-
-        # v12: compute the command ONCE
-        if snapshot is not None and snapshot.trajectory is not None and len(snapshot.trajectory) > 0:
-            cmd = self._compute_trajectory_tracking_command(
-                snapshot, current_time_s, pos, vel, yaw,
-                label_lookahead_time_s=0.0,
-                command_lookahead_time=command_lookahead_time)
-        else:
-            cmd = {"valid": False}
-
-        if cmd.get("valid"):
-            cmd_vel_flu = cmd["final_velocity_flu"]
-            cmd_yaw_rate = cmd["final_yaw_rate"]
-        else:
-            cmd_vel_flu = np.zeros(3, dtype=np.float64)
-            cmd_yaw_rate = 0.0
+        cmd_vel_flu = np.asarray(
+            command_velocity_flu, dtype=np.float64).copy()
+        cmd_yaw_rate = float(command_yaw_rate)
+        if (not np.all(np.isfinite(cmd_vel_flu)) or
+                not np.isfinite(cmd_yaw_rate) or not actor):
+            raise ValueError("fixed velocity command must be finite and attributed")
 
         elapsed = 0.0
         epsilon = 1e-9
 
-        while elapsed < dt_sample - epsilon:
-            step_dt = min(dt_ctrl, dt_sample - elapsed)
+        while elapsed < duration_s - epsilon:
+            step_dt = min(dt_ctrl, duration_s - elapsed)
             if self._dynamics.backend_name == "flightmare":
                 if not self._dynamics.step_velocity_command(
                         cmd_vel_flu, cmd_yaw_rate, step_dt):
@@ -3353,9 +3337,9 @@ class ILManager:
             total_yaw_change += yr * step_dt
             elapsed += step_dt
 
-        avg_yaw_rate = total_yaw_change / max(dt_sample, 1e-9)
+        avg_yaw_rate = total_yaw_change / max(duration_s, 1e-9)
         return (pos, vel, yaw, avg_yaw_rate,
-                cmd_vel_flu.copy(), float(cmd_yaw_rate))
+                cmd_vel_flu.copy(), float(cmd_yaw_rate), str(actor))
 
     def _scale_terminal(self, guide_sel, global_path, scale,
                          progress_index):
@@ -3590,9 +3574,9 @@ class ILManager:
             return last_direction, azimuth_rad
         return tie_break, azimuth_rad
 
-    def _compute_trajectory_tracking_command(self, snapshot, current_time_s,
-                                              cur_pos, cur_vel, cur_yaw,
-                                              label_lookahead_time_s=0.08,
+    def _compute_trajectory_tracking_command(
+            self, snapshot, current_time_s,
+            cur_pos, cur_vel, cur_yaw, current_quaternion_xyzw,
                                               command_lookahead_time=0.08):
         """Unified trajectory tracking command computation (v12).
 
@@ -3658,11 +3642,10 @@ class ILManager:
             desired_vel_world *= max_velocity / max(desired_speed, 1e-9)
 
         # Convert to FLU
-        ds = self._dynamics.get_state()
         desired_vel_flu = world_vector_to_body_flu_quat(
-            desired_vel_world, ds.quaternion_world_body)
+            desired_vel_world, current_quaternion_xyzw)
         feedforward_vel_flu = world_vector_to_body_flu_quat(
-            feedforward_vel, ds.quaternion_world_body)
+            feedforward_vel, current_quaternion_xyzw)
 
         result["reference_velocity_flu"] = feedforward_vel_flu
         result["feedback_velocity_flu"] = (
@@ -3679,26 +3662,6 @@ class ILManager:
         result["valid"] = True
 
         return result
-
-    def _sample_expert_command_from_snapshot(self, snapshot,
-                                              label_lookahead_time_s,
-                                              current_time_s, cur_yaw,
-                                              cur_pos, cur_vel):
-        """v12: delegates to unified tracking command with REAL current state.
-
-        Returns (expert_velocity_world, expert_yaw_rate).
-        """
-        cmd = self._compute_trajectory_tracking_command(
-            snapshot, current_time_s,
-            cur_pos=cur_pos, cur_vel=cur_vel, cur_yaw=cur_yaw,
-            label_lookahead_time_s=label_lookahead_time_s,
-            command_lookahead_time=0.08)
-        if not cmd["valid"]:
-            return np.zeros(3, dtype=np.float64), 0.0
-        ds = self._dynamics.get_state()
-        final_vel_world = body_flu_to_world_quat(
-            cmd["final_velocity_flu"], ds.quaternion_world_body)
-        return final_vel_world, cmd["final_yaw_rate"]
 
     def _execute_rotate_in_place(self, cur_pos, cur_vel, cur_yaw,
                                   yaw_rate_command, dt_sample, dt_ctrl,
@@ -4303,11 +4266,11 @@ class ILManager:
 
     def _build_training_row_v9(
             self, cur_pos, cur_vel, cur_yaw,
-            plan_snapshot,
+            decision: RuntimeDecision,
             plan_success, planner_compute_ms,
             planner_status_str,
             goal_np, goal_pt, global_path_length,
-            label_lookahead_time_s, max_guide_range,
+            max_guide_range,
             png_name, collision,
             plan, sample_index, dt_sample,
             frame_id, recording_start_mono, recording_start_epoch_ns,
@@ -4322,21 +4285,16 @@ class ILManager:
             planner_used_obs=0, planner_used_fallback=0,
             current_quaternion_xyzw=None,
             # v11 extras
-            planner_mode=None, control_mode=None, trend_mode=None,
             plan_is_fresh=0, plan_cache_valid=0,
             plan_source_frame_id=-1, plan_age_s=0.0,
             planner_due=False, planner_attempted=0,
             planner_retry_count=0, terminal_scale_used=1.0,
-            speed_scale_used=1.0,
-            recovery_target_world=None,
-            recovery_target_path_index=-1,
             recovery_elapsed_s=0.0,
-            recovery_last_direction="",
-            recovery_azimuth_rad=0.0,
             guide_progress_index=-1,
             global_path=None,
     ):
-        """Build one schema-v11 training row with 13-class Trend labels."""
+        """Serialize one schema-v14 row from an immutable RuntimeDecision."""
+        snapshot = decision.plan_snapshot
         row = {}
 
         # ── Time & matching ──────────────────────────────────────
@@ -4351,12 +4309,9 @@ class ILManager:
         row["match_method"] = "frame_id_exact"
 
         # ── v11: runtime mode enums ──────────────────────────────
-        row["planner_mode"] = (
-            planner_mode.value if planner_mode is not None else "UNKNOWN")
-        row["control_mode"] = (
-            control_mode.value if control_mode is not None else "UNKNOWN")
-        row["trend_mode"] = (
-            trend_mode.value if trend_mode is not None else "UNKNOWN")
+        row["planner_mode"] = decision.planner_mode
+        row["control_mode"] = decision.control_mode
+        row["trend_mode"] = decision.trend_mode
 
         # ── Current state (x_t) ──────────────────────────────────
         row["x"] = round(float(cur_pos[0]), 4)
@@ -4411,6 +4366,29 @@ class ILManager:
         row["expert_vy_flu"] = round(float(expert_vel_flu[1]), 6)
         row["expert_vz_flu"] = round(float(expert_vel_flu[2]), 6)
         row["expert_yaw_rate"] = round(float(expert_yaw_rate), 6)
+        row["selected_command_vx_flu"] = round(
+            float(decision.selected_velocity_flu[0]), 6)
+        row["selected_command_vy_flu"] = round(
+            float(decision.selected_velocity_flu[1]), 6)
+        row["selected_command_vz_flu"] = round(
+            float(decision.selected_velocity_flu[2]), 6)
+        row["selected_command_yaw_rate"] = round(
+            float(decision.selected_yaw_rate), 6)
+        row["final_executed_actor"] = decision.selected_actor
+        row["trajectory_reference_vx_flu"] = round(
+            float(decision.trajectory_reference_velocity_flu[0]), 6)
+        row["trajectory_reference_vy_flu"] = round(
+            float(decision.trajectory_reference_velocity_flu[1]), 6)
+        row["trajectory_reference_vz_flu"] = round(
+            float(decision.trajectory_reference_velocity_flu[2]), 6)
+        row["trajectory_feedback_vx_flu"] = round(
+            float(decision.trajectory_feedback_velocity_flu[0]), 6)
+        row["trajectory_feedback_vy_flu"] = round(
+            float(decision.trajectory_feedback_velocity_flu[1]), 6)
+        row["trajectory_feedback_vz_flu"] = round(
+            float(decision.trajectory_feedback_velocity_flu[2]), 6)
+        row["trajectory_sample_time_s"] = round(
+            float(decision.trajectory_sample_time_s), 6)
 
         # ── Executed next state placeholders ─────────────────────
         row["executed_next_x"] = round(float(cur_pos[0]), 4)
@@ -4453,30 +4431,24 @@ class ILManager:
         # 1. Recovery mode → recovery_global_astar_target
         # 2. Valid cached Guide from last successful plan → latest_successful_plan_guide
         # 3. No valid cache → MUST plan or recovery; NEVER use unvalidated current GuideSelector
-        if trend_mode == TrendMode.RECOVERY:
-            guide_source = "recovery_global_astar_target"
-            guide_target_world = recovery_target_world
-            guide_path_idx_target = recovery_target_path_index
+        guide_source = decision.guide_source
+        guide_target_world = decision.guide_target_world
+        guide_path_idx_target = decision.guide_target_path_index
+        if decision.trend_mode == TrendMode.RECOVERY.value:
             guide_cache_valid_int = 0
             guide_cache_age = 0.0
             guide_plan_id_val = -1
-        elif (plan_snapshot is not None and
+        elif (snapshot is not None and
               self._is_guide_cache_valid(
-                  plan_snapshot, trajectory_time_s,
+                  snapshot, trajectory_time_s,
                   guide_progress_index, global_path or [], cur_pos)):
-            guide_source = "latest_successful_plan_guide"
-            guide_target_world = plan_snapshot.guide_world
-            guide_path_idx_target = plan_snapshot.guide_path_index
             guide_cache_valid_int = 1
-            guide_cache_age = trajectory_time_s - plan_snapshot.plan_timestamp_s
-            guide_plan_id_val = plan_snapshot.plan_id
+            guide_cache_age = trajectory_time_s - snapshot.plan_timestamp_s
+            guide_plan_id_val = snapshot.plan_id
             self._max_guide_cache_age_s = max(
                 self._max_guide_cache_age_s, guide_cache_age)
         else:
             # v11 FIX: no valid cached guide → invalid trend (must plan or recover)
-            guide_source = "no_valid_cached_guide"
-            guide_target_world = cur_pos
-            guide_path_idx_target = -1
             guide_cache_valid_int = 0
             guide_cache_age = 0.0
             guide_plan_id_val = -1
@@ -4539,11 +4511,11 @@ class ILManager:
             # ── 13-class Trend horizontal label ──────────────────
             row["trend_label_valid"] = 1
 
-            if trend_mode == TrendMode.RECOVERY:
+            if decision.trend_mode == TrendMode.RECOVERY.value:
                 # Recovery: horizontal class = 0 (LEFT) or 12 (RIGHT)
                 # v11 FIX: use pre-computed recovery_direction and
                 # recovery_azimuth_rad from the control tick.
-                if recovery_last_direction == "left":
+                if decision.recovery_direction == "left":
                     h_class_13 = TREND_RECOVER_LEFT_CLASS
                 else:
                     h_class_13 = TREND_RECOVER_RIGHT_CLASS
@@ -4629,23 +4601,20 @@ class ILManager:
         row["planner_attempted"] = planner_attempted
         row["planner_retry_count"] = planner_retry_count
         row["terminal_scale_used"] = round(terminal_scale_used, 4)
-        row["speed_scale_used"] = round(speed_scale_used, 4)
 
         # ── v11: recovery fields ─────────────────────────────────
-        if recovery_target_world is not None:
-            row["recovery_target_x_world"] = round(
-                float(recovery_target_world[0]), 4)
-            row["recovery_target_y_world"] = round(
-                float(recovery_target_world[1]), 4)
-            row["recovery_target_z_world"] = round(
-                float(recovery_target_world[2]), 4)
-        else:
-            row["recovery_target_x_world"] = 0.0
-            row["recovery_target_y_world"] = 0.0
-            row["recovery_target_z_world"] = 0.0
-        row["recovery_target_path_index"] = recovery_target_path_index
+        row["recovery_target_x_world"] = round(
+            float(decision.recovery_target_world[0]), 4)
+        row["recovery_target_y_world"] = round(
+            float(decision.recovery_target_world[1]), 4)
+        row["recovery_target_z_world"] = round(
+            float(decision.recovery_target_world[2]), 4)
+        row["recovery_target_path_index"] = (
+            decision.recovery_target_path_index)
         row["recovery_elapsed_s"] = round(recovery_elapsed_s, 6)
-        row["recovery_direction"] = recovery_last_direction
+        row["recovery_direction"] = decision.recovery_direction
+        row["recovery_azimuth_rad"] = round(
+            float(decision.recovery_azimuth_rad), 6)
 
         # ── Depth & collision ────────────────────────────────────
         row["depth_file"] = png_name
@@ -4660,15 +4629,15 @@ class ILManager:
         row["goal_z"] = round(goal_pt[2], 4)
 
         # ── Planner & debug fields ───────────────────────────────
-        if plan_snapshot is not None:
+        if snapshot is not None:
             row["global_progress_s"] = round(
-                float(plan_snapshot.reference_path_start_index), 4)
-            row["global_progress_index"] = plan_snapshot.guide_path_index
-            row["local_goal_index"] = plan_snapshot.terminal_path_index
-            row["plan_id"] = plan_snapshot.plan_id
+                float(snapshot.reference_path_start_index), 4)
+            row["global_progress_index"] = snapshot.guide_path_index
+            row["local_goal_index"] = snapshot.terminal_path_index
+            row["plan_id"] = snapshot.plan_id
             row["plan_time_from_start_s"] = 0.0
             row["planner_min_clearance"] = round(
-                plan_snapshot.minimum_clearance_m, 4)
+                snapshot.minimum_clearance_m, 4)
         else:
             row["global_progress_s"] = round(previous_progress_s, 4)
             row["global_progress_index"] = -1
@@ -5941,16 +5910,21 @@ class ILManager:
             validation_passed = False
             failure_reasons.append("metadata_missing")
 
-        # 8. Schema v7 lightweight data checks (non-fatal for some)
+        # 8. Schema v14 command and row-integrity checks
         data_cfg = self.g.get("data", {})
         schema_version = int(data_cfg.get("schema_version", 7))
-        if schema_version >= 7 and os.path.isfile(data_path) and col_map:
-            v7_issues = self._validate_schema_v7(
+        if schema_version != 14:
+            validation_passed = False
+            failure_reasons.append(
+                "unsupported_current_schema_version:{}".format(
+                    schema_version))
+        elif os.path.isfile(data_path) and col_map:
+            v14_issues = self._validate_schema_v14(
                 data_path, col_map, data_cfg)
-            if v7_issues:
-                rospy.logwarn("[Validate] Schema v7 issues: %s",
-                              "; ".join(v7_issues[:10]))
-                failure_reasons.extend(v7_issues)
+            if v14_issues:
+                rospy.logwarn("[Validate] Schema v14 issues: %s",
+                              "; ".join(v14_issues[:10]))
+                failure_reasons.extend(v14_issues)
                 validation_passed = False
 
         # ── Commit or reject ──────────────────────────────────────
@@ -5963,8 +5937,8 @@ class ILManager:
         self._final_dir = None
         self._route_next()
 
-    def _validate_schema_v7(self, data_path, col_map, data_cfg):
-        """Validate schema-v11 data invariants. Returns issue strings."""
+    def _validate_schema_v14(self, data_path, col_map, data_cfg):
+        """Validate schema-v14 data invariants. Returns issue strings."""
         issues = []
         trend_cfg_v = data_cfg.get("trend", {})
         trend_normal_h_bins = int(trend_cfg_v.get(
@@ -5975,21 +5949,44 @@ class ILManager:
         lp_cfg = self.g.get("planning", {}).get("local_planner", {})
         max_velocity = float(lp_cfg.get("max_velocity", 2.5))
         max_yaw_rate = float(lp_cfg.get("max_yaw_rate", 2.0))
+        command_compare_atol = float(
+            self.g.get("planning", {}).get("validation", {}).get(
+                "command_compare_atol", 1.0e-5))
         required_fields = (
             "frame_valid", "frame_invalid_reason",
             "state_angular_velocity_x_body",
             "state_angular_velocity_y_body",
             "state_angular_velocity_z_body",
+            "state_angular_velocity_x_flu",
+            "state_angular_velocity_y_flu",
+            "state_angular_velocity_z_flu",
+            "gravity_direction_x_flu",
+            "gravity_direction_y_flu",
+            "gravity_direction_z_flu",
             "previous_executed_command_valid",
             "previous_executed_command_frame_id", "previous_executed_actor",
             "previous_executed_command_vx_flu",
             "previous_executed_command_vy_flu",
             "previous_executed_command_vz_flu",
             "previous_executed_command_yaw_rate",
-            "expert_label_valid", "trend_label_valid", "match_method",
+            "expert_label_valid",
+            "expert_vx_flu", "expert_vy_flu", "expert_vz_flu",
+            "expert_yaw_rate",
+            "trend_label_valid", "match_method",
             "learner_output_valid", "selected_command_vx_flu",
             "selected_command_vy_flu", "selected_command_vz_flu",
             "selected_command_yaw_rate", "final_executed_actor",
+            "applied_command_vx_flu", "applied_command_vy_flu",
+            "applied_command_vz_flu", "applied_command_yaw_rate",
+            "applied_command_actor", "applied_command_valid",
+            "trajectory_reference_vx_flu",
+            "trajectory_reference_vy_flu",
+            "trajectory_reference_vz_flu",
+            "trajectory_feedback_vx_flu",
+            "trajectory_feedback_vy_flu",
+            "trajectory_feedback_vz_flu",
+            "trajectory_sample_time_s",
+            "recovery_azimuth_rad",
             "actual_next_vx_flu", "actual_next_vy_flu",
             "actual_next_vz_flu", "scene_id", "task_id",
             "guide_source", "guide_visible", "guide_depth_visible",
@@ -6004,13 +6001,15 @@ class ILManager:
             with open(data_path, "r") as f:
                 reader = csv.DictReader(f)
                 prev_frame_id = -1
+                previous_applied_command = None
+                previous_applied_frame_id = -1
                 row_idx = 0
                 for row in reader:
                     row_idx += 1
 
                     for required in required_fields:
-                        if required not in row:
-                            issues.append("CRITICAL: missing {} at row {}".format(
+                        if required not in row or row.get(required, "") == "":
+                            issues.append("CRITICAL: missing_or_empty {} at row {}".format(
                                 required, row_idx))
 
                     if str(row.get("frame_valid", "0")) != "1":
@@ -6091,6 +6090,76 @@ class ILManager:
                             issues.append("CRITICAL: invalid expert command at row {}".format(row_idx))
                     except (ValueError, TypeError):
                         issues.append("CRITICAL: unparseable expert command at row {}".format(row_idx))
+
+                    try:
+                        expert_command = np.array([
+                            float(row["expert_vx_flu"]),
+                            float(row["expert_vy_flu"]),
+                            float(row["expert_vz_flu"]),
+                            float(row["expert_yaw_rate"])])
+                        selected_command = np.array([
+                            float(row["selected_command_vx_flu"]),
+                            float(row["selected_command_vy_flu"]),
+                            float(row["selected_command_vz_flu"]),
+                            float(row["selected_command_yaw_rate"])])
+                        applied_command = np.array([
+                            float(row["applied_command_vx_flu"]),
+                            float(row["applied_command_vy_flu"]),
+                            float(row["applied_command_vz_flu"]),
+                            float(row["applied_command_yaw_rate"])])
+                        current_previous_command = np.array([
+                            float(row["previous_executed_command_vx_flu"]),
+                            float(row["previous_executed_command_vy_flu"]),
+                            float(row["previous_executed_command_vz_flu"]),
+                            float(row["previous_executed_command_yaw_rate"])])
+
+                        if str(row.get("expert_label_valid", "0")) == "1":
+                            if not np.allclose(
+                                    expert_command, selected_command,
+                                    atol=command_compare_atol, rtol=0.0):
+                                issues.append(
+                                    "CRITICAL: expert_selected_command_mismatch "
+                                    "at row {}".format(row_idx))
+                        if (str(row.get("applied_command_valid", "0")) != "1" or
+                                not np.allclose(
+                                    selected_command, applied_command,
+                                    atol=command_compare_atol, rtol=0.0)):
+                            issues.append(
+                                "CRITICAL: selected_applied_command_mismatch "
+                                "at row {}".format(row_idx))
+                        if (row.get("final_executed_actor", "") !=
+                                row.get("applied_command_actor", "")):
+                            issues.append(
+                                "CRITICAL: selected_applied_actor_mismatch "
+                                "at row {}".format(row_idx))
+
+                        previous_valid = (
+                            str(row["previous_executed_command_valid"]) == "1")
+                        if row_idx == 1:
+                            if previous_valid or not np.allclose(
+                                    current_previous_command,
+                                    np.zeros(4, dtype=np.float64),
+                                    atol=command_compare_atol, rtol=0.0):
+                                issues.append(
+                                    "CRITICAL: invalid_episode_start_previous_command")
+                        elif (not previous_valid or
+                              previous_applied_command is None or
+                              not np.allclose(
+                                  current_previous_command,
+                                  previous_applied_command,
+                                  atol=command_compare_atol, rtol=0.0) or
+                              int(row["previous_executed_command_frame_id"]) !=
+                              previous_applied_frame_id):
+                            issues.append(
+                                "CRITICAL: previous_applied_command_discontinuity "
+                                "at row {}".format(row_idx))
+
+                        previous_applied_command = applied_command.copy()
+                        previous_applied_frame_id = int(row["frame_id"])
+                    except (KeyError, ValueError, TypeError):
+                        issues.append(
+                            "CRITICAL: unparseable command consistency fields "
+                            "at row {}".format(row_idx))
 
                     if str(row.get("learner_output_valid", "0")) == "1":
                         try:
