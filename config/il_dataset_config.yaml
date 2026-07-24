@@ -139,18 +139,18 @@ global:
 
     # ── Common task generation ─────────────────────────────────────
     common_task_generation:
-      tasks_per_scene: 3
+      tasks_per_scene: 10
 
       start_sampling_region:
-        x_min: -8.0
-        x_max: 10.0
-        y_min: -2.0
-        y_max: -1.0
+        x_min: 0.0
+        x_max: 4.0
+        y_min: -1.5
+        y_max: -0.5
 
       goal_sampling_region:
-        x_min: -8.0
-        x_max: 10.0
-        y_min: 30.0
+        x_min: 0.0
+        x_max: 4.0
+        y_min: 31.0
         y_max: 32.0
 
       start_height_min_m: 1.8
@@ -159,7 +159,7 @@ global:
       goal_height_min_m: 1.8
       goal_height_max_m: 2.2
 
-      maximum_start_goal_height_difference_m: 0.20
+      maximum_start_goal_height_difference_m: 1.50
 
       minimum_start_goal_distance_m: 28.0
       maximum_start_goal_distance_m: 40.0
@@ -203,7 +203,7 @@ global:
       grid_resolution_m: 0.10
       validation_halo_m: 3.0
 
-      vehicle_radius_m: 0.30
+      vehicle_radius_m: 0.20
       safety_margin_m: 0.10
 
       forbid_enclosed_free_components: true
@@ -262,7 +262,7 @@ global:
         y_max: 32.0
 
     side_cost:
-      enabled: true
+      enabled: false
 
       minimum_cost_difference_ratio: 0.15
       portal_lateral_clearance_m: 0.60
@@ -281,84 +281,222 @@ global:
       reject_episode_on_inconsistent_side_choice: true
 
     # ═══════════════════════════════════════════════════════════════
-    #  Scene generation profiles  (v9 multi-profile)
+    #  Scene generation profiles  (v10: 12 scenes, S01–S12)
     # ═══════════════════════════════════════════════════════════════
     profiles:
-      - name: "small_sparse"
+      # ── S01–S03: Small-scale (0.10–0.80 m) ───────────────────
+      - name: "S01_small_sparse"
         enabled: true
-        scene_count: 60
-        seed_offset: 1000
+        scene_count: 1
+        seed_offset: 1010
 
         cylinder:
-          radius_min_m: 0.30
-          radius_max_m: 0.80
-
+          radius_min_m: 0.10
+          radius_max_m: 0.35
           count_min: 8
-          count_max: 24
+          count_max: 16
 
         density:
           enabled: true
           mode: "inflated_occupancy"
+          target_min: 0.015
+          target_max: 0.035
 
-          target_min: 0.06
-          target_max: 0.10
-
-      - name: "medium"
+      - name: "S02_small_medium"
         enabled: true
-        scene_count: 60
-        seed_offset: 2000
+        scene_count: 1
+        seed_offset: 1020
+
+        cylinder:
+          radius_min_m: 0.30
+          radius_max_m: 0.60
+          count_min: 10
+          count_max: 18
+
+        density:
+          enabled: true
+          mode: "inflated_occupancy"
+          target_min: 0.04
+          target_max: 0.07
+
+      - name: "S03_small_dense"
+        enabled: true
+        scene_count: 1
+        seed_offset: 1030
+
+        cylinder:
+          radius_min_m: 0.50
+          radius_max_m: 0.80
+          count_min: 12
+          count_max: 20
+
+        density:
+          enabled: true
+          mode: "inflated_occupancy"
+          target_min: 0.07
+          target_max: 0.12
+
+      # ── S04–S06: Medium-scale (0.80–2.00 m) ──────────────────
+      - name: "S04_medium_sparse"
+        enabled: true
+        scene_count: 1
+        seed_offset: 2010
 
         cylinder:
           radius_min_m: 0.80
-          radius_max_m: 1.60
-
+          radius_max_m: 1.20
           count_min: 5
-          count_max: 14
+          count_max: 10
 
         density:
           enabled: true
           mode: "inflated_occupancy"
+          target_min: 0.05
+          target_max: 0.10
 
+      - name: "S05_medium_medium"
+        enabled: true
+        scene_count: 1
+        seed_offset: 2020
+
+        cylinder:
+          radius_min_m: 1.10
+          radius_max_m: 1.60
+          count_min: 6
+          count_max: 12
+
+        density:
+          enabled: true
+          mode: "inflated_occupancy"
           target_min: 0.08
           target_max: 0.14
 
-      - name: "mixed"
+      - name: "S06_medium_dense"
         enabled: true
-        scene_count: 50
-        seed_offset: 3000
+        scene_count: 1
+        seed_offset: 2030
 
         cylinder:
-          radius_min_m: 0.30
-          radius_max_m: 2.20
-
-          count_min: 5
+          radius_min_m: 1.50
+          radius_max_m: 2.00
+          count_min: 8
           count_max: 14
 
         density:
           enabled: true
           mode: "inflated_occupancy"
+          target_min: 0.12
+          target_max: 0.18
 
-          target_min: 0.08
-          target_max: 0.15
-
-      - name: "large"
+      # ── S07–S09: Large-scale (2.00–3.50 m) ───────────────────
+      - name: "S07_large_sparse"
         enabled: true
-        scene_count: 30
-        seed_offset: 4000
+        scene_count: 1
+        seed_offset: 3010
 
         cylinder:
-          radius_min_m: 1.60
-          radius_max_m: 3.00
-
+          radius_min_m: 2.00
+          radius_max_m: 2.50
           count_min: 2
+          count_max: 6
+
+        density:
+          enabled: true
+          mode: "inflated_occupancy"
+          target_min: 0.06
+          target_max: 0.12
+
+      - name: "S08_large_medium"
+        enabled: true
+        scene_count: 1
+        seed_offset: 3020
+
+        cylinder:
+          radius_min_m: 2.40
+          radius_max_m: 3.00
+          count_min: 3
           count_max: 7
 
         density:
           enabled: true
           mode: "inflated_occupancy"
+          target_min: 0.10
+          target_max: 0.18
 
-          target_min: 0.07
-          target_max: 0.14
+      - name: "S09_large_dense"
+        enabled: true
+        scene_count: 1
+        seed_offset: 3030
+
+        cylinder:
+          radius_min_m: 2.90
+          radius_max_m: 3.50
+          count_min: 4
+          count_max: 8
+
+        density:
+          enabled: true
+          mode: "inflated_occupancy"
+          target_min: 0.14
+          target_max: 0.22
+
+      # ── S10–S12: Mixed-scale (0.10–3.50 m, multi-range) ──────
+      - name: "S10_mixed_small_heavy"
+        enabled: true
+        scene_count: 1
+        seed_offset: 4010
+
+        cylinder:
+          ranges:
+            - {min: 0.10, max: 0.80, weight: 0.50}
+            - {min: 0.80, max: 2.00, weight: 0.30}
+            - {min: 2.00, max: 3.50, weight: 0.20}
+          count_min: 6
+          count_max: 12
+
+        density:
+          enabled: true
+          mode: "inflated_occupancy"
+          target_min: 0.08
+          target_max: 0.15
+
+      - name: "S11_mixed_balanced"
+        enabled: true
+        scene_count: 1
+        seed_offset: 4020
+
+        cylinder:
+          ranges:
+            - {min: 0.10, max: 0.80, weight: 0.33}
+            - {min: 0.80, max: 2.00, weight: 0.34}
+            - {min: 2.00, max: 3.50, weight: 0.33}
+          count_min: 6
+          count_max: 12
+
+        density:
+          enabled: true
+          mode: "inflated_occupancy"
+          target_min: 0.08
+          target_max: 0.15
+
+      - name: "S12_mixed_large_heavy"
+        enabled: true
+        scene_count: 1
+        seed_offset: 4030
+
+        cylinder:
+          ranges:
+            - {min: 0.10, max: 0.80, weight: 0.20}
+            - {min: 0.80, max: 2.00, weight: 0.30}
+            - {min: 2.00, max: 3.50, weight: 0.50}
+          count_min: 5
+          count_max: 10
+
+        density:
+          enabled: true
+          mode: "inflated_occupancy"
+          target_min: 0.08
+          target_max: 0.15
 
   # ── Phase 4: ESDF Cache ────────────────────────────────────────────
   esdf_cache:
@@ -486,7 +624,7 @@ global:
     # v11: random yaw offset applied to initial drone heading.
     # 0 = always face along the first global-path segment.
     # e.g. 30 = uniformly random offset in [-30°, +30°].
-    initial_yaw_randomization_deg: 100.0
+    initial_yaw_randomization_deg: 90.0
 
   # ── Trajectory planning & dynamics constraints ───────────────────────
   planning:

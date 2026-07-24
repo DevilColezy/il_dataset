@@ -1007,11 +1007,39 @@ def _validate_profiles(sg_cfg, errors):
         cyl = p.get("cylinder", {})
         r_min = float(cyl.get("radius_min_m", -1))
         r_max = float(cyl.get("radius_max_m", -1))
-        if r_min <= 0:
-            errors.append("profiles[{}] ('{}'): cylinder.radius_min_m must be > 0".format(i, name))
-        if r_max < r_min:
-            errors.append("profiles[{}] ('{}'): radius_max_m ({}) < radius_min_m ({})".format(
-                i, name, r_max, r_min))
+
+        # Multi-range sampling (mixed-scale scenes)
+        ranges_raw = cyl.get("ranges", None)
+        if ranges_raw is not None:
+            if not isinstance(ranges_raw, list) or len(ranges_raw) == 0:
+                errors.append("profiles[{}] ('{}'): cylinder.ranges must be a non-empty list".format(
+                    i, name))
+            else:
+                for ri, rng in enumerate(ranges_raw):
+                    rr_min = float(rng.get("min", -1))
+                    rr_max = float(rng.get("max", -1))
+                    rr_weight = float(rng.get("weight", -1))
+                    if rr_min <= 0:
+                        errors.append(
+                            "profiles[{}] ('{}'): cylinder.ranges[{}].min must be > 0, got {}".format(
+                                i, name, ri, rr_min))
+                    if rr_max < rr_min:
+                        errors.append(
+                            "profiles[{}] ('{}'): cylinder.ranges[{}].max ({}) < min ({})".format(
+                                i, name, ri, rr_max, rr_min))
+                    if rr_weight <= 0:
+                        errors.append(
+                            "profiles[{}] ('{}'): cylinder.ranges[{}].weight must be > 0, got {}".format(
+                                i, name, ri, rr_weight))
+            # When ranges is present, radius_min_m / radius_max_m are optional
+            # (they serve as fallback if ranges is somehow empty at runtime).
+        else:
+            # Legacy single-range: require valid radius_min_m / radius_max_m
+            if r_min <= 0:
+                errors.append("profiles[{}] ('{}'): cylinder.radius_min_m must be > 0".format(i, name))
+            if r_max < r_min:
+                errors.append("profiles[{}] ('{}'): radius_max_m ({}) < radius_min_m ({})".format(
+                    i, name, r_max, r_min))
 
         c_min = int(cyl.get("count_min", -1))
         c_max = int(cyl.get("count_max", -1))

@@ -134,6 +134,46 @@ def compute_pairwise_min_gaps(obstacles, vehicle_r, safety_m):
 
 
 # ============================================================================
+#  RadiusRange — multi-range cylinder sampling support
+# ============================================================================
+
+@dataclass
+class RadiusRange:
+    """A single radius sub-range with sampling weight.
+
+    Used by mixed-scale profiles (e.g. S10–S12) that need cylinders from
+    multiple distinct size classes within the same scene.
+
+    Attributes:
+        min_m: minimum radius in this sub-range (metres).
+        max_m: maximum radius in this sub-range (metres).
+        weight: relative probability of sampling from this range.
+            Weights are normalised across all ranges in a profile.
+    """
+    min_m: float
+    max_m: float
+    weight: float = 1.0
+
+    def __post_init__(self):
+        if self.min_m <= 0.0:
+            raise ValueError("RadiusRange.min_m must be > 0, got {}".format(self.min_m))
+        if self.max_m < self.min_m:
+            raise ValueError("RadiusRange.max_m ({}) < min_m ({})".format(
+                self.max_m, self.min_m))
+        if self.weight <= 0.0:
+            raise ValueError("RadiusRange.weight must be > 0, got {}".format(self.weight))
+
+    @staticmethod
+    def from_dict(d):
+        """Parse from a YAML dict with keys min, max, weight."""
+        return RadiusRange(
+            min_m=float(d.get("min", 0.0)),
+            max_m=float(d.get("max", 0.0)),
+            weight=float(d.get("weight", 1.0)),
+        )
+
+
+# ============================================================================
 #  SceneGenerationProfile dataclass
 # ============================================================================
 
@@ -191,6 +231,10 @@ class SceneGenerationProfile:
     # Overrides (any profile-level overrides dict, kept for metadata)
     overrides: dict = field(default_factory=dict)
 
+    # Multi-range sampling (mixed-scale scenes).  When non-empty this
+    # overrides radius_min_m / radius_max_m for per-cylinder radius draws.
+    radius_ranges: list = field(default_factory=list)
+
     @property
     def inflation_radius_m(self):
         return self.vehicle_radius_m + self.safety_margin_m
@@ -218,6 +262,13 @@ class SceneGenerationProfile:
             common_cyl.get("count_min", 4)))
         count_max = int(cyl_cfg.get("count_max",
             common_cyl.get("count_max", 12)))
+
+        # Multi-range sampling (mixed-scale scenes, e.g. S10–S12)
+        radius_ranges = []
+        ranges_raw = cyl_cfg.get("ranges", None)
+        if ranges_raw is not None:
+            for r in ranges_raw:
+                radius_ranges.append(RadiusRange.from_dict(r))
 
         # Density params
         density_cfg = profile_dict.get("density", {})
@@ -337,6 +388,7 @@ class SceneGenerationProfile:
             require_astar_reachable=require_astar_reachable,
             minimum_detour_ratio=minimum_detour_ratio,
             maximum_detour_ratio=maximum_detour_ratio,
+            radius_ranges=radius_ranges,
             overrides=overrides,
         )
 
@@ -691,14 +743,43 @@ class YamlCylinderSceneGenerator:
         obstacles = []
         count_min = profile.count_min
         count_max = profile.count_max
-        radius_min = profile.radius_min_m
-        radius_max = profile.radius_max_m
         height_min = profile.height_min_m
         height_max = profile.height_max_m
         boundary_margin = profile.region_boundary_margin_m
         min_surface_gap = profile.minimum_surface_gap_m
         min_post_inflation_gap = profile.minimum_post_inflation_gap_m
         infl_radius = profile.inflation_radius_m
+
+        # ── Radius sampling strategy ──────────────────────────────
+        # When radius_ranges is provided (mixed-scale scenes), sample a
+        # sub-range by weight first, then draw uniformly within it.
+        # Otherwise fall back to the legacy single [min, max] range.
+        use_multi_range = (
+            profile.radius_ranges is not None
+            and len(profile.radius_ranges) > 0)
+        if use_multi_range:
+            _range_weights = np.array(
+                [r.weight for r in profile.radius_ranges],
+                dtype=np.float64)
+            _range_weight_sum = float(np.sum(_range_weights))
+            if _range_weight_sum <= 0.0:
+                use_multi_range = False  # safety fallback
+            else:
+                _range_weights /= _range_weight_sum
+                _range_cumulative = np.cumsum(_range_weights)
+
+        def _sample_radius(rng_state):
+            """Sample a cylinder radius using the active strategy."""
+            if use_multi_range:
+                # Weighted range selection
+                p = float(rng_state.uniform(0.0, 1.0))
+                range_idx = int(np.searchsorted(_range_cumulative, p, side="right"))
+                range_idx = min(range_idx, len(profile.radius_ranges) - 1)
+                sel = profile.radius_ranges[range_idx]
+                return float(rng_state.uniform(sel.min_m, sel.max_m))
+            else:
+                return float(rng_state.uniform(
+                    profile.radius_min_m, profile.radius_max_m))
 
         # For fixed-count (density disabled): pick a target count
         if not profile.density_enabled:
@@ -722,8 +803,8 @@ class YamlCylinderSceneGenerator:
                                 target_density, density_mode.value)
                 break
 
-            # Sample radius
-            radius = float(rng.uniform(radius_min, radius_max))
+            # Sample radius (multi-range or single-range)
+            radius = _sample_radius(rng)
             height = float(rng.uniform(height_min, height_max))
 
             # Sample z
@@ -1247,6 +1328,66 @@ class StartGoalTaskGenerator:
         Used by profile mode to apply profile-specific tasks_per_scene.
         """
         self.tasks_per_scene = int(n)
+
+    def configure_from_profile(self, profile):
+        """Apply all profile-specific task generation parameters.
+
+        Called before generate_tasks() when running in profile mode.
+        This fixes the bug where profile-level start_sampling_region,
+        goal_sampling_region, height ranges, distance limits, and
+        blocking requirements were parsed but never applied at runtime.
+
+        Args:
+            profile: SceneGenerationProfile or None.
+        """
+        if profile is None:
+            return
+
+        # ── Task count ──────────────────────────────────────────
+        self.tasks_per_scene = int(profile.tasks_per_scene)
+
+        # ── Height ranges ───────────────────────────────────────
+        self.start_h_min = float(profile.start_height_min_m)
+        self.start_h_max = float(profile.start_height_max_m)
+        self.goal_h_min = float(profile.goal_height_min_m)
+        self.goal_h_max = float(profile.goal_height_max_m)
+        self.max_h_diff = float(profile.maximum_start_goal_height_difference_m)
+
+        # ── Distance limits ─────────────────────────────────────
+        self.min_dist = float(profile.minimum_start_goal_distance_m)
+        self.max_dist = float(profile.maximum_start_goal_distance_m)
+
+        # ── Blocked-path requirements ───────────────────────────
+        self.require_blocked = bool(profile.require_direct_path_blocked)
+        self.min_blockers = int(profile.minimum_direct_blocker_count)
+        self.max_blockers = int(profile.maximum_direct_blocker_count)
+
+        # ── A* reachability ─────────────────────────────────────
+        self.require_astar = bool(profile.require_astar_reachable)
+        self.min_detour = float(profile.minimum_detour_ratio)
+        self.max_detour = float(profile.maximum_detour_ratio)
+
+        # ── Sampling regions ────────────────────────────────────
+        sr = profile.start_sampling_region
+        if sr:
+            self.start_region = ObstacleRegion(
+                x_min=float(sr.get("x_min", self.start_region.x_min)),
+                x_max=float(sr.get("x_max", self.start_region.x_max)),
+                y_min=float(sr.get("y_min", self.start_region.y_min)),
+                y_max=float(sr.get("y_max", self.start_region.y_max)),
+                z_min=self.start_h_min,
+                z_max=self.start_h_max,
+            )
+        gr = profile.goal_sampling_region
+        if gr:
+            self.goal_region = ObstacleRegion(
+                x_min=float(gr.get("x_min", self.goal_region.x_min)),
+                x_max=float(gr.get("x_max", self.goal_region.x_max)),
+                y_min=float(gr.get("y_min", self.goal_region.y_min)),
+                y_max=float(gr.get("y_max", self.goal_region.y_max)),
+                z_min=self.goal_h_min,
+                z_max=self.goal_h_max,
+            )
 
     def generate_tasks(self, obstacles, esdf, esdf_origin, esdf_res,
                        astar_planner_fn, seed=0):

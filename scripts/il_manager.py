@@ -34,11 +34,14 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
-# Also add flightmare_dataset_tools scripts dir (for SmartObstacleSampler)
+# Also add flightmare_dataset_tools scripts dir (for SmartObstacleSampler, legacy)
 _rp = rospkg.RosPack()
-_ft_scripts = os.path.join(_rp.get_path("flightmare_dataset_tools"), "scripts")
-if os.path.isdir(_ft_scripts) and _ft_scripts not in sys.path:
-    sys.path.insert(0, _ft_scripts)
+try:
+    _ft_scripts = os.path.join(_rp.get_path("flightmare_dataset_tools"), "scripts")
+    if os.path.isdir(_ft_scripts) and _ft_scripts not in sys.path:
+        sys.path.insert(0, _ft_scripts)
+except rospkg.common.ResourceNotFound:
+    pass  # flightmare_dataset_tools not installed; unused in profile mode
 
 # Also add the devel lib path for the C++ module
 _devel_lib = os.path.join(_rp.get_path("il_dataset"), "..", "..", "devel", "lib")
@@ -649,14 +652,15 @@ class ILManager:
         self._observability_trigger_count = 0
         self._observability_consistent_count = 0
 
-        # ── Profile scheduling state (v9 multi-profile) ─────────
-        self._use_profile_mode = False
-        self._enabled_scene_profiles = []     # list of SceneGenerationProfile
-        self._scene_profile_index = 0         # which profile we're on
-        self._scene_index_in_profile = 0      # which scene within current profile
-        self._task_index_in_scene = 0         # which task within current scene
-        self._current_profile = None          # SceneGenerationProfile or None
-        self._current_profile_name = ""
+        # ── Profile scheduling defaults (overridden by Phase 3 if profiles loaded) ─
+        if not self._use_profile_mode:
+            self._use_profile_mode = False
+            self._enabled_scene_profiles = []
+            self._scene_profile_index = 0
+            self._scene_index_in_profile = 0
+            self._task_index_in_scene = 0
+            self._current_profile = None
+            self._current_profile_name = ""
         self._current_effective_scene_seed = 0
         self._current_target_density = None
         self._current_target_density_mode = ""
@@ -1577,10 +1581,12 @@ class ILManager:
                 len(self._current_scene_obstacles) > 0):
             rospy.loginfo("[FSM] Phase 3: generating tasks via StartGoalTaskGenerator...")
 
-            # Apply profile-specific tasks_per_scene
+            # Apply ALL profile-specific task generation parameters
+            # (sampling regions, height ranges, distance limits, blocking
+            #  requirements, etc.) — not just tasks_per_scene.
             if self._use_profile_mode and self._current_profile is not None:
-                self._task_generator.set_tasks_per_scene(
-                    self._current_profile.tasks_per_scene)
+                self._task_generator.configure_from_profile(
+                    self._current_profile)
 
             # Use the il_trajectory module already loaded via importlib at
             # module level (line ~133), which is guaranteed to come from
