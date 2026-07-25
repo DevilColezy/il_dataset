@@ -174,6 +174,62 @@ class RadiusRange:
 
 
 # ============================================================================
+#  SizeGroup — per-size-class params for density-driven generation
+# ============================================================================
+
+@dataclass
+class SizeGroup:
+    """Parameters for a single obstacle size class in density-driven generation.
+
+    Three groups (large, medium, small) share the total density budget
+    equally by default.  Each group places obstacles until its capacity is
+    exhausted or consecutive placement failures exceed the threshold.
+    """
+    name: str               # "large", "medium", or "small"
+    radius_min_m: float
+    radius_max_m: float
+    capacity_fraction: float = 1.0 / 3.0   # share of total inflated-area budget
+    consecutive_fail_threshold: int = 100
+
+    def __post_init__(self):
+        if self.radius_min_m <= 0.0:
+            raise ValueError("SizeGroup.radius_min_m must be > 0, got {}".format(
+                self.radius_min_m))
+        if self.radius_max_m < self.radius_min_m:
+            raise ValueError("SizeGroup.radius_max_m ({}) < radius_min_m ({})".format(
+                self.radius_max_m, self.radius_min_m))
+        if self.capacity_fraction <= 0.0 or self.capacity_fraction > 1.0:
+            raise ValueError("SizeGroup.capacity_fraction must be in (0, 1], got {}".format(
+                self.capacity_fraction))
+        if self.consecutive_fail_threshold < 1:
+            raise ValueError("SizeGroup.consecutive_fail_threshold must be >= 1, got {}".format(
+                self.consecutive_fail_threshold))
+
+    def min_inflated_area_m2(self, infl_radius):
+        """Minimum inflated area (m²) of one obstacle from this group."""
+        return math.pi * (self.radius_min_m + infl_radius) ** 2
+
+    def max_inflated_area_m2(self, infl_radius):
+        """Maximum inflated area (m²) of one obstacle from this group."""
+        return math.pi * (self.radius_max_m + infl_radius) ** 2
+
+    def sample_radius(self, rng):
+        """Sample a radius uniformly from [radius_min_m, radius_max_m]."""
+        return float(rng.uniform(self.radius_min_m, self.radius_max_m))
+
+    @staticmethod
+    def from_dict(d, default_name="unnamed"):
+        """Parse from a YAML dict."""
+        return SizeGroup(
+            name=str(d.get("name", default_name)),
+            radius_min_m=float(d.get("radius_min_m", 0.10)),
+            radius_max_m=float(d.get("radius_max_m", 0.80)),
+            capacity_fraction=float(d.get("capacity_fraction", 1.0 / 3.0)),
+            consecutive_fail_threshold=int(d.get("consecutive_fail_threshold", 100)),
+        )
+
+
+# ============================================================================
 #  SceneGenerationProfile dataclass
 # ============================================================================
 
@@ -212,8 +268,6 @@ class SceneGenerationProfile:
 
     # Task params
     tasks_per_scene: int
-    start_sampling_region: dict
-    goal_sampling_region: dict
     start_height_min_m: float
     start_height_max_m: float
     goal_height_min_m: float
@@ -231,9 +285,22 @@ class SceneGenerationProfile:
     # Overrides (any profile-level overrides dict, kept for metadata)
     overrides: dict = field(default_factory=dict)
 
-    # Multi-range sampling (mixed-scale scenes).  When non-empty this
-    # overrides radius_min_m / radius_max_m for per-cylinder radius draws.
+    # Multi-range sampling (mixed-scale scenes)
     radius_ranges: list = field(default_factory=list)
+
+    # ── Density-driven mode fields (v10) ──────────────────────────
+    size_groups: list = field(default_factory=list)     # list of SizeGroup
+    total_density_min: float = 0.05
+    total_density_max: float = 0.20
+    forbid_enclosed_free_components: bool = True
+    forbid_inflated_component_merging: bool = True
+
+    # Task params — legacy single-region (backward compat, must be after non-defaults)
+    start_sampling_region: dict = field(default_factory=dict)
+    goal_sampling_region: dict = field(default_factory=dict)
+    # Task params — multi-region lists (v6, preferred)
+    start_sampling_regions: list = field(default_factory=list)
+    goal_sampling_regions: list = field(default_factory=list)
 
     @property
     def inflation_radius_m(self):
@@ -304,12 +371,29 @@ class SceneGenerationProfile:
         tasks_per_scene = int(task_cfg.get("tasks_per_scene",
             common_task.get("tasks_per_scene", 3)))
 
-        start_sampling_region = task_cfg.get("start_sampling_region",
-            common_task.get("start_sampling_region", {
-                "x_min": -8.0, "x_max": 10.0, "y_min": -2.0, "y_max": -1.0}))
-        goal_sampling_region = task_cfg.get("goal_sampling_region",
-            common_task.get("goal_sampling_region", {
-                "x_min": -8.0, "x_max": 10.0, "y_min": 30.0, "y_max": 32.0}))
+        # Start/Goal sampling regions — support both single (legacy) and multi (v6)
+        start_sampling_region = task_cfg.get("start_sampling_region", None)
+        goal_sampling_region = task_cfg.get("goal_sampling_region", None)
+        start_sampling_regions = task_cfg.get("start_sampling_regions", None)
+        goal_sampling_regions = task_cfg.get("goal_sampling_regions", None)
+
+        # Backward compat: if singular is provided, wrap as single-element list
+        if start_sampling_regions is None and start_sampling_region is not None:
+            start_sampling_regions = [start_sampling_region]
+        if goal_sampling_regions is None and goal_sampling_region is not None:
+            goal_sampling_regions = [goal_sampling_region]
+
+        # Fallback from common if still None
+        if start_sampling_regions is None:
+            sr = common_task.get("start_sampling_region", {})
+            start_sampling_regions = common_task.get("start_sampling_regions", [sr] if sr else [{"x_min": -8.0, "x_max": 10.0, "y_min": -2.0, "y_max": -1.0}])
+        if goal_sampling_regions is None:
+            gr = common_task.get("goal_sampling_region", {})
+            goal_sampling_regions = common_task.get("goal_sampling_regions", [gr] if gr else [{"x_min": -8.0, "x_max": 10.0, "y_min": 30.0, "y_max": 32.0}])
+
+        # Also keep the first entry as the legacy singular fields for backward compat
+        start_sampling_region = start_sampling_regions[0] if start_sampling_regions else {}
+        goal_sampling_region = goal_sampling_regions[0] if goal_sampling_regions else {}
 
         start_height_min_m = float(task_cfg.get("start_height_min_m",
             common_task.get("start_height_min_m", 1.8)))
@@ -375,6 +459,8 @@ class SceneGenerationProfile:
             tasks_per_scene=tasks_per_scene,
             start_sampling_region=start_sampling_region,
             goal_sampling_region=goal_sampling_region,
+            start_sampling_regions=start_sampling_regions,
+            goal_sampling_regions=goal_sampling_regions,
             start_height_min_m=start_height_min_m,
             start_height_max_m=start_height_max_m,
             goal_height_min_m=goal_height_min_m,
@@ -392,9 +478,165 @@ class SceneGenerationProfile:
             overrides=overrides,
         )
 
+    @staticmethod
+    def from_yaml_dict_v2(profile_dict, sg_cfg):
+        """Parse a density-driven profile (v10 schema).
+
+        Uses size_groups + total_density instead of legacy cylinder params.
+        """
+        name = str(profile_dict.get("name", "unnamed"))
+        enabled = bool(profile_dict.get("enabled", True))
+        scene_count = int(profile_dict.get("scene_count", 1))
+        seed_offset = int(profile_dict.get("seed_offset", 0))
+
+        # Size groups
+        groups_raw = profile_dict.get("size_groups", {})
+        size_groups = []
+        for group_name in ("large", "medium", "small"):
+            gd = groups_raw.get(group_name, {})
+            sg = SizeGroup.from_dict(gd, default_name=group_name)
+            sg.name = group_name
+            size_groups.append(sg)
+
+        # Density range
+        total_density_min = float(profile_dict.get("density_min", 0.05))
+        total_density_max = float(profile_dict.get("density_max", 0.15))
+
+        # Core constraint params (from common level)
+        common_cyl = sg_cfg.get("common_cylinder", {})
+        vehicle_cfg = sg_cfg.get("vehicle", {})
+        topo_cfg = sg_cfg.get("topology_validation", {})
+
+        height_min_m = float(common_cyl.get("height_min_m", 8.0))
+        height_max_m = float(common_cyl.get("height_max_m", 8.0))
+        require_full_vertical_blocking = bool(common_cyl.get(
+            "require_full_vertical_blocking", True))
+        region_boundary_margin_m = float(sg_cfg.get("region_boundary_margin_m",
+            common_cyl.get("region_boundary_margin_m", 0.30)))
+        minimum_surface_gap_m = float(sg_cfg.get("minimum_surface_gap_m",
+            common_cyl.get("minimum_surface_gap_m", 0.0)))
+        minimum_post_inflation_gap_m = float(sg_cfg.get("post_inflation_gap_m",
+            common_cyl.get("minimum_post_inflation_gap_m", 0.15)))
+        allow_overlap = bool(sg_cfg.get("allow_overlap",
+            common_cyl.get("allow_overlap", False)))
+
+        vehicle_radius_m = float(vehicle_cfg.get("radius_m",
+            topo_cfg.get("vehicle_radius_m", 0.30)))
+        safety_margin_m = float(vehicle_cfg.get("safety_margin_m",
+            topo_cfg.get("safety_margin_m", 0.10)))
+
+        forbid_enclosed = bool(sg_cfg.get("forbid_enclosed_free_components",
+            topo_cfg.get("forbid_enclosed_free_components", True)))
+        forbid_merge = bool(sg_cfg.get("forbid_inflated_component_merging",
+            not common_cyl.get("allow_overlap", False)))
+
+        # Task params (from common_task_generation, profile may override)
+        task_cfg = profile_dict.get("task_generation", {})
+        common_task = sg_cfg.get("common_task_generation", {})
+
+        tasks_per_scene = int(task_cfg.get("tasks_per_scene",
+            common_task.get("tasks_per_scene", 12)))
+        start_sampling_regions = task_cfg.get("start_sampling_regions",
+            common_task.get("start_sampling_regions", None))
+        goal_sampling_regions = task_cfg.get("goal_sampling_regions",
+            common_task.get("goal_sampling_regions", None))
+        if start_sampling_regions is None:
+            start_sampling_regions = common_task.get("start_sampling_regions",
+                [{"x_min": -8.0, "x_max": 10.0, "y_min": -2.0, "y_max": -1.0}])
+        if goal_sampling_regions is None:
+            goal_sampling_regions = common_task.get("goal_sampling_regions",
+                [{"x_min": -8.0, "x_max": 10.0, "y_min": 30.0, "y_max": 32.0}])
+
+        start_height_min_m = float(task_cfg.get("start_height_min_m",
+            common_task.get("start_height_min_m", 1.8)))
+        start_height_max_m = float(task_cfg.get("start_height_max_m",
+            common_task.get("start_height_max_m", 2.2)))
+        goal_height_min_m = float(task_cfg.get("goal_height_min_m",
+            common_task.get("goal_height_min_m", 1.8)))
+        goal_height_max_m = float(task_cfg.get("goal_height_max_m",
+            common_task.get("goal_height_max_m", 2.2)))
+        maximum_start_goal_height_difference_m = float(
+            task_cfg.get("maximum_start_goal_height_difference_m",
+                common_task.get("maximum_start_goal_height_difference_m", 1.50)))
+        minimum_start_goal_distance_m = float(
+            task_cfg.get("minimum_start_goal_distance_m",
+                common_task.get("minimum_start_goal_distance_m", 10.0)))
+        maximum_start_goal_distance_m = float(
+            task_cfg.get("maximum_start_goal_distance_m",
+                common_task.get("maximum_start_goal_distance_m", 40.0)))
+        require_direct_path_blocked = bool(
+            task_cfg.get("require_direct_path_blocked",
+                common_task.get("require_direct_path_blocked", True)))
+        minimum_direct_blocker_count = int(
+            task_cfg.get("minimum_direct_blocker_count",
+                common_task.get("minimum_direct_blocker_count", 1)))
+        maximum_direct_blocker_count = int(
+            task_cfg.get("maximum_direct_blocker_count",
+                common_task.get("maximum_direct_blocker_count", 3)))
+        require_astar_reachable = bool(
+            task_cfg.get("require_astar_reachable",
+                common_task.get("require_astar_reachable", True)))
+        minimum_detour_ratio = float(
+            task_cfg.get("minimum_detour_ratio",
+                common_task.get("minimum_detour_ratio", 1.03)))
+        maximum_detour_ratio = float(
+            task_cfg.get("maximum_detour_ratio",
+                common_task.get("maximum_detour_ratio", 2.00)))
+
+        return SceneGenerationProfile(
+            name=name,
+            enabled=enabled,
+            scene_count=scene_count,
+            seed_offset=seed_offset,
+            radius_min_m=size_groups[2].radius_min_m if size_groups else 0.10,
+            radius_max_m=size_groups[0].radius_max_m if size_groups else 3.50,
+            count_min=0,  # n/a for density-driven
+            count_max=0,  # n/a for density-driven
+            density_enabled=True,
+            density_mode="inflated_occupancy",
+            density_target_min=total_density_min,
+            density_target_max=total_density_max,
+            height_min_m=height_min_m,
+            height_max_m=height_max_m,
+            require_full_vertical_blocking=require_full_vertical_blocking,
+            region_boundary_margin_m=region_boundary_margin_m,
+            minimum_surface_gap_m=minimum_surface_gap_m,
+            minimum_post_inflation_gap_m=minimum_post_inflation_gap_m,
+            allow_overlap=allow_overlap,
+            vehicle_radius_m=vehicle_radius_m,
+            safety_margin_m=safety_margin_m,
+            tasks_per_scene=tasks_per_scene,
+            start_sampling_region=start_sampling_regions[0] if start_sampling_regions else {},
+            goal_sampling_region=goal_sampling_regions[0] if goal_sampling_regions else {},
+            start_sampling_regions=start_sampling_regions,
+            goal_sampling_regions=goal_sampling_regions,
+            start_height_min_m=start_height_min_m,
+            start_height_max_m=start_height_max_m,
+            goal_height_min_m=goal_height_min_m,
+            goal_height_max_m=goal_height_max_m,
+            maximum_start_goal_height_difference_m=maximum_start_goal_height_difference_m,
+            minimum_start_goal_distance_m=minimum_start_goal_distance_m,
+            maximum_start_goal_distance_m=maximum_start_goal_distance_m,
+            require_direct_path_blocked=require_direct_path_blocked,
+            minimum_direct_blocker_count=minimum_direct_blocker_count,
+            maximum_direct_blocker_count=maximum_direct_blocker_count,
+            require_astar_reachable=require_astar_reachable,
+            minimum_detour_ratio=minimum_detour_ratio,
+            maximum_detour_ratio=maximum_detour_ratio,
+            radius_ranges=[],
+            size_groups=size_groups,
+            total_density_min=total_density_min,
+            total_density_max=total_density_max,
+            forbid_enclosed_free_components=forbid_enclosed,
+            forbid_inflated_component_merging=forbid_merge,
+            overrides=profile_dict.get("overrides", {}),
+        )
+
 
 def load_scene_profiles(config):
     """Load enabled scene generation profiles from config.
+
+    Supports sources: procedural_yaml, procedural_profiles, density_driven.
 
     Returns:
         list of SceneGenerationProfile (only enabled profiles, in YAML order).
@@ -402,19 +644,22 @@ def load_scene_profiles(config):
     sg_cfg = config.get("global", {}).get("scene_generation", {})
     source = sg_cfg.get("source", "procedural_yaml")
 
-    if source != "procedural_profiles":
+    if source not in ("procedural_profiles", "density_driven"):
         # Legacy mode: no profiles
         return []
 
     profiles_raw = sg_cfg.get("profiles", [])
     if not profiles_raw:
-        rospy.logwarn("[Profiles] source='procedural_profiles' but profiles list is empty.")
+        rospy.logwarn("[Profiles] source='%s' but profiles list is empty.", source)
         return []
 
     profiles = []
     seen_names = set()
     for p in profiles_raw:
-        profile = SceneGenerationProfile.from_yaml_dict(p, sg_cfg)
+        if source == "density_driven":
+            profile = SceneGenerationProfile.from_yaml_dict_v2(p, sg_cfg)
+        else:
+            profile = SceneGenerationProfile.from_yaml_dict(p, sg_cfg)
         if not profile.enabled:
             rospy.loginfo("[Profiles] Skipping disabled profile '%s'.", profile.name)
             continue
@@ -898,6 +1143,221 @@ class YamlCylinderSceneGenerator:
 
         return (obstacles, "", target_density, density_mode.value)
 
+    # ── Density-driven generation (v10) ──────────────────────────────
+
+    def generate_scene_density_driven(self, profile, effective_scene_seed,
+                                       scene_index_in_profile, attempt_index=0):
+        """Generate a scene using the density-driven algorithm (v10).
+
+        Algorithm:
+          1. Compute target inflated area = region_area × target_density.
+          2. Feasibility: target_area > 2 × max(inflated_area_over_all_groups).
+          3. Split budget equally among large/medium/small groups.
+          4. Large → medium → small placement order:
+             - Borrow from small group if large can't fit min obstacle.
+             - Place obstacles randomly; check inflated gap + boundary.
+             - Stop when: consecutive_fails >= threshold OR remaining < min_area.
+          5. Remaining capacity cascades to next group.
+
+        Returns:
+            (obstacles, rejection_reason, target_density, density_mode_str)
+        """
+        rng = self._make_np_rng(effective_scene_seed + attempt_index * 10007)
+        region_area = compute_region_area(self.obstacle_region)
+        infl_r = profile.inflation_radius_m
+
+        # ── Sanity: need at least 3 size groups ──
+        if not profile.size_groups or len(profile.size_groups) < 3:
+            return ([], "DENSITY_DRIVEN_NEEDS_3_SIZE_GROUPS",
+                    None, "inflated_occupancy")
+
+        # Sort groups by radius: large (idx 0), medium (idx 1), small (idx 2)
+        groups = sorted(profile.size_groups,
+                        key=lambda g: g.radius_max_m, reverse=True)
+        g_large, g_medium, g_small = groups[0], groups[1], groups[2]
+
+        # ── 1. Target density and area ──
+        target_density = float(rng.uniform(
+            profile.total_density_min, profile.total_density_max))
+        target_inflated_area = region_area * target_density
+
+        # ── 2. Feasibility check ──
+        max_inflated = g_large.max_inflated_area_m2(infl_r)
+        if target_inflated_area <= 2.0 * max_inflated:
+            return ([], "DENSITY_DRIVEN_AREA_TOO_SMALL_FOR_TWO_MAX_OBSTACLES",
+                    target_density, "inflated_occupancy")
+
+        # ── 3. Budget allocation (1/3 each) ──
+        budget_per_group = target_inflated_area / 3.0
+
+        # Capacity borrowing: if large group can't fit even 1 min obstacle
+        min_large_area = g_large.min_inflated_area_m2(infl_r)
+        if budget_per_group < min_large_area:
+            deficit = min_large_area - budget_per_group
+            small_budget = max(0.0, budget_per_group - deficit)
+            large_budget = budget_per_group + deficit
+            medium_budget = budget_per_group
+        else:
+            large_budget = budget_per_group
+            medium_budget = budget_per_group
+            small_budget = budget_per_group
+
+        # ── 4. Placement ──
+        obstacles = []
+        obstacle_id_counter = 0
+        boundary_margin = profile.region_boundary_margin_m
+        min_post_inflation_gap = profile.minimum_post_inflation_gap_m
+        height_min = profile.height_min_m
+        height_max = profile.height_max_m
+
+        # Track spent inflated area per group
+        spent_large = 0.0
+        spent_medium = 0.0
+        spent_small = 0.0
+
+        def _inflated_area(radius):
+            return math.pi * (radius + infl_r) ** 2
+
+        def _try_place(group, spent_budget, budget_limit, obstacles_list,
+                       consecutive_fail_threshold, rng_state, id_counter):
+            """Place obstacles from one size group.
+
+            Returns: (updated_spent, new_obstacles, updated_id_counter)
+            """
+            consecutive_fails = 0
+            new_obs = []
+            local_spent = spent_budget
+            local_id = id_counter
+
+            while True:
+                # Stop conditions
+                min_area = group.min_inflated_area_m2(infl_r)
+                remaining = budget_limit - local_spent
+                if remaining < min_area:
+                    break  # can't fit even smallest obstacle in this group
+                if consecutive_fails >= consecutive_fail_threshold:
+                    break  # too many consecutive placement failures
+
+                # Sample radius and position
+                radius = group.sample_radius(rng_state)
+                area = _inflated_area(radius)
+                if area > remaining:
+                    consecutive_fails += 1
+                    continue
+
+                height = float(rng_state.uniform(height_min, height_max))
+
+                # Sample z
+                z_min_bound = self.obstacle_region.z_min + height / 2.0
+                z_max_bound = self.obstacle_region.z_max - height / 2.0
+                if z_min_bound >= z_max_bound:
+                    z = self.obstacle_region.z_min + height / 2.0 + 0.01
+                else:
+                    z = float(rng_state.uniform(z_min_bound, z_max_bound))
+
+                # Sample (x, y) within region
+                eff_margin = radius + boundary_margin
+                x_min_bound = self.obstacle_region.x_min + eff_margin
+                x_max_bound = self.obstacle_region.x_max - eff_margin
+                y_min_bound = self.obstacle_region.y_min + eff_margin
+                y_max_bound = self.obstacle_region.y_max - eff_margin
+
+                if x_min_bound >= x_max_bound or y_min_bound >= y_max_bound:
+                    consecutive_fails += 1
+                    continue
+
+                cx = float(rng_state.uniform(x_min_bound, x_max_bound))
+                cy = float(rng_state.uniform(y_min_bound, y_max_bound))
+                center_xy = np.array([cx, cy])
+
+                # Check region boundary
+                if not self.obstacle_region.contains_cylinder(
+                        center_xy, radius, boundary_margin):
+                    consecutive_fails += 1
+                    continue
+
+                # Check pairwise inflated gap against ALL existing obstacles
+                all_obs = obstacles_list + new_obs
+                pairwise_ok = True
+                for prev in all_obs:
+                    prev_xy = prev.center_xy()
+                    d = float(np.linalg.norm(center_xy - prev_xy))
+                    # Post-inflation gap (the one that matters)
+                    post_gap = d - (radius + infl_r) - (prev.radius_m + infl_r)
+                    if post_gap < min_post_inflation_gap:
+                        pairwise_ok = False
+                        break
+                    # No overlap (hard constraint)
+                    surface_gap = d - radius - prev.radius_m
+                    if surface_gap < 0.0:
+                        pairwise_ok = False
+                        break
+
+                if not pairwise_ok:
+                    consecutive_fails += 1
+                    continue
+
+                # Accept
+                obs_id = "cylinder_{:04d}".format(local_id)
+                local_id += 1
+
+                obs = CylinderObstacleSpec(
+                    obstacle_id=obs_id,
+                    center_world=np.array([cx, cy, z]),
+                    radius_m=radius,
+                    height_m=height,
+                )
+                new_obs.append(obs)
+                local_spent += area
+                consecutive_fails = 0
+
+            return local_spent, new_obs, local_id
+
+        # ── Place large obstacles ──
+        spent_large, large_obs, obstacle_id_counter = _try_place(
+            g_large, spent_large, large_budget, obstacles,
+            g_large.consecutive_fail_threshold, rng, obstacle_id_counter)
+        obstacles.extend(large_obs)
+
+        # Remaining large budget → medium
+        remaining_large = max(0.0, large_budget - spent_large)
+        medium_budget += remaining_large
+
+        # ── Place medium obstacles ──
+        spent_medium, medium_obs, obstacle_id_counter = _try_place(
+            g_medium, spent_medium, medium_budget, obstacles,
+            g_medium.consecutive_fail_threshold, rng, obstacle_id_counter)
+        obstacles.extend(medium_obs)
+
+        # Remaining medium budget → small (regardless of medium success)
+        remaining_medium = max(0.0, medium_budget - spent_medium)
+        small_budget += remaining_medium
+
+        # ── Place small obstacles ──
+        spent_small, small_obs, obstacle_id_counter = _try_place(
+            g_small, spent_small, small_budget, obstacles,
+            g_small.consecutive_fail_threshold, rng, obstacle_id_counter)
+        obstacles.extend(small_obs)
+
+        # ── Post-generation: any obstacles at all? ──
+        if len(obstacles) == 0:
+            return ([], "DENSITY_DRIVEN_NO_OBSTACLES_PLACED",
+                    target_density, "inflated_occupancy")
+
+        # ── Density report ──
+        actual_density = compute_inflated_occupancy(
+            obstacles, region_area,
+            profile.vehicle_radius_m, profile.safety_margin_m)
+        rospy.loginfo("[DensityDriven] profile='%s' scene=%d: placed %d obstacles "
+                      "(L=%d M=%d S=%d), density=%.3f (target=%.3f), "
+                      "budget: L=%.1f M=%.1f S=%.1f m²",
+                      profile.name, scene_index_in_profile, len(obstacles),
+                      len(large_obs), len(medium_obs), len(small_obs),
+                      actual_density, target_density,
+                      large_budget, medium_budget, small_budget)
+
+        return (obstacles, "", target_density, "inflated_occupancy")
+
     def generate_unity_objects(self, obstacles):
         """Convert CylinderObstacleSpec list to Unity Object_t dicts."""
         obj_list = []
@@ -919,32 +1379,36 @@ class YamlCylinderSceneGenerator:
 # ============================================================================
 
 class CylinderSceneValidator:
-    """Validate 2D topology: enclosed free components, U-shapes, dead ends."""
+    """Simplified 2D topology validator (v10).
+
+    Keeps only the essential checks:
+      - Enclosed free components (unreachable from region exterior).
+      - Inflated obstacle component merging.
+    Removed: escape-sector U-shape/dead-end analysis, minimum corridor width.
+    """
 
     def __init__(self, config):
         cfg = config.get("global", {}).get("scene_generation", {})
         topo = cfg.get("topology_validation", {})
+        vehicle_cfg = cfg.get("vehicle", {})
         self._cfg = cfg
-        self._topo = topo
 
         self.res = float(topo.get("grid_resolution_m", 0.10))
         self.halo_m = float(topo.get("validation_halo_m", 3.0))
-        self.vehicle_r = float(topo.get("vehicle_radius_m", 0.30))
-        self.safety_m = float(topo.get("safety_margin_m", 0.10))
+        self.vehicle_r = float(vehicle_cfg.get("radius_m",
+            topo.get("vehicle_radius_m", 0.30)))
+        self.safety_m = float(vehicle_cfg.get("safety_margin_m",
+            topo.get("safety_margin_m", 0.10)))
         self.inflated_extra = self.vehicle_r + self.safety_m
 
-        self.min_corridor_w = float(topo.get("minimum_navigable_corridor_width_m", 0.80))
-        self.forbid_u_shapes = bool(topo.get("forbid_u_shapes", True))
-        self.forbid_dead_ends = bool(topo.get("forbid_dead_ends", True))
-        self.escape_rays = int(topo.get("escape_ray_count", 24))
-        self.min_sector_w_deg = float(topo.get("minimum_escape_sector_width_deg", 35.0))
-        self.min_sectors = int(topo.get("minimum_separated_escape_sectors", 2))
-        self.min_sep_deg = float(topo.get("minimum_escape_sector_separation_deg", 80.0))
-        self.dead_probe_spacing = float(topo.get("dead_end_probe_spacing_m", 0.50))
-        self.dead_min_depth = float(topo.get("dead_end_minimum_depth_m", 1.50))
+        # Simplified flags (read from density_driven config or topo compat)
+        self.forbid_enclosed = bool(cfg.get("forbid_enclosed_free_components",
+            topo.get("forbid_enclosed_free_components", True)))
+        self.forbid_merge = bool(cfg.get("forbid_inflated_component_merging",
+            not cfg.get("cylinder", {}).get("allow_inflated_component_merging", False)))
 
     def validate(self, obstacles, obstacle_region):
-        """Run full topology validation. Returns SceneValidationResult."""
+        """Run simplified topology validation. Returns SceneValidationResult."""
         result = SceneValidationResult()
         result.obstacle_count = len(obstacles)
 
@@ -952,7 +1416,7 @@ class CylinderSceneValidator:
             result.valid = True
             return result
 
-        # Compute pairwise minimum gaps
+        # Compute pairwise minimum gaps (informational)
         min_surface_gap = float('inf')
         min_inflated_gap = float('inf')
         for i in range(len(obstacles)):
@@ -968,7 +1432,7 @@ class CylinderSceneValidator:
         result.minimum_surface_gap_m = (min_surface_gap if min_surface_gap != float('inf') else 0.0)
         result.minimum_inflated_gap_m = (min_inflated_gap if min_inflated_gap != float('inf') else 0.0)
 
-        # Build 2D inflated occupancy grid
+        # Build 2D inflated occupancy grid with halo
         x_min = obstacle_region.x_min - self.halo_m
         x_max = obstacle_region.x_max + self.halo_m
         y_min = obstacle_region.y_min - self.halo_m
@@ -983,19 +1447,16 @@ class CylinderSceneValidator:
         occ = np.zeros((gx, gy), dtype=np.uint8)
         origin = np.array([x_min, y_min])
 
-        def w2g(pt):
-            return (int(math.floor((pt[0] - origin[0]) / self.res)),
-                    int(math.floor((pt[1] - origin[1]) / self.res)))
-
         def in_bounds(ix, iy):
             return 0 <= ix < gx and 0 <= iy < gy
 
-        # Mark inflated cylinders
+        # Mark inflated cylinders on the grid
         for obs in obstacles:
             infl_r = obs.radius_m + self.inflated_extra
             cx, cy = obs.center_xy()
+            gx0 = int(math.floor((cx - origin[0]) / self.res))
+            gy0 = int(math.floor((cy - origin[1]) / self.res))
             ir = int(math.ceil(infl_r / self.res))
-            gx0, gy0 = w2g([cx, cy])
             for dx in range(-ir, ir + 1):
                 for dy in range(-ir, ir + 1):
                     ix, iy = gx0 + dx, gy0 + dy
@@ -1006,88 +1467,58 @@ class CylinderSceneValidator:
                     if (wx - cx)**2 + (wy - cy)**2 <= infl_r**2:
                         occ[ix, iy] = 1
 
-        # ── Enclosed free component check ──
-        free_mask = (occ == 0)
-        # Flood fill from all edge free cells
-        visited = np.zeros((gx, gy), dtype=bool)
-        from collections import deque
-        # Push all edge free cells
-        q = deque()
-        for ix in range(gx):
-            for iy in [0, gy - 1]:
-                if free_mask[ix, iy]:
-                    visited[ix, iy] = True
-                    q.append((ix, iy))
-        for iy in range(gy):
-            for ix in [0, gx - 1]:
-                if free_mask[ix, iy] and not visited[ix, iy]:
-                    visited[ix, iy] = True
-                    q.append((ix, iy))
+        # ── 1. Enclosed free component check ──
+        if self.forbid_enclosed:
+            free_mask = (occ == 0)
+            visited = np.zeros((gx, gy), dtype=bool)
+            from collections import deque
+            q = deque()
+            # Seed all edge free cells
+            for ix in range(gx):
+                for iy in [0, gy - 1]:
+                    if free_mask[ix, iy]:
+                        visited[ix, iy] = True
+                        q.append((ix, iy))
+            for iy in range(gy):
+                for ix in [0, gx - 1]:
+                    if free_mask[ix, iy] and not visited[ix, iy]:
+                        visited[ix, iy] = True
+                        q.append((ix, iy))
 
-        while q:
-            ix, iy = q.popleft()
-            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nx, ny = ix + dx, iy + dy
-                if in_bounds(nx, ny) and free_mask[nx, ny] and not visited[nx, ny]:
-                    visited[nx, ny] = True
-                    q.append((nx, ny))
+            while q:
+                ix, iy = q.popleft()
+                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nx, ny = ix + dx, iy + dy
+                    if in_bounds(nx, ny) and free_mask[nx, ny] and not visited[nx, ny]:
+                        visited[nx, ny] = True
+                        q.append((nx, ny))
 
-        enclosed_count = int(np.sum(free_mask & ~visited))
-        result.enclosed_free_component_count = enclosed_count
-        if enclosed_count > 0:
-            result.valid = False
-            result.rejection_reason = "SCENE_ENCLOSED_FREE_COMPONENT"
-            return result
-
-        # ── Minimum navigable corridor width ──
-        try:
-            from scipy.ndimage import distance_transform_edt
-            dt = distance_transform_edt(occ == 0, sampling=self.res)
-        except ImportError:
-            dt = None
-
-        if dt is not None:
-            navigable = (free_mask & visited)
-            if np.any(navigable):
-                result.navigable_free_ratio = float(np.sum(navigable)) / max(gx * gy, 1)
-                # ``occ`` is already inflated by vehicle radius + safety
-                # margin.  Taking min(EDT) over all free cells always selects
-                # a cell adjacent to an obstacle and falsely rejects every
-                # non-empty scene.  The usable corridor width is instead the
-                # surface gap between distinct inflated components.
-                if min_inflated_gap != float('inf'):
-                    result.minimum_navigable_clearance_m = max(
-                        0.0, 0.5 * min_inflated_gap)
-                    if min_inflated_gap + 1e-9 < self.min_corridor_w:
-                        result.valid = False
-                        result.rejection_reason = "SCENE_NARROW_CORRIDOR"
-                        return result
-                else:
-                    result.minimum_navigable_clearance_m = float(np.max(dt[navigable]))
-            else:
+            enclosed_count = int(np.sum(free_mask & ~visited))
+            result.enclosed_free_component_count = enclosed_count
+            if enclosed_count > 0:
                 result.valid = False
                 result.rejection_reason = "SCENE_ENCLOSED_FREE_COMPONENT"
                 return result
 
-        # ── U-shape and dead-end check via escape sectors ──
-        u_detected, dead_detected, max_depth = self._check_escape_sectors(
-            occ, origin, free_mask, visited, obstacle_region)
-        result.u_shape_detected = u_detected
-        result.dead_end_detected = dead_detected
-        result.dead_end_max_depth_m = max_depth
+            # Navigable free ratio (informational)
+            navigable = free_mask & visited
+            result.navigable_free_ratio = float(np.sum(navigable)) / max(gx * gy, 1)
+        else:
+            result.navigable_free_ratio = 1.0
+            result.enclosed_free_component_count = 0
 
-        if self.forbid_u_shapes and u_detected:
-            result.valid = False
-            result.rejection_reason = "SCENE_U_SHAPE"
-            return result
-        if self.forbid_dead_ends and dead_detected:
-            result.valid = False
-            result.rejection_reason = "SCENE_DEAD_END"
-            return result
+        # Informational: distance-transform based minimum clearance
+        try:
+            from scipy.ndimage import distance_transform_edt
+            dt = distance_transform_edt(occ == 0, sampling=self.res)
+            free_mask = (occ == 0)
+            if np.any(free_mask):
+                result.minimum_navigable_clearance_m = float(np.max(dt[free_mask]))
+        except ImportError:
+            result.minimum_navigable_clearance_m = 0.0
 
-        # ── Inflated component check ──
-        if not self._cfg.get("cylinder", {}).get("allow_inflated_component_merging", False):
-            # Count connected components of inflated obstacles
+        # ── 2. Inflated component merge check ──
+        if self.forbid_merge:
             comp_labels = np.zeros((gx, gy), dtype=np.int32)
             comp_id = 0
             for ix in range(gx):
@@ -1104,173 +1535,37 @@ class CylinderSceneValidator:
                                     comp_labels[nx, ny] = comp_id
                                     stack.append((nx, ny))
             result.inflated_components = comp_id
-            if comp_id != len(obstacles) and not self._cfg.get("cylinder", {}).get("allow_inflated_component_merging", False):
+            if comp_id != len(obstacles):
                 result.valid = False
                 result.rejection_reason = "SCENE_INFLATED_OBSTACLE_COMPONENT_MERGE"
                 return result
         else:
             result.inflated_components = len(obstacles)
 
+        # Not checked in simplified validator
+        result.u_shape_detected = False
+        result.dead_end_detected = False
+        result.dead_end_max_depth_m = 0.0
+
         result.valid = True
         return result
-
-    def _check_escape_sectors(self, occ, origin, free_mask, visited, region):
-        """Escape-sector dead-end / U-shape detection."""
-        gx, gy = occ.shape
-        u_detected = False
-        dead_detected = False
-        max_depth = 0.0
-
-        # Sample probe points in free space within the obstacle region
-        try:
-            from scipy.ndimage import distance_transform_edt
-            dt = distance_transform_edt(occ == 0, sampling=self.res)
-        except ImportError:
-            return False, False, 0.0
-
-        # Navigable points: free, visited (connected to outside), with sufficient clearance
-        navigable = free_mask & visited & (dt >= self.vehicle_r + self.safety_m - 1e-6)
-        if not np.any(navigable):
-            return False, False, 0.0
-
-        # Find distance to nearest outside-of-region free cell for depth check
-        # Outside region area is where halo extends beyond the obstacle region
-        ox_min = int(math.floor((region.x_min - origin[0]) / self.res))
-        ox_max = int(math.ceil((region.x_max - origin[0]) / self.res))
-        oy_min = int(math.floor((region.y_min - origin[1]) / self.res))
-        oy_max = int(math.ceil((region.y_max - origin[1]) / self.res))
-
-        # Probe points: sample navigable free cells inside the obstacle region
-        # at dead_end_probe_spacing
-        probe_step = max(1, int(self.dead_probe_spacing / self.res))
-        probes = []
-        for ix in range(0, gx, probe_step):
-            for iy in range(0, gy, probe_step):
-                if navigable[ix, iy]:
-                    # Check if inside obstacle region (not halo)
-                    wx = origin[0] + (ix + 0.5) * self.res
-                    wy = origin[1] + (iy + 0.5) * self.res
-                    in_region = (region.x_min <= wx <= region.x_max and
-                                 region.y_min <= wy <= region.y_max)
-                    if in_region:
-                        probes.append((ix, iy, wx, wy))
-
-        for ix, iy, wx, wy in probes:
-            # Compute escape ray results
-            ray_results = []
-            for k in range(self.escape_rays):
-                angle = 2.0 * math.pi * k / self.escape_rays
-                dx = math.cos(angle)
-                dy = math.sin(angle)
-                escaped = False
-                cx, cy = ix, iy
-                max_steps = max(gx, gy)
-                for step in range(max_steps):
-                    cx_f = cx + dx * step * 0.5
-                    cy_f = cy + dy * step * 0.5
-                    ci = int(round(cx_f))
-                    cj = int(round(cy_f))
-                    if not (0 <= ci < gx and 0 <= cj < gy):
-                        escaped = True
-                        break
-                    if occ[ci, cj]:
-                        break  # blocked
-                    # Check if we've left the obstacle region
-                    rwx = origin[0] + (ci + 0.5) * self.res
-                    rwy = origin[1] + (cj + 0.5) * self.res
-                    if (rwx < region.x_min or rwx > region.x_max or
-                        rwy < region.y_min or rwy > region.y_max):
-                        escaped = True
-                        break
-                ray_results.append((angle, escaped))
-
-            # Group consecutive escaped rays into sectors
-            extended = ray_results + ray_results  # wrap-around
-            sector_widths = []
-            sector_centers = []
-            in_sector = False
-            sector_start = 0.0
-            sector_run = 0
-            for k in range(len(extended)):
-                if extended[k][1]:
-                    if not in_sector:
-                        in_sector = True
-                        sector_start = extended[k][0]
-                        sector_run = 1
-                    else:
-                        sector_run += 1
-                else:
-                    if in_sector:
-                        in_sector = False
-                        sector_w = sector_run * 360.0 / self.escape_rays
-                        sector_center = sector_start + math.radians(sector_w / 2.0)
-                        sector_widths.append(sector_w)
-                        sector_centers.append(sector_center)
-            if in_sector:
-                sector_w = sector_run * 360.0 / self.escape_rays
-                sector_center = sector_start + math.radians(sector_w / 2.0)
-                sector_widths.append(sector_w)
-                sector_centers.append(sector_center)
-
-            # Filter by minimum sector width
-            valid_sectors = [(w, c) for w, c in zip(sector_widths, sector_centers)
-                             if w >= self.min_sector_w_deg]
-
-            # Check if dead-end (too few or insufficiently separated sectors)
-            if len(valid_sectors) < self.min_sectors:
-                # Check depth: if deep enough, it's a dead end
-                min_dist_to_halo = float('inf')
-                for si in range(gx):
-                    for sj in range(gy):
-                        swx = origin[0] + (si + 0.5) * self.res
-                        swy = origin[1] + (sj + 0.5) * self.res
-                        outside = (swx < region.x_min or swx > region.x_max or
-                                   swy < region.y_min or swy > region.y_max)
-                        if outside and visited[si, sj]:
-                            d = math.sqrt((wx - swx)**2 + (wy - swy)**2)
-                            if d < min_dist_to_halo:
-                                min_dist_to_halo = d
-                if min_dist_to_halo > self.dead_min_depth:
-                    if len(valid_sectors) == 1:
-                        dead_detected = True
-                    else:
-                        u_detected = True
-                if min_dist_to_halo > max_depth:
-                    max_depth = min_dist_to_halo
-            else:
-                # Check angular separation between sectors
-                valid_centers = [c for _, c in valid_sectors]
-                min_sep = float('inf')
-                for a in range(len(valid_centers)):
-                    for b in range(a + 1, len(valid_centers)):
-                        diff = abs(valid_centers[a] - valid_centers[b])
-                        diff = min(diff, 2.0 * math.pi - diff)
-                        if math.degrees(diff) < min_sep:
-                            min_sep = math.degrees(diff)
-                if min_sep < self.min_sep_deg:
-                    # Sectors too close — potential pocket
-                    min_dist_to_halo = float('inf')
-                    for si in range(gx):
-                        for sj in range(gy):
-                            swx = origin[0] + (si + 0.5) * self.res
-                            swy = origin[1] + (sj + 0.5) * self.res
-                            outside = (swx < region.x_min or swx > region.x_max or
-                                       swy < region.y_min or swy > region.y_max)
-                            if outside and visited[si, sj]:
-                                d = math.sqrt((wx - swx)**2 + (wy - swy)**2)
-                                if d < min_dist_to_halo:
-                                    min_dist_to_halo = d
-                    if min_dist_to_halo > self.dead_min_depth:
-                        u_detected = True
-                    if min_dist_to_halo > max_depth:
-                        max_depth = min_dist_to_halo
-
-        return u_detected, dead_detected, max_depth
 
 
 # ============================================================================
 #  StartGoalTaskGenerator
 # ============================================================================
+
+def _region_from_dict(d, z_min, z_max):
+    """Build an ObstacleRegion from a dict with optional z_min/z_max override."""
+    return ObstacleRegion(
+        x_min=float(d.get("x_min", -8.0)),
+        x_max=float(d.get("x_max", 8.0)),
+        y_min=float(d.get("y_min", -2.0)),
+        y_max=float(d.get("y_max", 2.0)),
+        z_min=float(d.get("z_min", z_min)),
+        z_max=float(d.get("z_max", z_max)),
+    )
+
 
 class StartGoalTaskGenerator:
     """Generate and validate start-goal task pairs."""
@@ -1304,23 +1599,30 @@ class StartGoalTaskGenerator:
         self.max_detour = float(cfg.get("maximum_detour_ratio", 1.80))
 
         sr = cfg.get("start_sampling_region", {})
-        self.start_region = ObstacleRegion(
+        self.start_regions = [ObstacleRegion(
             x_min=float(sr.get("x_min", -12.0)),
             x_max=float(sr.get("x_max", -8.0)),
             y_min=float(sr.get("y_min", -8.0)),
             y_max=float(sr.get("y_max", 8.0)),
             z_min=float(cfg.get("start_height_min_m", 1.8)),
             z_max=float(cfg.get("start_height_max_m", 2.2)),
-        )
+        )]
         gr = cfg.get("goal_sampling_region", {})
-        self.goal_region = ObstacleRegion(
+        self.goal_regions = [ObstacleRegion(
             x_min=float(gr.get("x_min", 8.0)),
             x_max=float(gr.get("x_max", 12.0)),
             y_min=float(gr.get("y_min", -8.0)),
             y_max=float(gr.get("y_max", 8.0)),
             z_min=float(cfg.get("goal_height_min_m", 1.8)),
             z_max=float(cfg.get("goal_height_max_m", 2.2)),
-        )
+        )]
+
+        # Multi-region support (v6) — overwrites single if present
+        srs = cfg.get("start_sampling_regions", None)
+        grs = cfg.get("goal_sampling_regions", None)
+        if srs is not None and grs is not None:
+            self.start_regions = [_region_from_dict(r, self.start_h_min, self.start_h_max) for r in srs]
+            self.goal_regions = [_region_from_dict(r, self.goal_h_min, self.goal_h_max) for r in grs]
 
     def set_tasks_per_scene(self, n):
         """Override the number of tasks to generate per scene.
@@ -1367,27 +1669,38 @@ class StartGoalTaskGenerator:
         self.min_detour = float(profile.minimum_detour_ratio)
         self.max_detour = float(profile.maximum_detour_ratio)
 
-        # ── Sampling regions ────────────────────────────────────
-        sr = profile.start_sampling_region
-        if sr:
-            self.start_region = ObstacleRegion(
-                x_min=float(sr.get("x_min", self.start_region.x_min)),
-                x_max=float(sr.get("x_max", self.start_region.x_max)),
-                y_min=float(sr.get("y_min", self.start_region.y_min)),
-                y_max=float(sr.get("y_max", self.start_region.y_max)),
+        # ── Sampling regions (v6: multi-region) ────────────────
+        if profile.start_sampling_regions:
+            self.start_regions = [
+                _region_from_dict(r, self.start_h_min, self.start_h_max)
+                for r in profile.start_sampling_regions
+            ]
+        elif profile.start_sampling_region:
+            sr = profile.start_sampling_region
+            self.start_regions = [ObstacleRegion(
+                x_min=float(sr.get("x_min", self.start_regions[0].x_min)),
+                x_max=float(sr.get("x_max", self.start_regions[0].x_max)),
+                y_min=float(sr.get("y_min", self.start_regions[0].y_min)),
+                y_max=float(sr.get("y_max", self.start_regions[0].y_max)),
                 z_min=self.start_h_min,
                 z_max=self.start_h_max,
-            )
-        gr = profile.goal_sampling_region
-        if gr:
-            self.goal_region = ObstacleRegion(
-                x_min=float(gr.get("x_min", self.goal_region.x_min)),
-                x_max=float(gr.get("x_max", self.goal_region.x_max)),
-                y_min=float(gr.get("y_min", self.goal_region.y_min)),
-                y_max=float(gr.get("y_max", self.goal_region.y_max)),
+            )]
+
+        if profile.goal_sampling_regions:
+            self.goal_regions = [
+                _region_from_dict(r, self.goal_h_min, self.goal_h_max)
+                for r in profile.goal_sampling_regions
+            ]
+        elif profile.goal_sampling_region:
+            gr = profile.goal_sampling_region
+            self.goal_regions = [ObstacleRegion(
+                x_min=float(gr.get("x_min", self.goal_regions[0].x_min)),
+                x_max=float(gr.get("x_max", self.goal_regions[0].x_max)),
+                y_min=float(gr.get("y_min", self.goal_regions[0].y_min)),
+                y_max=float(gr.get("y_max", self.goal_regions[0].y_max)),
                 z_min=self.goal_h_min,
                 z_max=self.goal_h_max,
-            )
+            )]
 
     def generate_tasks(self, obstacles, esdf, esdf_origin, esdf_res,
                        astar_planner_fn, seed=0):
@@ -1410,13 +1723,18 @@ class StartGoalTaskGenerator:
         for task_idx in range(self.tasks_per_scene):
             accepted = False
             for attempt in range(self.max_attempts):
-                # Sample start and goal
-                sx = rng.uniform(self.start_region.x_min, self.start_region.x_max)
-                sy = rng.uniform(self.start_region.y_min, self.start_region.y_max)
+                # Round-robin distribution across region pairs (v6)
+                # Ensures tasks are evenly spread across all start/goal pairs.
+                pair_idx = task_idx % len(self.start_regions)
+                start_r = self.start_regions[pair_idx]
+                goal_r = self.goal_regions[min(pair_idx, len(self.goal_regions) - 1)]
+
+                sx = rng.uniform(start_r.x_min, start_r.x_max)
+                sy = rng.uniform(start_r.y_min, start_r.y_max)
                 sz = rng.uniform(self.start_h_min, self.start_h_max)
 
-                gx = rng.uniform(self.goal_region.x_min, self.goal_region.x_max)
-                gy = rng.uniform(self.goal_region.y_min, self.goal_region.y_max)
+                gx = rng.uniform(goal_r.x_min, goal_r.x_max)
+                gy = rng.uniform(goal_r.y_min, goal_r.y_max)
                 gz = rng.uniform(self.goal_h_min, self.goal_h_max)
 
                 start = np.array([sx, sy, sz])

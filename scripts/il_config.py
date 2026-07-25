@@ -466,8 +466,8 @@ def _validate_config(cfg):
     if sg_cfg.get("enabled", False):
         # Basic type checks
         source = sg_cfg.get("source", "procedural_yaml")
-        if source not in ("procedural_yaml", "procedural_profiles"):
-            errors.append("scene_generation.source must be 'procedural_yaml' or 'procedural_profiles', got '{}'".format(source))
+        if source not in ("procedural_yaml", "procedural_profiles", "density_driven"):
+            errors.append("scene_generation.source must be 'procedural_yaml', 'procedural_profiles', or 'density_driven', got '{}'".format(source))
         if sg_cfg.get("obstacle_type", "cylinder") != "cylinder":
             errors.append("Phase 3 only supports obstacle_type='cylinder'")
         outside_policy = sg_cfg.get("outside_region_policy",
@@ -487,34 +487,36 @@ def _validate_config(cfg):
         if oreg.get("z_min", 0) >= oreg.get("z_max", 0):
             errors.append("obstacle_region.z_min >= z_max")
 
-        # Cylinder params
-        cyl = sg_cfg.get("cylinder", {})
-        for k in ("radius_min_m", "radius_max_m", "height_min_m", "height_max_m"):
-            v = cyl.get(k, 0)
-            if v <= 0:
-                errors.append("global.scene_generation.cylinder.{} must be > 0".format(k))
-        if cyl.get("radius_min_m", 0) > cyl.get("radius_max_m", 0):
-            errors.append("cylinder.radius_min_m > radius_max_m")
-        if cyl.get("height_min_m", 0) > cyl.get("height_max_m", 0):
-            errors.append("cylinder.height_min_m > height_max_m")
-        if cyl.get("count_min", 0) > cyl.get("count_max", 0):
-            errors.append("cylinder.count_min > count_max")
-        if cyl.get("minimum_surface_gap_m", 0) < 0:
-            errors.append("cylinder.minimum_surface_gap_m must be >= 0")
-        if cyl.get("minimum_inflated_gap_m", 0) < 0:
-            errors.append("cylinder.minimum_inflated_gap_m must be >= 0")
+        # Cylinder params (only validated for legacy / procedural_profiles; skipped for density_driven)
+        if source != "density_driven":
+            cyl = sg_cfg.get("cylinder", {})
+            for k in ("radius_min_m", "radius_max_m", "height_min_m", "height_max_m"):
+                v = cyl.get(k, 0)
+                if v <= 0:
+                    errors.append("global.scene_generation.cylinder.{} must be > 0".format(k))
+            if cyl.get("radius_min_m", 0) > cyl.get("radius_max_m", 0):
+                errors.append("cylinder.radius_min_m > radius_max_m")
+            if cyl.get("height_min_m", 0) > cyl.get("height_max_m", 0):
+                errors.append("cylinder.height_min_m > height_max_m")
+            if cyl.get("count_min", 0) > cyl.get("count_max", 0):
+                errors.append("cylinder.count_min > count_max")
+            if cyl.get("minimum_surface_gap_m", 0) < 0:
+                errors.append("cylinder.minimum_surface_gap_m must be >= 0")
+            if cyl.get("minimum_inflated_gap_m", 0) < 0:
+                errors.append("cylinder.minimum_inflated_gap_m must be >= 0")
 
-        # Topology validation
+        # Topology validation (escape sector params only required for legacy modes)
         topo = sg_cfg.get("topology_validation", {})
         if topo.get("grid_resolution_m", 0) <= 0:
             errors.append("topology_validation.grid_resolution_m must be > 0")
         if topo.get("validation_halo_m", 0) <= 0:
             errors.append("topology_validation.validation_halo_m must be > 0")
-        if topo.get("escape_ray_count", 0) < 8:
+        # Escape sector params: optional in density_driven mode (simplified validator)
+        if "escape_ray_count" in topo and topo.get("escape_ray_count", 0) < 8:
             errors.append("topology_validation.escape_ray_count must be >= 8")
-        if topo.get("minimum_escape_sector_width_deg", 0) <= 0:
+        if "minimum_escape_sector_width_deg" in topo and topo.get("minimum_escape_sector_width_deg", 0) <= 0:
             errors.append("topology_validation.minimum_escape_sector_width_deg must be > 0")
-        if topo.get("minimum_separated_escape_sectors", 0) < 1:
+        if "minimum_separated_escape_sectors" in topo and topo.get("minimum_separated_escape_sectors", 0) < 1:
             errors.append("minimum_separated_escape_sectors must be >= 1")
 
         # Task generation
@@ -836,9 +838,9 @@ def _validate_config(cfg):
 
     # ── Scenes ──────────────────────────────────────────────────
     scenes = cfg.get("scenes", [])
-    # Legacy scenes are only required when NOT using procedural_profiles
+    # Legacy scenes are only required when NOT using procedural_profiles or density_driven
     source = g.get("scene_generation", {}).get("source", "procedural_yaml")
-    if source != "procedural_profiles" and not scenes:
+    if source not in ("procedural_profiles", "density_driven") and not scenes:
         errors.append("No scenes defined")
     for i, s in enumerate(scenes):
         if "name" not in s:
@@ -963,16 +965,18 @@ def _validate_config(cfg):
 
 
 def _validate_profiles(sg_cfg, errors):
-    """Validate the profiles list in a procedural_profiles config.
+    """Validate the profiles list in a procedural_profiles or density_driven config.
 
-    Checks: name uniqueness, positive counts, radius/height ranges,
-    density mode validity, gap requirements, task params.
+    Checks: name uniqueness, size_groups (density_driven) or cylinder params
+    (procedural_profiles), density ranges, task params.
     """
+    source = sg_cfg.get("source", "procedural_yaml")
     profiles = sg_cfg.get("profiles", [])
     if not profiles:
-        errors.append("procedural_profiles source requires non-empty profiles list")
+        errors.append("{} source requires non-empty profiles list".format(source))
         return
 
+    is_density_driven = (source == "density_driven")
     seen_names = set()
     any_enabled = False
     vehicle_cfg = sg_cfg.get("vehicle", {})
@@ -1003,70 +1007,107 @@ def _validate_profiles(sg_cfg, errors):
         if not isinstance(seed_offset, int):
             errors.append("profiles[{}] ('{}'): seed_offset must be an integer".format(i, name))
 
-        # Cylinder params
-        cyl = p.get("cylinder", {})
-        r_min = float(cyl.get("radius_min_m", -1))
-        r_max = float(cyl.get("radius_max_m", -1))
+        if is_density_driven:
+            # ── density_driven: validate size_groups ──
+            groups = p.get("size_groups", {})
+            required_groups = ("large", "medium", "small")
+            for gn in required_groups:
+                if gn not in groups:
+                    errors.append("profiles[{}] ('{}'): size_groups.{} is required".format(
+                        i, name, gn))
+                    continue
+                g = groups[gn]
+                r_min = float(g.get("radius_min_m", -1))
+                r_max = float(g.get("radius_max_m", -1))
+                if r_min <= 0:
+                    errors.append("profiles[{}] ('{}'): size_groups.{}.radius_min_m must be > 0".format(
+                        i, name, gn))
+                if r_max < r_min:
+                    errors.append("profiles[{}] ('{}'): size_groups.{}.radius_max_m ({}) < radius_min_m ({})".format(
+                        i, name, gn, r_max, r_min))
+                cf = float(g.get("capacity_fraction", 1.0/3.0))
+                if cf <= 0 or cf > 1.0:
+                    errors.append("profiles[{}] ('{}'): size_groups.{}.capacity_fraction must be in (0, 1]".format(
+                        i, name, gn))
+                cft = int(g.get("consecutive_fail_threshold", -1))
+                if cft < 1:
+                    errors.append("profiles[{}] ('{}'): size_groups.{}.consecutive_fail_threshold must be >= 1".format(
+                        i, name, gn))
 
-        # Multi-range sampling (mixed-scale scenes)
-        ranges_raw = cyl.get("ranges", None)
-        if ranges_raw is not None:
-            if not isinstance(ranges_raw, list) or len(ranges_raw) == 0:
-                errors.append("profiles[{}] ('{}'): cylinder.ranges must be a non-empty list".format(
-                    i, name))
-            else:
-                for ri, rng in enumerate(ranges_raw):
-                    rr_min = float(rng.get("min", -1))
-                    rr_max = float(rng.get("max", -1))
-                    rr_weight = float(rng.get("weight", -1))
-                    if rr_min <= 0:
-                        errors.append(
-                            "profiles[{}] ('{}'): cylinder.ranges[{}].min must be > 0, got {}".format(
-                                i, name, ri, rr_min))
-                    if rr_max < rr_min:
-                        errors.append(
-                            "profiles[{}] ('{}'): cylinder.ranges[{}].max ({}) < min ({})".format(
-                                i, name, ri, rr_max, rr_min))
-                    if rr_weight <= 0:
-                        errors.append(
-                            "profiles[{}] ('{}'): cylinder.ranges[{}].weight must be > 0, got {}".format(
-                                i, name, ri, rr_weight))
-            # When ranges is present, radius_min_m / radius_max_m are optional
-            # (they serve as fallback if ranges is somehow empty at runtime).
-        else:
-            # Legacy single-range: require valid radius_min_m / radius_max_m
-            if r_min <= 0:
-                errors.append("profiles[{}] ('{}'): cylinder.radius_min_m must be > 0".format(i, name))
-            if r_max < r_min:
-                errors.append("profiles[{}] ('{}'): radius_max_m ({}) < radius_min_m ({})".format(
-                    i, name, r_max, r_min))
-
-        c_min = int(cyl.get("count_min", -1))
-        c_max = int(cyl.get("count_max", -1))
-        if c_min <= 0:
-            errors.append("profiles[{}] ('{}'): cylinder.count_min must be > 0".format(i, name))
-        if c_max < c_min:
-            errors.append("profiles[{}] ('{}'): count_max ({}) < count_min ({})".format(
-                i, name, c_max, c_min))
-
-        # Density params
-        density = p.get("density", {})
-        d_enabled = bool(density.get("enabled", True))
-        d_mode = str(density.get("mode", "inflated_occupancy"))
-        supported_modes = ["inflated_occupancy", "raw_occupancy",
-                           "obstacles_per_100m2", "fixed_count"]
-        if d_mode not in supported_modes:
-            errors.append("profiles[{}] ('{}'): density.mode '{}' not in {}".format(
-                i, name, d_mode, supported_modes))
-
-        if d_enabled:
-            d_min = float(density.get("target_min", -1))
-            d_max = float(density.get("target_max", -1))
+            # Validate density range
+            d_min = float(p.get("density_min", -1))
+            d_max = float(p.get("density_max", -1))
             if d_min < 0:
-                errors.append("profiles[{}] ('{}'): density.target_min must be >= 0".format(i, name))
+                errors.append("profiles[{}] ('{}'): density_min must be >= 0".format(i, name))
             if d_max < d_min:
-                errors.append("profiles[{}] ('{}'): density.target_max ({}) < target_min ({})".format(
+                errors.append("profiles[{}] ('{}'): density_max ({}) < density_min ({})".format(
                     i, name, d_max, d_min))
+            if d_max >= 1.0:
+                errors.append("profiles[{}] ('{}'): density_max ({}) must be < 1.0 (100%)".format(
+                    i, name, d_max))
+        else:
+            # ── procedural_profiles: validate cylinder params ──
+            # ... (existing validation logic for cylinder, density, ranges)
+            cyl = p.get("cylinder", {})
+            r_min = float(cyl.get("radius_min_m", -1))
+            r_max = float(cyl.get("radius_max_m", -1))
+
+            # Multi-range sampling (mixed-scale scenes)
+            ranges_raw = cyl.get("ranges", None)
+            if ranges_raw is not None:
+                if not isinstance(ranges_raw, list) or len(ranges_raw) == 0:
+                    errors.append("profiles[{}] ('{}'): cylinder.ranges must be a non-empty list".format(
+                        i, name))
+                else:
+                    for ri, rng in enumerate(ranges_raw):
+                        rr_min = float(rng.get("min", -1))
+                        rr_max = float(rng.get("max", -1))
+                        rr_weight = float(rng.get("weight", -1))
+                        if rr_min <= 0:
+                            errors.append(
+                                "profiles[{}] ('{}'): cylinder.ranges[{}].min must be > 0".format(
+                                    i, name, ri))
+                        if rr_max < rr_min:
+                            errors.append(
+                                "profiles[{}] ('{}'): cylinder.ranges[{}].max ({}) < min ({})".format(
+                                    i, name, ri, rr_max, rr_min))
+                        if rr_weight <= 0:
+                            errors.append(
+                                "profiles[{}] ('{}'): cylinder.ranges[{}].weight must be > 0".format(
+                                    i, name, ri))
+            else:
+                if r_min <= 0:
+                    errors.append("profiles[{}] ('{}'): cylinder.radius_min_m must be > 0".format(i, name))
+                if r_max < r_min:
+                    errors.append("profiles[{}] ('{}'): radius_max_m ({}) < radius_min_m ({})".format(
+                        i, name, r_max, r_min))
+
+            c_min = int(cyl.get("count_min", -1))
+            c_max = int(cyl.get("count_max", -1))
+            if c_min <= 0:
+                errors.append("profiles[{}] ('{}'): cylinder.count_min must be > 0".format(i, name))
+            if c_max < c_min:
+                errors.append("profiles[{}] ('{}'): count_max ({}) < count_min ({})".format(
+                    i, name, c_max, c_min))
+
+            # Density params
+            density = p.get("density", {})
+            d_enabled = bool(density.get("enabled", True))
+            d_mode = str(density.get("mode", "inflated_occupancy"))
+            supported_modes = ["inflated_occupancy", "raw_occupancy",
+                               "obstacles_per_100m2", "fixed_count"]
+            if d_mode not in supported_modes:
+                errors.append("profiles[{}] ('{}'): density.mode '{}' not in {}".format(
+                    i, name, d_mode, supported_modes))
+
+            if d_enabled:
+                d_min = float(density.get("target_min", -1))
+                d_max = float(density.get("target_max", -1))
+                if d_min < 0:
+                    errors.append("profiles[{}] ('{}'): density.target_min must be >= 0".format(i, name))
+                if d_max < d_min:
+                    errors.append("profiles[{}] ('{}'): density.target_max ({}) < target_min ({})".format(
+                        i, name, d_max, d_min))
             if d_mode in ("inflated_occupancy", "raw_occupancy") and d_max >= 1.0:
                 errors.append("profiles[{}] ('{}'): occupancy density target_max ({}) must be < 1.0".format(
                     i, name, d_max))

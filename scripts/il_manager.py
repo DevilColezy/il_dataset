@@ -588,11 +588,12 @@ class ILManager:
             self._obs_auditor = ObstacleVisibilityAuditor(config)
             rospy.loginfo("[Manager] Phase 3: scene + task generation + observability audit enabled.")
 
-            # ── Load profiles if in procedural_profiles mode ────────
-            if sg_cfg.get("source", "") == "procedural_profiles":
+            # ── Load profiles if in procedural_profiles or density_driven mode ──
+            if sg_cfg.get("source", "") in ("procedural_profiles", "density_driven"):
                 self._enabled_scene_profiles = load_scene_profiles(config)
                 if self._enabled_scene_profiles:
                     self._use_profile_mode = True
+                    self._use_density_driven = (sg_cfg.get("source", "") == "density_driven")
                     self._scene_profile_index = 0
                     self._scene_index_in_profile = 0
                     self._task_index_in_scene = 0
@@ -655,6 +656,7 @@ class ILManager:
         # ── Profile scheduling defaults (overridden by Phase 3 if profiles loaded) ─
         if not self._use_profile_mode:
             self._use_profile_mode = False
+            self._use_density_driven = False
             self._enabled_scene_profiles = []
             self._scene_profile_index = 0
             self._scene_index_in_profile = 0
@@ -1211,11 +1213,18 @@ class ILManager:
             final_attempt_index = 0
 
             for attempt in range(max_attempts):
-                (obstacles, rejection,
-                 target_density, density_mode_str) = \
-                    self._scene_generator.generate_scene_from_profile(
-                        profile, effective_scene_seed,
-                        self._scene_index_in_profile, attempt)
+                if getattr(self, '_use_density_driven', False):
+                    (obstacles, rejection,
+                     target_density, density_mode_str) = \
+                        self._scene_generator.generate_scene_density_driven(
+                            profile, effective_scene_seed,
+                            self._scene_index_in_profile, attempt)
+                else:
+                    (obstacles, rejection,
+                     target_density, density_mode_str) = \
+                        self._scene_generator.generate_scene_from_profile(
+                            profile, effective_scene_seed,
+                            self._scene_index_in_profile, attempt)
 
                 if not obstacles:
                     rospy.logwarn("[SceneGen] Profile '%s' scene %d attempt %d: %s",
