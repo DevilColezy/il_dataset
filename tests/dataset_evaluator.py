@@ -32,6 +32,7 @@ import os
 import sys
 import csv
 import math
+import re
 import warnings
 from collections import defaultdict, Counter
 from datetime import datetime
@@ -65,13 +66,12 @@ except ImportError:
 # Expected data.csv columns (Schema v15)
 TREND_HORIZONTAL_CLASS_COL = "trend_horizontal_class_13"
 GUIDE_ELEVATION_BIN_COL = "guide_elevation_bin"
-GUIDE_MODE_COL = "trend_mode"  # trend_mode doubles as guide/control mode
+GUIDE_MODE_COL = "guide_mode"
 TREND_MODE_COL = "trend_mode"
-RECOVERY_DIRECTION_COL = "recovery_direction"  # non-zero indicates recovery active
-RECOVERY_ELAPSED_COL = "recovery_elapsed_s"
 COLLISION_COL = "collision"
 FRAME_VALID_COL = "frame_valid"
 PLANNER_SUCCESS_COL = "planner_success"
+PLANNER_ATTEMPTED_COL = "planner_attempted"
 PLANNER_COMPUTE_MS_COL = "planner_compute_ms"
 PLANNER_MIN_CLEARANCE_COL = "planner_min_clearance"
 EXECUTED_CLEARANCE_COL = "minimum_executed_clearance"  # in metadata
@@ -114,14 +114,15 @@ FINAL_GOAL_ERROR_KEY = "final_goal_error"
 
 # 13-class horizontal trend label names
 TREND_CLASS_NAMES = {
-    0: "fwd center", 1: "fwd slightly L", 2: "fwd L",
-    3: "fwd slightly R", 4: "fwd R",
-    5: "left", 6: "back L", 7: "back", 8: "back R", 9: "right",
-    10: "up", 11: "down",
-    12: "recovery_L", 13: "recovery_R",
+    0: "RECOVER_LEFT",
+    1: "NORMAL_00", 2: "NORMAL_01", 3: "NORMAL_02",
+    4: "NORMAL_03", 5: "NORMAL_04", 6: "NORMAL_05",
+    7: "NORMAL_06", 8: "NORMAL_07", 9: "NORMAL_08",
+    10: "NORMAL_09", 11: "NORMAL_10",
+    12: "RECOVER_RIGHT",
 }
-# Actually 11 normal + 2 recovery = 13 classes (indices 0-12)
-# But the mapping may vary; we'll be data-driven
+RECOVERY_TREND_CLASSES = {0, 12}
+NORMAL_TREND_CLASSES = set(range(1, 12))
 
 # Guide mode names
 GUIDE_MODE_NAMES = {
@@ -159,22 +160,31 @@ def discover_datasets(data_root: str) -> List[str]:
     if not root.exists():
         return []
 
+    ignored_names = {"scenes", "legacy"}
     traj_dirs = []
-    for item in sorted(root.iterdir()):
-        if not item.is_dir():
+    for csv_path in root.rglob("data.csv"):
+        traj_dir = csv_path.parent
+        relative_parts = traj_dir.relative_to(root).parts
+        if any(
+            part.startswith(("_", ".")) or
+            part.endswith(".inprogress") or
+            part in ignored_names
+            for part in relative_parts
+        ):
             continue
-        name = item.name
-        # Skip special directories
-        if name.startswith("_") or name == "scenes":
+        meta_path = traj_dir / "metadata.json"
+        if not meta_path.is_file():
             continue
-        # Check for trajectories inside
-        for sub in sorted(item.iterdir()):
-            if sub.is_dir() and not sub.name.endswith(".inprogress"):
-                # Verify it has data.csv
-                if (sub / "data.csv").exists():
-                    traj_dirs.append(str(sub))
+        meta = load_metadata(str(meta_path))
+        try:
+            schema_version = int(meta.get("schema_version", -1))
+        except (TypeError, ValueError):
+            schema_version = -1
+        if schema_version != 15 or meta.get("status") != "committed":
+            continue
+        traj_dirs.append(str(traj_dir.resolve()))
 
-    return traj_dirs
+    return sorted(set(traj_dirs))
 
 
 def find_latest_dataset(search_paths: List[str]) -> str:
@@ -186,90 +196,67 @@ def find_latest_dataset(search_paths: List[str]) -> str:
         p = Path(search_path)
         if not p.exists():
             continue
-        # Check if it directly contains trajectories
-        if any((d / "data.csv").exists() for d in p.iterdir() if d.is_dir() and not d.name.startswith("_")):
-            mtime = p.stat().st_mtime
+        trajectories = discover_datasets(str(p))
+        if trajectories:
+            mtime = max(Path(td, "data.csv").stat().st_mtime
+                        for td in trajectories)
             if mtime > best_mtime:
                 best_mtime = mtime
-                best_dir = str(p)
-        # Also check subdirectories
-        for sub in p.iterdir():
-            if sub.is_dir() and not sub.name.startswith("_"):
-                if any((d / "data.csv").exists() for d in sub.iterdir() if d.is_dir() and not d.name.endswith(".inprogress")):
-                    mtime = sub.stat().st_mtime
-                    if mtime > best_mtime:
-                        best_mtime = mtime
-                        best_dir = str(sub)
-                        # Also go one level deeper to get all trajectories
-                        # We want the PARENT that contains scene_* dirs
-    if best_dir is None and search_paths:
-        # Fallback: return first that exists and has csv files anywhere
-        for sp in search_paths:
-            for root, dirs, files in os.walk(sp):
-                if "data.csv" in files:
-                    # Get parent of the traj dir → scene dir → root
-                    parts = Path(root).relative_to(sp).parts
-                    if len(parts) >= 2 and not parts[0].startswith("_"):
-                        best_dir = str(Path(sp) / parts[0])
-                        break
-            if best_dir:
-                break
-
+                best_dir = str(p.resolve())
+            # Recursive discovery already covers every nested scene. Do not
+            # replace the dataset root with one arbitrarily newer scene.
+            continue
     return best_dir or ""
 
 
 def _infer_column_type(values: List[str]) -> str:
-    """Infer numpy dtype for a column by sampling non-empty values."""
-    sample = [v for v in values[:20] if v and v.strip()]
+    """Infer a lossless numpy dtype from all non-empty values."""
+    sample = [v.strip() for v in values if v and v.strip()]
     if not sample:
-        return "U32"  # default to string
-    # Try float first
+        return "U1"
     try:
-        for v in sample:
-            float(v)
-        # Check if all are integers
-        all_int = True
-        for v in sample:
-            f = float(v)
-            if f != int(f):
-                all_int = False
-                break
-        if all_int:
+        numeric = [float(v) for v in sample]
+        has_missing = len(sample) != len(values)
+        if (not has_missing and
+                all(math.isfinite(v) and v.is_integer() for v in numeric)):
             return "i8"
         return "f8"
-    except ValueError:
-        return "U64"
+    except (ValueError, OverflowError):
+        return "U{}".format(max(1, max(len(v) for v in sample)))
 
 
 def load_trajectory_csv(csv_path: str) -> Optional[np.ndarray]:
     """Load a data.csv file into a structured numpy array with mixed types."""
     try:
-        with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
             reader = csv.reader(f)
             header = next(reader)
             rows = list(reader)
         if not rows or not header:
             return None
 
+        header = [name.strip() for name in header]
+        if any(not name for name in header):
+            raise ValueError("CSV header contains an empty column name")
+        if len(set(header)) != len(header):
+            raise ValueError("CSV header contains duplicate column names")
+
         n_cols = len(header)
         # Transpose to get column values
         columns = [[] for _ in range(n_cols)]
-        for row in rows:
-            # Pad/truncate to match header length
-            if len(row) < n_cols:
-                row = row + [""] * (n_cols - len(row))
+        for row_number, row in enumerate(rows, start=2):
+            if len(row) != n_cols:
+                raise ValueError(
+                    "CSV row {} has {} columns; expected {}".format(
+                        row_number, len(row), n_cols))
             for i in range(n_cols):
-                columns[i].append(row[i] if i < len(row) else "")
+                columns[i].append(row[i])
 
         # Build dtype from inferred column types
         dtype_parts = []
         for i, col_name in enumerate(header):
             col_type = _infer_column_type(columns[i])
-            # Sanitize column name for numpy (no special chars)
-            safe_name = col_name.strip().replace(" ", "_").replace("(", "").replace(")", "").replace("/", "_")
-            if not safe_name:
-                safe_name = f"col_{i}"
-            dtype_parts.append((safe_name, col_type))
+            dtype_parts.append((col_name, col_type))
 
         # Parse rows into tuples with proper types
         data = []
@@ -300,7 +287,7 @@ def load_trajectory_csv(csv_path: str) -> Optional[np.ndarray]:
 def load_metadata(meta_path: str) -> Dict[str, Any]:
     """Load metadata.json."""
     try:
-        with open(meta_path, "r") as f:
+        with open(meta_path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
@@ -356,6 +343,30 @@ class TrajectoryMetrics:
         self.positions = None
 
 
+def _as_float(values: np.ndarray) -> np.ndarray:
+    """Convert numeric/bool/string values to float, using NaN for bad cells."""
+    result = np.full(len(values), np.nan, dtype=float)
+    for i, value in enumerate(values):
+        text = str(value).strip().lower()
+        if text in ("true", "yes"):
+            result[i] = 1.0
+        elif text in ("false", "no", ""):
+            result[i] = 0.0 if text else np.nan
+        else:
+            try:
+                result[i] = float(value)
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return result
+
+
+def _valid_mask(data: np.ndarray, column: str) -> np.ndarray:
+    if column not in data.dtype.names:
+        return np.ones(len(data), dtype=bool)
+    values = _as_float(data[column])
+    return np.isfinite(values) & (values > 0.5)
+
+
 def compute_trajectory_metrics(
     data: np.ndarray, meta: Dict[str, Any], traj_id: str, scene_id: str, task_id: str
 ) -> TrajectoryMetrics:
@@ -405,49 +416,47 @@ def compute_trajectory_metrics(
     m.exit_reason = meta.get(EXIT_REASON_KEY, "unknown")
     m.final_goal_error_m = meta.get(FINAL_GOAL_ERROR_KEY, None)
 
-    # Trend class distribution
+    # Count only labels that are valid training targets for their respective loss.
     if TREND_HORIZONTAL_CLASS_COL in data.dtype.names:
-        classes = data[TREND_HORIZONTAL_CLASS_COL]
-        for c in classes:
-            if not np.isnan(c):
-                m.trend_class_distribution[int(c)] += 1
+        classes = _as_float(data[TREND_HORIZONTAL_CLASS_COL])
+        mask = _valid_mask(data, TREND_H_LOSS_VALID_COL)
+        mask &= np.isfinite(classes) & (classes >= 0) & (classes <= 12)
+        for c in classes[mask]:
+            m.trend_class_distribution[int(c)] += 1
 
-    # Guide elevation distribution
     if GUIDE_ELEVATION_BIN_COL in data.dtype.names:
-        bins = data[GUIDE_ELEVATION_BIN_COL]
-        for b in bins:
-            if not np.isnan(b):
-                m.guide_elevation_distribution[int(b)] += 1
+        bins = _as_float(data[GUIDE_ELEVATION_BIN_COL])
+        mask = _valid_mask(data, TREND_V_LOSS_VALID_COL)
+        mask &= np.isfinite(bins) & (bins >= 0) & (bins <= 6)
+        for b in bins[mask]:
+            m.guide_elevation_distribution[int(b)] += 1
 
-    # Guide mode distribution (trend_mode column: TRACK_GUIDE, RECOVER_LEFT, RECOVER_RIGHT, HOVER, etc.)
+    # guide_mode is distinct from trend_mode in schema v15.
     if GUIDE_MODE_COL in data.dtype.names:
         modes = data[GUIDE_MODE_COL]
         for mode in modes:
-            if isinstance(mode, str) and mode.strip():
-                m.guide_mode_distribution[mode.strip()] += 1
-            elif isinstance(mode, (int, float)) and not np.isnan(mode):
-                m.guide_mode_distribution[str(int(mode))] += 1
+            value = str(mode).strip()
+            if value:
+                m.guide_mode_distribution[value] += 1
 
-    # Recovery frames: recovery_direction != 0 or recovery_elapsed_s > 0
-    recovery_mask = None
-    if RECOVERY_DIRECTION_COL in data.dtype.names:
-        rd = data[RECOVERY_DIRECTION_COL]
-        try:
-            rd_vals = rd.astype(float)
-            recovery_mask = np.abs(rd_vals) > 0.01
-        except (ValueError, TypeError):
-            recovery_mask = np.array([str(v).strip() not in ("", "0", "0.0", "None", "none") for v in rd])
-    elif RECOVERY_ELAPSED_COL in data.dtype.names:
-        re = data[RECOVERY_ELAPSED_COL]
-        try:
-            re_vals = re.astype(float)
-            recovery_mask = re_vals > 0.0
-        except (ValueError, TypeError):
-            pass
-
-    if recovery_mask is not None:
-        m.recovery_frame_count = int(np.sum(recovery_mask))
-        m.recovery_rate = m.recovery_frame_count / m.num_frames if m.num_frames > 0 else 0.0
+    # recovery_direction is intentionally persistent and cannot indicate whether
+    # the current frame is recovering. Prefer guide_mode, then schema-v15 class.
+    if GUIDE_MODE_COL in data.dtype.names:
+        recovery_mask = np.array([
+            str(v).strip() in ("RECOVER_LEFT", "RECOVER_RIGHT")
+            for v in data[GUIDE_MODE_COL]
+        ])
+    elif TREND_HORIZONTAL_CLASS_COL in data.dtype.names:
+        classes = _as_float(data[TREND_HORIZONTAL_CLASS_COL])
+        recovery_mask = np.isin(classes, list(RECOVERY_TREND_CLASSES))
+    elif TREND_MODE_COL in data.dtype.names:
+        recovery_mask = np.array([
+            str(v).strip() == "RECOVERY" for v in data[TREND_MODE_COL]
+        ])
+    else:
+        recovery_mask = np.zeros(m.num_frames, dtype=bool)
+    m.recovery_frame_count = int(np.sum(recovery_mask))
+    m.recovery_rate = m.recovery_frame_count / m.num_frames
 
     # Speed
     if VELOCITY_X_COL in data.dtype.names and VELOCITY_Y_COL in data.dtype.names and VELOCITY_Z_COL in data.dtype.names:
@@ -466,12 +475,16 @@ def compute_trajectory_metrics(
         m.mean_yaw_rate = float(np.nanmean(np.abs(yr))) if len(yr) > 0 else 0.0
         m.max_yaw_rate = float(np.nanmax(np.abs(yr))) if len(yr) > 0 else 0.0
 
-    # Clearance
+    # This is planner trajectory clearance, not executed-flight clearance.
     if PLANNER_MIN_CLEARANCE_COL in data.dtype.names:
-        cl = data[PLANNER_MIN_CLEARANCE_COL]
-        m.clearance_profile = cl
-        m.mean_clearance = float(np.nanmean(cl)) if len(cl) > 0 else 0.0
-        m.min_clearance = float(np.nanmin(cl)) if len(cl) > 0 else 0.0
+        cl = _as_float(data[PLANNER_MIN_CLEARANCE_COL])
+        mask = np.isfinite(cl) & (cl > 0.0)
+        if PLANNER_SUCCESS_COL in data.dtype.names:
+            mask &= _as_float(data[PLANNER_SUCCESS_COL]) > 0.5
+        m.clearance_profile = np.where(mask, cl, np.nan)
+        if np.any(mask):
+            m.mean_clearance = float(np.mean(cl[mask]))
+            m.min_clearance = float(np.min(cl[mask]))
 
     # Jerk / smoothness (from acceleration difference)
     if VELOCITY_X_COL in data.dtype.names:
@@ -500,26 +513,30 @@ def compute_trajectory_metrics(
         err = data[YAW_RATE_TRACKING_COL]
         m.yaw_rate_tracking_rmse = float(np.sqrt(np.nanmean(err**2))) if len(err) > 0 else 0.0
 
-    # Planner stats
-    if PLANNER_SUCCESS_COL in data.dtype.names:
-        ps = data[PLANNER_SUCCESS_COL]
-        try:
-            if isinstance(ps[0], (str, np.str_)):
-                # String values like "True"/"False"
-                m.planner_success_rate = float(np.mean([1.0 if str(v).strip().lower() == "true" else 0.0 for v in ps]))
-            else:
-                m.planner_success_rate = float(np.nanmean(ps.astype(float))) if len(ps) > 0 else 1.0
-        except Exception:
-            pass
-    if PLANNER_COMPUTE_MS_COL in data.dtype.names:
-        pt = data[PLANNER_COMPUTE_MS_COL]
-        pt_valid = pt[~np.isnan(pt)]
-        m.mean_planning_ms = float(np.nanmean(pt_valid)) if len(pt_valid) > 0 else 0.0
-        m.p95_planning_ms = float(np.percentile(pt_valid, 95)) if len(pt_valid) > 0 else 0.0
+    # Planner rates and timing are defined only on frames that attempted planning.
+    attempted = None
+    if PLANNER_ATTEMPTED_COL in data.dtype.names:
+        attempted = _as_float(data[PLANNER_ATTEMPTED_COL]) > 0.5
+    elif PLANNER_COMPUTE_MS_COL in data.dtype.names:
+        attempted = _as_float(data[PLANNER_COMPUTE_MS_COL]) > 0.0
 
-    # Planner replans from metadata
-    m.num_replans = meta.get("fresh_plan_control_frame_count", 0)
-    m.num_failed_replans = meta.get("failed_replans", 0)
+    if attempted is not None:
+        m.num_replans = int(np.sum(attempted))
+        if PLANNER_SUCCESS_COL in data.dtype.names and m.num_replans:
+            success = _as_float(data[PLANNER_SUCCESS_COL]) > 0.5
+            m.planner_success_rate = float(np.mean(success[attempted]))
+            m.num_failed_replans = int(np.sum(attempted & ~success))
+        else:
+            m.num_failed_replans = 0
+        if PLANNER_COMPUTE_MS_COL in data.dtype.names and m.num_replans:
+            planning_ms = _as_float(data[PLANNER_COMPUTE_MS_COL])
+            valid = attempted & np.isfinite(planning_ms) & (planning_ms >= 0.0)
+            if np.any(valid):
+                m.mean_planning_ms = float(np.mean(planning_ms[valid]))
+                m.p95_planning_ms = float(np.percentile(planning_ms[valid], 95))
+    else:
+        m.num_replans = int(meta.get("fresh_plan_control_frame_count", 0) or 0)
+        m.num_failed_replans = int(meta.get("failed_replans", 0) or 0)
 
     # Start/goal
     sx = sy = sz = gx = gy = gz = None
@@ -606,11 +623,15 @@ class DatasetSummary:
         # or "scene_0000_sub0000" → no profile
         if sid:
             # Try profile_mode naming: {profile_name}_{scene_index:06d}
-            parts = sid.rsplit("_", 1)
-            if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) >= 4:
-                profile_name = parts[0]
+            if re.match(r"^scene_\d+_sub\d+$", sid):
+                profile_name = "generated_scene"
             else:
-                profile_name = "unknown_profile"
+                parts = sid.rsplit("_", 1)
+                if (len(parts) == 2 and parts[1].isdigit() and
+                        len(parts[1]) >= 4):
+                    profile_name = parts[0]
+                else:
+                    profile_name = "unknown_profile"
             ps = self.profile_stats[profile_name]
             ps["num_trajs"] += 1
             ps["total_frames"] += tm.num_frames
@@ -677,6 +698,20 @@ def print_bar_chart(counter: Dict, max_bars: int = 20, width: int = 40):
         print(f"  {key_str:.<28s} {bar} {count:,} ({pct:.1f}%)")
 
 
+def weighted_metric(ds: DatasetSummary, attribute: str,
+                    weight_attribute: str = "num_frames") -> Optional[float]:
+    pairs = []
+    for metric in ds.trajectory_metrics:
+        value = getattr(metric, attribute)
+        weight = getattr(metric, weight_attribute)
+        if value is not None and weight is not None and weight > 0:
+            pairs.append((float(value), float(weight)))
+    if not pairs:
+        return None
+    total_weight = sum(weight for _, weight in pairs)
+    return sum(value * weight for value, weight in pairs) / total_weight
+
+
 # ============================================================================
 # Report Generation
 # ============================================================================
@@ -704,12 +739,15 @@ def generate_full_report(ds: DatasetSummary, traj_dirs: List[str], data_root: st
     if ds.global_trend_classes:
         total_labels = sum(ds.global_trend_classes.values())
         print(f"  Total labeled frames: {total_labels:,}")
-        # Group into normal (indices 0-10) and recovery (indices 11-12 or similar)
-        # We'll just print all
-        print_bar_chart(dict(ds.global_trend_classes), max_bars=15, width=35)
-        # Highlight recovery vs normal
-        normal_count = sum(c for k, c in ds.global_trend_classes.items() if k < 11)
-        recovery_count = sum(c for k, c in ds.global_trend_classes.items() if k >= 11)
+        display_classes = {
+            "{} {}".format(k, TREND_CLASS_NAMES.get(k, "UNKNOWN")): count
+            for k, count in sorted(ds.global_trend_classes.items())
+        }
+        print_bar_chart(display_classes, max_bars=15, width=35)
+        normal_count = sum(c for k, c in ds.global_trend_classes.items()
+                           if k in NORMAL_TREND_CLASSES)
+        recovery_count = sum(c for k, c in ds.global_trend_classes.items()
+                             if k in RECOVERY_TREND_CLASSES)
         if total_labels > 0:
             print(f"\n  {Term.GREEN}Normal frames: {normal_count:,} ({normal_count/total_labels*100:.1f}%){Term.RESET}")
             print(f"  {Term.YELLOW}Recovery frames: {recovery_count:,} ({recovery_count/total_labels*100:.1f}%){Term.RESET}")
@@ -730,18 +768,18 @@ def generate_full_report(ds: DatasetSummary, traj_dirs: List[str], data_root: st
 
     print_subheader("2.4 Label Validity Rates (per-frame average)")
     if ds.trajectory_metrics:
-        avg_expert = np.mean([m.expert_label_valid_rate for m in ds.trajectory_metrics if m.expert_label_valid_rate is not None])
-        avg_trend = np.mean([m.trend_label_valid_rate for m in ds.trajectory_metrics if m.trend_label_valid_rate is not None])
-        avg_h_loss = np.mean([m.trend_h_loss_valid_rate for m in ds.trajectory_metrics if m.trend_h_loss_valid_rate is not None])
-        avg_v_loss = np.mean([m.trend_v_loss_valid_rate for m in ds.trajectory_metrics if m.trend_v_loss_valid_rate is not None])
-        avg_val_loss = np.mean([m.trend_value_loss_valid_rate for m in ds.trajectory_metrics if m.trend_value_loss_valid_rate is not None])
-        avg_ctrl_loss = np.mean([m.control_loss_valid_rate for m in ds.trajectory_metrics if m.control_loss_valid_rate is not None])
-        print_stat("Expert label valid", avg_expert, "", good=avg_expert >= 0.99, warn_thresh=0.95)
-        print_stat("Trend label valid", avg_trend, "", good=avg_trend >= 0.99, warn_thresh=0.95)
-        print_stat("Horizontal loss valid", avg_h_loss, "", good=avg_h_loss >= 0.99, warn_thresh=0.95)
-        print_stat("Vertical loss valid", avg_v_loss, "", good=avg_v_loss >= 0.99, warn_thresh=0.95)
-        print_stat("Value loss valid", avg_val_loss, "", good=avg_val_loss >= 0.99, warn_thresh=0.95)
-        print_stat("Control loss valid", avg_ctrl_loss, "", good=avg_ctrl_loss >= 0.99, warn_thresh=0.95)
+        for label, attribute in [
+            ("Expert label valid", "expert_label_valid_rate"),
+            ("Trend label valid", "trend_label_valid_rate"),
+            ("Horizontal loss valid", "trend_h_loss_valid_rate"),
+            ("Vertical loss valid", "trend_v_loss_valid_rate"),
+            ("Value loss valid", "trend_value_loss_valid_rate"),
+            ("Control loss valid", "control_loss_valid_rate"),
+        ]:
+            value = weighted_metric(ds, attribute)
+            if value is not None:
+                print_stat(label, value, "", good=value >= 0.99,
+                           warn_thresh=0.95)
 
     # === 3. Trajectory Quality ===
     print_header("3. TRAJECTORY QUALITY")
@@ -766,13 +804,13 @@ def generate_full_report(ds: DatasetSummary, traj_dirs: List[str], data_root: st
     print_bar_chart(dict(ds.exit_reasons), max_bars=8, width=30)
 
     # Clearance
-    print_subheader("3.3 Clearance (ESDF)")
+    print_subheader("3.3 Planned Trajectory Clearance")
     mean_clearances = [m.mean_clearance for m in ds.trajectory_metrics if m.mean_clearance is not None]
     min_clearances = [m.min_clearance for m in ds.trajectory_metrics if m.min_clearance is not None]
     if mean_clearances:
-        print_stat("Avg mean clearance", np.mean(mean_clearances), "m")
-        print_stat("Avg min clearance", np.mean(min_clearances), "m")
-        print_stat("Worst min clearance", np.min(min_clearances), "m",
+        print_stat("Avg planned mean clearance", np.mean(mean_clearances), "m")
+        print_stat("Avg planned min clearance", np.mean(min_clearances), "m")
+        print_stat("Worst planned min clearance", np.min(min_clearances), "m",
                    good=np.min(min_clearances) > 0.05, warn_thresh=0.1)
 
     # Smoothness
@@ -806,7 +844,10 @@ def generate_full_report(ds: DatasetSummary, traj_dirs: List[str], data_root: st
     pmt = [m.mean_planning_ms for m in ds.trajectory_metrics if m.mean_planning_ms is not None]
     pp95 = [m.p95_planning_ms for m in ds.trajectory_metrics if m.p95_planning_ms is not None]
     if psr:
-        print_stat("Mean planner success rate", np.mean(psr), "", good=np.mean(psr) >= 0.99, warn_thresh=0.95)
+        attempt_success = weighted_metric(
+            ds, "planner_success_rate", "num_replans")
+        print_stat("Planner attempt success rate", attempt_success, "",
+                   good=attempt_success >= 0.99, warn_thresh=0.95)
     if pmt:
         print_stat("Mean planning time", np.mean(pmt), "ms")
         print_stat("P95 planning time", np.mean(pp95), "ms")
@@ -856,8 +897,11 @@ def generate_full_report(ds: DatasetSummary, traj_dirs: List[str], data_root: st
     print_header("8. WARNINGS & RECOMMENDATIONS")
     warnings_list = []
 
-    if psr and np.mean(psr) < 0.95:
-        warnings_list.append(f"⚠  Planner success rate is {np.mean(psr):.2%} (below 95%)")
+    attempt_success = weighted_metric(ds, "planner_success_rate", "num_replans")
+    if attempt_success is not None and attempt_success < 0.95:
+        warnings_list.append(
+            f"⚠  Planner attempt success rate is {attempt_success:.2%} "
+            "(below 95%)")
     if goal_errors and np.mean(goal_errors) > 0.5:
         warnings_list.append(f"⚠  Mean goal error is {np.mean(goal_errors):.3f}m (above 0.5m)")
     if coll_rates and np.mean(coll_rates) > 0.01:
@@ -902,7 +946,10 @@ def generate_plots(ds: DatasetSummary, output_dir: str, data_root: str):
         items = sorted(ds.global_trend_classes.items())
         labels = [str(k) for k, _ in items]
         values = [v for _, v in items]
-        colors = ["#3498db" if int(k) < 11 else "#e74c3c" for k, _ in items]
+        colors = [
+            "#e74c3c" if int(k) in RECOVERY_TREND_CLASSES else "#3498db"
+            for k, _ in items
+        ]
         ax.bar(range(len(values)), values, color=colors, edgecolor="white", linewidth=0.5)
         ax.set_xticks(range(len(values)))
         ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
@@ -985,7 +1032,7 @@ def generate_plots(ds: DatasetSummary, output_dir: str, data_root: str):
         ax.axvline(np.mean(clearances), color="black", linestyle="--", label=f"Mean={np.mean(clearances):.3f}m")
         ax.set_xlabel("Mean Clearance (m)")
         ax.set_ylabel("Trajectories")
-        ax.set_title("ESDF Clearance Distribution")
+        ax.set_title("Planned Trajectory Clearance Distribution")
         ax.legend(fontsize=8)
         ax.grid(axis="y", alpha=0.3)
 
@@ -1111,9 +1158,9 @@ def generate_plots(ds: DatasetSummary, output_dir: str, data_root: str):
         bins = np.linspace(0, 1, 21)
         ax.hist(psr, bins=bins, color="#2ecc71", edgecolor="white", alpha=0.8)
         ax.axvline(np.mean(psr), color="black", linestyle="--", label=f"Mean={np.mean(psr):.2%}")
-        ax.set_xlabel("Success Rate")
+        ax.set_xlabel("Attempt Success Rate")
         ax.set_ylabel("Trajectories")
-        ax.set_title("Planner Success Rate")
+        ax.set_title("Planner Attempt Success Rate")
         ax.legend(fontsize=8)
         ax.grid(axis="y", alpha=0.3)
 
@@ -1164,7 +1211,7 @@ def generate_plots(ds: DatasetSummary, output_dir: str, data_root: str):
                 ax.plot(time, m.clearance_profile, linewidth=0.5, color="#2ecc71")
                 ax.axhline(y=0.05, color="red", linestyle="--", linewidth=0.5, label="Danger")
                 ax.set_ylabel("Clearance (m)")
-                ax.set_title("ESDF Clearance Profile")
+                ax.set_title("Planned Trajectory Clearance Profile")
                 ax.legend(fontsize=7)
                 ax.grid(alpha=0.3)
 
@@ -1211,10 +1258,22 @@ def export_json(ds: DatasetSummary, output_dir: str, data_root: str):
         },
         "label_distribution": {
             "horizontal_trend_classes": {str(k): v for k, v in ds.global_trend_classes.items()},
+            "horizontal_trend_class_names": {
+                str(k): v for k, v in TREND_CLASS_NAMES.items()
+            },
             "guide_elevation_bins": {str(k): v for k, v in ds.global_elevation_bins.items()},
             "guide_modes": {str(k): v for k, v in ds.global_guide_modes.items()},
             "total_collision_frames": ds.total_collision_frames,
             "total_recovery_frames": ds.total_recovery_frames,
+        },
+        "validity_rates": {
+            attribute: weighted_metric(ds, attribute)
+            for attribute in (
+                "frame_valid_rate", "expert_label_valid_rate",
+                "trend_label_valid_rate", "trend_h_loss_valid_rate",
+                "trend_v_loss_valid_rate", "trend_value_loss_valid_rate",
+                "control_loss_valid_rate",
+            )
         },
         "exit_reasons": dict(ds.exit_reasons),
         "quality_summary": {},
@@ -1258,6 +1317,12 @@ def export_json(ds: DatasetSummary, output_dir: str, data_root: str):
                 "median": float(np.median(vals)),
                 "max": float(np.max(vals)),
             }
+    report["planner_summary"]["attempt_success_rate"] = weighted_metric(
+        ds, "planner_success_rate", "num_replans")
+    report["planner_summary"]["total_attempts"] = sum(
+        m.num_replans or 0 for m in trajs)
+    report["planner_summary"]["total_failed_attempts"] = sum(
+        m.num_failed_replans or 0 for m in trajs)
 
     # Per scene
     for sid, ss in ds.scene_stats.items():
@@ -1296,8 +1361,20 @@ def export_json(ds: DatasetSummary, output_dir: str, data_root: str):
         })
 
     json_path = os.path.join(output_dir, "evaluation_report.json")
-    with open(json_path, "w") as f:
-        json.dump(report, f, indent=2, default=str)
+    def json_safe(value):
+        if isinstance(value, dict):
+            return {str(k): json_safe(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [json_safe(v) for v in value]
+        if isinstance(value, (float, np.floating)) and not math.isfinite(value):
+            return None
+        if isinstance(value, np.integer):
+            return int(value)
+        return value
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(json_safe(report), f, indent=2, ensure_ascii=False,
+                  allow_nan=False)
     print(f"  Saved JSON report: {json_path}")
     return report
 
@@ -1342,10 +1419,12 @@ def main():
         data_root = args.data_dir
     else:
         # Auto-detect from common locations
+        workspace_root = Path(__file__).resolve().parents[3]
         search_paths = [
-            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "il_data"),
+            str(workspace_root / "il_data"),
+            str(workspace_root / "il_data_3"),
             os.path.join(os.getcwd(), "il_data"),
-            "g:\\Code\\flightmare_ws\\il_data",
+            os.path.join(os.getcwd(), "il_data_3"),
         ]
         data_root = find_latest_dataset(search_paths)
         if not data_root:
@@ -1426,7 +1505,11 @@ def main():
     elif args.mode == "labels":
         print_header("LABEL DISTRIBUTION REPORT")
         print_subheader("Horizontal Trend Classes")
-        print_bar_chart(dict(ds.global_trend_classes), max_bars=15)
+        display_classes = {
+            "{} {}".format(k, TREND_CLASS_NAMES.get(k, "UNKNOWN")): count
+            for k, count in sorted(ds.global_trend_classes.items())
+        }
+        print_bar_chart(display_classes, max_bars=15)
         print_subheader("Guide Elevation Bins")
         print_bar_chart(dict(ds.global_elevation_bins), max_bars=15)
         print_subheader("Guide Modes")
@@ -1445,7 +1528,9 @@ def main():
         print_header("PLANNER PERFORMANCE REPORT")
         for m in ds.trajectory_metrics:
             print(f"\n  {m.traj_id}:")
-            print_stat("  Success rate", m.planner_success_rate or 0)
+            print_stat("  Attempt success rate",
+                       m.planner_success_rate
+                       if m.planner_success_rate is not None else float("nan"))
             print_stat("  Mean time", m.mean_planning_ms or 0, "ms")
             print_stat("  P95 time", m.p95_planning_ms or 0, "ms")
             print_stat("  Replans", m.num_replans or 0)

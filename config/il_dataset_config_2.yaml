@@ -76,7 +76,7 @@ global:
     # SmartObstacleSampler produces an obstacle surface gap of:
     # min_gap + 2*drone_radius + safety_margin = 0.80 m.  A 0.40 m vehicle
     # therefore has 0.40 m total spare width in every generated pairwise gap.
-    min_gap:        0.80
+    min_gap:        0.50
     drone_radius:   0.30
     safety_margin:  0.20
     border_margin:  0.20               # avoids creating an oversized perimeter corridor
@@ -126,7 +126,7 @@ global:
     # minimum surface gap  = 0.15 + 2×0.40 = 0.95 m
 
     # ── Core constraints (the only ones that matter) ──────────────
-    post_inflation_gap_m: 0.30         # minimum gap after inflation
+    post_inflation_gap_m: 0.15         # minimum gap after inflation
     region_boundary_margin_m: 0.30     # obstacle centre inset from region edge
     allow_overlap: false               # raw cylinders must not overlap
 
@@ -152,7 +152,7 @@ global:
 
     # ── Common task generation ─────────────────────────────────────
     common_task_generation:
-      tasks_per_scene: 48
+      tasks_per_scene: 24
 
       start_sampling_regions:
         - {x_min: -6.5, x_max: 9.5, y_min: -1.5, y_max: -0.5}
@@ -648,8 +648,8 @@ global:
       max_planning_time_coarse_s: 8.0  # wall-clock guard for downsampled search
       max_planning_time_full_s: 45.0   # bounded guard sized for the 0.10 m grid
       cost_weight: 0.0                 # geometric shortest feasible path, no perimeter bias
-      clearance_target: 0.45           # preferred ESDF clearance (actual ≥ 0.65 m with drone_r=0.30)
-      min_clearance: 0.40              # hard constraint: ESDF ≥ 0.25 (actual ≥ 0.55 m)
+      clearance_target: 0.35           # preferred ESDF clearance (actual ≥ 0.65 m with drone_r=0.30)
+      min_clearance: 0.25              # hard constraint: ESDF ≥ 0.25 (actual ≥ 0.55 m)
       shortcut_enabled: true
       shortcut_check_spacing: 0.05
       reference_resample_spacing_m: 0.20
@@ -688,7 +688,7 @@ global:
       minimum_step_size: 1.0e-4
       max_cost_samples_per_segment: 64   # bounds every objective evaluation
 
-      min_clearance: 0.35
+      min_clearance: 0.20
       target_clearance: 0.40
       collision_check_spacing: 0.05
 
