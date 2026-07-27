@@ -126,3 +126,9 @@ catkin_package(
   LIBRARIES il_local_planner_lib
 )
 
+catkin_install_python(PROGRAMS
+  scripts/expert_behavior_test.py
+  scripts/expert_behavior_visualizer.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+

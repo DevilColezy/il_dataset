@@ -57,7 +57,6 @@ if os.path.isdir(_devel_lib):
 _MPL_AVAILABLE = False
 try:
     import matplotlib
-    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Circle
     _MPL_AVAILABLE = True
@@ -696,7 +695,9 @@ class ILManager:
         self._inprogress_file = None
         self._sync_file = None
         self._global_path_file = None
+        self._raw_global_path_file = None
         self._local_plans_file = None
+        self._local_plan_points_file = None
 
         # ── v5: online planning stats ───────────────────────────
         self._total_replans = 0
@@ -741,6 +742,8 @@ class ILManager:
         cfg.max_reference_points = int(lp_cfg.get("max_reference_points", 32))
 
         cfg.control_points = int(lp_cfg.get("control_points", 12))
+        cfg.control_point_spacing = float(
+            lp_cfg.get("control_point_spacing", 0.20))
         cfg.max_iterations = int(lp_cfg.get("max_iterations", 60))
         cfg.convergence_tolerance = float(lp_cfg.get("convergence_tolerance", 1e-4))
         cfg.initial_step_size = float(lp_cfg.get("initial_step_size", 0.1))
@@ -939,6 +942,87 @@ class ILManager:
         self.bridge.send_pose(ka)
 
     # ── File lifecycle ──────────────────────────────────────────────
+    def _open_local_plan_points_file(self):
+        """Open the dense local-plan sidecar used by expert diagnostics."""
+        path = os.path.join(self._inprogress_dir, "local_plan_points.csv")
+        self._local_plan_points_file = open(path, "w")
+        self._local_plan_points_file.write(
+            "plan_id,point_index,t,x,y,z,vx,vy,vz,ax,ay,az,"
+            "yaw,yaw_rate,clearance\n")
+
+    def _write_raw_global_path(self, raw_path):
+        """Persist the un-shortcut global-planner path for diagnostics."""
+        path = os.path.join(self._inprogress_dir, "raw_global_path.csv")
+        self._raw_global_path_file = open(path, "w")
+        self._raw_global_path_file.write("index,x,y,z\n")
+        for index, point in enumerate(raw_path or []):
+            self._raw_global_path_file.write(
+                "{},{:.6f},{:.6f},{:.6f}\n".format(
+                    index, float(point[0]), float(point[1]),
+                    float(point[2])))
+        self._raw_global_path_file.flush()
+
+    def _write_local_plan_points(self, result):
+        """Persist every dense point without changing local_plans.csv."""
+        out = self._local_plan_points_file
+        if out is None or result is None:
+            return
+        for point_index, point in enumerate(result.trajectory):
+            pos = point.position
+            vel = point.velocity
+            acc = point.acceleration
+            out.write(
+                "{},{},{:.6f},{:.6f},{:.6f},{:.6f},"
+                "{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},"
+                "{:.6f},{:.6f},{:.6f}\n".format(
+                    int(result.plan_id), point_index, float(point.t),
+                    float(pos[0]), float(pos[1]), float(pos[2]),
+                    float(vel[0]), float(vel[1]), float(vel[2]),
+                    float(acc[0]), float(acc[1]), float(acc[2]),
+                    float(point.yaw), float(point.yaw_rate),
+                    float(point.clearance)))
+        out.flush()
+
+    def _write_local_plan_summary(
+            self, result, state, request_timestamp_ns,
+            source_frame_id=-1, terminal_scale=1.0):
+        """Write one plan summary with a stable frame/plan association."""
+        if self._local_plans_file is None or result is None:
+            return
+        trajectory = result.trajectory
+        duration = float(trajectory[-1].t) if len(trajectory) > 0 else 0.0
+        guide = result.guide_waypoint
+        goal = result.local_goal
+        values = [
+            int(result.plan_id), int(source_frame_id),
+            int(request_timestamp_ns),
+            "{:.6f}".format(float(state.position[0])),
+            "{:.6f}".format(float(state.position[1])),
+            "{:.6f}".format(float(state.position[2])),
+            "{:.6f}".format(float(state.velocity[0])),
+            "{:.6f}".format(float(state.velocity[1])),
+            "{:.6f}".format(float(state.velocity[2])),
+            "{:.6f}".format(float(state.yaw)),
+            "{:.6f}".format(float(guide[0])),
+            "{:.6f}".format(float(guide[1])),
+            "{:.6f}".format(float(guide[2])),
+            int(result.guide_waypoint_index),
+            "{:.6f}".format(float(goal[0])),
+            "{:.6f}".format(float(goal[1])),
+            "{:.6f}".format(float(goal[2])),
+            "{:.6f}".format(float(result.progress_s)),
+            int(result.progress_index), int(result.local_goal_index),
+            int(result.status), bool(result.success),
+            "{:.6f}".format(float(result.planning_time_ms)),
+            "{:.6f}".format(float(result.min_clearance)),
+            len(trajectory), "{:.6f}".format(duration),
+            "{:.4f}".format(float(terminal_scale)),
+        ]
+        self._local_plans_file.write(
+            ",".join(str(value) for value in values) + "\n")
+        self._local_plans_file.flush()
+        self._write_local_plan_points(result)
+
     def _close_open_files(self):
         # v11: flush buffered depth images to disk before closing
         depth_buffer = getattr(self, "_depth_buffer", None)
@@ -952,7 +1036,9 @@ class ILManager:
                 rospy.logerr("[Recorder] Async image writer failed: %s", exc)
                 self._trajectory_exit_reason = "image_writer_failure"
             self._image_writer = None
-        for attr in ("_inprogress_file", "_sync_file", "_global_path_file", "_local_plans_file"):
+        for attr in ("_inprogress_file", "_sync_file", "_global_path_file",
+                     "_raw_global_path_file", "_local_plans_file",
+                     "_local_plan_points_file"):
             f = getattr(self, attr, None)
             if f is not None:
                 try:
@@ -1901,8 +1987,34 @@ class ILManager:
 
     def _st_wait_drone_stable(self):
         if self._timed_out():
+            rospy.logwarn("[FSM] Drone stable timeout reached; proceeding anyway.")
             self._enter_state(State.INIT_LOCAL_PLANNER)
             return
+
+        # ── Real stability check: velocity must be near zero ──
+        stab_cfg = self.g.get("fsm", {}).get("drone_stable", {})
+        vel_thresh = stab_cfg.get("velocity_threshold", 0.05)   # m/s
+        ticks_req  = stab_cfg.get("consecutive_ticks", 20)       # 2 s @ 10 Hz
+
+        state = self._dynamics.get_state()
+        vel_norm = float(np.linalg.norm(state.velocity_world))
+
+        if not hasattr(self, "_drone_stable_ticks"):
+            self._drone_stable_ticks = 0
+
+        if vel_norm < vel_thresh:
+            self._drone_stable_ticks += 1
+            if self._drone_stable_ticks >= ticks_req:
+                rospy.loginfo("[FSM] Drone stable (|v|=%.3f m/s for %d ticks).",
+                              vel_norm, self._drone_stable_ticks)
+                self._enter_state(State.INIT_LOCAL_PLANNER)
+                return
+        else:
+            if self._drone_stable_ticks > 0:
+                rospy.logdebug("[FSM] Drone velocity %.3f > %.3f, resetting stable counter.",
+                               vel_norm, vel_thresh)
+            self._drone_stable_ticks = 0
+
         plan = self.current_planned[self.traj_idx]
         start = plan["start"]
         init_yaw = self._get_current_initial_yaw()
@@ -1935,7 +2047,6 @@ class ILManager:
         self._observability_consistent_count = 0
         if (self._current_task_validation is not None and
                 self._current_task_validation.dominant_obstacle_id):
-            # Find the dominant obstacle object
             for obs in getattr(self, "_current_scene_obstacles", []):
                 if obs.obstacle_id == self._current_task_validation.dominant_obstacle_id:
                     self._current_dominant_obstacle = obs
@@ -1968,9 +2079,7 @@ class ILManager:
                 self._guide_progress_index = -1
                 self._consecutive_guide_failures = 0
 
-                # Planner-map choice is independent from Guide selection.
-                # In global-ESDF mode the complete ESDF is uploaded once here;
-                # current depth is still used every frame for Guide visibility.
+                # Set ESDF and global path in C++ planner
                 if not self._use_observed_esdf and self.current_esdf is not None:
                     esdf_c = np.ascontiguousarray(
                         self.current_esdf, dtype=np.float32)
@@ -1985,7 +2094,6 @@ class ILManager:
                         return
                     rospy.loginfo("[FSM] Uploaded global ESDF (%s) to C++ planner.",
                                   "×".join(str(d) for d in self.current_esdf.shape))
-                # Set the global reference path.
                 gp_np = np.array(global_path, dtype=np.float64, order='C')
                 ok = self._cpp_planner.set_global_path(gp_np)
                 if not ok:
@@ -1993,21 +2101,24 @@ class ILManager:
                     self._enter_state(State.ERROR)
                     return
 
-                # Reset planner state
-                dynamics_state = self._dynamics.get_state()
-                qx, qy, qz, qw = dynamics_state.quaternion_world_body
-                actual_yaw = math.atan2(2.0 * (qw*qz + qx*qy),
-                                        1.0 - 2.0 * (qy*qy + qz*qz))
+                # ── Build initial state from the PLANNED start ──
+                # Do NOT trust dynamics.get_state() — Flightmare's reset()
+                # does not guarantee zero velocity (gravity acts immediately
+                # after the internal 0.3 s settle ends), and the reported z
+                # is offset from the task start.  Using the planned start
+                # guarantees the planner sees a consistent initial state.
                 init_state = _VehicleState()
-                init_state.position = tuple(float(v) for v in dynamics_state.position_world)
-                init_state.velocity = tuple(float(v) for v in dynamics_state.velocity_world)
-                init_state.acceleration = tuple(float(v) for v in dynamics_state.acceleration_world)
-                init_state.yaw = float(actual_yaw)
-                init_state.yaw_rate = float(dynamics_state.angular_velocity_body[2])
+                init_state.position = tuple(float(v) for v in start)
+                init_state.velocity = (0.0, 0.0, 0.0)
+                init_state.acceleration = (0.0, 0.0, 0.0)
+                init_state.yaw = float(init_yaw)
+                init_state.yaw_rate = 0.0
                 self._cpp_planner.reset(init_state)
 
-                rospy.loginfo("[FSM] C++ local planner initialized for trajectory %d.",
-                              self.traj_idx + 1)
+                rospy.loginfo("[FSM] C++ local planner initialized for trajectory %d "
+                              "(start=%.2f,%.2f,%.2f yaw=%.1f°).",
+                              self.traj_idx + 1, *start,
+                              math.degrees(init_yaw))
             except Exception as exc:
                 rospy.logerr("[FSM] C++ planner init failed: %s", exc)
                 traceback.print_exc()
@@ -2016,6 +2127,33 @@ class ILManager:
                     return
         else:
             rospy.loginfo("[FSM] No C++ planner; using kinematic pass-through mode.")
+
+        # ── Just-in-time dynamics reset (after planner init) ─────
+        # The Flightmare sim falls whenever no hover command is active.
+        # Reset the drone NOW (after all slow Python work is done) and
+        # extend the settle time to bridge the gap until the first
+        # control frame arrives in ONLINE_PLAN_AND_RECORD.
+        if self._dynamics is not None:
+            try:
+                self._dynamics.reset(start, init_yaw)
+                # Extended hover to cover START_RECORDING transition
+                extra_settle = float(
+                    self.g.get("fsm", {}).get("jit_settle_extra_s", 2.0))
+                if extra_settle > 0.0:
+                    self._dynamics.step_velocity_command(
+                        np.zeros(3, dtype=np.float64), 0.0, extra_settle)
+            except Exception as exc:
+                rospy.logerr("[FSM] JIT dynamics reset failed: %s", exc)
+                self._enter_state(State.ERROR)
+                return
+            # Sync Unity (frame_id=-1 so lockstep counter stays clean)
+            reset_state = self._dynamics.get_state()
+            vehicle = make_depth_vehicle(
+                reset_state.position_world.tolist(), init_yaw, self._depth_cfg,
+                quaternion_xyzw=reset_state.quaternion_world_body)
+            msg = {"scene_id": self.g["scene_id"], "frame_id": -1,
+                   "vehicles": [vehicle], "objects": self.current_obj_list}
+            self.bridge.send_pose(msg)
 
         self._enter_state(State.START_RECORDING)
 
@@ -2222,17 +2360,20 @@ class ILManager:
             self._global_path_file.write("{},{:.4f},{:.4f},{:.4f},{:.4f}\n".format(
                 idx, pt[0], pt[1], pt[2], cum_s))
         self._global_path_file.flush()
+        self._write_raw_global_path(plan.get("raw_path", []))
 
         # ── Local plans CSV ──────────────────────────────────────────
         self._local_plans_file = open(lp_path, "w")
         self._local_plans_file.write(
-            "plan_id,request_timestamp_ns,"
+            "plan_id,source_frame_id,request_timestamp_ns,"
             "state_x,state_y,state_z,state_vx,state_vy,state_vz,state_yaw,"
+            "guide_x,guide_y,guide_z,guide_path_index,"
             "local_goal_x,local_goal_y,local_goal_z,"
             "progress_s,progress_index,local_goal_index,"
-            "status,success,planning_time_ms,min_clearance,traj_point_count\n")
+            "status,success,planning_time_ms,min_clearance,traj_point_count,"
+            "trajectory_duration_s,terminal_scale\n")
+        self._open_local_plan_points_file()
         self._image_writer = None
-        # v11: accumulate depth images in memory, flush to disk at end of trajectory
         self._depth_buffer = []  # list of (png_name, depth_u16)
         self._depth_buffer_enabled = bool(
             self.g.get("online_runtime", {}).get("depth_in_memory", True))
@@ -2273,8 +2414,6 @@ class ILManager:
         runtime_loop_hz = rec_hz
 
         retry_cfg = online_rt.get("planner_retry", {})
-        terminal_scales = list(retry_cfg.get(
-            "terminal_scale_sequence", [1.0, 0.75, 0.50, 0.30]))
         # v11 FIX: speed_scale removed — C++ pybind does not export it.
         recovery_initial_scales = list(retry_cfg.get(
             "recovery_initial_terminal_scales", [0.30, 0.50]))
@@ -2298,8 +2437,6 @@ class ILManager:
         previous_planner_mode = PlannerMode.FRESH_PLAN  # for recovery-entry detection
         control_mode = ControlMode.TRACK_TRAJECTORY
         trend_mode = TrendMode.TRACK_GUIDE
-        plan_id_counter = 0
-
         # v11: recovery state
         recovery_elapsed_s = 0.0
         recovery_step_count = 0
@@ -2466,7 +2603,7 @@ class ILManager:
                         guide_sel.progress_path_index)
                     ref_segment = self._guide_selector.get_reference_segment(
                         global_path, max(0, self._guide_progress_index),
-                        guide_sel.terminal_path_index)
+                        guide_sel.guide_path_index)
                     if len(ref_segment) >= 2:
                         self._consecutive_guide_failures = 0
                     else:
@@ -2536,19 +2673,26 @@ class ILManager:
                 # v11: Guide visible → plan trajectory; not visible → recovery (no plan needed)
                 if guide_sel.valid and len(ref_segment) >= 2:
                     # ── Normal: visible Guide → plan trajectory ──────
-                    # v12: if coming out of RECOVERY, use short terminals first
+                    # NORMAL mode optimizes all the way to the selected Guide.
+                    # Recovery keeps the conservative short-terminal sequence.
                     if planner_mode == PlannerMode.RECOVERY:
                         scales_for_plan = recovery_initial_scales
                     else:
-                        scales_for_plan = terminal_scales
+                        scales_for_plan = [1.0]
 
                     for ts in scales_for_plan:
                         planner_retry_count += 1
 
-                        scaled_terminal, scaled_terminal_idx = \
-                            self._scale_terminal(
-                                guide_sel, global_path, ts,
-                                self._guide_progress_index)
+                        if planner_mode == PlannerMode.RECOVERY:
+                            scaled_terminal, scaled_terminal_idx = \
+                                self._scale_terminal(
+                                    guide_sel, global_path, ts,
+                                    self._guide_progress_index)
+                        else:
+                            scaled_terminal = np.asarray(
+                                guide_sel.guide_position_world,
+                                dtype=np.float64)
+                            scaled_terminal_idx = guide_sel.guide_path_index
                         if scaled_terminal is None:
                             continue
                         scaled_ref = self._scale_reference_segment(
@@ -2613,6 +2757,16 @@ class ILManager:
                                     str(result.status)
                                     if result is not None
                                     else "PLAN_FAILED")
+                                rospy.logwarn_throttle(
+                                    1.0,
+                                    "[LOCAL-PLAN] rejected: frame=%d "
+                                    "status=%s message=%s guide_idx=%d "
+                                    "guide_dist=%.2fm",
+                                    frame_id, planner_status_str,
+                                    str(result.message)
+                                    if result is not None else "no result",
+                                    int(guide_sel.guide_path_index),
+                                    float(guide_sel.guide_distance_m))
                         except Exception as exc:
                             rospy.logerr(
                                 "[ONLINE-LOCKSTEP] Planner exception: %s", exc)
@@ -2631,7 +2785,7 @@ class ILManager:
                         self._executed_clearances.append(result.min_clearance)
 
                         snapshot = LocalPlanSnapshot(
-                            plan_id=plan_id_counter,
+                            plan_id=int(result.plan_id),
                             plan_timestamp_s=trajectory_time_s,
                             source_frame_id=frame_id,
                             source_state_timestamp_s=trajectory_time_s,
@@ -2644,7 +2798,7 @@ class ILManager:
                                 dtype=np.float64),
                             terminal_path_index=result.local_goal_index,
                             reference_path_start_index=self._guide_progress_index,
-                            reference_path_end_index=guide_sel.terminal_path_index,
+                            reference_path_end_index=result.local_goal_index,
                             trajectory=result.trajectory,
                             trajectory_duration_s=float(
                                 result.trajectory[-1].t)
@@ -2654,28 +2808,12 @@ class ILManager:
                             terminal_scale=terminal_scale_used,
                         )
                         self._latest_plan_snapshot = snapshot
-                        plan_id_counter += 1
                         planner_mode = PlannerMode.FRESH_PLAN
 
-                        if self._local_plans_file is not None:
-                            self._local_plans_file.write(
-                                "{},{},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},"
-                                "{:.4f},{:.4f},{:.4f},{:.4f},{},{},{},{},{},{:.2f},{:.4f}\n"
-                                .format(result.plan_id,
-                                        int(t_request_mono * 1e9),
-                                        state.position[0], state.position[1],
-                                        state.position[2],
-                                        state.velocity[0], state.velocity[1],
-                                        state.velocity[2],
-                                        state.yaw,
-                                        result.local_goal[0], result.local_goal[1],
-                                        result.local_goal[2],
-                                        result.progress_s, result.progress_index,
-                                        result.local_goal_index,
-                                        int(result.status), result.success,
-                                        result.planning_time_ms, result.min_clearance,
-                                        len(result.trajectory)))
-                            self._local_plans_file.flush()
+                        self._write_local_plan_summary(
+                            result, state, int(t_request_mono * 1e9),
+                            source_frame_id=frame_id,
+                            terminal_scale=terminal_scale_used)
                     else:
                         self._failed_replans += 1
                         self._planner_failure_count += 1
@@ -2688,6 +2826,13 @@ class ILManager:
                             global_path, self._guide_progress_index,
                             recovery_lookahead_m)
                     planner_status_str = "RECOVERY_NO_GUIDE"
+                    rospy.logwarn_throttle(
+                        1.0,
+                        "[GUIDE] unavailable: frame=%d reason=%s "
+                        "candidates=%d progress_idx=%d",
+                        frame_id, str(guide_sel.rejection_reason),
+                        int(guide_sel.candidate_count),
+                        int(self._guide_progress_index))
                     # planner statistics: not a planner attempt (no C++ call)
                     # below handles whether to enter RECOVERY or use cached plan.
 
@@ -4893,15 +5038,19 @@ class ILManager:
             self._global_path_file.write("{},{:.4f},{:.4f},{:.4f},{:.4f}\n".format(
                 idx, pt[0], pt[1], pt[2], cum_s))
         self._global_path_file.flush()
+        self._write_raw_global_path(plan.get("raw_path", []))
 
         # ── Local plans CSV ──────────────────────────────────────
         self._local_plans_file = open(lp_path, "w")
         self._local_plans_file.write(
-            "plan_id,request_timestamp_ns,"
+            "plan_id,source_frame_id,request_timestamp_ns,"
             "state_x,state_y,state_z,state_vx,state_vy,state_vz,state_yaw,"
+            "guide_x,guide_y,guide_z,guide_path_index,"
             "local_goal_x,local_goal_y,local_goal_z,"
             "progress_s,progress_index,local_goal_index,"
-            "status,success,planning_time_ms,min_clearance,traj_point_count\n")
+            "status,success,planning_time_ms,min_clearance,traj_point_count,"
+            "trajectory_duration_s,terminal_scale\n")
+        self._open_local_plan_points_file()
 
         # ── State variables ──────────────────────────────────────
         goal_pt = plan["goal"]
@@ -4982,19 +5131,8 @@ class ILManager:
                     consecutive_failures += 1
                 elif result is not None:
                     self._planning_times_ms.append(result.planning_time_ms)
-                    self._local_plans_file.write(
-                        "{},{},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},"
-                        "{:.4f},{:.4f},{:.4f},{:.4f},{},{},{},{},{},{:.2f},{:.4f}\n"
-                        .format(result.plan_id, int(request_mono * 1e9),
-                                state.position[0], state.position[1], state.position[2],
-                                state.velocity[0], state.velocity[1], state.velocity[2],
-                                state.yaw,
-                                result.local_goal[0], result.local_goal[1], result.local_goal[2],
-                                result.progress_s, result.progress_index, result.local_goal_index,
-                                int(result.status), result.success,
-                                result.planning_time_ms, result.min_clearance,
-                                len(result.trajectory)))
-                    self._local_plans_file.flush()
+                    self._write_local_plan_summary(
+                        result, state, int(request_mono * 1e9))
 
                     if result.success and request_age <= max_plan_age:
                         latest_plan_result = result
@@ -5080,19 +5218,8 @@ class ILManager:
                             else:
                                 latest_plan_result = None
 
-                    self._local_plans_file.write(
-                        "{},{},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},"
-                        "{:.4f},{:.4f},{:.4f},{:.4f},{},{},{},{},{},{:.2f},{:.4f}\n"
-                        .format(result.plan_id, int(now_mono * 1e9),
-                                state.position[0], state.position[1], state.position[2],
-                                state.velocity[0], state.velocity[1], state.velocity[2],
-                                state.yaw,
-                                result.local_goal[0], result.local_goal[1], result.local_goal[2],
-                                result.progress_s, result.progress_index, result.local_goal_index,
-                                int(result.status), result.success,
-                                result.planning_time_ms, result.min_clearance,
-                                len(result.trajectory)))
-                    self._local_plans_file.flush()
+                    self._write_local_plan_summary(
+                        result, state, int(now_mono * 1e9))
                 except Exception as exc:
                     rospy.logerr("[ONLINE] Planner exception: %s", exc)
                     consecutive_failures += 1
@@ -5473,7 +5600,9 @@ class ILManager:
                 "and_current_depth_visibility"),
             "guide_known_free_corridor_check_enabled": False,
             "trajectory_terminal_rule": (
-                "farthest_dynamically_reachable_astar_path_point_not_beyond_guide"),
+                "NORMAL: selected visible Guide is the hard optimization "
+                "endpoint with automatically allocated feasible duration; "
+                "RECOVERY: conservative scaled terminal"),
             "unknown_space_policy": "not_applicable_to_complete_global_esdf",
             "global_map_fallback_enabled": False,
             "trend_config": {

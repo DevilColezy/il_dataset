@@ -702,6 +702,24 @@ def _validate_config(cfg):
     if generated_gap + 1e-9 < required_gap:
         errors.append("generated obstacle surface gap ({}) < planner-required width ({})".format(
             generated_gap, required_gap))
+    # Density-driven scenes use their own vehicle inflation and guaranteed
+    # post-inflation gap.  A corridor can only guarantee half that remaining
+    # gap, in addition to the scene's safety inflation, on each side.
+    scene_cfg = g.get("scene_generation", {})
+    scene_vehicle = scene_cfg.get("vehicle", {})
+    scene_safety = float(
+        scene_vehicle.get("safety_margin_m", 0.0) or 0.0)
+    post_inflation_gap = float(
+        scene_cfg.get("post_inflation_gap_m", 0.0) or 0.0)
+    guaranteed_planner_margin = (
+        scene_safety + 0.5 * post_inflation_gap)
+    if (scene_cfg.get("enabled", False) and
+            "post_inflation_gap_m" in scene_cfg and
+            hard_margin > guaranteed_planner_margin + 1e-9):
+        errors.append(
+            "planner hard clearance ({}) exceeds the density-driven "
+            "scene corridor guarantee ({})".format(
+                hard_margin, guaranteed_planner_margin))
     scale_weights = obs.get("scale_weights", [0.70, 0.25, 0.05])
     if (not isinstance(scale_weights, list) or len(scale_weights) != 3 or
             any(not isinstance(w, (int, float)) or w < 0 for w in scale_weights) or
@@ -716,6 +734,20 @@ def _validate_config(cfg):
     for key in ("max_planning_time_coarse_s", "max_planning_time_full_s"):
         if key in gp:
             _validate_positive("global.planning.global_planner.{}".format(key), gp[key])
+    if gp.get("algorithm", "line_push") not in ("line_push", "weighted_astar"):
+        errors.append(
+            "global.planning.global_planner.algorithm must be "
+            "'line_push' or 'weighted_astar'")
+    line_push_cfg = gp.get("line_push", {})
+    for key in (
+            "point_spacing_m", "target_clearance_m", "influence_radius_m",
+            "push_margin_m", "max_iterations", "max_offset_m",
+            "max_control_points",
+            "max_segment_refinements_per_iteration"):
+        if key in line_push_cfg:
+            _validate_positive(
+                "global.planning.global_planner.line_push.{}".format(key),
+                line_push_cfg[key])
 
     # Validate local_planner (if present and backend != python_fallback)
     if lp and lp.get("backend") != "python_fallback":
@@ -794,7 +826,8 @@ def _validate_config(cfg):
                      "yaw_speed_threshold",
                      "lookahead_distance", "min_lookahead_distance", "max_lookahead_distance",
                      "lookahead_velocity_gain", "local_map_radius", "max_reference_points",
-                     "control_points", "max_iterations", "max_cost_samples_per_segment",
+                     "control_points", "control_point_spacing",
+                     "max_iterations", "max_cost_samples_per_segment",
                      "min_clearance", "target_clearance", "collision_check_spacing",
                      "nominal_speed", "max_velocity", "max_acceleration", "max_jerk",
                      "max_yaw_rate", "goal_tolerance", "goal_speed_tolerance",

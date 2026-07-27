@@ -27,6 +27,7 @@
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>flightmare_dataset_tools</exec_depend>
   <exec_depend>eigen</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
 
   <!-- Python dependencies (must be installed manually or via requirements.txt) -->
   <!--   pip3 install pybind11 numpy scipy pillow pyzmq pyyaml -->

@@ -259,8 +259,7 @@ LocalPlanner::selectLocalGoal(double progress_s,
 // ─────────────────────────────────────────────────────────────────────
 
 double LocalPlanner::yawFromTangent(const Eigen::Vector3d& direction) {
-    // ROS yaw convention: yaw=0 → nose faces +Y (left in ROS world)
-    // yaw = atan2(dy, dx) - pi/2
+    // Project convention: yaw=0 means the vehicle nose faces world +Y.
     return std::atan2(direction.y(), direction.x()) - kPi / 2.0;
 }
 
@@ -282,17 +281,111 @@ LocalPlanner::sampleTrajectory(
     const Eigen::Vector3d& start_vel,
     const Eigen::Vector3d& start_acc,
     const Eigen::Vector3d& goal_pos,
+    double start_yaw,
     double dt,
     int num_samples) const {
 
     std::vector<TrajectoryPoint> traj;
     traj.reserve(num_samples);
+    // A receding-horizon planner repeatedly executes only the beginning of
+    // each trajectory. Therefore braking/steering toward the goal must be a
+    // boundary condition at t=0; postponing it to the middle of the horizon
+    // makes every replan reset before the correction is reached.
+    (void)start_acc;
+    auto desired_initial_acceleration =
+        [&](double total_time) -> Eigen::Vector3d {
+        const double safe_time = std::max(dt, total_time);
+        Eigen::Vector3d acceleration =
+            6.0 * (goal_pos - start_pos) /
+                (safe_time * safe_time) -
+            4.0 * start_vel / safe_time;
+        const double limit =
+            0.85 * std::max(0.1, config_.max_acceleration);
+        const double magnitude = acceleration.norm();
+        if (magnitude > limit) {
+            acceleration *= limit / magnitude;
+        }
+        return acceleration;
+    };
 
     // Use a minimum-jerk / quintic polynomial approach from start to goal
     // with control points shaping the interior of the trajectory.
     // For simplicity and determinism, we use a cubic spline through control points
     // with the first control point being the start position and the last being
     // the goal (or near it).
+
+    if (control_points.size() == 2 && num_samples >= 2) {
+        const Eigen::Vector3d delta = goal_pos - start_pos;
+        const double distance = delta.norm();
+        const double total_time = std::max(dt, (num_samples - 1) * dt);
+        Eigen::Vector3d tangent = Eigen::Vector3d::UnitX();
+        if (distance > 1.0e-9) {
+            tangent = delta / distance;
+        }
+        // Full vector boundary conditions are important here.  Projecting the
+        // current velocity onto the new line silently discarded lateral
+        // inertia, so the reported velocity was not the derivative of the
+        // reported position during replanning.
+        const Eigen::Vector3d displacement = goal_pos - start_pos;
+        const Eigen::Vector3d initial_acceleration =
+            desired_initial_acceleration(total_time);
+        const Eigen::Vector3d a3 =
+            10.0 * displacement / std::pow(total_time, 3) -
+            6.0 * start_vel / std::pow(total_time, 2) -
+            1.5 * initial_acceleration / total_time;
+        const Eigen::Vector3d a4 =
+            -15.0 * displacement / std::pow(total_time, 4) +
+            8.0 * start_vel / std::pow(total_time, 3) +
+            1.5 * initial_acceleration /
+                std::pow(total_time, 2);
+        const Eigen::Vector3d a5 =
+            6.0 * displacement / std::pow(total_time, 5) -
+            3.0 * start_vel / std::pow(total_time, 4) -
+            0.5 * initial_acceleration /
+                std::pow(total_time, 3);
+
+        const double initial_yaw = start_yaw;
+        const double target_yaw = yawFromTangent(tangent);
+        const double yaw_delta = wrapAngle(target_yaw - initial_yaw);
+
+        for (int i = 0; i < num_samples; ++i) {
+            const double t = i * dt;
+            const double u = std::min(1.0, t / total_time);
+            const double t2 = t * t;
+            const double t3 = t2 * t;
+            const double t4 = t3 * t;
+            const double t5 = t4 * t;
+            const double progress =
+                10.0 * u * u * u - 15.0 * std::pow(u, 4) +
+                6.0 * std::pow(u, 5);
+            const double progress_rate =
+                (30.0 * u * u - 60.0 * u * u * u +
+                 30.0 * std::pow(u, 4)) / total_time;
+
+            TrajectoryPoint point;
+            point.t = t;
+            point.position =
+                start_pos + start_vel * t +
+                0.5 * initial_acceleration * t2 +
+                a3 * t3 + a4 * t4 + a5 * t5;
+            point.velocity =
+                start_vel + initial_acceleration * t +
+                3.0 * a3 * t2 + 4.0 * a4 * t3 + 5.0 * a5 * t4;
+            point.acceleration =
+                initial_acceleration +
+                6.0 * a3 * t + 12.0 * a4 * t2 + 20.0 * a5 * t3;
+            point.yaw = wrapAngle(initial_yaw + progress * yaw_delta);
+            point.yaw_rate = progress_rate * yaw_delta;
+            point.clearance = esdf_.getValue(
+                point.position.x(), point.position.y(), point.position.z());
+            traj.push_back(point);
+        }
+        traj.front().position = start_pos;
+        traj.back().position = goal_pos;
+        traj.back().velocity.setZero();
+        traj.back().acceleration.setZero();
+        return traj;
+    }
 
     if (control_points.size() < 2 || num_samples < 2) {
         // Fallback: straight line with velocity profile
@@ -327,7 +420,7 @@ LocalPlanner::sampleTrajectory(
 
         Eigen::Vector3d prev_pos = start_pos;
         Eigen::Vector3d prev_vel = start_vel;
-        double prev_yaw = initial_state_.yaw;
+        double prev_yaw = start_yaw;
 
         for (int i = 0; i < num_samples; ++i) {
             double t = i * dt;
@@ -375,7 +468,11 @@ LocalPlanner::sampleTrajectory(
             pt.t = t;
             pt.position = pos;
             pt.velocity = vel;
-            pt.acceleration = (i == 0) ? start_acc : (vel - prev_vel) / dt;
+            if (i == 0) {
+                pt.acceleration.setZero();
+            } else {
+                pt.acceleration = (vel - prev_vel) / dt;
+            }
             pt.yaw = yaw;
             pt.yaw_rate = yaw_rate;
             pt.clearance = esdf_.getValue(pos.x(), pos.y(), pos.z());
@@ -402,13 +499,11 @@ LocalPlanner::sampleTrajectory(
     if (total_cp_len < 1e-6) {
         // Degenerate: straight line
         return sampleTrajectory({start_pos, goal_pos}, start_pos, start_vel,
-                                start_acc, goal_pos, dt, num_samples);
+                                start_acc, goal_pos, start_yaw, dt, num_samples);
     }
 
     double total_time = std::max(dt, (num_samples - 1) * dt);
-    Eigen::Vector3d prev_pos = start_pos;
-    Eigen::Vector3d prev_vel = start_vel;
-    double prev_yaw = initial_state_.yaw;
+    double prev_yaw = start_yaw;
 
     // Clamped uniform cubic B-spline.  Clamping makes the first and last
     // control points exact curve endpoints; de Boor evaluation preserves all
@@ -444,66 +539,183 @@ LocalPlanner::sampleTrajectory(
         return d[degree];
     };
 
+    // Use a minimum-jerk progress law for the reference geometry.  A
+    // short-lived boundary correction represents the vehicle's current
+    // inertia without overwriting velocity independently of position.
+    std::vector<Eigen::Vector3d> positions(num_samples);
+    const double braking_time = std::max(
+        0.45, std::min(2.00,
+            2.50 * start_vel.norm() /
+            std::max(0.1, config_.max_acceleration)));
+    const Eigen::Vector3d initial_acceleration =
+        desired_initial_acceleration(total_time);
+    const Eigen::Vector3d correction_quadratic =
+        initial_acceleration +
+        2.0 * start_vel / braking_time +
+        6.0 * start_vel / total_time;
     for (int i = 0; i < num_samples; ++i) {
-        double t = i * dt;
-        double frac = static_cast<double>(i) / (num_samples - 1);  // [0, 1]
-        Eigen::Vector3d pos = evaluate_bspline(frac);
-        const double du = std::max(1e-5, std::min(0.01, dt / total_time));
-        const double u0 = std::max(0.0, frac - du);
-        const double u1 = std::min(1.0, frac + du);
-        Eigen::Vector3d vel = (evaluate_bspline(u1) - evaluate_bspline(u0)) /
-                              std::max((u1 - u0) * total_time, dt);
-        double speed = vel.norm();
-        if (speed > config_.max_velocity) {
-            vel = vel / speed * config_.max_velocity;
-        }
-        if (speed < 0.01 && i > 0) {
-            vel = (pos - prev_pos) / dt;
-        }
+        const double t = i * dt;
+        const double u = std::min(1.0, t / total_time);
+        const double u2 = u * u;
+        const double u3 = u2 * u;
+        const double path_u =
+            10.0 * u3 - 15.0 * u3 * u + 6.0 * u3 * u2;
+        const double end_taper = std::pow(1.0 - u, 3);
+        const Eigen::Vector3d inertia_correction =
+            (start_vel * t +
+             0.5 * correction_quadratic * t * t) *
+            std::exp(-t / braking_time) * end_taper;
+        positions[i] = evaluate_bspline(path_u) + inertia_correction;
+    }
+    positions.front() = start_pos;
+    positions.back() = goal_pos;
 
-        // Near start and end, respect start_vel and zero terminal velocity
-        if (frac < 0.05) {
-            vel = start_vel + (vel - start_vel) * (frac / 0.05);
-        }
-        if (frac > 0.9) {
-            double blend = (frac - 0.9) / 0.1;
-            vel = vel * (1.0 - blend);  // decelerate to near-zero
-        }
+    std::vector<Eigen::Vector3d> velocities(
+        num_samples, Eigen::Vector3d::Zero());
+    for (int i = 0; i < num_samples - 1; ++i) {
+        velocities[i] = (positions[i + 1] - positions[i]) / dt;
+    }
+    velocities.back().setZero();
 
-        double yaw;
-        if (vel.norm() > 0.01) {
-            yaw = yawFromTangent(vel.normalized());
-        } else {
-            yaw = prev_yaw;
-        }
+    std::vector<Eigen::Vector3d> accelerations(
+        num_samples, Eigen::Vector3d::Zero());
+    for (int i = 0; i < num_samples - 1; ++i) {
+        accelerations[i] = (velocities[i + 1] - velocities[i]) / dt;
+    }
+    if (num_samples > 1) {
+        accelerations.back() = accelerations[num_samples - 2];
+    }
+
+    for (int i = 0; i < num_samples; ++i) {
+        const double t = i * dt;
+        double yaw = prev_yaw;
         double yaw_rate = 0.0;
-        if (i > 0 && dt > 1e-9) {
-            yaw_rate = wrapAngle(yaw - prev_yaw) / dt;
-            // Clamp yaw rate
-            if (std::abs(yaw_rate) > config_.max_yaw_rate) {
-                yaw_rate = std::copysign(config_.max_yaw_rate, yaw_rate);
-                yaw = wrapAngle(prev_yaw + yaw_rate * dt);
-            }
+        if (i > 0 && velocities[i].norm() > 0.01) {
+            const double desired_yaw =
+                yawFromTangent(velocities[i].normalized());
+            const double max_step =
+                std::max(0.0, config_.max_yaw_rate) * dt * 0.98;
+            const double desired_step = wrapAngle(desired_yaw - prev_yaw);
+            const double step = std::max(
+                -max_step, std::min(max_step, desired_step));
+            yaw = wrapAngle(prev_yaw + step);
+            yaw_rate = step / dt;
         }
-
-        Eigen::Vector3d acc = (i == 0) ? start_acc : (vel - prev_vel) / dt;
 
         TrajectoryPoint pt;
         pt.t = t;
-        pt.position = pos;
-        pt.velocity = vel;
-        pt.acceleration = acc;
+        pt.position = positions[i];
+        pt.velocity = velocities[i];
+        pt.acceleration = accelerations[i];
         pt.yaw = yaw;
         pt.yaw_rate = yaw_rate;
-        pt.clearance = esdf_.getValue(pos.x(), pos.y(), pos.z());
+        pt.clearance = esdf_.getValue(
+            pt.position.x(), pt.position.y(), pt.position.z());
         traj.push_back(pt);
-
-        prev_pos = pos;
-        prev_vel = vel;
         prev_yaw = yaw;
     }
 
     return traj;
+}
+
+std::vector<TrajectoryPoint>
+LocalPlanner::sampleTrajectoryFeasible(
+    const std::vector<Eigen::Vector3d>& control_points,
+    const Eigen::Vector3d& start_pos,
+    const Eigen::Vector3d& start_vel,
+    const Eigen::Vector3d& start_acc,
+    const Eigen::Vector3d& goal_pos,
+    double start_yaw) const {
+
+    double path_length = 0.0;
+    for (size_t i = 1; i < control_points.size(); ++i) {
+        path_length += (control_points[i] - control_points[i - 1]).norm();
+    }
+    path_length = std::max(path_length, (goal_pos - start_pos).norm());
+
+    const double dt = config_.trajectory_dt;
+    const double nominal = std::max(0.1,
+        std::min(config_.nominal_speed, config_.max_velocity));
+    const double accel = std::max(0.1, config_.max_acceleration);
+    double duration = std::max({
+        4.0 * dt,
+        path_length / nominal,
+        2.0 * std::sqrt(std::max(0.0, path_length) / accel),
+        start_vel.norm() / accel
+    });
+    // Local guides are range-limited. Six nominal travel times leaves room
+    // for jerk-limited start/stop transitions; a larger value indicates an
+    // invalid sampled shape and must not become a 200 s "successful" plan.
+    const double duration_cap = std::max(
+        6.0, 6.0 * path_length / nominal + start_vel.norm() / accel);
+    duration = std::min(duration, duration_cap);
+
+    std::vector<TrajectoryPoint> trajectory;
+    double sampled_duration = -1.0;
+    for (int iteration = 0; iteration < 8; ++iteration) {
+        const int samples = std::max(
+            2, static_cast<int>(std::ceil(duration / dt)) + 1);
+        trajectory = sampleTrajectory(
+            control_points, start_pos, start_vel, start_acc, goal_pos,
+            start_yaw, dt, samples);
+        sampled_duration = (samples - 1) * dt;
+
+        double max_speed = 0.0;
+        double max_acceleration = 0.0;
+        double max_jerk = 0.0;
+        double max_yaw_rate = 0.0;
+        for (size_t i = 0; i < trajectory.size(); ++i) {
+            max_speed = std::max(max_speed, trajectory[i].velocity.norm());
+            max_acceleration = std::max(
+                max_acceleration, trajectory[i].acceleration.norm());
+            max_yaw_rate = std::max(
+                max_yaw_rate, std::abs(trajectory[i].yaw_rate));
+            if (i > 0) {
+                const double positional_speed =
+                    (trajectory[i].position -
+                     trajectory[i - 1].position).norm() / dt;
+                max_speed = std::max(max_speed, positional_speed);
+                const double finite_difference_acceleration =
+                    (trajectory[i].velocity -
+                     trajectory[i - 1].velocity).norm() / dt;
+                max_acceleration = std::max(
+                    max_acceleration, finite_difference_acceleration);
+                const double finite_difference_jerk =
+                    (trajectory[i].acceleration -
+                     trajectory[i - 1].acceleration).norm() / dt;
+                max_jerk = std::max(max_jerk, finite_difference_jerk);
+            }
+        }
+
+        const double speed_scale =
+            max_speed / std::max(0.1, config_.max_velocity);
+        const double acceleration_scale = std::sqrt(
+            max_acceleration / std::max(0.1, config_.max_acceleration));
+        // Jerk scales as ~1/T³ for position-sampled trajectories, so the
+        // required time extension is linear in the violation ratio (not cbrt).
+        const double jerk_scale =
+            max_jerk / std::max(0.1, config_.max_jerk);
+        const double yaw_scale =
+            max_yaw_rate / std::max(0.1, config_.max_yaw_rate);
+        const double required_scale = std::max({
+            1.0, speed_scale, acceleration_scale, jerk_scale, yaw_scale});
+        // Match the validator's kRequestDynamicsTolerance (2 %) so the
+        // auto-timed result passes final validation.
+        if (required_scale <= 1.02) break;
+        const double next_duration = std::min(
+            duration_cap,
+            duration * std::min(3.0, required_scale * 1.05));
+        if (next_duration <= duration + 1.0e-9) break;
+        duration = next_duration;
+    }
+    if (duration > sampled_duration + 0.5 * dt) {
+        const int samples = std::max(
+            2, static_cast<int>(std::ceil(duration / dt)) + 1);
+        trajectory = sampleTrajectory(
+            control_points, start_pos, start_vel, start_acc, goal_pos,
+            start_yaw, dt, samples);
+    }
+    return trajectory;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -592,7 +804,17 @@ double LocalPlanner::computeCost(
     // J_dynamics: velocity / acceleration limits on sampled trajectory
     // (sampled from control points to approximate). Quick check: distance between
     // consecutive control points should not exceed max_velocity * dt_control_points
-    double cp_dt = config_.horizon_time / (n - 1);
+    double control_polygon_length = 0.0;
+    for (int i = 1; i < n; ++i) {
+        control_polygon_length +=
+            (control_points[i] - control_points[i - 1]).norm();
+    }
+    const double optimization_time = std::max(
+        config_.horizon_time,
+        control_polygon_length /
+            std::max(0.1, std::min(config_.nominal_speed,
+                                   config_.max_velocity)));
+    double cp_dt = optimization_time / (n - 1);
     double dyn_cost = 0.0;
     for (int i = 1; i < n; ++i) {
         double dist = (control_points[i] - control_points[i - 1]).norm();
@@ -1043,6 +1265,7 @@ LocalPlanner::generateGlobalPathFallback(const VehicleState& current_state,
     int n_samples = static_cast<int>(config_.horizon_time / config_.trajectory_dt);
     return sampleTrajectory(segment, current_state.position, current_state.velocity,
                             current_state.acceleration, segment.back(),
+                            current_state.yaw,
                             config_.trajectory_dt, n_samples);
 }
 
@@ -1130,6 +1353,7 @@ LocalPlanResult LocalPlanner::planLocal(
         std::vector<Eigen::Vector3d> cp = {current_state.position, local_goal.position};
         traj = sampleTrajectory(cp, current_state.position, current_state.velocity,
                                 current_state.acceleration, local_goal.position,
+                                current_state.yaw,
                                 config_.trajectory_dt, n_samples);
         optimized = true;
     } else {
@@ -1192,11 +1416,21 @@ LocalPlanResult LocalPlanner::planLocal(
         }
 
         // ── Optimize ───────────────────────────────────────────
+        // Guide reference: uniformly-spaced points on the straight
+        // line from current position to local_goal.  One point per
+        // control point ensures even CP distribution, preventing
+        // endpoint collapse and giving natural deceleration.
+        std::vector<Eigen::Vector3d> straight_guide(n_cp);
+        for (int i = 0; i < n_cp; ++i) {
+            double frac = static_cast<double>(i) / (n_cp - 1);
+            straight_guide[i] = current_state.position * (1.0 - frac) +
+                                local_goal.position * frac;
+        }
         optimized = optimizeControlPoints(control_points,
                                           current_state.position,
                                           current_state.velocity,
                                           local_goal.position,
-                                          ref_segment,
+                                          straight_guide,
                                           local_goal.is_final_goal);
 
         // ── Sample trajectory from control points ──────────────
@@ -1206,6 +1440,7 @@ LocalPlanResult LocalPlanner::planLocal(
                                 current_state.velocity,
                                 current_state.acceleration,
                                 local_goal.position,
+                                current_state.yaw,
                                 config_.trajectory_dt,
                                 n_samples);
 
@@ -1242,6 +1477,37 @@ LocalPlanResult LocalPlanner::planLocal(
     }
 
     // ── Populate result ────────────────────────────────────────
+    // Verify the time-scaled trajectory itself, not just the nominal-horizon
+    // optimizer cost. This prevents a geometrically valid trajectory from
+    // being reported successful when its timing still exceeds a vehicle limit.
+    bool dynamics_feasible = !traj.empty();
+    constexpr double kDynamicsTolerance = 1.02;
+    for (size_t i = 0; dynamics_feasible && i < traj.size(); ++i) {
+        const auto& point = traj[i];
+        dynamics_feasible =
+            point.velocity.norm() <= config_.max_velocity * kDynamicsTolerance &&
+            point.acceleration.norm() <=
+                config_.max_acceleration * kDynamicsTolerance &&
+            std::abs(point.yaw_rate) <=
+                config_.max_yaw_rate * kDynamicsTolerance;
+        if (!dynamics_feasible || i == 0) {
+            continue;
+        }
+
+        const double dt = point.t - traj[i - 1].t;
+        if (!(dt > 1.0e-9)) {
+            dynamics_feasible = false;
+            break;
+        }
+        const double position_speed =
+            (point.position - traj[i - 1].position).norm() / dt;
+        const double jerk =
+            (point.acceleration - traj[i - 1].acceleration).norm() / dt;
+        dynamics_feasible =
+            position_speed <= config_.max_velocity * kDynamicsTolerance &&
+            jerk <= config_.max_jerk * kDynamicsTolerance;
+    }
+
     result.trajectory = std::move(traj);
     result.min_clearance = validation.min_clearance;
 
@@ -1259,6 +1525,10 @@ LocalPlanResult LocalPlanner::planLocal(
         result.message = "Trajectory has " +
                          std::to_string(validation.clearance_violation_count) +
                          " clearance violations";
+    } else if (!dynamics_feasible) {
+        result.success = false;
+        result.status = PlannerStatus::DYNAMICS_VIOLATION;
+        result.message = "Time-scaled trajectory exceeds a dynamics limit";
     } else if (!optimized && !direct_clear) {
         result.success = false;
         result.status = PlannerStatus::OPTIMIZATION_FAILED;
@@ -1357,39 +1627,59 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
     std::vector<TrajectoryPoint> traj;
     bool optimized = false;
     bool used_global_fallback = false;
+    std::vector<Eigen::Vector3d> reference_control_points;
 
-    if (direct_clear && request.reference_path_segment.size() < 2) {
-        int n_samples = static_cast<int>(
-            config_.horizon_time / config_.trajectory_dt);
+    if (direct_clear) {
         std::vector<Eigen::Vector3d> cp = {cs.position, terminal};
-        traj = sampleTrajectory(cp, cs.position, cs.velocity,
-                                cs.acceleration, terminal,
-                                config_.trajectory_dt, n_samples);
+        traj = sampleTrajectoryFeasible(
+            cp, cs.position, cs.velocity, cs.acceleration, terminal,
+            cs.yaw);
         optimized = true;
-    } else {
+        const auto direct_validation = validateTrajectory(traj);
+        if (direct_validation.any_collision ||
+            !direct_validation.all_clear) {
+            direct_clear = false;
+            optimized = false;
+            traj.clear();
+        }
+    }
+    if (!direct_clear) {
         // ── Initialize control points from reference path segment ──
-        int n_cp = config_.control_points;
-        std::vector<Eigen::Vector3d> control_points(n_cp);
-
         const auto& ref_seg = request.reference_path_segment;
+        std::vector<double> ref_arc;
+        double ref_total = (terminal - cs.position).norm();
         if (ref_seg.size() >= 2) {
             // Compute cumulative arc-length on reference segment
-            std::vector<double> ref_arc;
             ref_arc.push_back(0.0);
             for (size_t i = 1; i < ref_seg.size(); ++i) {
                 ref_arc.push_back(ref_arc.back() +
                     (ref_seg[i] - ref_seg[i - 1]).norm());
             }
-            double ref_total = ref_arc.back();
+            ref_total = std::max(ref_total, ref_arc.back());
+        }
 
+        const double desired_cp_spacing = std::max(
+            2.0 * config_.collision_check_spacing,
+            config_.control_point_spacing);
+        const int density_cp =
+            static_cast<int>(std::ceil(ref_total / desired_cp_spacing)) + 1;
+        const int n_cp = std::max(
+            2, std::min(
+                std::max(2, config_.max_reference_points),
+                std::max(config_.control_points, density_cp)));
+        std::vector<Eigen::Vector3d> control_points(n_cp);
+        const double sampling_ref_total =
+            ref_arc.empty() ? 0.0 : ref_arc.back();
+
+        if (ref_seg.size() >= 2) {
             // Fix first control point to start position
             control_points[0] = cs.position;
 
-            if (ref_total > 1e-6) {
+            if (sampling_ref_total > 1e-6) {
                 // Sample control points at uniform arc-length along reference
                 for (int i = 1; i < n_cp; ++i) {
                     double frac = static_cast<double>(i) / (n_cp - 1);
-                    double target_s = frac * ref_total;
+                    double target_s = frac * sampling_ref_total;
                     auto it = std::lower_bound(ref_arc.begin(), ref_arc.end(), target_s);
                     int idx = std::min(static_cast<int>(it - ref_arc.begin()),
                                        static_cast<int>(ref_seg.size()) - 1);
@@ -1422,6 +1712,9 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
                                     terminal * alpha;
             }
         }
+        control_points.front() = cs.position;
+        control_points.back() = terminal;
+        reference_control_points = control_points;
 
         // Build reference segment from A* sub-path (or fallback)
         std::vector<Eigen::Vector3d> ref_for_cost = ref_seg;
@@ -1442,17 +1735,26 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
         }
 
         // ── Optimize ───────────────────────────────────────────
+        // Guide reference: uniformly-spaced points on the straight
+        // line (one per control point).  Prevents CP bunching at
+        // endpoints and gives natural velocity taper near goal.
+        std::vector<Eigen::Vector3d> straight_guide(n_cp);
+        for (int i = 0; i < n_cp; ++i) {
+            double frac = static_cast<double>(i) / (n_cp - 1);
+            straight_guide[i] = cs.position * (1.0 - frac) +
+                                terminal * frac;
+        }
         optimized = optimizeControlPoints(control_points,
                                           cs.position, cs.velocity,
-                                          terminal, ref_for_cost,
+                                          terminal, straight_guide,
                                           near_final_goal);
+        control_points.front() = cs.position;
+        control_points.back() = terminal;
 
         // ── Sample ─────────────────────────────────────────────
-        int n_samples = static_cast<int>(
-            config_.horizon_time / config_.trajectory_dt);
-        traj = sampleTrajectory(control_points, cs.position, cs.velocity,
-                                cs.acceleration, terminal,
-                                config_.trajectory_dt, n_samples);
+        traj = sampleTrajectoryFeasible(
+            control_points, cs.position, cs.velocity,
+            cs.acceleration, terminal, cs.yaw);
 
         if (!optimized) {
             auto val = validateTrajectory(traj);
@@ -1474,6 +1776,24 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
     // ── Final validation ───────────────────────────────────────
     auto validation = validateTrajectory(traj);
 
+    // Smoothing can cut a collision-free reference corner. In that case,
+    // retry the unmodified reference shape while preserving the exact Guide
+    // terminal and its automatically assigned arrival time.
+    if ((validation.any_collision || !validation.all_clear) &&
+        !reference_control_points.empty()) {
+        auto reference_trajectory = sampleTrajectoryFeasible(
+            reference_control_points, cs.position, cs.velocity,
+            cs.acceleration, terminal, cs.yaw);
+        auto reference_validation =
+            validateTrajectory(reference_trajectory);
+        if (!reference_validation.any_collision &&
+            reference_validation.all_clear) {
+            traj = std::move(reference_trajectory);
+            validation = reference_validation;
+            optimized = true;
+        }
+    }
+
     if ((validation.any_collision || !validation.all_clear) &&
         request.allow_global_map_fallback) {
         auto fallback = generateGlobalPathFallback(
@@ -1490,6 +1810,85 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
     }
 
     // Check for unknown space violations
+    // Validate the actual time-scaled samples. The optimizer uses a nominal
+    // horizon for shaping, while sampleTrajectoryFeasible() assigns the final
+    // arrival time from the configured vehicle limits.
+    bool request_dynamics_feasible = !traj.empty();
+    constexpr double kRequestDynamicsTolerance = 1.02;
+    double request_max_velocity = 0.0;
+    double request_max_acceleration = 0.0;
+    double request_max_jerk = 0.0;
+    double request_max_yaw_rate = 0.0;
+    double request_max_velocity_residual = 0.0;
+    double request_max_acceleration_residual = 0.0;
+    for (size_t i = 0; i < traj.size(); ++i) {
+        const auto& point = traj[i];
+        request_max_velocity =
+            std::max(request_max_velocity, point.velocity.norm());
+        request_max_acceleration =
+            std::max(request_max_acceleration, point.acceleration.norm());
+        request_max_yaw_rate =
+            std::max(request_max_yaw_rate, std::abs(point.yaw_rate));
+        const bool point_feasible =
+            point.position.allFinite() &&
+            point.velocity.allFinite() &&
+            point.acceleration.allFinite() &&
+            point.velocity.norm() <=
+                config_.max_velocity * kRequestDynamicsTolerance &&
+            point.acceleration.norm() <=
+                config_.max_acceleration * kRequestDynamicsTolerance &&
+            std::abs(point.yaw_rate) <=
+                config_.max_yaw_rate * kRequestDynamicsTolerance;
+        request_dynamics_feasible =
+            request_dynamics_feasible && point_feasible;
+        if (i == 0) {
+            continue;
+        }
+
+        const double dt = point.t - traj[i - 1].t;
+        if (!(dt > 1.0e-9)) {
+            request_dynamics_feasible = false;
+            continue;
+        }
+        const Eigen::Vector3d interval_velocity =
+            (point.position - traj[i - 1].position) / dt;
+        const double position_speed = interval_velocity.norm();
+        const Eigen::Vector3d interval_acceleration =
+            (point.velocity - traj[i - 1].velocity) / dt;
+        const double jerk =
+            (point.acceleration - traj[i - 1].acceleration).norm() / dt;
+        request_max_velocity =
+            std::max(request_max_velocity, position_speed);
+        request_max_jerk = std::max(request_max_jerk, jerk);
+
+        // Trapezoidal integration residuals catch trajectories whose reported
+        // velocity/acceleration were generated independently of position.
+        const double velocity_residual =
+            (interval_velocity -
+             0.5 * (point.velocity + traj[i - 1].velocity)).norm();
+        const double acceleration_residual =
+            (interval_acceleration -
+             0.5 * (point.acceleration +
+                    traj[i - 1].acceleration)).norm();
+        request_max_velocity_residual =
+            std::max(request_max_velocity_residual, velocity_residual);
+        request_max_acceleration_residual =
+            std::max(request_max_acceleration_residual,
+                     acceleration_residual);
+
+        const double velocity_residual_limit = std::max(
+            0.15, 2.0 * config_.max_acceleration * dt);
+        const double acceleration_residual_limit = std::max(
+            0.50, 2.0 * config_.max_jerk * dt);
+        request_dynamics_feasible =
+            request_dynamics_feasible &&
+            position_speed <=
+                config_.max_velocity * kRequestDynamicsTolerance &&
+            jerk <= config_.max_jerk * kRequestDynamicsTolerance &&
+            velocity_residual <= velocity_residual_limit &&
+            acceleration_residual <= acceleration_residual_limit;
+    }
+
     if (forbid_unknown && esdf_.hasKnownMask()) {
         bool has_unknown = false;
         for (const auto& tp : traj) {
@@ -1529,6 +1928,19 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
         result.message = "Trajectory has " +
                          std::to_string(validation.clearance_violation_count) +
                          " clearance violations";
+    } else if (!request_dynamics_feasible) {
+        result.success = false;
+        result.status = PlannerStatus::DYNAMICS_VIOLATION;
+        result.message =
+            "Auto-timed trajectory exceeds a dynamics limit: v=" +
+            std::to_string(request_max_velocity) +
+            ", a=" + std::to_string(request_max_acceleration) +
+            ", jerk=" + std::to_string(request_max_jerk) +
+            ", yaw_rate=" + std::to_string(request_max_yaw_rate) +
+            ", v_residual=" +
+            std::to_string(request_max_velocity_residual) +
+            ", a_residual=" +
+            std::to_string(request_max_acceleration_residual);
     } else if (!optimized && !direct_clear) {
         result.success = false;
         result.status = PlannerStatus::OPTIMIZATION_FAILED;

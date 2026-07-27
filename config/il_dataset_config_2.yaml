@@ -641,6 +641,19 @@ global:
     #  Global path planner (A* on ESDF) — ONE call per start→goal pair
     # ═══════════════════════════════════════════════════════════════════
     global_planner:
+      algorithm: "line_push"
+      line_push:
+        point_spacing_m: 0.10
+        target_clearance_m: 0.25
+        influence_radius_m: 1.50
+        push_margin_m: 0.10
+        smoothing_weight: 0.20
+        max_iterations: 80
+        max_offset_m: 12.0
+        max_control_points: 5000
+        max_segment_refinements_per_iteration: 256
+        clearance_cost_weight: 0.20
+        fallback_to_astar: true
       coarse_factor: 1                 # full resolution; min-pooling can close narrow corridors
       epsilon: 1.10                    # <=10% weighted-A* bound; avoids 800k-node failures
       max_iterations_coarse: 300000
@@ -648,11 +661,11 @@ global:
       max_planning_time_coarse_s: 8.0  # wall-clock guard for downsampled search
       max_planning_time_full_s: 45.0   # bounded guard sized for the 0.10 m grid
       cost_weight: 0.0                 # geometric shortest feasible path, no perimeter bias
-      clearance_target: 0.35           # preferred ESDF clearance (actual ≥ 0.65 m with drone_r=0.30)
-      min_clearance: 0.25              # hard constraint: ESDF ≥ 0.25 (actual ≥ 0.55 m)
+      clearance_target: 0.25           # preferred extra margin beyond drone_radius
+      min_clearance: 0.15              # within the generated corridor guarantee
       shortcut_enabled: true
       shortcut_check_spacing: 0.05
-      reference_resample_spacing_m: 0.20
+      reference_resample_spacing_m: 0.10
 
     # ═══════════════════════════════════════════════════════════════════
     #  Local receding-horizon planner (C++ pybind11 backend)
@@ -664,7 +677,7 @@ global:
       optimizer: "auto"
 
       planner_hz: 30.0
-      horizon_time: 2.5
+      horizon_time: 2.5                 # nominal optimizer horizon; sampled duration is auto-scaled
       execute_prefix_time: 0.60          # legacy field; position prefixes are no longer replayed
       velocity_command_lookahead_time: 0.08  # shorter preview reduces corner cutting
       velocity_tracking_gain: 2.0        # [1/s] feedback toward the collision-checked local path
@@ -682,14 +695,15 @@ global:
       max_reference_points: 32           # fixed upper bound for local guide complexity
 
       control_points: 12
+      control_point_spacing: 0.20
       max_iterations: 200
       convergence_tolerance: 1.0e-4
       initial_step_size: 0.1
       minimum_step_size: 1.0e-4
       max_cost_samples_per_segment: 64   # bounds every objective evaluation
 
-      min_clearance: 0.20
-      target_clearance: 0.40
+      min_clearance: 0.15
+      target_clearance: 0.25
       collision_check_spacing: 0.05
 
       weight_smooth: 1.0
@@ -792,7 +806,7 @@ global:
     corridor_radius_m: 0.35
     corridor_sample_spacing_m: 0.10
 
-    min_clearance_m: 0.35
+    min_clearance_m: 0.15
 
     path_search_max_points: 200
 

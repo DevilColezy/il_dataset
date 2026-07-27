@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Global Path Planning Module  —  A* with shortcut, NO full-trajectory smoothing.
+Global Path Planning Module — line-push geometric planner with A* fallback.
 
 === v5: Receding-Horizon Refactor ===
 This module now ONLY provides:
@@ -564,12 +564,356 @@ def shortcut_path(raw_path, esdf, origin, resolution,
     return shortcut
 
 
+def _validate_polyline(path, esdf, origin, resolution,
+                       min_clearance, check_spacing):
+    """Return (valid, worst_clearance) for a continuously checked polyline."""
+    if len(path) < 2:
+        return False, -1.0
+    worst = float("inf")
+    for index in range(1, len(path)):
+        clear, segment_worst = _check_segment_clearance_adaptive(
+            path[index - 1], path[index], esdf, origin, resolution,
+            min_clearance, check_spacing)
+        worst = min(worst, segment_worst)
+        if not clear:
+            return False, worst
+    return True, worst
+
+
+def line_push_path(start, goal, esdf, origin, resolution,
+                   min_clearance, check_spacing, config):
+    """Push colliding control points locally away from obstacles.
+
+    Dense control points are generated on the start-goal line. Each colliding
+    point computes its current local tangent, evaluates both perpendicular
+    directions, and selects the lower local obstacle/path cost. Corrections
+    are spread only to neighbouring points for continuity, so successive
+    obstacles may independently choose different sides.
+    """
+    start = np.asarray(start, dtype=np.float64)
+    goal = np.asarray(goal, dtype=np.float64)
+    delta = goal - start
+    distance = float(np.linalg.norm(delta))
+    if distance < 1e-6:
+        return None, {"reason": "degenerate_start_goal"}
+
+    direct_clear, direct_worst = _check_segment_clearance_adaptive(
+        start, goal, esdf, origin, resolution,
+        min_clearance, check_spacing)
+    if direct_clear:
+        return [tuple(start), tuple(goal)], {
+            "side": "direct", "cost": distance,
+            "worst_clearance": direct_worst, "iterations": 0}
+
+    xy_norm = float(np.linalg.norm(delta[:2]))
+    if xy_norm < 1e-6:
+        return None, {"reason": "vertical_line_has_no_horizontal_normal"}
+    left_normal = np.array(
+        [-delta[1] / xy_norm, delta[0] / xy_norm, 0.0],
+        dtype=np.float64)
+
+    point_spacing = max(
+        resolution * 0.5, float(config.get("point_spacing_m", 0.10)))
+    target_clearance = max(
+        min_clearance,
+        float(config.get("target_clearance_m", min_clearance + 0.10)))
+    influence_radius = max(
+        point_spacing, float(config.get("influence_radius_m", 1.50)))
+    push_margin = max(
+        0.01, float(config.get("push_margin_m", 0.10)))
+    smoothing = min(
+        0.45, max(0.0, float(config.get("smoothing_weight", 0.20))))
+    max_iterations = max(1, int(config.get("max_iterations", 80)))
+    max_offset = max(
+        influence_radius, float(config.get("max_offset_m", 12.0)))
+    max_control_points = max(
+        16, int(config.get("max_control_points", 5000)))
+    max_refinements_per_iteration = max(
+        1, int(config.get(
+            "max_segment_refinements_per_iteration", 256)))
+    clearance_cost_weight = max(
+        0.0, float(config.get("clearance_cost_weight", 0.20)))
+
+    point_count = max(3, int(math.ceil(distance / point_spacing)) + 1)
+    fractions = np.linspace(0.0, 1.0, point_count)
+    base = start[None, :] + fractions[:, None] * delta[None, :]
+    initial_base = base.copy()
+    arc_spacing = distance / (point_count - 1)
+
+    candidates = []
+    seed_reports = []
+    # Two seeds are used only to break perfectly symmetric local decisions.
+    # Every colliding control point is otherwise free to select its own side.
+    for seed_name, seed_sign in (("left", 1.0), ("right", -1.0)):
+        path = initial_base.copy()
+        path_anchors = fractions.copy()
+        solved_iteration = -1
+        local_side_switches = 0
+        adaptive_refinements = 0
+        previous_choice = None
+
+        for iteration in range(max_iterations):
+            valid, worst = _validate_polyline(
+                path, esdf, origin, resolution,
+                min_clearance, check_spacing)
+            if valid:
+                solved_iteration = iteration
+                break
+
+            # After every push, continuously inspect every new segment. If a
+            # segment collides between its endpoints, insert a control point
+            # at its worst interior sample before performing the next push.
+            remaining_capacity = max_control_points - len(path)
+            if remaining_capacity > 0:
+                refinement_candidates = []
+                for index in range(len(path) - 1):
+                    segment = path[index + 1] - path[index]
+                    segment_length = float(np.linalg.norm(segment))
+                    if segment_length <= check_spacing * 0.75:
+                        continue
+                    steps = max(
+                        2, int(math.ceil(
+                            segment_length / check_spacing)))
+                    worst_clearance = float("inf")
+                    worst_alpha = None
+                    worst_point = None
+                    for sample_index in range(1, steps):
+                        alpha = float(sample_index) / steps
+                        point = (
+                            path[index] * (1.0 - alpha) +
+                            path[index + 1] * alpha)
+                        clearance = _trilinear_esdf(
+                            esdf, origin, resolution, point)
+                        if clearance < worst_clearance:
+                            worst_clearance = clearance
+                            worst_alpha = alpha
+                            worst_point = point
+                    if (worst_alpha is not None and
+                            worst_clearance < min_clearance):
+                        refinement_candidates.append((
+                            worst_clearance, index,
+                            worst_alpha, worst_point))
+
+                refinement_candidates.sort(key=lambda item: item[0])
+                refinement_candidates = refinement_candidates[
+                    :min(remaining_capacity,
+                         max_refinements_per_iteration)]
+                insertion_by_segment = {
+                    item[1]: item for item in refinement_candidates}
+                if insertion_by_segment:
+                    refined_path = []
+                    refined_anchors = []
+                    for index in range(len(path) - 1):
+                        refined_path.append(path[index])
+                        refined_anchors.append(path_anchors[index])
+                        insertion = insertion_by_segment.get(index)
+                        if insertion is not None:
+                            _, _, alpha, point = insertion
+                            refined_path.append(point)
+                            refined_anchors.append(
+                                path_anchors[index] * (1.0 - alpha) +
+                                path_anchors[index + 1] * alpha)
+                    refined_path.append(path[-1])
+                    refined_anchors.append(path_anchors[-1])
+                    path = np.asarray(
+                        refined_path, dtype=np.float64)
+                    path_anchors = np.asarray(
+                        refined_anchors, dtype=np.float64)
+                    adaptive_refinements += len(insertion_by_segment)
+
+            point_count = len(path)
+            base = (
+                start[None, :] +
+                path_anchors[:, None] * delta[None, :])
+            segment_lengths = np.linalg.norm(
+                np.diff(path, axis=0), axis=1)
+            positive_lengths = segment_lengths[
+                segment_lengths > 1.0e-9]
+            local_spacing = (
+                float(np.median(positive_lengths))
+                if positive_lengths.size else point_spacing)
+            local_spacing = max(
+                check_spacing * 0.5, local_spacing)
+            influence_points = max(
+                1, int(math.ceil(
+                    influence_radius / local_spacing)))
+            influence_points = min(
+                influence_points, max(1, point_count - 2))
+            kernel_indices = np.arange(
+                -influence_points, influence_points + 1)
+            sigma = max(1.0, influence_points * 0.5)
+            kernel = np.exp(
+                -0.5 * (kernel_indices / sigma) ** 2)
+
+            active = []
+            for index in range(1, point_count - 1):
+                clearance = _trilinear_esdf(
+                    esdf, origin, resolution, path[index])
+                if clearance < target_clearance:
+                    active.append((
+                        index,
+                        target_clearance - clearance + push_margin))
+
+            # Continuous checking can find a collision between two otherwise
+            # clear control points. Mark both ends of every failed segment.
+            if not active:
+                marked = {}
+                for index in range(1, point_count):
+                    clear, segment_worst = \
+                        _check_segment_clearance_adaptive(
+                            path[index - 1], path[index],
+                            esdf, origin, resolution,
+                            min_clearance, check_spacing)
+                    if clear:
+                        continue
+                    deficit = (
+                        target_clearance - segment_worst + push_margin)
+                    for marked_index in (index - 1, index):
+                        if 0 < marked_index < point_count - 1:
+                            marked[marked_index] = max(
+                                marked.get(marked_index, 0.0), deficit)
+                active = sorted(marked.items())
+            if not active:
+                break
+
+            accumulated = np.zeros_like(path)
+            accumulated_weight = np.zeros(point_count, dtype=np.float64)
+            for collision_index, deficit in active:
+                tangent = (
+                    path[collision_index + 1] -
+                    path[collision_index - 1])
+                tangent_xy_norm = float(np.linalg.norm(tangent[:2]))
+                if tangent_xy_norm < 1e-9:
+                    normal = left_normal.copy()
+                else:
+                    normal = np.array(
+                        [-tangent[1] / tangent_xy_norm,
+                         tangent[0] / tangent_xy_norm, 0.0],
+                        dtype=np.float64)
+
+                step = min(
+                    0.75, max(point_spacing, float(deficit)))
+                plus = path[collision_index] + step * normal
+                minus = path[collision_index] - step * normal
+
+                def local_cost(candidate):
+                    clearance = _trilinear_esdf(
+                        esdf, origin, resolution, candidate)
+                    obstacle_cost = max(
+                        0.0, target_clearance - clearance)
+                    length_cost = (
+                        np.linalg.norm(
+                            candidate - path[collision_index - 1]) +
+                        np.linalg.norm(
+                            path[collision_index + 1] - candidate))
+                    offset_cost = 0.02 * np.linalg.norm(
+                        candidate - base[collision_index])
+                    return (
+                        length_cost + offset_cost +
+                        max(10.0, 50.0 * clearance_cost_weight) *
+                        obstacle_cost * obstacle_cost)
+
+                plus_cost = float(local_cost(plus))
+                minus_cost = float(local_cost(minus))
+                if abs(plus_cost - minus_cost) <= 1e-9:
+                    choice = seed_sign
+                else:
+                    choice = 1.0 if plus_cost < minus_cost else -1.0
+                if previous_choice is not None and choice != previous_choice:
+                    local_side_switches += 1
+                previous_choice = choice
+                correction = choice * step * normal
+
+                lo = max(1, collision_index - influence_points)
+                hi = min(
+                    point_count - 1,
+                    collision_index + influence_points + 1)
+                kernel_lo = lo - (
+                    collision_index - influence_points)
+                kernel_hi = kernel_lo + (hi - lo)
+                weights = kernel[kernel_lo:kernel_hi]
+                accumulated[lo:hi] += (
+                    weights[:, None] * correction[None, :])
+                accumulated_weight[lo:hi] += weights
+
+            movable = accumulated_weight > 1e-12
+            path[movable] += (
+                accumulated[movable] /
+                accumulated_weight[movable, None])
+            if smoothing > 0.0 and point_count > 3:
+                smoothed = path.copy()
+                smoothed[1:-1] = (
+                    (1.0 - smoothing) * path[1:-1] +
+                    0.5 * smoothing *
+                    (path[:-2] + path[2:]))
+                path = smoothed
+
+            displacement = path - base
+            displacement_norm = np.linalg.norm(
+                displacement[:, :2], axis=1)
+            over_limit = displacement_norm > max_offset
+            if np.any(over_limit):
+                displacement[over_limit, :2] *= (
+                    max_offset /
+                    displacement_norm[over_limit])[:, None]
+                path = base + displacement
+            path[0] = start
+            path[-1] = goal
+
+        valid, worst = _validate_polyline(
+            path, esdf, origin, resolution,
+            min_clearance, check_spacing)
+        if not valid:
+            seed_reports.append({
+                "seed": seed_name, "valid": False,
+                "worst_clearance": float(worst),
+                "local_side_switches": local_side_switches,
+                "adaptive_refinements": adaptive_refinements,
+                "control_points": len(path)})
+            continue
+
+        simplified = shortcut_path(
+            [tuple(point) for point in path],
+            esdf, origin, resolution, min_clearance, check_spacing)
+        if len(simplified) < 2:
+            continue
+        length = sum(float(np.linalg.norm(
+            np.asarray(simplified[i]) - np.asarray(simplified[i - 1])))
+                     for i in range(1, len(simplified)))
+        clearance_penalty = 0.0
+        for point in path:
+            clearance = _trilinear_esdf(
+                esdf, origin, resolution, point)
+            clearance_penalty += max(
+                0.0, target_clearance - clearance) * arc_spacing
+        cost = length + clearance_cost_weight * clearance_penalty
+        report = {
+            "side": "pointwise_{}".format(seed_name),
+            "seed": seed_name, "valid": True, "cost": float(cost),
+            "length": float(length), "worst_clearance": float(worst),
+            "iterations": solved_iteration,
+            "local_side_switches": local_side_switches,
+            "adaptive_refinements": adaptive_refinements,
+            "control_points": len(path)}
+        candidates.append((cost, simplified, report))
+        seed_reports.append(report)
+
+    if not candidates:
+        return None, {"reason": "pointwise_push_failed",
+                      "candidates": seed_reports}
+    candidates.sort(key=lambda item: item[0])
+    _, best_path, best_report = candidates[0]
+    best_report = dict(best_report)
+    best_report["candidates"] = [dict(report) for report in seed_reports]
+    return best_path, best_report
+
+
 # ============================================================================
 #  6.  GlobalPathPlanner — A* + shortcut only, no full-trajectory smoothing
 # ============================================================================
 
 class GlobalPathPlanner:
-    """Global path planner: A* search + greedy shortcut.
+    """Global path planner: two-sided line-push with weighted-A* fallback.
     
     This class ONLY produces a global reference path. It does NOT:
     - Smooth the entire path iteratively
@@ -596,10 +940,15 @@ class GlobalPathPlanner:
         self.cost_weight = gp_cfg.get("cost_weight", 0.35)
         self.clearance_target = gp_cfg.get("clearance_target", 0.20)
         self.min_clearance = gp_cfg.get("min_clearance", 0.10)
+        self.algorithm = str(
+            gp_cfg.get("algorithm", "line_push")).lower()
+        self.line_push_config = gp_cfg.get("line_push", {})
+        self.fallback_to_astar = bool(
+            self.line_push_config.get("fallback_to_astar", True))
         self.shortcut_enabled = gp_cfg.get("shortcut_enabled", True)
         self.shortcut_check_spacing = gp_cfg.get("shortcut_check_spacing", 0.05)
         self.reference_spacing = float(
-            gp_cfg.get("reference_resample_spacing_m", 0.20))
+            gp_cfg.get("reference_resample_spacing_m", 0.10))
         
         # Ensure check spacing <= resolution / 2
         self.shortcut_check_spacing = min(
@@ -609,6 +958,37 @@ class GlobalPathPlanner:
             esdf, esdf_resolution, esdf_origin,
             cost_weight=self.cost_weight,
             clearance_target=self.clearance_target)
+
+    def _run_astar(self, start, goal):
+        """Run the existing weighted A* as a robust fallback."""
+        if self.coarse_factor <= 1:
+            rospy.loginfo("[GlobalPath] Full-resolution A* fallback.")
+            return self.a_star.plan(
+                start, goal, min_clearance=self.min_clearance,
+                max_iterations=self.max_iter_full, epsilon=self.epsilon,
+                max_time_sec=self.max_time_full)
+
+        coarse_esdf = make_coarse_esdf(
+            self.esdf, factor=self.coarse_factor)
+        coarse_res = self.esdf_res * self.coarse_factor
+        coarse_astar = AStarPlanner(
+            coarse_esdf, coarse_res, self.esdf_origin,
+            cost_weight=self.cost_weight,
+            clearance_target=self.clearance_target)
+        result = coarse_astar.plan(
+            start, goal, min_clearance=self.min_clearance,
+            max_iterations=self.max_iter_coarse, epsilon=self.epsilon,
+            max_time_sec=self.max_time_coarse)
+        if (not result.reached_goal and
+                result.failure_reason != "shutdown_requested"):
+            rospy.loginfo(
+                "[GlobalPath] Coarse A* failed (%s), trying full-res...",
+                result.failure_reason)
+            result = self.a_star.plan(
+                start, goal, min_clearance=self.min_clearance,
+                max_iterations=self.max_iter_full, epsilon=self.epsilon,
+                max_time_sec=self.max_time_full)
+        return result
     
     def plan_global(self, start, goal):
         """Plan a global reference path from start to goal.
@@ -620,17 +1000,45 @@ class GlobalPathPlanner:
         Returns None on total A* failure.
         """
         t0 = time.time()
+        result = None
+        geometric_report = {}
+        algorithm_used = "weighted_astar"
+
+        if self.algorithm == "line_push":
+            geometric_path, geometric_report = line_push_path(
+                start, goal, self.esdf, self.esdf_origin, self.esdf_res,
+                self.min_clearance, self.shortcut_check_spacing,
+                self.line_push_config)
+            if geometric_path is not None:
+                result = PlanResult(
+                    path=geometric_path, reached_goal=True,
+                    iterations=int(geometric_report.get("iterations", 0)))
+                algorithm_used = "line_push"
+                rospy.loginfo(
+                    "[GlobalPath] line-push selected side=%s cost=%.2f.",
+                    geometric_report.get("side", "?"),
+                    geometric_report.get("cost", 0.0))
+            elif not self.fallback_to_astar:
+                rospy.logwarn(
+                    "[GlobalPath] line-push failed and fallback is disabled: %s",
+                    geometric_report.get("reason", "unknown"))
+                return None
+            else:
+                rospy.logwarn(
+                    "[GlobalPath] line-push failed (%s); falling back to "
+                    "weighted A*.",
+                    geometric_report.get("reason", "unknown"))
         
         # ── Coarse A* first ────────────────────────────────────
         # factor=1 already means full resolution.  Do not search the identical
         # grid twice after hitting the first iteration limit.
-        if self.coarse_factor <= 1:
+        if result is None and self.coarse_factor <= 1:
             rospy.loginfo("[GlobalPath] Full-resolution A* (single pass).")
             result = self.a_star.plan(
                 start, goal, min_clearance=self.min_clearance,
                 max_iterations=self.max_iter_full, epsilon=self.epsilon,
                 max_time_sec=self.max_time_full)
-        else:
+        elif result is None:
             coarse_esdf = make_coarse_esdf(
                 self.esdf, factor=self.coarse_factor)
             coarse_res = self.esdf_res * self.coarse_factor
@@ -707,9 +1115,18 @@ class GlobalPathPlanner:
         
         # ── Build validation report ─────────────────────────────
         report = {
-            "astar_reached_goal": result.reached_goal,
-            "astar_iterations": result.iterations,
-            "astar_failure_reason": result.failure_reason if not result.reached_goal else "",
+            "planner_algorithm": algorithm_used,
+            "line_push": geometric_report,
+            "astar_reached_goal": (
+                result.reached_goal if algorithm_used == "weighted_astar"
+                else False),
+            "astar_iterations": (
+                result.iterations if algorithm_used == "weighted_astar"
+                else 0),
+            "astar_failure_reason": (
+                result.failure_reason
+                if algorithm_used == "weighted_astar" and
+                not result.reached_goal else ""),
             "raw_path_points": len(raw_path),
             "shortcut_path_points": len(global_path),
             "global_path_length_m": round(global_path_length, 3),
@@ -748,9 +1165,10 @@ class GlobalPathPlanner:
             "total_time": 0.0,
         }
         
-        rospy.loginfo("[GlobalPath] A* %d pts → shortcut %d pts, length=%.1fm, "
+        rospy.loginfo("[GlobalPath] %s %d pts -> reference %d pts, length=%.1fm, "
                       "valid=%s, time=%.2fs",
-                      len(raw_path), len(global_path), global_path_length,
+                      algorithm_used, len(raw_path), len(global_path),
+                      global_path_length,
                       valid, report["planning_time_sec"])
         
         return plan

@@ -35,6 +35,7 @@ struct LocalPlannerConfig {
     // Optimization
     std::string optimizer = "auto";  // auto | nlopt | native
     int control_points = 12;
+    double control_point_spacing = 0.20;
     int max_iterations = 60;
     double convergence_tolerance = 1.0e-4;
     double initial_step_size = 0.1;
@@ -203,8 +204,19 @@ private:
         const Eigen::Vector3d& start_vel,
         const Eigen::Vector3d& start_acc,
         const Eigen::Vector3d& goal_pos,
+        double start_yaw,
         double dt,
         int num_samples) const;
+
+    /// Sample with an automatically allocated duration, lengthening time
+    /// until finite-difference velocity/acceleration limits are satisfied.
+    std::vector<TrajectoryPoint> sampleTrajectoryFeasible(
+        const std::vector<Eigen::Vector3d>& control_points,
+        const Eigen::Vector3d& start_pos,
+        const Eigen::Vector3d& start_vel,
+        const Eigen::Vector3d& start_acc,
+        const Eigen::Vector3d& goal_pos,
+        double start_yaw) const;
 
     /// Compute total cost for a set of control points.
     double computeCost(const std::vector<Eigen::Vector3d>& control_points,

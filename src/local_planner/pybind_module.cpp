@@ -218,6 +218,8 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("max_reference_points",
                        &LocalPlannerConfig::max_reference_points)
         .def_readwrite("control_points", &LocalPlannerConfig::control_points)
+        .def_readwrite("control_point_spacing",
+                       &LocalPlannerConfig::control_point_spacing)
         .def_readwrite("max_iterations", &LocalPlannerConfig::max_iterations)
         .def_readwrite("convergence_tolerance",
                        &LocalPlannerConfig::convergence_tolerance)
