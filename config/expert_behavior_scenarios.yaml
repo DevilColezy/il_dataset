@@ -1,66 +1,8 @@
-version: 2
+version: 1
 
 # Deterministic regression scenes for the complete expert pipeline.
 # All cylinders span z=[0,8] so vertical escape has no benefit.
 # Start/goal are deliberately fixed to isolate obstacle phase and geometry.
-suites:
-  quick_check:
-    description: "Short smoke test spanning clear, scale and clutter cases."
-    scenarios:
-      - open_baseline
-      - small_mid_center
-      - large_mid_center
-      - scale_transition
-      - dense_mixed_field
-
-  single_obstacles:
-    description: "Left/right symmetry and small/large single-blocker response."
-    scenarios:
-      - small_mid_center
-      - small_mid_left_offset
-      - small_mid_right_offset
-      - large_mid_center
-      - large_mid_left_offset
-      - large_mid_right_offset
-
-  distance_and_terminal:
-    description: "Near, middle and late encounters plus terminal braking."
-    scenarios:
-      - open_baseline
-      - large_early_center
-      - large_mid_center
-      - large_late_center
-      - large_early_and_late
-
-  clutter_review:
-    description: "Sparse/dense fields, narrow passage and sequential avoidance."
-    scenarios:
-      - sparse_mixed_field
-      - narrow_gate
-      - double_slalom
-      - scale_transition
-      - large_to_small_transition
-      - dense_mixed_field
-
-  human_review:
-    description: "Default balanced manual expert-behaviour review."
-    scenarios:
-      - open_baseline
-      - small_mid_center
-      - small_mid_left_offset
-      - small_mid_right_offset
-      - large_early_center
-      - large_mid_center
-      - large_mid_left_offset
-      - large_mid_right_offset
-      - large_late_center
-      - sparse_mixed_field
-      - narrow_gate
-      - double_slalom
-      - scale_transition
-      - large_to_small_transition
-      - dense_mixed_field
-
 scenarios:
   open_baseline:
     description: "Open-flight speed and terminal-braking baseline."
@@ -70,33 +12,6 @@ scenarios:
     require_direct_path_blocked: false
     obstacles:
       - {id: harmless_side, center: [-5.5, 16.0, 4.0], radius_m: 0.50, height_m: 8.0}
-
-  small_mid_center:
-    description: "One small centered blocker tests late, fine-scale reaction."
-    tags: [small, middle, center, single]
-    start: [0.0, -1.0, 2.0]
-    goal: [0.0, 32.0, 2.0]
-    require_direct_path_blocked: true
-    obstacles:
-      - {id: mid_small, center: [0.0, 16.0, 4.0], radius_m: 0.65, height_m: 8.0}
-
-  small_mid_left_offset:
-    description: "Small blocker offset left tests right-side fine correction."
-    tags: [small, middle, asymmetric, right_avoidance, single]
-    start: [0.0, -1.0, 2.0]
-    goal: [0.0, 32.0, 2.0]
-    require_direct_path_blocked: true
-    obstacles:
-      - {id: mid_small_left, center: [-0.55, 16.0, 4.0], radius_m: 0.70, height_m: 8.0}
-
-  small_mid_right_offset:
-    description: "Small blocker offset right tests left-side fine correction."
-    tags: [small, middle, asymmetric, left_avoidance, single]
-    start: [0.0, -1.0, 2.0]
-    goal: [0.0, 32.0, 2.0]
-    require_direct_path_blocked: true
-    obstacles:
-      - {id: mid_small_right, center: [0.55, 16.0, 4.0], radius_m: 0.70, height_m: 8.0}
 
   large_early_center:
     description: "A large blocker is visible almost immediately after takeoff."
@@ -188,49 +103,6 @@ scenarios:
     obstacles:
       - {id: early_small, center: [0.25, 9.0, 4.0], radius_m: 0.60, height_m: 8.0}
       - {id: late_large, center: [-0.40, 22.0, 4.0], radius_m: 2.00, height_m: 8.0}
-
-  large_to_small_transition:
-    description: "A large early detour followed by a small late correction."
-    tags: [mixed_scale, sequence, reverse_scale_order]
-    start: [0.0, -1.0, 2.0]
-    goal: [0.0, 32.0, 2.0]
-    require_direct_path_blocked: true
-    minimum_direct_blocker_count: 2
-    maximum_direct_blocker_count: 2
-    obstacles:
-      - {id: early_large, center: [0.35, 9.0, 4.0], radius_m: 1.90, height_m: 8.0}
-      - {id: late_small, center: [-0.25, 23.0, 4.0], radius_m: 0.65, height_m: 8.0}
-
-  sparse_mixed_field:
-    description: "One relevant small blocker with two remote distractors."
-    tags: [sparse, mixed_scale, distractors]
-    start: [0.0, -1.0, 2.0]
-    goal: [0.0, 32.0, 2.0]
-    require_direct_path_blocked: true
-    minimum_direct_blocker_count: 1
-    maximum_direct_blocker_count: 1
-    obstacles:
-      - {id: sparse_left, center: [-5.4, 6.0, 4.0], radius_m: 0.60, height_m: 8.0}
-      - {id: sparse_direct, center: [0.40, 14.0, 4.0], radius_m: 0.75, height_m: 8.0}
-      - {id: sparse_right, center: [7.5, 25.0, 4.0], radius_m: 1.30, height_m: 8.0}
-
-  dense_mixed_field:
-    description: "Mixed-scale clutter with two direct blockers and side distractors."
-    tags: [dense, mixed_scale, multi_obstacle, distractors]
-    start: [0.0, -1.0, 2.0]
-    goal: [0.0, 32.0, 2.0]
-    require_direct_path_blocked: true
-    minimum_direct_blocker_count: 2
-    maximum_direct_blocker_count: 2
-    obstacles:
-      - {id: dense_left_low, center: [-4.8, 5.5, 4.0], radius_m: 0.55, height_m: 8.0}
-      - {id: dense_right_low, center: [4.5, 6.5, 4.0], radius_m: 1.10, height_m: 8.0}
-      - {id: dense_direct_small, center: [0.35, 9.5, 4.0], radius_m: 0.65, height_m: 8.0}
-      - {id: dense_left_mid, center: [-4.2, 13.5, 4.0], radius_m: 1.40, height_m: 8.0}
-      - {id: dense_right_mid, center: [4.6, 16.0, 4.0], radius_m: 0.75, height_m: 8.0}
-      - {id: dense_direct_large, center: [-0.50, 20.5, 4.0], radius_m: 1.70, height_m: 8.0}
-      - {id: dense_right_late, center: [4.5, 24.5, 4.0], radius_m: 1.30, height_m: 8.0}
-      - {id: dense_left_late, center: [-4.5, 27.0, 4.0], radius_m: 0.70, height_m: 8.0}
 
 acceptance:
   require_reached_goal: true

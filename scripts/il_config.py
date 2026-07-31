@@ -42,7 +42,7 @@ except ImportError:
 REQUIRED_GLOBAL_KEYS = [
     "scene_id", "pub_port", "sub_port", "output_dir",
     "fsm", "depth", "pointcloud", "esdf", "control",
-    "obstacle", "planning", "data",
+    "obstacle", "start_goal", "planning", "data",
 ]
 
 REQUIRED_FSM_KEYS = [
@@ -68,6 +68,7 @@ V1_TO_V2_MIGRATION = {
     "global.flight.data_hz": "global.control.record_hz",
     "global.flight.settle_time": "global.control.settle_time (note: unused)",
     "global.flight.keep_alive_period": "global.fsm.keep_alive_period",
+    "scene.trajectories": "global.start_goal (automatic pair generation replaces manual trajectories)",
 }
 
 
@@ -103,6 +104,23 @@ def _validate_list_of_n(name, value, n, min_val=None, max_val=None):
             raise ValueError("{} values must be >= {}, got {}".format(name, min_val, v))
         if max_val is not None and v > max_val:
             raise ValueError("{} values must be <= {}, got {}".format(name, max_val, v))
+
+
+def _validate_zone(name, zone):
+    """Validate a start/goal zone dict."""
+    for key in ("x", "y"):
+        if key not in zone:
+            raise ValueError("{} missing '{}'".format(name, key))
+        _validate_list_of_n("{}.{}".format(name, key), zone[key], 2)
+        if zone[key][0] >= zone[key][1]:
+            raise ValueError("{}.{} min >= max: {}".format(name, key, zone[key]))
+    for key in ("z_min", "z_max"):
+        if key not in zone:
+            raise ValueError("{} missing '{}'".format(name, key))
+        if not isinstance(zone[key], (int, float)):
+            raise ValueError("{}.{} must be numeric".format(name, key))
+    if zone["z_min"] >= zone["z_max"]:
+        raise ValueError("{}.z_min >= z_max".format(name))
 
 
 def load_config(config_path=None, validate=True):
@@ -186,6 +204,15 @@ def _warn_v1_migration(cfg):
     # v1 uses global.connect_timeout instead of global.fsm.connect_timeout
     if "connect_timeout" in g:
         v1_markers.append("global.connect_timeout (v1) — should be global.fsm.connect_timeout (v2)")
+
+    # v1 scenes use trajectories field
+    for s in cfg.get("scenes", []):
+        if "trajectories" in s:
+            v1_markers.append(
+                "scene.{}.trajectories (v1) — manual trajectories replaced by "
+                "automatic start/goal pair generation via global.start_goal (v2)".format(
+                    s.get("name", "?")))
+            break
 
     if v1_markers:
         rospy.logwarn("=" * 60)
@@ -295,71 +322,77 @@ def _validate_config(cfg):
         errors.append("global.control.record_hz ({}) > control_hz ({})".format(
             ctrl["record_hz"], ctrl["control_hz"]))
 
-    # ── Data (the only supported production schema) ────────────
+    # ── Data (schema v7) ────────────────────────────────────────
     data = g.get("data", {})
-    schema_version = data.get("schema_version")
-    if schema_version != 16:
-        errors.append(
-            "global.data.schema_version must be exactly 16, got {}".format(
-                schema_version))
-    mode = data.get("collection_mode")
-    if mode != "deterministic_lockstep":
-        errors.append(
-            "global.data.collection_mode must be "
-            "'deterministic_lockstep', got '{}'".format(mode))
-
-    lookahead = data.get("label_lookahead_time_s", 0.08)
-    if lookahead <= 0:
-        errors.append(
-            "global.data.label_lookahead_time_s must be > 0, got {}".format(
-                lookahead))
-
-    for removed_key in (
-            "trend_horizontal_bins",
-            "trend_vertical_bins",
-            "trend_soft_sigma_bins"):
-        if removed_key in data:
+    schema_version = data.get("schema_version", 5)
+    if schema_version >= 7:
+        # label_lookahead_time_s validation
+        lookahead = data.get("label_lookahead_time_s", 0.08)
+        if lookahead <= 0:
             errors.append(
-                "global.data.{} is no longer supported; use the nested "
-                "global.data.trend schema".format(removed_key))
+                "global.data.label_lookahead_time_s must be > 0, got {}".format(lookahead))
 
-    trend_cfg = data.get("trend")
-    if not isinstance(trend_cfg, dict):
-        errors.append("global.data.trend must be a mapping")
-        trend_cfg = {}
-    normal_h_bins = int(trend_cfg.get(
-        "normal_horizontal_bins", TREND_NORMAL_HORIZONTAL_BIN_COUNT))
-    h_class_count = int(trend_cfg.get(
-        "horizontal_class_count", TREND_HORIZONTAL_CLASS_COUNT))
-    v_bins = int(trend_cfg.get("vertical_bins", 7))
-    sigma = float(trend_cfg.get("soft_sigma_bins", 0.75))
+        # trend config (v11: nested under data.trend)
+        trend_cfg = data.get("trend", {})
+        normal_h_bins = int(trend_cfg.get("normal_horizontal_bins",
+                              data.get("trend_horizontal_bins", 11)))
+        h_class_count = int(trend_cfg.get("horizontal_class_count",
+                              TREND_HORIZONTAL_CLASS_COUNT))
+        v_bins = int(trend_cfg.get("vertical_bins",
+                       data.get("trend_vertical_bins", 7)))
+        sigma = float(trend_cfg.get("soft_sigma_bins",
+                       data.get("trend_soft_sigma_bins", 0.75)))
 
-    if normal_h_bins != TREND_NORMAL_HORIZONTAL_BIN_COUNT:
-        errors.append(
-            "data.trend.normal_horizontal_bins must be {}, got {}".format(
-                TREND_NORMAL_HORIZONTAL_BIN_COUNT, normal_h_bins))
-    if h_class_count != TREND_HORIZONTAL_CLASS_COUNT:
-        errors.append(
-            "data.trend.horizontal_class_count must be {}, got {}".format(
-                TREND_HORIZONTAL_CLASS_COUNT, h_class_count))
-    if normal_h_bins < 3 or normal_h_bins % 2 == 0:
-        errors.append("data.trend.normal_horizontal_bins must be odd > 1")
-    if v_bins < 3 or v_bins % 2 == 0:
-        errors.append("data.trend.vertical_bins must be odd > 1")
-    if sigma <= 0:
-        errors.append(
-            "data.trend.soft_sigma_bins must be > 0, got {}".format(sigma))
-    rlc = int(trend_cfg.get("recover_left_class", TREND_RECOVER_LEFT_CLASS))
-    rrc = int(trend_cfg.get("recover_right_class", TREND_RECOVER_RIGHT_CLASS))
-    nco = int(trend_cfg.get("normal_class_offset", TREND_NORMAL_CLASS_OFFSET))
-    if rlc != 0:
-        errors.append("data.trend.recover_left_class must be 0")
-    if rrc != h_class_count - 1:
-        errors.append(
-            "data.trend.recover_right_class must be {}, got {}".format(
-                h_class_count - 1, rrc))
-    if nco != 1:
-        errors.append("data.trend.normal_class_offset must be 1")
+        if normal_h_bins != TREND_NORMAL_HORIZONTAL_BIN_COUNT:
+            errors.append(
+                "data.trend.normal_horizontal_bins must be {}, got {}".format(
+                    TREND_NORMAL_HORIZONTAL_BIN_COUNT, normal_h_bins))
+        if h_class_count != TREND_HORIZONTAL_CLASS_COUNT:
+            errors.append(
+                "data.trend.horizontal_class_count must be {}, got {}".format(
+                    TREND_HORIZONTAL_CLASS_COUNT, h_class_count))
+        if normal_h_bins < 3 or normal_h_bins % 2 == 0:
+            errors.append(
+                "data.trend.normal_horizontal_bins must be odd > 1")
+        if v_bins < 3 or v_bins % 2 == 0:
+            errors.append(
+                "data.trend.vertical_bins must be odd > 1")
+        if sigma <= 0:
+            errors.append(
+                "data.trend.soft_sigma_bins must be > 0, got {}".format(sigma))
+        # Validate class constants match config
+        rlc = int(trend_cfg.get("recover_left_class", TREND_RECOVER_LEFT_CLASS))
+        rrc = int(trend_cfg.get("recover_right_class", TREND_RECOVER_RIGHT_CLASS))
+        nco = int(trend_cfg.get("normal_class_offset", TREND_NORMAL_CLASS_OFFSET))
+        if rlc != 0:
+            errors.append("data.trend.recover_left_class must be 0")
+        if rrc != h_class_count - 1:
+            errors.append(
+                "data.trend.recover_right_class must be {}, got {}".format(
+                    h_class_count - 1, rrc))
+        if nco != 1:
+            errors.append("data.trend.normal_class_offset must be 1")
+        # Warn about deprecated flat config keys
+        if "trend_horizontal_bins" in data:
+            rospy.logwarn(
+                "[Config] DEPRECATED: global.data.trend_horizontal_bins – "
+                "use global.data.trend.normal_horizontal_bins instead")
+        if "trend_vertical_bins" in data:
+            rospy.logwarn(
+                "[Config] DEPRECATED: global.data.trend_vertical_bins – "
+                "use global.data.trend.vertical_bins instead")
+        if "trend_soft_sigma_bins" in data:
+            rospy.logwarn(
+                "[Config] DEPRECATED: global.data.trend_soft_sigma_bins – "
+                "use global.data.trend.soft_sigma_bins instead")
+
+        # collection_mode validation
+        mode = data.get("collection_mode", "deterministic_lockstep")
+        accepted_modes = ("deterministic_lockstep", "legacy_async")
+        if mode not in accepted_modes:
+            errors.append(
+                "global.data.collection_mode must be one of {}, got '{}'".format(
+                    accepted_modes, mode))
 
     # ── Observed map (Phase 2) ──────────────────────────────────
     obs_map = g.get("observed_map", {})
@@ -455,24 +488,13 @@ def _validate_config(cfg):
 
     # ── Phase 3: scene_generation validation ────────────────────
     sg_cfg = g.get("scene_generation", {})
-    if not sg_cfg.get("enabled", False):
-        errors.append(
-            "formal collection requires scene_generation.enabled = true")
-    else:
+    if sg_cfg.get("enabled", False):
         # Basic type checks
-        source = str(sg_cfg.get("source", "")).strip()
-        if source not in ("density_driven", "fixed_scenario"):
-            errors.append(
-                "scene_generation.source must be 'density_driven' or "
-                "'fixed_scenario', got '{}'".format(source))
+        source = sg_cfg.get("source", "procedural_yaml")
+        if source not in ("procedural_yaml", "procedural_profiles", "density_driven"):
+            errors.append("scene_generation.source must be 'procedural_yaml', 'procedural_profiles', or 'density_driven', got '{}'".format(source))
         if sg_cfg.get("obstacle_type", "cylinder") != "cylinder":
             errors.append("Phase 3 only supports obstacle_type='cylinder'")
-        for legacy_key in ("cylinder", "task_generation"):
-            if legacy_key in sg_cfg:
-                errors.append(
-                    "scene_generation.{} is no longer supported; use "
-                    "common_cylinder/common_task_generation"
-                    .format(legacy_key))
         outside_policy = sg_cfg.get("outside_region_policy",
                                      sg_cfg.get("outside_obstacle_region_policy", "free"))
         if outside_policy != "free":
@@ -490,28 +512,31 @@ def _validate_config(cfg):
         if oreg.get("z_min", 0) >= oreg.get("z_max", 0):
             errors.append("obstacle_region.z_min >= z_max")
 
-        # Common cylinder geometry
-        common_cyl = sg_cfg.get("common_cylinder", {})
-        for key in ("height_min_m", "height_max_m"):
-            if float(common_cyl.get(key, 0.0)) <= 0.0:
-                errors.append(
-                    "common_cylinder.{} must be > 0".format(key))
-        if (float(common_cyl.get("height_min_m", 0.0)) >
-                float(common_cyl.get("height_max_m", 0.0))):
-            errors.append(
-                "common_cylinder.height_min_m > height_max_m")
-        for key in ("minimum_surface_gap_m",
-                    "minimum_post_inflation_gap_m"):
-            if float(common_cyl.get(key, -1.0)) < 0.0:
-                errors.append(
-                    "common_cylinder.{} must be >= 0".format(key))
+        # Cylinder params (only validated for legacy / procedural_profiles; skipped for density_driven)
+        if source != "density_driven":
+            cyl = sg_cfg.get("cylinder", {})
+            for k in ("radius_min_m", "radius_max_m", "height_min_m", "height_max_m"):
+                v = cyl.get(k, 0)
+                if v <= 0:
+                    errors.append("global.scene_generation.cylinder.{} must be > 0".format(k))
+            if cyl.get("radius_min_m", 0) > cyl.get("radius_max_m", 0):
+                errors.append("cylinder.radius_min_m > radius_max_m")
+            if cyl.get("height_min_m", 0) > cyl.get("height_max_m", 0):
+                errors.append("cylinder.height_min_m > height_max_m")
+            if cyl.get("count_min", 0) > cyl.get("count_max", 0):
+                errors.append("cylinder.count_min > count_max")
+            if cyl.get("minimum_surface_gap_m", 0) < 0:
+                errors.append("cylinder.minimum_surface_gap_m must be >= 0")
+            if cyl.get("minimum_inflated_gap_m", 0) < 0:
+                errors.append("cylinder.minimum_inflated_gap_m must be >= 0")
 
-        # Topology validation
+        # Topology validation (escape sector params only required for legacy modes)
         topo = sg_cfg.get("topology_validation", {})
         if topo.get("grid_resolution_m", 0) <= 0:
             errors.append("topology_validation.grid_resolution_m must be > 0")
         if topo.get("validation_halo_m", 0) <= 0:
             errors.append("topology_validation.validation_halo_m must be > 0")
+        # Escape sector params: optional in density_driven mode (simplified validator)
         if "escape_ray_count" in topo and topo.get("escape_ray_count", 0) < 8:
             errors.append("topology_validation.escape_ray_count must be >= 8")
         if "minimum_escape_sector_width_deg" in topo and topo.get("minimum_escape_sector_width_deg", 0) <= 0:
@@ -519,83 +544,20 @@ def _validate_config(cfg):
         if "minimum_separated_escape_sectors" in topo and topo.get("minimum_separated_escape_sectors", 0) < 1:
             errors.append("minimum_separated_escape_sectors must be >= 1")
 
-        # One task schema for both formal and fixed-scenario flows.
-        tg = sg_cfg.get("common_task_generation", {})
-        if int(tg.get("tasks_per_scene", 0)) <= 0:
-            errors.append(
-                "common_task_generation.tasks_per_scene must be > 0")
-        if int(tg.get("max_task_sampling_attempts", 0)) <= 0:
-            errors.append(
-                "common_task_generation.max_task_sampling_attempts must be > 0")
-        for key in ("start_clearance_m", "goal_clearance_m"):
-            if float(tg.get(key, -1.0)) < 0.0:
-                errors.append(
-                    "common_task_generation.{} must be >= 0".format(key))
-        if float(tg.get("direct_path_corridor_radius_m", 0.0)) <= 0.0:
-            errors.append(
-                "common_task_generation.direct_path_corridor_radius_m "
-                "must be > 0")
-        min_dist = float(tg.get("minimum_start_goal_distance_m", -1.0))
-        max_dist = float(tg.get("maximum_start_goal_distance_m", -1.0))
-        if min_dist < 0.0:
-            errors.append(
-                "common_task_generation.minimum_start_goal_distance_m "
-                "must be >= 0")
-        if max_dist < min_dist:
-            errors.append(
-                "common_task_generation.maximum_start_goal_distance_m "
-                "< minimum")
-        if float(tg.get(
-                "maximum_start_goal_height_difference_m", -1.0)) < 0.0:
-            errors.append(
-                "common_task_generation."
-                "maximum_start_goal_height_difference_m must be >= 0")
-        for prefix in ("start", "goal"):
-            min_key = "{}_height_min_m".format(prefix)
-            max_key = "{}_height_max_m".format(prefix)
-            min_height = float(tg.get(min_key, -1.0))
-            max_height = float(tg.get(max_key, -1.0))
-            if min_height <= 0.0:
-                errors.append(
-                    "common_task_generation.{} must be > 0".format(
-                        min_key))
-            if max_height < min_height:
-                errors.append(
-                    "common_task_generation.{} < {}".format(
-                        max_key, min_key))
-        min_blockers = int(tg.get("minimum_direct_blocker_count", -1))
-        max_blockers = int(tg.get("maximum_direct_blocker_count", -1))
-        if min_blockers < 0:
-            errors.append(
-                "common_task_generation.minimum_direct_blocker_count "
-                "must be >= 0")
-        if max_blockers < min_blockers:
-            errors.append(
-                "common_task_generation.maximum_direct_blocker_count "
-                "< minimum_direct_blocker_count")
-        min_detour = float(tg.get("minimum_detour_ratio", 0.0))
-        max_detour = float(tg.get("maximum_detour_ratio", 0.0))
-        if min_detour < 1.0:
-            errors.append(
-                "common_task_generation.minimum_detour_ratio must be >= 1")
-        if max_detour < min_detour:
-            errors.append(
-                "common_task_generation.maximum_detour_ratio "
-                "< minimum_detour_ratio")
-        yaw_randomization_deg = float(
-            tg.get("initial_yaw_randomization_deg", -1.0))
-        if not (0.0 <= yaw_randomization_deg <= 180.0):
-            errors.append(
-                "common_task_generation.initial_yaw_randomization_deg "
-                "must be in [0, 180]")
-
-        coverage = tg.get("coverage_balancing", {})
-        for removed_key in ("fallback_to_any_valid", "fallback_attempts"):
-            if removed_key in coverage:
-                errors.append(
-                    "common_task_generation.coverage_balancing.{} was "
-                    "removed; a quota miss must reject/regenerate the scene"
-                    .format(removed_key))
+        # Task generation
+        tg = sg_cfg.get("task_generation", {})
+        if tg.get("minimum_start_goal_distance_m", 0) > tg.get("maximum_start_goal_distance_m", 0):
+            errors.append("task_generation.minimum_start_goal_distance > maximum")
+        if tg.get("minimum_detour_ratio", 0) < 1.0:
+            errors.append("task_generation.minimum_detour_ratio must be >= 1")
+        if tg.get("maximum_detour_ratio", 0) < tg.get("minimum_detour_ratio", 0):
+            errors.append("task_generation.maximum_detour_ratio < minimum_detour_ratio")
+        if tg.get("maximum_start_goal_height_difference_m", 0) < 0:
+            errors.append("maximum_start_goal_height_difference_m must be >= 0")
+        if tg.get("minimum_direct_blocker_count", 0) < 0:
+            errors.append("minimum_direct_blocker_count must be >= 0")
+        if tg.get("maximum_direct_blocker_count", 0) < tg.get("minimum_direct_blocker_count", 0):
+            errors.append("maximum_direct_blocker_count < minimum_direct_blocker_count")
 
         # Side cost
         sc = sg_cfg.get("side_cost", {})
@@ -607,116 +569,24 @@ def _validate_config(cfg):
         if obs_audit.get("maximum_invalid_frames_before_reject", 0) < 0:
             errors.append("maximum_invalid_frames_before_reject must be >= 0")
 
-        if source == "density_driven":
-            if "fixed_obstacles" in sg_cfg:
-                errors.append(
-                    "density_driven must not define fixed_obstacles")
-            if "fixed_tasks" in tg:
-                errors.append(
-                    "density_driven must not define fixed_tasks")
-            _validate_profiles(sg_cfg, errors)
-            quality = sg_cfg.get("generation_quality", {})
-            ratio = float(quality.get(
-                "minimum_density_achievement_ratio", 0.0))
-            if not (0.0 < ratio <= 1.0):
-                errors.append(
-                    "generation_quality."
-                    "minimum_density_achievement_ratio must be in (0, 1]")
-            stratification = sg_cfg.get(
-                "placement_stratification", {})
-            if not stratification.get("enabled", False):
-                errors.append(
-                    "density_driven requires "
-                    "placement_stratification.enabled = true")
-            for key in ("x_bands", "y_bands"):
-                if int(stratification.get(key, 0)) < 1:
-                    errors.append(
-                        "placement_stratification.{} must be >= 1"
-                        .format(key))
-            for region_key in (
-                    "start_sampling_regions", "goal_sampling_regions"):
-                regions = tg.get(region_key, [])
-                if not isinstance(regions, list) or not regions:
-                    errors.append(
-                        "density_driven requires non-empty "
-                        "common_task_generation.{}".format(region_key))
-                    continue
-                for region_index, region in enumerate(regions):
-                    for axis in ("x", "y"):
-                        low = region.get("{}_min".format(axis))
-                        high = region.get("{}_max".format(axis))
-                        if (not isinstance(low, (int, float)) or
-                                not isinstance(high, (int, float)) or
-                                low >= high):
-                            errors.append(
-                                "{}[{}].{}_min/{}_max must be numeric "
-                                "and increasing".format(
-                                    region_key, region_index, axis, axis))
-        elif source == "fixed_scenario":
-            if "profiles" in sg_cfg:
-                errors.append(
-                    "fixed_scenario must not define profiles")
-            if not str(sg_cfg.get("fixed_scene_name", "")).strip():
-                errors.append(
-                    "fixed_scenario requires fixed_scene_name")
-            fixed_obstacles = sg_cfg.get("fixed_obstacles", [])
-            if not isinstance(fixed_obstacles, list) or not fixed_obstacles:
-                errors.append(
-                    "fixed_scenario requires non-empty fixed_obstacles")
-            else:
-                seen_ids = set()
-                for obstacle_index, obstacle in enumerate(fixed_obstacles):
-                    obstacle_id = str(obstacle.get("id", "")).strip()
-                    if not obstacle_id:
-                        errors.append(
-                            "fixed_obstacles[{}].id must be non-empty"
-                            .format(obstacle_index))
-                    elif obstacle_id in seen_ids:
-                        errors.append(
-                            "fixed_obstacles[{}].id '{}' is duplicated"
-                            .format(obstacle_index, obstacle_id))
-                    seen_ids.add(obstacle_id)
-                    center = obstacle.get("center")
-                    if (not isinstance(center, (list, tuple)) or
-                            len(center) != 3 or
-                            any(not isinstance(v, (int, float))
-                                for v in center)):
-                        errors.append(
-                            "fixed_obstacles[{}].center must contain "
-                            "three numbers".format(obstacle_index))
-                    if float(obstacle.get("radius_m", 0.0)) <= 0.0:
-                        errors.append(
-                            "fixed_obstacles[{}].radius_m must be > 0"
-                            .format(obstacle_index))
-                    if float(obstacle.get("height_m", 0.0)) <= 0.0:
-                        errors.append(
-                            "fixed_obstacles[{}].height_m must be > 0"
-                            .format(obstacle_index))
-            fixed_tasks = tg.get("fixed_tasks", [])
-            if not isinstance(fixed_tasks, list) or not fixed_tasks:
-                errors.append(
-                    "fixed_scenario requires non-empty "
-                    "common_task_generation.fixed_tasks")
-            else:
-                if int(tg.get("tasks_per_scene", 0)) != len(fixed_tasks):
-                    errors.append(
-                        "fixed_scenario tasks_per_scene must equal the "
-                        "number of fixed_tasks")
-                for task_index, task in enumerate(fixed_tasks):
-                    for endpoint in ("start", "goal"):
-                        point = task.get(endpoint)
-                        if (not isinstance(point, (list, tuple)) or
-                                len(point) != 3 or
-                                any(not isinstance(v, (int, float))
-                                    for v in point)):
-                            errors.append(
-                                "fixed_tasks[{}].{} must contain three "
-                                "numbers".format(task_index, endpoint))
+        # source check
+        if sg_cfg.get("source") == "explicit_yaml":
+            layout = sg_cfg.get("layout_file", "")
+            if not layout:
+                errors.append("explicit_yaml mode requires layout_file")
+            elif not os.path.isfile(layout):
+                errors.append("layout_file not found: {}".format(layout))
 
-    if "scenes" in cfg:
-        errors.append(
-            "top-level scenes is no longer supported; use "
-            "scene_generation.profiles or fixed_scenario")
+        # ── Profile validation (v9 multi-profile) ─────────────────
+        if sg_cfg.get("source") == "procedural_profiles":
+            _validate_profiles(sg_cfg, errors)
+
+        # ── Prevent both profile and legacy pipeline ──────────────
+        scenes_list = cfg.get("scenes", [])
+        if sg_cfg.get("source") == "procedural_profiles" and scenes_list:
+            errors.append(
+                "Both procedural_profiles (scene_generation.profiles) and legacy "
+                "scenes: list are configured. Only one pipeline may be enabled.")
 
     # ── Online runtime (v13) ───────────────────────────────────
     online_rt = g.get("online_runtime", {})
@@ -796,6 +666,24 @@ def _validate_config(cfg):
         _validate_list_of_n("global.obstacle.area_x", obs["area_x"], 2)
     if "area_y" in obs:
         _validate_list_of_n("global.obstacle.area_y", obs["area_y"], 2)
+
+    # ── Start/Goal zones ────────────────────────────────────────
+    sg = g.get("start_goal", {})
+    if "start_zone" in sg:
+        _validate_zone("global.start_goal.start_zone", sg["start_zone"])
+    if "goal_zone" in sg:
+        _validate_zone("global.start_goal.goal_zone", sg["goal_zone"])
+    if "num_pairs_per_config" in sg:
+        if sg["num_pairs_per_config"] < 1:
+            errors.append("global.start_goal.num_pairs_per_config must be >= 1")
+    if "candidate_pair_multiplier" in sg:
+        value = sg["candidate_pair_multiplier"]
+        if not isinstance(value, int) or value < 1:
+            errors.append(
+                "global.start_goal.candidate_pair_multiplier must be an integer >= 1")
+    if "min_esdf_clearance_at_endpoints" in sg:
+        _validate_positive("global.start_goal.min_esdf_clearance_at_endpoints",
+                           sg["min_esdf_clearance_at_endpoints"])
 
     # ── Planning (v5: new local_planner validation) ──────────────
     planning = g.get("planning", {})
@@ -1013,6 +901,56 @@ def _validate_config(cfg):
         if key in tp:
             _validate_positive("global.planning.time_param.{}".format(key), tp[key])
 
+    # ── Check start/goal zones are within pointcloud range ──────
+    if "range" in pc and "origin" in pc:
+        rng = pc["range"]
+        org = pc["origin"]
+        x_min = org[0] - rng[0] / 2.0
+        x_max = org[0] + rng[0] / 2.0
+        y_min = org[1] - rng[1] / 2.0
+        y_max = org[1] + rng[1] / 2.0
+        z_min = org[2] - rng[2] / 2.0
+        z_max = org[2] + rng[2] / 2.0
+
+        for zone_name, zone in [("start_zone", sg.get("start_zone", {})),
+                                 ("goal_zone", sg.get("goal_zone", {}))]:
+            if not zone:
+                continue
+            if zone.get("x", [0, 0])[0] < x_min or zone.get("x", [0, 0])[1] > x_max:
+                errors.append("global.start_goal.{} x-range {} outside pointcloud range [{:.1f}, {:.1f}]".format(
+                    zone_name, zone.get("x"), x_min, x_max))
+            if zone.get("y", [0, 0])[0] < y_min or zone.get("y", [0, 0])[1] > y_max:
+                errors.append("global.start_goal.{} y-range {} outside pointcloud range [{:.1f}, {:.1f}]".format(
+                    zone_name, zone.get("y"), y_min, y_max))
+            if zone.get("z_min", 0) < z_min or zone.get("z_max", 0) > z_max:
+                errors.append("global.start_goal.{} z-range [{}, {}] outside pointcloud range [{:.1f}, {:.1f}]".format(
+                    zone_name, zone.get("z_min", 0), zone.get("z_max", 0), z_min, z_max))
+
+    # ── Scenes ──────────────────────────────────────────────────
+    scenes = cfg.get("scenes", [])
+    # Legacy scenes are only required when NOT using procedural_profiles or density_driven
+    source = g.get("scene_generation", {}).get("source", "procedural_yaml")
+    if source not in ("procedural_profiles", "density_driven") and not scenes:
+        errors.append("No scenes defined")
+    for i, s in enumerate(scenes):
+        if "name" not in s:
+            errors.append("scenes[{}] missing 'name'".format(i))
+        if "seeds" not in s:
+            errors.append("scenes[{}] missing 'seeds'".format(i))
+        elif not isinstance(s["seeds"], list) or len(s["seeds"]) == 0:
+            errors.append("scenes[{}].seeds must be non-empty list".format(i))
+        for key in ("target_occupancy", "radius_min", "radius_max"):
+            if key not in s:
+                errors.append("scenes[{}] missing '{}'".format(i, key))
+        if s.get("radius_min", 0) > s.get("radius_max", 0):
+            errors.append("scenes[{}].radius_min > radius_max".format(i))
+        count_min = s.get("obstacle_count_min", 0)
+        count_max = s.get("obstacle_count_max", 0)
+        if (not isinstance(count_min, int) or not isinstance(count_max, int) or
+                count_min < 0 or count_max < count_min):
+            errors.append(
+                "scenes[{}] obstacle_count range must satisfy 0 <= min <= max".format(i))
+
     # ── Phase 4: ESDF cache validation ──────────────────────────
     esdf_cache = g.get("esdf_cache", {})
     if esdf_cache.get("enabled", True):
@@ -1117,13 +1055,18 @@ def _validate_config(cfg):
 
 
 def _validate_profiles(sg_cfg, errors):
-    """Validate the density-driven profile catalog."""
-    source = sg_cfg.get("source", "")
+    """Validate the profiles list in a procedural_profiles or density_driven config.
+
+    Checks: name uniqueness, size_groups (density_driven) or cylinder params
+    (procedural_profiles), density ranges, task params.
+    """
+    source = sg_cfg.get("source", "procedural_yaml")
     profiles = sg_cfg.get("profiles", [])
     if not profiles:
         errors.append("{} source requires non-empty profiles list".format(source))
         return
 
+    is_density_driven = (source == "density_driven")
     seen_names = set()
     any_enabled = False
     vehicle_cfg = sg_cfg.get("vehicle", {})
@@ -1154,10 +1097,10 @@ def _validate_profiles(sg_cfg, errors):
         if not isinstance(seed_offset, int):
             errors.append("profiles[{}] ('{}'): seed_offset must be an integer".format(i, name))
 
-        if source == "density_driven":
+        if is_density_driven:
+            # ── density_driven: validate size_groups ──
             groups = p.get("size_groups", {})
             required_groups = ("large", "medium", "small")
-            capacity_sum = 0.0
             for gn in required_groups:
                 if gn not in groups:
                     errors.append("profiles[{}] ('{}'): size_groups.{} is required".format(
@@ -1173,7 +1116,6 @@ def _validate_profiles(sg_cfg, errors):
                     errors.append("profiles[{}] ('{}'): size_groups.{}.radius_max_m ({}) < radius_min_m ({})".format(
                         i, name, gn, r_max, r_min))
                 cf = float(g.get("capacity_fraction", 1.0/3.0))
-                capacity_sum += cf
                 if cf <= 0 or cf > 1.0:
                     errors.append("profiles[{}] ('{}'): size_groups.{}.capacity_fraction must be in (0, 1]".format(
                         i, name, gn))
@@ -1181,11 +1123,6 @@ def _validate_profiles(sg_cfg, errors):
                 if cft < 1:
                     errors.append("profiles[{}] ('{}'): size_groups.{}.consecutive_fail_threshold must be >= 1".format(
                         i, name, gn))
-            if abs(capacity_sum - 1.0) > 1.0e-6:
-                errors.append(
-                    "profiles[{}] ('{}'): size-group capacity_fraction "
-                    "values must sum to 1.0, got {}".format(
-                        i, name, capacity_sum))
 
             # Validate density range
             d_min = float(p.get("density_min", -1))
@@ -1197,6 +1134,72 @@ def _validate_profiles(sg_cfg, errors):
                     i, name, d_max, d_min))
             if d_max >= 1.0:
                 errors.append("profiles[{}] ('{}'): density_max ({}) must be < 1.0 (100%)".format(
+                    i, name, d_max))
+        else:
+            # ── procedural_profiles: validate cylinder params ──
+            # ... (existing validation logic for cylinder, density, ranges)
+            cyl = p.get("cylinder", {})
+            r_min = float(cyl.get("radius_min_m", -1))
+            r_max = float(cyl.get("radius_max_m", -1))
+
+            # Multi-range sampling (mixed-scale scenes)
+            ranges_raw = cyl.get("ranges", None)
+            if ranges_raw is not None:
+                if not isinstance(ranges_raw, list) or len(ranges_raw) == 0:
+                    errors.append("profiles[{}] ('{}'): cylinder.ranges must be a non-empty list".format(
+                        i, name))
+                else:
+                    for ri, rng in enumerate(ranges_raw):
+                        rr_min = float(rng.get("min", -1))
+                        rr_max = float(rng.get("max", -1))
+                        rr_weight = float(rng.get("weight", -1))
+                        if rr_min <= 0:
+                            errors.append(
+                                "profiles[{}] ('{}'): cylinder.ranges[{}].min must be > 0".format(
+                                    i, name, ri))
+                        if rr_max < rr_min:
+                            errors.append(
+                                "profiles[{}] ('{}'): cylinder.ranges[{}].max ({}) < min ({})".format(
+                                    i, name, ri, rr_max, rr_min))
+                        if rr_weight <= 0:
+                            errors.append(
+                                "profiles[{}] ('{}'): cylinder.ranges[{}].weight must be > 0".format(
+                                    i, name, ri))
+            else:
+                if r_min <= 0:
+                    errors.append("profiles[{}] ('{}'): cylinder.radius_min_m must be > 0".format(i, name))
+                if r_max < r_min:
+                    errors.append("profiles[{}] ('{}'): radius_max_m ({}) < radius_min_m ({})".format(
+                        i, name, r_max, r_min))
+
+            c_min = int(cyl.get("count_min", -1))
+            c_max = int(cyl.get("count_max", -1))
+            if c_min <= 0:
+                errors.append("profiles[{}] ('{}'): cylinder.count_min must be > 0".format(i, name))
+            if c_max < c_min:
+                errors.append("profiles[{}] ('{}'): count_max ({}) < count_min ({})".format(
+                    i, name, c_max, c_min))
+
+            # Density params
+            density = p.get("density", {})
+            d_enabled = bool(density.get("enabled", True))
+            d_mode = str(density.get("mode", "inflated_occupancy"))
+            supported_modes = ["inflated_occupancy", "raw_occupancy",
+                               "obstacles_per_100m2", "fixed_count"]
+            if d_mode not in supported_modes:
+                errors.append("profiles[{}] ('{}'): density.mode '{}' not in {}".format(
+                    i, name, d_mode, supported_modes))
+
+            if d_enabled:
+                d_min = float(density.get("target_min", -1))
+                d_max = float(density.get("target_max", -1))
+                if d_min < 0:
+                    errors.append("profiles[{}] ('{}'): density.target_min must be >= 0".format(i, name))
+                if d_max < d_min:
+                    errors.append("profiles[{}] ('{}'): density.target_max ({}) < target_min ({})".format(
+                        i, name, d_max, d_min))
+            if d_mode in ("inflated_occupancy", "raw_occupancy") and d_max >= 1.0:
+                errors.append("profiles[{}] ('{}'): occupancy density target_max ({}) must be < 1.0".format(
                     i, name, d_max))
 
     if not any_enabled:

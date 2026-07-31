@@ -99,17 +99,6 @@ global:
 
     seed: 12345
 
-    coverage_balancing:
-      enabled: true
-      require_density_tier_mix: true
-      density_tier_mix_scope: "full_catalog"
-      required_density_tiers: [sparse, medium, dense]
-      minimum_scene_fraction_per_density_tier: 0.15
-      maximum_scene_fraction_per_density_tier: 0.60
-      density_tier_thresholds:
-        sparse_max: 0.06
-        medium_max: 0.14
-
     # ── Execution control ──────────────────────────────────────────
     execution:
       profile_order: "sequential"
@@ -145,14 +134,7 @@ global:
     forbid_enclosed_free_components: true
     forbid_inflated_component_merging: true
 
-    generation_quality:
-      minimum_density_achievement_ratio: 0.97
-
-    placement_stratification:
-      enabled: true
-      x_bands: 4
-      y_bands: 6
-
+    # ── Legacy compatibility (kept for il_config.py, validator) ────
     topology_validation:
       grid_resolution_m: 0.10
       validation_halo_m: 3.0
@@ -171,10 +153,6 @@ global:
     # ── Common task generation ─────────────────────────────────────
     common_task_generation:
       tasks_per_scene: 24
-      max_task_sampling_attempts: 2000
-      start_clearance_m: 0.40
-      goal_clearance_m: 0.40
-      direct_path_corridor_radius_m: 0.55
 
       start_sampling_regions:
         - {x_min: -6.5, x_max: 9.5, y_min: -1.5, y_max: -0.5}
@@ -193,10 +171,10 @@ global:
 
       # ── Disabled constraints (v10: let the scene define difficulty) ──
       maximum_start_goal_height_difference_m: 100.0   # effectively unlimited
-      minimum_start_goal_distance_m: 1.0
+      minimum_start_goal_distance_m: 0.0
       maximum_start_goal_distance_m: 1000.0
 
-      require_direct_path_blocked: false
+      require_direct_path_blocked: true
       minimum_direct_blocker_count: 1
       maximum_direct_blocker_count: 3
 
@@ -204,35 +182,51 @@ global:
       minimum_detour_ratio: 1.0         # no minimum
       maximum_detour_ratio: 1000.0      # effectively unlimited
 
-      coverage_balancing:
-        enabled: true
-        rotate_region_pairs_by_seed: true
-        center_lateral_fraction: 0.25
-        task_type_weights_by_density_tier:
-          default:
-            {clear: 0.20, single_left: 0.20, single_right: 0.20,
-             single_center: 0.20, multi_blocker: 0.20}
-          sparse:
-            {clear: 0.55, single_left: 0.15, single_right: 0.15,
-             single_center: 0.15, multi_blocker: 0.00}
-          medium:
-            {clear: 0.20, single_left: 0.20, single_right: 0.20,
-             single_center: 0.20, multi_blocker: 0.20}
-          dense:
-            {clear: 0.00, single_left: 0.15, single_right: 0.15,
-             single_center: 0.10, multi_blocker: 0.60}
-        blocker_distance_bands_m:
-          near: [0.0, 6.0]
-          middle: [6.0, 15.0]
-          far: [15.0, 1000.0]
-        blocker_distance_weights_by_density_tier:
-          sparse: {near: 0.35, middle: 0.40, far: 0.25}
-          medium: {near: 0.45, middle: 0.45, far: 0.10}
-          dense: {near: 0.60, middle: 0.40, far: 0.00}
-        level_height_delta_max_m: 0.25
-        minimum_nonlevel_height_delta_m: 0.75
-        height_delta_weights:
-          {level: 1.0, ascending: 0.0, descending: 0.0}
+    # ── Legacy block for backward compat ──────────────────────────
+    cylinder:
+      count_min: 6
+      count_max: 10
+      radius_min_m: 0.30
+      radius_max_m: 2.0
+      height_min_m: 8.0
+      height_max_m: 8.0
+      require_full_vertical_blocking: true
+      region_boundary_margin_m: 0.30
+      minimum_surface_gap_m: 0.80
+      minimum_inflated_gap_m: 0.40
+      allow_overlap: false
+      allow_inflated_component_merging: false
+
+    task_generation:
+      enabled: true
+      max_task_sampling_attempts: 2000
+      tasks_per_scene: 24
+      start_height_min_m: 1.8
+      start_height_max_m: 2.2
+      goal_height_min_m: 1.8
+      goal_height_max_m: 2.2
+      maximum_start_goal_height_difference_m: 100.0
+      start_clearance_m: 0.0
+      goal_clearance_m: 0.0
+      minimum_start_goal_distance_m: 0.0
+      maximum_start_goal_distance_m: 1000.0
+      require_direct_path_blocked: true
+      direct_path_corridor_radius_m: 0.35
+      minimum_direct_blocker_count: 1
+      maximum_direct_blocker_count: 3
+      require_astar_reachable: true
+      minimum_detour_ratio: 1.0
+      maximum_detour_ratio: 1000.0
+      start_sampling_region:
+        x_min: -8.0
+        x_max: 10.0
+        y_min: -2.0
+        y_max: -1.0
+      goal_sampling_region:
+        x_min: -8.0
+        x_max: 10.0
+        y_min: 30.0
+        y_max: 32.0
 
     side_cost:
       enabled: false
@@ -271,21 +265,18 @@ global:
         enabled: true
         scene_count: 1
         seed_offset: 1010
-        density_min: 0.01
-        density_max: 0.02
+        density_min: 0.08
+        density_max: 0.12
         size_groups:
           large:
-            capacity_fraction: 0.333333
             radius_min_m: 0.35
             radius_max_m: 0.50
             consecutive_fail_threshold: 30
           medium:
-            capacity_fraction: 0.333333
             radius_min_m: 0.20
             radius_max_m: 0.35
             consecutive_fail_threshold: 80
           small:
-            capacity_fraction: 0.333334
             radius_min_m: 0.10
             radius_max_m: 0.20
             consecutive_fail_threshold: 150
@@ -294,21 +285,18 @@ global:
         enabled: true
         scene_count: 1
         seed_offset: 1020
-        density_min: 0.035
-        density_max: 0.055
+        density_min: 0.14
+        density_max: 0.18
         size_groups:
           large:
-            capacity_fraction: 0.333333
             radius_min_m: 0.35
             radius_max_m: 0.50
             consecutive_fail_threshold: 40
           medium:
-            capacity_fraction: 0.333333
             radius_min_m: 0.20
             radius_max_m: 0.35
             consecutive_fail_threshold: 100
           small:
-            capacity_fraction: 0.333334
             radius_min_m: 0.10
             radius_max_m: 0.20
             consecutive_fail_threshold: 180
@@ -317,21 +305,18 @@ global:
         enabled: true
         scene_count: 1
         seed_offset: 1030
-        density_min: 0.10
-        density_max: 0.14
+        density_min: 0.20
+        density_max: 0.25
         size_groups:
           large:
-            capacity_fraction: 0.333333
             radius_min_m: 0.35
             radius_max_m: 0.50
             consecutive_fail_threshold: 50
           medium:
-            capacity_fraction: 0.333333
             radius_min_m: 0.20
             radius_max_m: 0.35
             consecutive_fail_threshold: 120
           small:
-            capacity_fraction: 0.333334
             radius_min_m: 0.10
             radius_max_m: 0.20
             consecutive_fail_threshold: 200
@@ -342,21 +327,18 @@ global:
         enabled: true
         scene_count: 1
         seed_offset: 2010
-        density_min: 0.025
-        density_max: 0.045
+        density_min: 0.10
+        density_max: 0.15
         size_groups:
           large:
-            capacity_fraction: 0.333333
             radius_min_m: 1.00
             radius_max_m: 1.50
             consecutive_fail_threshold: 40
           medium:
-            capacity_fraction: 0.333333
             radius_min_m: 0.50
             radius_max_m: 1.00
             consecutive_fail_threshold: 80
           small:
-            capacity_fraction: 0.333334
             radius_min_m: 0.10
             radius_max_m: 0.50
             consecutive_fail_threshold: 150
@@ -365,21 +347,18 @@ global:
         enabled: true
         scene_count: 1
         seed_offset: 2020
-        density_min: 0.07
-        density_max: 0.10
+        density_min: 0.16
+        density_max: 0.22
         size_groups:
           large:
-            capacity_fraction: 0.333333
             radius_min_m: 1.00
             radius_max_m: 1.50
             consecutive_fail_threshold: 50
           medium:
-            capacity_fraction: 0.333333
             radius_min_m: 0.50
             radius_max_m: 1.00
             consecutive_fail_threshold: 100
           small:
-            capacity_fraction: 0.333334
             radius_min_m: 0.10
             radius_max_m: 0.50
             consecutive_fail_threshold: 180
@@ -388,21 +367,18 @@ global:
         enabled: true
         scene_count: 1
         seed_offset: 2030
-        density_min: 0.14
-        density_max: 0.18
+        density_min: 0.23
+        density_max: 0.28
         size_groups:
           large:
-            capacity_fraction: 0.333333
             radius_min_m: 1.00
             radius_max_m: 1.50
             consecutive_fail_threshold: 50
           medium:
-            capacity_fraction: 0.333333
             radius_min_m: 0.50
             radius_max_m: 1.00
             consecutive_fail_threshold: 120
           small:
-            capacity_fraction: 0.333334
             radius_min_m: 0.10
             radius_max_m: 0.50
             consecutive_fail_threshold: 200
@@ -413,21 +389,18 @@ global:
         enabled: true
         scene_count: 1
         seed_offset: 3010
-        density_min: 0.04
-        density_max: 0.06
+        density_min: 0.12
+        density_max: 0.18
         size_groups:
           large:
-            capacity_fraction: 0.333333
             radius_min_m: 1.60
             radius_max_m: 2.50
             consecutive_fail_threshold: 40
           medium:
-            capacity_fraction: 0.333333
             radius_min_m: 0.80
             radius_max_m: 1.60
             consecutive_fail_threshold: 80
           small:
-            capacity_fraction: 0.333334
             radius_min_m: 0.10
             radius_max_m: 0.80
             consecutive_fail_threshold: 150
@@ -436,21 +409,18 @@ global:
         enabled: true
         scene_count: 1
         seed_offset: 3020
-        density_min: 0.08
-        density_max: 0.12
+        density_min: 0.19
+        density_max: 0.25
         size_groups:
           large:
-            capacity_fraction: 0.333333
             radius_min_m: 1.60
             radius_max_m: 2.50
             consecutive_fail_threshold: 50
           medium:
-            capacity_fraction: 0.333333
             radius_min_m: 0.80
             radius_max_m: 1.60
             consecutive_fail_threshold: 100
           small:
-            capacity_fraction: 0.333334
             radius_min_m: 0.10
             radius_max_m: 0.80
             consecutive_fail_threshold: 180
@@ -459,21 +429,18 @@ global:
         enabled: true
         scene_count: 1
         seed_offset: 3030
-        density_min: 0.15
-        density_max: 0.20
+        density_min: 0.26
+        density_max: 0.32
         size_groups:
           large:
-            capacity_fraction: 0.333333
             radius_min_m: 1.60
             radius_max_m: 2.50
             consecutive_fail_threshold: 50
           medium:
-            capacity_fraction: 0.333333
             radius_min_m: 0.80
             radius_max_m: 1.60
             consecutive_fail_threshold: 120
           small:
-            capacity_fraction: 0.333334
             radius_min_m: 0.10
             radius_max_m: 0.80
             consecutive_fail_threshold: 200
@@ -484,21 +451,18 @@ global:
         enabled: true
         scene_count: 1
         seed_offset: 4010
-        density_min: 0.06
-        density_max: 0.09
+        density_min: 0.15
+        density_max: 0.22
         size_groups:
           large:
-            capacity_fraction: 0.15
             radius_min_m: 2.20
             radius_max_m: 3.50
             consecutive_fail_threshold: 40
           medium:
-            capacity_fraction: 0.25
             radius_min_m: 1.00
             radius_max_m: 2.20
             consecutive_fail_threshold: 80
           small:
-            capacity_fraction: 0.60
             radius_min_m: 0.10
             radius_max_m: 1.00
             consecutive_fail_threshold: 150
@@ -507,21 +471,18 @@ global:
         enabled: true
         scene_count: 1
         seed_offset: 4020
-        density_min: 0.10
-        density_max: 0.14
+        density_min: 0.18
+        density_max: 0.26
         size_groups:
           large:
-            capacity_fraction: 0.333333
             radius_min_m: 2.20
             radius_max_m: 3.50
             consecutive_fail_threshold: 50
           medium:
-            capacity_fraction: 0.333333
             radius_min_m: 1.00
             radius_max_m: 2.20
             consecutive_fail_threshold: 100
           small:
-            capacity_fraction: 0.333334
             radius_min_m: 0.10
             radius_max_m: 1.00
             consecutive_fail_threshold: 180
@@ -530,21 +491,18 @@ global:
         enabled: true
         scene_count: 1
         seed_offset: 4030
-        density_min: 0.16
-        density_max: 0.21
+        density_min: 0.22
+        density_max: 0.30
         size_groups:
           large:
-            capacity_fraction: 0.60
             radius_min_m: 2.20
             radius_max_m: 3.50
             consecutive_fail_threshold: 50
           medium:
-            capacity_fraction: 0.25
             radius_min_m: 1.00
             radius_max_m: 2.20
             consecutive_fail_threshold: 120
           small:
-            capacity_fraction: 0.15
             radius_min_m: 0.10
             radius_max_m: 1.00
             consecutive_fail_threshold: 200
@@ -783,7 +741,7 @@ global:
   # ── Data format ──────────────────────────────────────────────────────
   data:
     coordinate_frame: "CAMERA_FLU"
-    schema_version: 16
+    schema_version: 15
     collection_mode: "deterministic_lockstep"
     image_write_queue_size: 16
     label_lookahead_time_s: 0.08
@@ -905,3 +863,7 @@ global:
     strict_collision_policy: true          # reject trajectory on ANY collision
     atomic_rename:           true          # use .inprogress → rename commit
 
+# ── Scene definitions (legacy — superseded by scene_generation.profiles) ────
+# The legacy scenes: list is disabled when source == "procedural_profiles".
+# To use legacy mode, set scene_generation.source to "procedural_yaml".
+scenes: []

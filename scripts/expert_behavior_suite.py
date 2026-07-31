@@ -13,36 +13,19 @@ import os
 import subprocess
 import sys
 
+import yaml
+
+
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 PACKAGE_DIR = os.path.dirname(SCRIPT_DIR)
-if SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, SCRIPT_DIR)
-
-from expert_behavior_catalog import (  # noqa: E402
-    load_scenario_catalog,
-    select_scenarios,
-)
-
-
-def _as_bool(value):
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in ("1", "true", "yes", "on"):
-        return True
-    if text in ("0", "false", "no", "off"):
-        return False
-    raise argparse.ArgumentTypeError(
-        "expected true/false, got '{}'".format(value))
 
 
 def _parse_args():
     parser = argparse.ArgumentParser(
         description="Run the deterministic expert avoidance regression suite.")
     parser.add_argument(
-        "--selection", default="human_review",
-        help=(
-            "Suite name, scenario name, 'all', or a comma-separated mix."))
+        "--scenarios", default="all",
+        help="Comma-separated scenario names, or 'all' (catalog order).")
     parser.add_argument(
         "--scenario-file",
         default=os.path.join(
@@ -56,15 +39,39 @@ def _parse_args():
                              "expert_behavior_suite"))
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument(
-        "--show-plot", nargs="?", const=True, default=False, type=_as_bool,
-        help="Open each diagnostic and wait for it to be closed.")
+        "--show-plot", action="store_true",
+        help="Open each interactive diagnostic (disabled by default).")
     parser.add_argument(
-        "--stop-on-failure", nargs="?", const=True, default=False,
-        type=_as_bool,
+        "--stop-on-failure", action="store_true",
         help="Stop launching scenarios after the first failure.")
-    parser.add_argument(
-        "--debug", nargs="?", const=True, default=False, type=_as_bool)
     return parser.parse_args()
+
+
+def _load_catalog(path):
+    path = os.path.abspath(os.path.expanduser(path))
+    with open(path, "r") as stream:
+        catalog = yaml.safe_load(stream) or {}
+    scenarios = catalog.get("scenarios", {})
+    if not isinstance(scenarios, dict) or not scenarios:
+        raise ValueError("No scenarios found in {}".format(path))
+    acceptance = catalog.get("acceptance", {})
+    if not isinstance(acceptance, dict):
+        raise ValueError("'acceptance' must be a mapping")
+    return path, scenarios, acceptance
+
+
+def _select_scenarios(spec, scenarios):
+    if spec.strip().lower() == "all":
+        return list(scenarios.keys())
+    selected = [item.strip() for item in spec.split(",") if item.strip()]
+    unknown = [item for item in selected if item not in scenarios]
+    if unknown:
+        raise ValueError(
+            "Unknown scenarios {}; available: {}".format(
+                unknown, list(scenarios.keys())))
+    if not selected:
+        raise ValueError("No scenarios selected")
+    return selected
 
 
 def _newest_metadata(run_dir):
@@ -168,10 +175,9 @@ def _print_result(name, result):
 
 def main():
     args = _parse_args()
-    scenario_file, _, scenarios, suites, acceptance = (
-        load_scenario_catalog(args.scenario_file))
-    selected = select_scenarios(
-        args.selection, scenarios, suites)
+    scenario_file, scenarios, acceptance = _load_catalog(
+        args.scenario_file)
+    selected = _select_scenarios(args.scenarios, scenarios)
     output_root = os.path.abspath(os.path.expanduser(args.output_dir))
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     suite_dir = os.path.join(output_root, stamp)
@@ -185,16 +191,11 @@ def main():
             "config_file:={}".format(
                 os.path.abspath(os.path.expanduser(args.config_file))),
             "scenario:={}".format(name),
-            # Avoid recursively launching this suite: a non-empty scenario
-            # selects the single-scenario branch in the launch file.
-            "suite:=",
             "scenario_file:={}".format(scenario_file),
             "output_dir:={}".format(run_dir),
             "seed:={}".format(args.seed + index),
             "show_plot:={}".format(
                 "true" if args.show_plot else "false"),
-            "debug:={}".format(
-                "true" if args.debug else "false"),
         ]
         print("\n[RUN] {}".format(name), flush=True)
         return_code = subprocess.call(command)
@@ -219,7 +220,6 @@ def main():
         "scenario_file": scenario_file,
         "config_file": os.path.abspath(os.path.expanduser(args.config_file)),
         "acceptance": acceptance,
-        "selection": args.selection,
         "selected_scenarios": selected,
         "passed": all(item["passed"] for item in results),
         "completed_count": len(results),

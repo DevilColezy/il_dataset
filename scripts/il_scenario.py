@@ -133,154 +133,44 @@ def compute_pairwise_min_gaps(obstacles, vehicle_r, safety_m):
     return (min_surface, min_post)
 
 
-def _deep_merge_dict(base, override):
-    """Return a recursive copy of ``base`` updated by ``override``."""
-    merged = copy.deepcopy(base) if isinstance(base, dict) else {}
-    if not isinstance(override, dict):
-        return merged
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dict(merged[key], value)
-        else:
-            merged[key] = copy.deepcopy(value)
-    return merged
+# ============================================================================
+#  RadiusRange — multi-range cylinder sampling support
+# ============================================================================
 
+@dataclass
+class RadiusRange:
+    """A single radius sub-range with sampling weight.
 
-def _infer_density_tier(profile_name, density_min, density_max, sg_cfg):
-    """Classify a profile as sparse/medium/dense for coverage scheduling."""
-    name = str(profile_name).lower()
-    for tier in ("sparse", "medium", "dense"):
-        if name.endswith("_{}".format(tier)):
-            return tier
+    Used by mixed-scale profiles (e.g. S10–S12) that need cylinders from
+    multiple distinct size classes within the same scene.
 
-    coverage_cfg = sg_cfg.get("coverage_balancing", {})
-    thresholds = coverage_cfg.get("density_tier_thresholds", {})
-    sparse_max = float(thresholds.get("sparse_max", 0.16))
-    medium_max = float(thresholds.get("medium_max", 0.24))
-    midpoint = 0.5 * (float(density_min) + float(density_max))
-    if midpoint <= sparse_max:
-        return "sparse"
-    if midpoint <= medium_max:
-        return "medium"
-    return "dense"
-
-
-class _StratifiedGridSampler:
-    """Yield jittered XY samples with one sample per grid stratum.
-
-    The old generator drew every obstacle centre independently from a
-    uniform distribution.  That creates avoidable clumps and large empty
-    bands, especially in the long, narrow collection region.  This sampler
-    traverses a shuffled grid and jitters once inside every cell before
-    starting a new pass.  Bounds are supplied at draw time so cylinders with
-    different radii retain their own valid boundary inset.
+    Attributes:
+        min_m: minimum radius in this sub-range (metres).
+        max_m: maximum radius in this sub-range (metres).
+        weight: relative probability of sampling from this range.
+            Weights are normalised across all ranges in a profile.
     """
+    min_m: float
+    max_m: float
+    weight: float = 1.0
 
-    def __init__(self, rng, target_cell_count, aspect_ratio,
-                 minimum_x_bands=1, minimum_y_bands=1):
-        self._rng = rng
-        target_cell_count = max(1, int(target_cell_count))
-        aspect_ratio = max(float(aspect_ratio), 1.0e-6)
-        derived_nx = max(
-            1, int(math.ceil(math.sqrt(
-                target_cell_count * aspect_ratio))))
-        derived_ny = max(
-            1, int(math.ceil(
-                float(target_cell_count) / float(derived_nx))))
-        self.nx = max(int(minimum_x_bands), derived_nx)
-        self.ny = max(int(minimum_y_bands), derived_ny)
-        self._points = []
-        self._cursor = 0
-        self._refill()
+    def __post_init__(self):
+        if self.min_m <= 0.0:
+            raise ValueError("RadiusRange.min_m must be > 0, got {}".format(self.min_m))
+        if self.max_m < self.min_m:
+            raise ValueError("RadiusRange.max_m ({}) < min_m ({})".format(
+                self.max_m, self.min_m))
+        if self.weight <= 0.0:
+            raise ValueError("RadiusRange.weight must be > 0, got {}".format(self.weight))
 
-    def _refill(self):
-        points = []
-        for ix in range(self.nx):
-            for iy in range(self.ny):
-                u = (float(ix) + float(self._rng.uniform(0.0, 1.0))) / self.nx
-                v = (float(iy) + float(self._rng.uniform(0.0, 1.0))) / self.ny
-                points.append((u, v))
-        self._rng.shuffle(points)
-        self._points = points
-        self._cursor = 0
-
-    def draw(self, x_min, x_max, y_min, y_max):
-        if x_min >= x_max or y_min >= y_max:
-            return None
-        if self._cursor >= len(self._points):
-            self._refill()
-        u, v = self._points[self._cursor]
-        self._cursor += 1
-        return (
-            float(x_min + u * (x_max - x_min)),
-            float(y_min + v * (y_max - y_min)),
+    @staticmethod
+    def from_dict(d):
+        """Parse from a YAML dict with keys min, max, weight."""
+        return RadiusRange(
+            min_m=float(d.get("min", 0.0)),
+            max_m=float(d.get("max", 0.0)),
+            weight=float(d.get("weight", 1.0)),
         )
-
-
-def _plan_obstacle_areas(rng, budget_m2, minimum_area_m2,
-                         maximum_area_m2):
-    """Plan individually feasible obstacle areas near a group budget.
-
-    For a chosen obstacle count ``n``, the realisable interval is
-    ``[n * min_area, n * max_area]``.  This function finds the closest such
-    interval to the requested budget and then allocates every obstacle area
-    while preserving feasibility for all remaining obstacles.  It avoids the
-    systematic low-density under-fill caused by greedily placing a minimum
-    obstacle and abandoning a residual smaller than another minimum.
-    """
-    budget = float(budget_m2)
-    minimum_area = float(minimum_area_m2)
-    maximum_area = float(maximum_area_m2)
-    if (budget <= 0.0 or minimum_area <= 0.0 or
-            maximum_area + 1.0e-12 < minimum_area):
-        return []
-
-    ideal_area = 0.5 * (minimum_area + maximum_area)
-    ideal_count = max(1.0, budget / max(ideal_area, 1.0e-12))
-    maximum_count = max(
-        1, int(math.ceil(budget / minimum_area)) + 1)
-    best = None
-    for count in range(1, maximum_count + 1):
-        lower_total = count * minimum_area
-        upper_total = count * maximum_area
-        realised_total = min(
-            max(budget, lower_total), upper_total)
-        error = abs(realised_total - budget)
-        # Prefer an equally close under-fill over an over-fill, then the
-        # count whose mean area is closest to the middle of the radius band.
-        key = (
-            error,
-            1 if realised_total > budget else 0,
-            abs(float(count) - ideal_count),
-            count,
-        )
-        if best is None or key < best[0]:
-            best = (key, count, realised_total)
-
-    _key, count, realised_total = best
-    remaining_total = realised_total
-    areas = []
-    for index in range(count):
-        remaining_count = count - index
-        if remaining_count == 1:
-            area = remaining_total
-        else:
-            lower = max(
-                minimum_area,
-                remaining_total -
-                (remaining_count - 1) * maximum_area)
-            upper = min(
-                maximum_area,
-                remaining_total -
-                (remaining_count - 1) * minimum_area)
-            if upper < lower:
-                upper = lower
-            area = float(rng.uniform(lower, upper))
-        area = min(max(area, minimum_area), maximum_area)
-        areas.append(area)
-        remaining_total -= area
-    rng.shuffle(areas)
-    return areas
 
 
 # ============================================================================
@@ -345,116 +235,431 @@ class SizeGroup:
 
 @dataclass
 class SceneGenerationProfile:
-    """Runtime contract for one density-driven scene profile."""
+    """A single scene generation profile parsed from YAML."""
     name: str
     enabled: bool
     scene_count: int
     seed_offset: int
-    density_mode: str
 
-    size_groups: list
-    total_density_min: float
-    total_density_max: float
+    # Cylinder params
+    radius_min_m: float
+    radius_max_m: float
+    count_min: int
+    count_max: int
 
+    # Density params
+    density_enabled: bool
+    density_mode: str  # "inflated_occupancy" etc.
+    density_target_min: float
+    density_target_max: float
+
+    # Resolved common params (merged from common_cylinder / common_task_generation)
     height_min_m: float
     height_max_m: float
+    require_full_vertical_blocking: bool
     region_boundary_margin_m: float
     minimum_surface_gap_m: float
     minimum_post_inflation_gap_m: float
+    allow_overlap: bool
 
+    # Vehicle
     vehicle_radius_m: float
     safety_margin_m: float
 
-    density_tier: str
-    coverage_balancing: dict
+    # Task params
+    tasks_per_scene: int
+    start_height_min_m: float
+    start_height_max_m: float
+    goal_height_min_m: float
+    goal_height_max_m: float
+    maximum_start_goal_height_difference_m: float
+    minimum_start_goal_distance_m: float
+    maximum_start_goal_distance_m: float
+    require_direct_path_blocked: bool
+    minimum_direct_blocker_count: int
+    maximum_direct_blocker_count: int
+    require_astar_reachable: bool
+    minimum_detour_ratio: float
+    maximum_detour_ratio: float
+
+    # Overrides (any profile-level overrides dict, kept for metadata)
+    overrides: dict = field(default_factory=dict)
+
+    # Multi-range sampling (mixed-scale scenes)
+    radius_ranges: list = field(default_factory=list)
+
+    # ── Density-driven mode fields (v10) ──────────────────────────
+    size_groups: list = field(default_factory=list)     # list of SizeGroup
+    total_density_min: float = 0.05
+    total_density_max: float = 0.20
+    forbid_enclosed_free_components: bool = True
+    forbid_inflated_component_merging: bool = True
+
+    # Task params — legacy single-region (backward compat, must be after non-defaults)
+    start_sampling_region: dict = field(default_factory=dict)
+    goal_sampling_region: dict = field(default_factory=dict)
+    # Task params — multi-region lists (v6, preferred)
+    start_sampling_regions: list = field(default_factory=list)
+    goal_sampling_regions: list = field(default_factory=list)
 
     @property
     def inflation_radius_m(self):
         return self.vehicle_radius_m + self.safety_margin_m
 
     @staticmethod
-    def from_density_config(profile_dict, scene_generation_cfg):
-        """Parse the sole density-driven profile schema."""
+    def from_yaml_dict(profile_dict, common_cfg):
+        """Parse a single profile dict with common config fallback.
+
+        Profile fields override common_cfg fields.
+        """
         name = str(profile_dict.get("name", "unnamed"))
         enabled = bool(profile_dict.get("enabled", True))
-        scene_count = int(profile_dict.get("scene_count", 1))
+        scene_count = int(profile_dict.get("scene_count", 10))
         seed_offset = int(profile_dict.get("seed_offset", 0))
 
-        groups_raw = profile_dict.get("size_groups", {})
-        size_groups = []
-        for group_name in ("large", "medium", "small"):
-            group = SizeGroup.from_dict(
-                groups_raw.get(group_name, {}),
-                default_name=group_name)
-            group.name = group_name
-            size_groups.append(group)
+        # Cylinder params (profile overrides common_cylinder)
+        cyl_cfg = profile_dict.get("cylinder", {})
+        common_cyl = common_cfg.get("common_cylinder", {})
 
-        total_density_min = float(
-            profile_dict.get("density_min", 0.05))
-        total_density_max = float(
-            profile_dict.get("density_max", 0.15))
+        radius_min_m = float(cyl_cfg.get("radius_min_m",
+            common_cyl.get("radius_min_m", 0.30)))
+        radius_max_m = float(cyl_cfg.get("radius_max_m",
+            common_cyl.get("radius_max_m", 1.20)))
+        count_min = int(cyl_cfg.get("count_min",
+            common_cyl.get("count_min", 4)))
+        count_max = int(cyl_cfg.get("count_max",
+            common_cyl.get("count_max", 12)))
 
-        common_cylinder = scene_generation_cfg.get(
-            "common_cylinder", {})
-        vehicle = scene_generation_cfg.get("vehicle", {})
-        common_task = scene_generation_cfg.get(
-            "common_task_generation", {})
+        # Multi-range sampling (mixed-scale scenes, e.g. S10–S12)
+        radius_ranges = []
+        ranges_raw = cyl_cfg.get("ranges", None)
+        if ranges_raw is not None:
+            for r in ranges_raw:
+                radius_ranges.append(RadiusRange.from_dict(r))
+
+        # Density params
+        density_cfg = profile_dict.get("density", {})
+        density_enabled = bool(density_cfg.get("enabled", True))
+        density_mode = str(density_cfg.get("mode", "inflated_occupancy"))
+        density_target_min = float(density_cfg.get("target_min", 0.05))
+        density_target_max = float(density_cfg.get("target_max", 0.15))
+
+        # Resolved common cylinder params
+        height_min_m = float(common_cyl.get("height_min_m", 8.0))
+        height_max_m = float(common_cyl.get("height_max_m", 8.0))
+        require_full_vertical_blocking = bool(common_cyl.get(
+            "require_full_vertical_blocking", True))
+        region_boundary_margin_m = float(common_cyl.get(
+            "region_boundary_margin_m", 0.30))
+        minimum_surface_gap_m = float(common_cyl.get(
+            "minimum_surface_gap_m", 0.0))
+        minimum_post_inflation_gap_m = float(common_cyl.get(
+            "minimum_post_inflation_gap_m", 0.15))
+        allow_overlap = bool(common_cyl.get("allow_overlap", False))
+
+        # Vehicle params
+        vehicle_cfg = common_cfg.get("vehicle", {})
+        vehicle_radius_m = float(vehicle_cfg.get("radius_m",
+            common_cfg.get("topology_validation", {}).get("vehicle_radius_m", 0.30)))
+        safety_margin_m = float(vehicle_cfg.get("safety_margin_m",
+            common_cfg.get("topology_validation", {}).get("safety_margin_m", 0.10)))
+
+        # Task params (profile overrides common_task_generation)
+        task_cfg = profile_dict.get("task_generation", {})
+        common_task = common_cfg.get("common_task_generation", {})
+
+        tasks_per_scene = int(task_cfg.get("tasks_per_scene",
+            common_task.get("tasks_per_scene", 3)))
+
+        # Start/Goal sampling regions — support both single (legacy) and multi (v6)
+        start_sampling_region = task_cfg.get("start_sampling_region", None)
+        goal_sampling_region = task_cfg.get("goal_sampling_region", None)
+        start_sampling_regions = task_cfg.get("start_sampling_regions", None)
+        goal_sampling_regions = task_cfg.get("goal_sampling_regions", None)
+
+        # Backward compat: if singular is provided, wrap as single-element list
+        if start_sampling_regions is None and start_sampling_region is not None:
+            start_sampling_regions = [start_sampling_region]
+        if goal_sampling_regions is None and goal_sampling_region is not None:
+            goal_sampling_regions = [goal_sampling_region]
+
+        # Fallback from common if still None
+        if start_sampling_regions is None:
+            sr = common_task.get("start_sampling_region", {})
+            start_sampling_regions = common_task.get("start_sampling_regions", [sr] if sr else [{"x_min": -8.0, "x_max": 10.0, "y_min": -2.0, "y_max": -1.0}])
+        if goal_sampling_regions is None:
+            gr = common_task.get("goal_sampling_region", {})
+            goal_sampling_regions = common_task.get("goal_sampling_regions", [gr] if gr else [{"x_min": -8.0, "x_max": 10.0, "y_min": 30.0, "y_max": 32.0}])
+
+        # Also keep the first entry as the legacy singular fields for backward compat
+        start_sampling_region = start_sampling_regions[0] if start_sampling_regions else {}
+        goal_sampling_region = goal_sampling_regions[0] if goal_sampling_regions else {}
+
+        start_height_min_m = float(task_cfg.get("start_height_min_m",
+            common_task.get("start_height_min_m", 1.8)))
+        start_height_max_m = float(task_cfg.get("start_height_max_m",
+            common_task.get("start_height_max_m", 2.2)))
+        goal_height_min_m = float(task_cfg.get("goal_height_min_m",
+            common_task.get("goal_height_min_m", 1.8)))
+        goal_height_max_m = float(task_cfg.get("goal_height_max_m",
+            common_task.get("goal_height_max_m", 2.2)))
+        maximum_start_goal_height_difference_m = float(
+            task_cfg.get("maximum_start_goal_height_difference_m",
+                common_task.get("maximum_start_goal_height_difference_m", 0.20)))
+        minimum_start_goal_distance_m = float(
+            task_cfg.get("minimum_start_goal_distance_m",
+                common_task.get("minimum_start_goal_distance_m", 28.0)))
+        maximum_start_goal_distance_m = float(
+            task_cfg.get("maximum_start_goal_distance_m",
+                common_task.get("maximum_start_goal_distance_m", 40.0)))
+        require_direct_path_blocked = bool(
+            task_cfg.get("require_direct_path_blocked",
+                common_task.get("require_direct_path_blocked", True)))
+        minimum_direct_blocker_count = int(
+            task_cfg.get("minimum_direct_blocker_count",
+                common_task.get("minimum_direct_blocker_count", 1)))
+        maximum_direct_blocker_count = int(
+            task_cfg.get("maximum_direct_blocker_count",
+                common_task.get("maximum_direct_blocker_count", 3)))
+        require_astar_reachable = bool(
+            task_cfg.get("require_astar_reachable",
+                common_task.get("require_astar_reachable", True)))
+        minimum_detour_ratio = float(
+            task_cfg.get("minimum_detour_ratio",
+                common_task.get("minimum_detour_ratio", 1.03)))
+        maximum_detour_ratio = float(
+            task_cfg.get("maximum_detour_ratio",
+                common_task.get("maximum_detour_ratio", 2.00)))
+
+        # Explicit overrides
+        overrides = profile_dict.get("overrides", {})
 
         return SceneGenerationProfile(
             name=name,
             enabled=enabled,
             scene_count=scene_count,
             seed_offset=seed_offset,
+            radius_min_m=radius_min_m,
+            radius_max_m=radius_max_m,
+            count_min=count_min,
+            count_max=count_max,
+            density_enabled=density_enabled,
+            density_mode=density_mode,
+            density_target_min=density_target_min,
+            density_target_max=density_target_max,
+            height_min_m=height_min_m,
+            height_max_m=height_max_m,
+            require_full_vertical_blocking=require_full_vertical_blocking,
+            region_boundary_margin_m=region_boundary_margin_m,
+            minimum_surface_gap_m=minimum_surface_gap_m,
+            minimum_post_inflation_gap_m=minimum_post_inflation_gap_m,
+            allow_overlap=allow_overlap,
+            vehicle_radius_m=vehicle_radius_m,
+            safety_margin_m=safety_margin_m,
+            tasks_per_scene=tasks_per_scene,
+            start_sampling_region=start_sampling_region,
+            goal_sampling_region=goal_sampling_region,
+            start_sampling_regions=start_sampling_regions,
+            goal_sampling_regions=goal_sampling_regions,
+            start_height_min_m=start_height_min_m,
+            start_height_max_m=start_height_max_m,
+            goal_height_min_m=goal_height_min_m,
+            goal_height_max_m=goal_height_max_m,
+            maximum_start_goal_height_difference_m=maximum_start_goal_height_difference_m,
+            minimum_start_goal_distance_m=minimum_start_goal_distance_m,
+            maximum_start_goal_distance_m=maximum_start_goal_distance_m,
+            require_direct_path_blocked=require_direct_path_blocked,
+            minimum_direct_blocker_count=minimum_direct_blocker_count,
+            maximum_direct_blocker_count=maximum_direct_blocker_count,
+            require_astar_reachable=require_astar_reachable,
+            minimum_detour_ratio=minimum_detour_ratio,
+            maximum_detour_ratio=maximum_detour_ratio,
+            radius_ranges=radius_ranges,
+            overrides=overrides,
+        )
+
+    @staticmethod
+    def from_yaml_dict_v2(profile_dict, sg_cfg):
+        """Parse a density-driven profile (v10 schema).
+
+        Uses size_groups + total_density instead of legacy cylinder params.
+        """
+        name = str(profile_dict.get("name", "unnamed"))
+        enabled = bool(profile_dict.get("enabled", True))
+        scene_count = int(profile_dict.get("scene_count", 1))
+        seed_offset = int(profile_dict.get("seed_offset", 0))
+
+        # Size groups
+        groups_raw = profile_dict.get("size_groups", {})
+        size_groups = []
+        for group_name in ("large", "medium", "small"):
+            gd = groups_raw.get(group_name, {})
+            sg = SizeGroup.from_dict(gd, default_name=group_name)
+            sg.name = group_name
+            size_groups.append(sg)
+
+        # Density range
+        total_density_min = float(profile_dict.get("density_min", 0.05))
+        total_density_max = float(profile_dict.get("density_max", 0.15))
+
+        # Core constraint params (from common level)
+        common_cyl = sg_cfg.get("common_cylinder", {})
+        vehicle_cfg = sg_cfg.get("vehicle", {})
+        topo_cfg = sg_cfg.get("topology_validation", {})
+
+        height_min_m = float(common_cyl.get("height_min_m", 8.0))
+        height_max_m = float(common_cyl.get("height_max_m", 8.0))
+        require_full_vertical_blocking = bool(common_cyl.get(
+            "require_full_vertical_blocking", True))
+        region_boundary_margin_m = float(sg_cfg.get("region_boundary_margin_m",
+            common_cyl.get("region_boundary_margin_m", 0.30)))
+        minimum_surface_gap_m = float(sg_cfg.get("minimum_surface_gap_m",
+            common_cyl.get("minimum_surface_gap_m", 0.0)))
+        minimum_post_inflation_gap_m = float(sg_cfg.get("post_inflation_gap_m",
+            common_cyl.get("minimum_post_inflation_gap_m", 0.15)))
+        allow_overlap = bool(sg_cfg.get("allow_overlap",
+            common_cyl.get("allow_overlap", False)))
+
+        vehicle_radius_m = float(vehicle_cfg.get("radius_m",
+            topo_cfg.get("vehicle_radius_m", 0.30)))
+        safety_margin_m = float(vehicle_cfg.get("safety_margin_m",
+            topo_cfg.get("safety_margin_m", 0.10)))
+
+        forbid_enclosed = bool(sg_cfg.get("forbid_enclosed_free_components",
+            topo_cfg.get("forbid_enclosed_free_components", True)))
+        forbid_merge = bool(sg_cfg.get("forbid_inflated_component_merging",
+            not common_cyl.get("allow_overlap", False)))
+
+        # Task params (from common_task_generation, profile may override)
+        task_cfg = profile_dict.get("task_generation", {})
+        common_task = sg_cfg.get("common_task_generation", {})
+
+        tasks_per_scene = int(task_cfg.get("tasks_per_scene",
+            common_task.get("tasks_per_scene", 12)))
+        start_sampling_regions = task_cfg.get("start_sampling_regions",
+            common_task.get("start_sampling_regions", None))
+        goal_sampling_regions = task_cfg.get("goal_sampling_regions",
+            common_task.get("goal_sampling_regions", None))
+        if start_sampling_regions is None:
+            start_sampling_regions = common_task.get("start_sampling_regions",
+                [{"x_min": -8.0, "x_max": 10.0, "y_min": -2.0, "y_max": -1.0}])
+        if goal_sampling_regions is None:
+            goal_sampling_regions = common_task.get("goal_sampling_regions",
+                [{"x_min": -8.0, "x_max": 10.0, "y_min": 30.0, "y_max": 32.0}])
+
+        start_height_min_m = float(task_cfg.get("start_height_min_m",
+            common_task.get("start_height_min_m", 1.8)))
+        start_height_max_m = float(task_cfg.get("start_height_max_m",
+            common_task.get("start_height_max_m", 2.2)))
+        goal_height_min_m = float(task_cfg.get("goal_height_min_m",
+            common_task.get("goal_height_min_m", 1.8)))
+        goal_height_max_m = float(task_cfg.get("goal_height_max_m",
+            common_task.get("goal_height_max_m", 2.2)))
+        maximum_start_goal_height_difference_m = float(
+            task_cfg.get("maximum_start_goal_height_difference_m",
+                common_task.get("maximum_start_goal_height_difference_m", 1.50)))
+        minimum_start_goal_distance_m = float(
+            task_cfg.get("minimum_start_goal_distance_m",
+                common_task.get("minimum_start_goal_distance_m", 10.0)))
+        maximum_start_goal_distance_m = float(
+            task_cfg.get("maximum_start_goal_distance_m",
+                common_task.get("maximum_start_goal_distance_m", 40.0)))
+        require_direct_path_blocked = bool(
+            task_cfg.get("require_direct_path_blocked",
+                common_task.get("require_direct_path_blocked", True)))
+        minimum_direct_blocker_count = int(
+            task_cfg.get("minimum_direct_blocker_count",
+                common_task.get("minimum_direct_blocker_count", 1)))
+        maximum_direct_blocker_count = int(
+            task_cfg.get("maximum_direct_blocker_count",
+                common_task.get("maximum_direct_blocker_count", 3)))
+        require_astar_reachable = bool(
+            task_cfg.get("require_astar_reachable",
+                common_task.get("require_astar_reachable", True)))
+        minimum_detour_ratio = float(
+            task_cfg.get("minimum_detour_ratio",
+                common_task.get("minimum_detour_ratio", 1.03)))
+        maximum_detour_ratio = float(
+            task_cfg.get("maximum_detour_ratio",
+                common_task.get("maximum_detour_ratio", 2.00)))
+
+        return SceneGenerationProfile(
+            name=name,
+            enabled=enabled,
+            scene_count=scene_count,
+            seed_offset=seed_offset,
+            radius_min_m=size_groups[2].radius_min_m if size_groups else 0.10,
+            radius_max_m=size_groups[0].radius_max_m if size_groups else 3.50,
+            count_min=0,  # n/a for density-driven
+            count_max=0,  # n/a for density-driven
+            density_enabled=True,
             density_mode="inflated_occupancy",
+            density_target_min=total_density_min,
+            density_target_max=total_density_max,
+            height_min_m=height_min_m,
+            height_max_m=height_max_m,
+            require_full_vertical_blocking=require_full_vertical_blocking,
+            region_boundary_margin_m=region_boundary_margin_m,
+            minimum_surface_gap_m=minimum_surface_gap_m,
+            minimum_post_inflation_gap_m=minimum_post_inflation_gap_m,
+            allow_overlap=allow_overlap,
+            vehicle_radius_m=vehicle_radius_m,
+            safety_margin_m=safety_margin_m,
+            tasks_per_scene=tasks_per_scene,
+            start_sampling_region=start_sampling_regions[0] if start_sampling_regions else {},
+            goal_sampling_region=goal_sampling_regions[0] if goal_sampling_regions else {},
+            start_sampling_regions=start_sampling_regions,
+            goal_sampling_regions=goal_sampling_regions,
+            start_height_min_m=start_height_min_m,
+            start_height_max_m=start_height_max_m,
+            goal_height_min_m=goal_height_min_m,
+            goal_height_max_m=goal_height_max_m,
+            maximum_start_goal_height_difference_m=maximum_start_goal_height_difference_m,
+            minimum_start_goal_distance_m=minimum_start_goal_distance_m,
+            maximum_start_goal_distance_m=maximum_start_goal_distance_m,
+            require_direct_path_blocked=require_direct_path_blocked,
+            minimum_direct_blocker_count=minimum_direct_blocker_count,
+            maximum_direct_blocker_count=maximum_direct_blocker_count,
+            require_astar_reachable=require_astar_reachable,
+            minimum_detour_ratio=minimum_detour_ratio,
+            maximum_detour_ratio=maximum_detour_ratio,
+            radius_ranges=[],
             size_groups=size_groups,
             total_density_min=total_density_min,
             total_density_max=total_density_max,
-            height_min_m=float(
-                common_cylinder.get("height_min_m", 8.0)),
-            height_max_m=float(
-                common_cylinder.get("height_max_m", 8.0)),
-            region_boundary_margin_m=float(
-                common_cylinder.get(
-                    "region_boundary_margin_m", 0.30)),
-            minimum_surface_gap_m=float(
-                common_cylinder.get(
-                    "minimum_surface_gap_m", 0.0)),
-            minimum_post_inflation_gap_m=float(
-                common_cylinder.get(
-                    "minimum_post_inflation_gap_m", 0.15)),
-            vehicle_radius_m=float(vehicle.get("radius_m", 0.30)),
-            safety_margin_m=float(
-                vehicle.get("safety_margin_m", 0.10)),
-            density_tier=str(profile_dict.get(
-                "density_tier",
-                _infer_density_tier(
-                    name, total_density_min, total_density_max,
-                    scene_generation_cfg))),
-            coverage_balancing=dict(
-                common_task.get("coverage_balancing", {})),
+            forbid_enclosed_free_components=forbid_enclosed,
+            forbid_inflated_component_merging=forbid_merge,
+            overrides=profile_dict.get("overrides", {}),
         )
 
 
-
 def load_scene_profiles(config):
-    """Load enabled density-driven profiles in YAML order."""
+    """Load enabled scene generation profiles from config.
+
+    Supports sources: procedural_yaml, procedural_profiles, density_driven.
+
+    Returns:
+        list of SceneGenerationProfile (only enabled profiles, in YAML order).
+    """
     sg_cfg = config.get("global", {}).get("scene_generation", {})
-    source = str(sg_cfg.get("source", "density_driven")).strip()
-    if source != "density_driven":
-        raise ValueError(
-            "load_scene_profiles requires source='density_driven', got '{}'"
-            .format(source))
+    source = sg_cfg.get("source", "procedural_yaml")
+
+    if source not in ("procedural_profiles", "density_driven"):
+        # Legacy mode: no profiles
+        return []
 
     profiles_raw = sg_cfg.get("profiles", [])
     if not profiles_raw:
-        rospy.logwarn(
-            "[Profiles] density_driven profiles list is empty.")
+        rospy.logwarn("[Profiles] source='%s' but profiles list is empty.", source)
         return []
 
     profiles = []
     seen_names = set()
     for p in profiles_raw:
-        profile = SceneGenerationProfile.from_density_config(p, sg_cfg)
+        if source == "density_driven":
+            profile = SceneGenerationProfile.from_yaml_dict_v2(p, sg_cfg)
+        else:
+            profile = SceneGenerationProfile.from_yaml_dict(p, sg_cfg)
         if not profile.enabled:
             rospy.loginfo("[Profiles] Skipping disabled profile '%s'.", profile.name)
             continue
@@ -462,55 +667,6 @@ def load_scene_profiles(config):
             raise ValueError("Duplicate profile name: '{}'".format(profile.name))
         seen_names.add(profile.name)
         profiles.append(profile)
-
-    coverage_cfg = sg_cfg.get("coverage_balancing", {})
-    if (coverage_cfg.get("enabled", False) and
-            coverage_cfg.get("require_density_tier_mix", True)):
-        mix_scope = str(coverage_cfg.get(
-            "density_tier_mix_scope", "all_multi_scene_runs")).lower()
-        if mix_scope not in ("all_multi_scene_runs", "full_catalog"):
-            raise ValueError(
-                "coverage_balancing.density_tier_mix_scope must be "
-                "'all_multi_scene_runs' or 'full_catalog'")
-        full_catalog_enabled = all(
-            bool(item.get("enabled", True)) for item in profiles_raw)
-        check_density_mix = (
-            mix_scope == "all_multi_scene_runs" or full_catalog_enabled)
-        required = set(str(v).lower() for v in coverage_cfg.get(
-            "required_density_tiers", ["sparse", "medium", "dense"]))
-        scene_counts = {}
-        for profile in profiles:
-            tier = str(profile.density_tier).lower()
-            scene_counts[tier] = (
-                scene_counts.get(tier, 0) + int(profile.scene_count))
-        total_scenes = sum(scene_counts.values())
-
-        # A one-scene expert smoke test deliberately selects one profile.
-        # The canonical full-catalog run must retain every requested density
-        # domain.  Explicit profile subsets remain useful for diagnostics.
-        if check_density_mix and total_scenes > 1:
-            missing = sorted(required.difference(scene_counts))
-            if missing:
-                raise ValueError(
-                    "Coverage-balanced generation needs density tiers {}; "
-                    "missing {} from enabled profiles".format(
-                        sorted(required), missing))
-            minimum_fraction = float(coverage_cfg.get(
-                "minimum_scene_fraction_per_density_tier", 0.0))
-            maximum_fraction = float(coverage_cfg.get(
-                "maximum_scene_fraction_per_density_tier", 1.0))
-            for tier in sorted(required):
-                fraction = float(scene_counts[tier]) / float(total_scenes)
-                if fraction < minimum_fraction or fraction > maximum_fraction:
-                    raise ValueError(
-                        "Density tier '{}' occupies {:.1%} of {} scenes; "
-                        "coverage limits are [{:.1%}, {:.1%}]".format(
-                            tier, fraction, total_scenes,
-                            minimum_fraction, maximum_fraction))
-        elif not check_density_mix:
-            rospy.logwarn(
-                "[Profiles] Density-tier mix guard skipped for an explicit "
-                "profile subset (scope=full_catalog).")
 
     rospy.loginfo("[Profiles] Loaded %d enabled profiles: %s",
                   len(profiles), [p.name for p in profiles])
@@ -623,18 +779,6 @@ class TaskValidationResult:
     left_path_length_m: float = 0.0
     right_path_length_m: float = 0.0
 
-    # Coverage-balanced task sampling metadata.  These are task-level
-    # geometric proxies for downstream Guide-label coverage; the actual
-    # frame-level label histogram remains the final source of truth.
-    coverage_target_task_type: str = ""
-    coverage_actual_task_type: str = ""
-    coverage_target_blocker_distance_band: str = ""
-    coverage_actual_blocker_distance_band: str = ""
-    coverage_target_height_band: str = ""
-    coverage_actual_height_band: str = ""
-    coverage_region_pair_index: int = -1
-    nearest_direct_blocker_distance_m: float = 0.0
-
 
 @dataclass
 class ObservabilityAuditResult:
@@ -659,363 +803,593 @@ class ObservabilityAuditResult:
 # ============================================================================
 
 class YamlCylinderSceneGenerator:
-    """Generate density-driven catalogs or explicit fixed test scenes.
+    """Generate random cylinder obstacle scenes from YAML configuration.
 
-    density_driven is the sole dataset-generation path. fixed_scenario
-    reuses the same geometry contract for deterministic expert diagnostics.
+    Supports two modes:
+      - Legacy (source="procedural_yaml"): single flat cylinder config.
+      - Profile (source="procedural_profiles"): density-driven per-profile generation.
+
+    Only cylinder obstacles are generated.
+    The obstacle generation region is not treated as a wall or flight boundary.
+    Space outside the obstacle generation region remains traversable.
     """
-
-    _SUPPORTED_SOURCES = ("density_driven", "fixed_scenario")
 
     def __init__(self, config):
         cfg = config.get("global", {}).get("scene_generation", {})
         self._cfg = cfg
-        self._source = str(
-            cfg.get("source", "density_driven")).strip()
-        if self._source not in self._SUPPORTED_SOURCES:
-            raise ValueError(
-                "scene_generation.source must be one of {}, got '{}'"
-                .format(self._SUPPORTED_SOURCES, self._source))
+        self._source = cfg.get("source", "procedural_yaml")
+        self._legacy_cyl_cfg = cfg.get("cylinder", {})
+        self._topo_cfg = cfg.get("topology_validation", {})
 
-        region = cfg.get("obstacle_region", {})
         self.obstacle_region = ObstacleRegion(
-            x_min=float(region.get("x_min", -8.0)),
-            x_max=float(region.get("x_max", 8.0)),
-            y_min=float(region.get("y_min", -6.0)),
-            y_max=float(region.get("y_max", 6.0)),
-            z_min=float(region.get("z_min", 0.0)),
-            z_max=float(region.get("z_max", 6.0)),
+            x_min=float(cfg.get("obstacle_region", {}).get("x_min", -8.0)),
+            x_max=float(cfg.get("obstacle_region", {}).get("x_max", 8.0)),
+            y_min=float(cfg.get("obstacle_region", {}).get("y_min", -6.0)),
+            y_max=float(cfg.get("obstacle_region", {}).get("y_max", 6.0)),
+            z_min=float(cfg.get("obstacle_region", {}).get("z_min", 0.0)),
+            z_max=float(cfg.get("obstacle_region", {}).get("z_max", 6.0)),
         )
 
-        execution = cfg.get("execution", {})
-        self.max_scene_attempts = int(execution.get(
-            "max_generation_attempts_per_scene", 500))
-        self.max_obs_attempts = int(execution.get(
-            "max_obstacle_sampling_attempts", 5000))
+        exec_cfg = cfg.get("execution", {})
+        self.max_scene_attempts = int(exec_cfg.get(
+            "max_generation_attempts_per_scene",
+            cfg.get("max_scene_generation_attempts", 500)))
+        self.max_obs_attempts = int(exec_cfg.get(
+            "max_obstacle_sampling_attempts",
+            cfg.get("max_obstacle_sampling_attempts", 5000)))
 
-        generation_quality = cfg.get("generation_quality", {})
-        self.minimum_density_achievement_ratio = float(
-            generation_quality.get(
-                "minimum_density_achievement_ratio", 0.97))
-        if not 0.0 < self.minimum_density_achievement_ratio <= 1.0:
-            raise ValueError(
-                "scene_generation.generation_quality."
-                "minimum_density_achievement_ratio must be in (0, 1]")
+        # Legacy params (used when source != "procedural_profiles")
+        self.region_margin = float(self._legacy_cyl_cfg.get("region_boundary_margin_m", 0.30))
+        self.min_surface_gap = float(self._legacy_cyl_cfg.get("minimum_surface_gap_m", 1.20))
+        self.min_inflated_gap = float(self._legacy_cyl_cfg.get("minimum_inflated_gap_m", 0.60))
+        self.allow_overlap = bool(self._legacy_cyl_cfg.get("allow_overlap", False))
+        self.allow_inflated_merge = bool(self._legacy_cyl_cfg.get("allow_inflated_component_merging", False))
 
-        stratification = cfg.get("placement_stratification", {})
-        self.placement_stratification_enabled = bool(
-            stratification.get("enabled", True))
-        self.placement_x_bands = int(
-            stratification.get("x_bands", 1))
-        self.placement_y_bands = int(
-            stratification.get("y_bands", 1))
-        if self.placement_x_bands < 1 or self.placement_y_bands < 1:
-            raise ValueError(
-                "scene_generation.placement_stratification x_bands and "
-                "y_bands must both be >= 1")
+        self.vehicle_r = float(self._topo_cfg.get("vehicle_radius_m", 0.30))
+        self.safety_m = float(self._topo_cfg.get("safety_margin_m", 0.10))
+        self.inflated_extra = self.vehicle_r + self.safety_m
 
-        common_cylinder = cfg.get("common_cylinder", {})
-        self.region_margin = float(common_cylinder.get(
-            "region_boundary_margin_m", 0.30))
         self.base_seed = int(cfg.get("seed", 12345))
+        self._rng = None
+
+        # Profile mode: loaded profiles
+        self._profiles = []
+        if self._source == "procedural_profiles":
+            self._profiles = load_scene_profiles(config)
+
+    @property
+    def is_profile_mode(self):
+        return self._source == "procedural_profiles" and len(self._profiles) > 0
+
+    def get_profiles(self):
+        return list(self._profiles)
+
+    def set_seed(self, seed):
+        self.base_seed = int(seed)
+        self._rng = np.random.Generator(np.random.PCG64(self.base_seed))
 
     def _make_np_rng(self, seed):
-        """Create a reproducible NumPy generator."""
+        """Create a numpy Generator for reproducible randomness."""
         return np.random.Generator(np.random.PCG64(int(seed)))
 
+    def _make_rng(self, sub_seed):
+        """Legacy random.Random (for backward compat)."""
+        return random.Random(self.base_seed + int(sub_seed))
 
-    @staticmethod
-    def _allocate_group_budgets(groups, target_area, inflation_radius):
-        """Allocate inflated-area budget while preserving every scale group.
-
-        Each configured group first receives enough area for one minimum-size
-        obstacle.  Remaining area is distributed by the normalized
-        ``capacity_fraction`` values.  This makes small-heavy/balanced/
-        large-heavy profiles real rather than cosmetic names.
-        """
-        if not groups:
-            raise ValueError("at least one size group is required")
-        target = float(target_area)
-        if not np.isfinite(target) or target <= 0.0:
-            raise ValueError("target_area must be finite and positive")
-
-        minimums = np.asarray([
-            group.min_inflated_area_m2(inflation_radius)
-            for group in groups
-        ], dtype=np.float64)
-        minimum_total = float(np.sum(minimums))
-        if target + 1.0e-9 < minimum_total:
-            return None
-
-        fractions = np.asarray([
-            group.capacity_fraction for group in groups
-        ], dtype=np.float64)
-        if (not np.all(np.isfinite(fractions)) or
-                np.any(fractions <= 0.0)):
-            raise ValueError(
-                "size-group capacity fractions must be finite and positive")
-        fractions /= float(np.sum(fractions))
-        remaining = max(0.0, target - minimum_total)
-        budgets = minimums + remaining * fractions
-        return {
-            group.name: float(budget)
-            for group, budget in zip(groups, budgets)
-        }
+    # ── Legacy generation ────────────────────────────────────────────
 
     def generate_scene(self, attempt_sub_seed=0):
-        """Load the explicit obstacle list for a fixed diagnostic scene."""
-        del attempt_sub_seed
-        if self._source != "fixed_scenario":
-            raise RuntimeError(
-                "generate_scene is only valid for source='fixed_scenario'")
+        """Legacy generate one obstacle layout. Returns (obstacles, rejection).
 
-        fixed_specs = self._cfg.get("fixed_obstacles", [])
-        common_cylinder = self._cfg.get("common_cylinder", {})
-        default_height = 0.5 * (
-            float(common_cylinder.get("height_min_m", 8.0)) +
-            float(common_cylinder.get("height_max_m", 8.0)))
+        Used when source != "procedural_profiles".
+        On failure, returns ([], reason_string).
+        """
+        fixed_specs = self._cfg.get("fixed_obstacles", None)
+        if fixed_specs is not None:
+            obstacles = []
+            seen_ids = set()
+            for index, item in enumerate(fixed_specs):
+                try:
+                    obstacle_id = str(
+                        item.get("id", "fixed_{:03d}".format(index)))
+                    center = np.asarray(item["center"], dtype=np.float64)
+                    radius = float(item["radius_m"])
+                    height = float(item.get("height_m", 8.0))
+                except (KeyError, TypeError, ValueError):
+                    return [], "FIXED_OBSTACLE_SCHEMA_INVALID"
+                if (obstacle_id in seen_ids or center.shape != (3,) or
+                        not np.all(np.isfinite(center)) or radius <= 0.0 or
+                        height <= 0.0):
+                    return [], "FIXED_OBSTACLE_SCHEMA_INVALID"
+                if not self.obstacle_region.contains_cylinder(
+                        center[:2], radius, self.region_margin):
+                    return [], "FIXED_OBSTACLE_OUTSIDE_REGION"
+                if (center[2] - 0.5 * height <
+                        self.obstacle_region.z_min - 1.0e-6 or
+                        center[2] + 0.5 * height >
+                        self.obstacle_region.z_max + 1.0e-6):
+                    return [], "FIXED_OBSTACLE_OUTSIDE_VERTICAL_REGION"
+                seen_ids.add(obstacle_id)
+                obstacles.append(CylinderObstacleSpec(
+                    obstacle_id=obstacle_id,
+                    center_world=center,
+                    radius_m=radius,
+                    height_m=height))
+            if not obstacles:
+                return [], "FIXED_OBSTACLE_LIST_EMPTY"
+            return obstacles, ""
+
+        rng = self._make_rng(attempt_sub_seed)
+
+        count_min = int(self._legacy_cyl_cfg.get("count_min", 4))
+        count_max = int(self._legacy_cyl_cfg.get("count_max", 12))
+        n_obs = rng.randint(count_min, count_max)
+
+        radius_min = float(self._legacy_cyl_cfg.get("radius_min_m", 0.40))
+        radius_max = float(self._legacy_cyl_cfg.get("radius_max_m", 1.20))
+        height_min = float(self._legacy_cyl_cfg.get("height_min_m", 5.0))
+        height_max = float(self._legacy_cyl_cfg.get("height_max_m", 6.0))
 
         obstacles = []
-        seen_ids = set()
-        for index, item in enumerate(fixed_specs):
-            try:
-                obstacle_id = str(
-                    item.get("id", "fixed_{:03d}".format(index)))
-                center = np.asarray(item["center"], dtype=np.float64)
-                radius = float(item["radius_m"])
-                height = float(item.get("height_m", default_height))
-            except (KeyError, TypeError, ValueError):
-                return [], "FIXED_OBSTACLE_SCHEMA_INVALID"
-            if (obstacle_id in seen_ids or center.shape != (3,) or
-                    not np.all(np.isfinite(center)) or radius <= 0.0 or
-                    height <= 0.0):
-                return [], "FIXED_OBSTACLE_SCHEMA_INVALID"
-            if not self.obstacle_region.contains_cylinder(
-                    center[:2], radius, self.region_margin):
-                return [], "FIXED_OBSTACLE_OUTSIDE_REGION"
-            if (center[2] - 0.5 * height <
-                    self.obstacle_region.z_min - 1.0e-6 or
-                    center[2] + 0.5 * height >
-                    self.obstacle_region.z_max + 1.0e-6):
-                return [], "FIXED_OBSTACLE_OUTSIDE_VERTICAL_REGION"
-            seen_ids.add(obstacle_id)
-            obstacles.append(CylinderObstacleSpec(
-                obstacle_id=obstacle_id,
-                center_world=center,
-                radius_m=radius,
-                height_m=height))
 
-        if not obstacles:
-            return [], "FIXED_OBSTACLE_LIST_EMPTY"
+        for i in range(n_obs):
+            placed = False
+            for _attempt in range(self.max_obs_attempts):
+                radius = rng.uniform(radius_min, radius_max)
+                height = rng.uniform(height_min, height_max)
+                z = rng.uniform(self.obstacle_region.z_min + height / 2.0,
+                                self.obstacle_region.z_max - height / 2.0)
+                if height / 2.0 >= z - self.obstacle_region.z_min:
+                    z = self.obstacle_region.z_min + height / 2.0 + 0.01
+
+                cx = rng.uniform(
+                    self.obstacle_region.x_min + radius + self.region_margin,
+                    self.obstacle_region.x_max - radius - self.region_margin)
+                cy = rng.uniform(
+                    self.obstacle_region.y_min + radius + self.region_margin,
+                    self.obstacle_region.y_max - radius - self.region_margin)
+
+                valid = True
+                center_xy = np.array([cx, cy])
+                for prev in obstacles:
+                    prev_xy = prev.center_xy()
+                    d = float(np.linalg.norm(center_xy - prev_xy))
+                    surface_gap = d - radius - prev.radius_m
+                    if surface_gap < self.min_surface_gap:
+                        valid = False
+                        break
+                    infl_r_i = radius + self.inflated_extra
+                    infl_r_j = prev.radius_m + self.inflated_extra
+                    inflated_gap = d - infl_r_i - infl_r_j
+                    if inflated_gap < self.min_inflated_gap and not self.allow_inflated_merge:
+                        valid = False
+                        break
+
+                if valid:
+                    obs_id = "cylinder_{:04d}".format(i)
+                    obs = CylinderObstacleSpec(
+                        obstacle_id=obs_id,
+                        center_world=np.array([cx, cy, z]),
+                        radius_m=radius,
+                        height_m=height,
+                    )
+                    obstacles.append(obs)
+                    placed = True
+                    break
+
+            if not placed:
+                return [], "SCENE_OBSTACLE_SAMPLING_EXHAUSTED"
+
+        if len(obstacles) < count_min:
+            return [], "SCENE_OBSTACLE_SAMPLING_EXHAUSTED"
+
         return obstacles, ""
 
-    # ── Density-driven dataset generation ────────────────────────────
+    # ── Profile-based generation ─────────────────────────────────────
 
+    def generate_scene_from_profile(self, profile, effective_scene_seed,
+                                     scene_index_in_profile, attempt_index=0):
+        """Generate one scene using a specific profile.
+
+        Density-driven algorithm:
+          1. Sample target_density from [density_target_min, density_target_max]
+          2. Iteratively sample candidate cylinders
+          3. Check region boundary and pairwise passable gap
+          4. Accept if conditions satisfied
+          5. Stop when count >= count_min AND actual density >= target_density
+
+        Args:
+            profile: SceneGenerationProfile.
+            effective_scene_seed: seed for this scene (= base_seed + seed_offset + scene_index).
+            scene_index_in_profile: 0-based index within the profile.
+            attempt_index: generation retry index (0 for first attempt).
+
+        Returns:
+            (obstacles, rejection_reason, actual_target_density, density_mode)
+        """
+        rng = self._make_np_rng(effective_scene_seed + attempt_index * 10007)
+
+        region_area = compute_region_area(self.obstacle_region)
+        density_mode = DensityMode.from_string(profile.density_mode)
+
+        # Sample target density
+        if profile.density_enabled:
+            target_density = float(rng.uniform(
+                profile.density_target_min, profile.density_target_max))
+        else:
+            # Fixed count mode: no density target
+            target_density = None
+
+        obstacles = []
+        count_min = profile.count_min
+        count_max = profile.count_max
+        height_min = profile.height_min_m
+        height_max = profile.height_max_m
+        boundary_margin = profile.region_boundary_margin_m
+        min_surface_gap = profile.minimum_surface_gap_m
+        min_post_inflation_gap = profile.minimum_post_inflation_gap_m
+        infl_radius = profile.inflation_radius_m
+
+        # ── Radius sampling strategy ──────────────────────────────
+        # When radius_ranges is provided (mixed-scale scenes), sample a
+        # sub-range by weight first, then draw uniformly within it.
+        # Otherwise fall back to the legacy single [min, max] range.
+        use_multi_range = (
+            profile.radius_ranges is not None
+            and len(profile.radius_ranges) > 0)
+        if use_multi_range:
+            _range_weights = np.array(
+                [r.weight for r in profile.radius_ranges],
+                dtype=np.float64)
+            _range_weight_sum = float(np.sum(_range_weights))
+            if _range_weight_sum <= 0.0:
+                use_multi_range = False  # safety fallback
+            else:
+                _range_weights /= _range_weight_sum
+                _range_cumulative = np.cumsum(_range_weights)
+
+        def _sample_radius(rng_state):
+            """Sample a cylinder radius using the active strategy."""
+            if use_multi_range:
+                # Weighted range selection
+                p = float(rng_state.uniform(0.0, 1.0))
+                range_idx = int(np.searchsorted(_range_cumulative, p, side="right"))
+                range_idx = min(range_idx, len(profile.radius_ranges) - 1)
+                sel = profile.radius_ranges[range_idx]
+                return float(rng_state.uniform(sel.min_m, sel.max_m))
+            else:
+                return float(rng_state.uniform(
+                    profile.radius_min_m, profile.radius_max_m))
+
+        # For fixed-count (density disabled): pick a target count
+        if not profile.density_enabled:
+            target_count = int(rng.integers(count_min, count_max + 1))
+        else:
+            target_count = None
+
+        obstacle_id_counter = 0
+        sampling_attempts_used = 0
+
+        while sampling_attempts_used < self.max_obs_attempts:
+            # Check count limit
+            if len(obstacles) >= count_max:
+                if profile.density_enabled:
+                    # Reached count_max but density may not be reached
+                    actual_density = compute_density(
+                        obstacles, region_area, density_mode,
+                        profile.vehicle_radius_m, profile.safety_margin_m)
+                    if actual_density < target_density:
+                        return ([], "SCENE_COUNT_LIMIT_REACHED_BEFORE_DENSITY",
+                                target_density, density_mode.value)
+                break
+
+            # Sample radius (multi-range or single-range)
+            radius = _sample_radius(rng)
+            height = float(rng.uniform(height_min, height_max))
+
+            # Sample z
+            z_min_bound = self.obstacle_region.z_min + height / 2.0
+            z_max_bound = self.obstacle_region.z_max - height / 2.0
+            if z_min_bound >= z_max_bound:
+                z = self.obstacle_region.z_min + height / 2.0 + 0.01
+            else:
+                z = float(rng.uniform(z_min_bound, z_max_bound))
+
+            # Sample center (x, y) within region accounting for radius + margin
+            eff_margin = radius + boundary_margin
+            x_min_bound = self.obstacle_region.x_min + eff_margin
+            x_max_bound = self.obstacle_region.x_max - eff_margin
+            y_min_bound = self.obstacle_region.y_min + eff_margin
+            y_max_bound = self.obstacle_region.y_max - eff_margin
+
+            if x_min_bound >= x_max_bound or y_min_bound >= y_max_bound:
+                sampling_attempts_used += 1
+                continue
+
+            cx = float(rng.uniform(x_min_bound, x_max_bound))
+            cy = float(rng.uniform(y_min_bound, y_max_bound))
+
+            center_xy = np.array([cx, cy])
+
+            # Check region boundary
+            if not self.obstacle_region.contains_cylinder(center_xy, radius, boundary_margin):
+                sampling_attempts_used += 1
+                continue
+
+            # Check pairwise passable gap against all existing obstacles
+            pairwise_ok = True
+            for prev in obstacles:
+                prev_xy = prev.center_xy()
+                d = float(np.linalg.norm(center_xy - prev_xy))
+
+                # Surface gap
+                surface_gap = d - radius - prev.radius_m
+                if surface_gap < min_surface_gap:
+                    pairwise_ok = False
+                    break
+
+                # Post-inflation gap
+                # post_inflation_gap = surface_gap - 2 * (vehicle_r + safety_m)
+                post_inflation_gap = d - (radius + infl_radius) - (prev.radius_m + infl_radius)
+                if post_inflation_gap < min_post_inflation_gap:
+                    pairwise_ok = False
+                    break
+
+            if not pairwise_ok:
+                sampling_attempts_used += 1
+                continue
+
+            # Accept candidate
+            obs_id = "cylinder_{:04d}".format(obstacle_id_counter)
+            obstacle_id_counter += 1
+            obs = CylinderObstacleSpec(
+                obstacle_id=obs_id,
+                center_world=np.array([cx, cy, z]),
+                radius_m=radius,
+                height_m=height,
+            )
+            obstacles.append(obs)
+
+            # Check stopping condition
+            if profile.density_enabled and target_density is not None:
+                if len(obstacles) >= count_min:
+                    actual_density = compute_density(
+                        obstacles, region_area, density_mode,
+                        profile.vehicle_radius_m, profile.safety_margin_m)
+                    if actual_density >= target_density:
+                        # Success: density target reached with at least count_min obstacles
+                        break
+            elif target_count is not None:
+                if len(obstacles) >= target_count:
+                    break
+
+        # Post-generation checks
+        if len(obstacles) < count_min:
+            return ([], "SCENE_OBSTACLE_SAMPLING_EXHAUSTED",
+                    target_density, density_mode.value)
+
+        if profile.density_enabled and target_density is not None:
+            actual_density = compute_density(
+                obstacles, region_area, density_mode,
+                profile.vehicle_radius_m, profile.safety_margin_m)
+            if actual_density < target_density:
+                return ([], "SCENE_TARGET_DENSITY_UNREACHABLE",
+                        target_density, density_mode.value)
+
+        return (obstacles, "", target_density, density_mode.value)
+
+    # ── Density-driven generation (v10) ──────────────────────────────
 
     def generate_scene_density_driven(self, profile, effective_scene_seed,
                                        scene_index_in_profile, attempt_index=0):
-        """Generate a stratified, capacity-controlled cylinder scene.
+        """Generate a scene using the density-driven algorithm (v10).
 
-        Each size group is guaranteed at least one feasible obstacle, and the
-        remaining inflated-area budget follows ``capacity_fraction``.  The
-        caller must retry any layout that cannot realise the configured
-        minimum fraction of its sampled target density.
+        Algorithm:
+          1. Compute target inflated area = region_area × target_density.
+          2. Feasibility: target_area > 2 × max(inflated_area_over_all_groups).
+          3. Split budget equally among large/medium/small groups.
+          4. Large → medium → small placement order:
+             - Borrow from small group if large can't fit min obstacle.
+             - Place obstacles randomly; check inflated gap + boundary.
+             - Stop when: consecutive_fails >= threshold OR remaining < min_area.
+          5. Remaining capacity cascades to next group.
+
+        Returns:
+            (obstacles, rejection_reason, target_density, density_mode_str)
         """
         rng = self._make_np_rng(effective_scene_seed + attempt_index * 10007)
         region_area = compute_region_area(self.obstacle_region)
         infl_r = profile.inflation_radius_m
 
-        # Every scale group is part of the new density contract.
-        if not profile.size_groups or len(profile.size_groups) != 3:
-            return ([], "DENSITY_DRIVEN_NEEDS_EXACTLY_3_SIZE_GROUPS",
+        # ── Sanity: need at least 3 size groups ──
+        if not profile.size_groups or len(profile.size_groups) < 3:
+            return ([], "DENSITY_DRIVEN_NEEDS_3_SIZE_GROUPS",
                     None, "inflated_occupancy")
 
-        groups = sorted(
-            profile.size_groups,
-            key=lambda group: group.radius_max_m,
-            reverse=True)
-        g_large, g_medium, g_small = groups
-        fraction_sum = float(sum(
-            group.capacity_fraction for group in groups))
-        if abs(fraction_sum - 1.0) > 1.0e-6:
-            return ([], "DENSITY_DRIVEN_CAPACITY_FRACTIONS_MUST_SUM_TO_ONE",
-                    None, "inflated_occupancy")
+        # Sort groups by radius: large (idx 0), medium (idx 1), small (idx 2)
+        groups = sorted(profile.size_groups,
+                        key=lambda g: g.radius_max_m, reverse=True)
+        g_large, g_medium, g_small = groups[0], groups[1], groups[2]
 
+        # ── 1. Target density and area ──
         target_density = float(rng.uniform(
             profile.total_density_min, profile.total_density_max))
         target_inflated_area = region_area * target_density
 
-        # Reserve one minimum-radius obstacle in every group, then allocate
-        # the discretionary area by the configured capacity fractions.
-        minimum_areas = [
-            group.min_inflated_area_m2(infl_r) for group in groups]
-        mandatory_area = float(sum(minimum_areas))
-        if target_inflated_area + 1.0e-9 < mandatory_area:
-            return ([], "DENSITY_DRIVEN_AREA_TOO_SMALL_FOR_GROUP_MINIMA",
+        # ── 2. Feasibility check ──
+        max_inflated = g_large.max_inflated_area_m2(infl_r)
+        if target_inflated_area <= 2.0 * max_inflated:
+            return ([], "DENSITY_DRIVEN_AREA_TOO_SMALL_FOR_TWO_MAX_OBSTACLES",
                     target_density, "inflated_occupancy")
-        discretionary_area = target_inflated_area - mandatory_area
-        budgets = [
-            minimum_area + discretionary_area * group.capacity_fraction
-            for group, minimum_area in zip(groups, minimum_areas)
-        ]
-        large_budget, medium_budget, small_budget = budgets
+
+        # ── 3. Budget allocation (1/3 each) ──
+        budget_per_group = target_inflated_area / 3.0
+
+        # Capacity borrowing: if large group can't fit even 1 min obstacle
+        min_large_area = g_large.min_inflated_area_m2(infl_r)
+        if budget_per_group < min_large_area:
+            deficit = min_large_area - budget_per_group
+            small_budget = max(0.0, budget_per_group - deficit)
+            large_budget = budget_per_group + deficit
+            medium_budget = budget_per_group
+        else:
+            large_budget = budget_per_group
+            medium_budget = budget_per_group
+            small_budget = budget_per_group
 
         # ── 4. Placement ──
         obstacles = []
         obstacle_id_counter = 0
         boundary_margin = profile.region_boundary_margin_m
-        min_surface_gap = profile.minimum_surface_gap_m
         min_post_inflation_gap = profile.minimum_post_inflation_gap_m
         height_min = profile.height_min_m
         height_max = profile.height_max_m
-        region_width = (
-            self.obstacle_region.x_max - self.obstacle_region.x_min)
-        region_height = (
-            self.obstacle_region.y_max - self.obstacle_region.y_min)
-        aspect_ratio = region_width / max(region_height, 1.0e-9)
+
+        # Track spent inflated area per group
+        spent_large = 0.0
+        spent_medium = 0.0
+        spent_small = 0.0
 
         def _inflated_area(radius):
             return math.pi * (radius + infl_r) ** 2
 
-        def _try_place(group, budget_limit, obstacles_list, id_counter):
+        def _try_place(group, spent_budget, budget_limit, obstacles_list,
+                       consecutive_fail_threshold, rng_state, id_counter):
             """Place obstacles from one size group.
 
-            Returns: (new_obstacles_or_none, spent_area, updated_id_counter).
+            Returns: (updated_spent, new_obstacles, updated_id_counter)
             """
+            consecutive_fails = 0
             new_obs = []
-            local_spent = 0.0
+            local_spent = spent_budget
             local_id = id_counter
-            attempts_used = 0
-            min_area = group.min_inflated_area_m2(infl_r)
-            max_area = group.max_inflated_area_m2(infl_r)
-            planned_areas = _plan_obstacle_areas(
-                rng, budget_limit, min_area, max_area)
-            if not planned_areas:
-                return None, local_spent, local_id
-            sampler = _StratifiedGridSampler(
-                rng,
-                target_cell_count=max(4, 2 * len(planned_areas)),
-                aspect_ratio=aspect_ratio,
-                minimum_x_bands=(
-                    self.placement_x_bands
-                    if self.placement_stratification_enabled else 1),
-                minimum_y_bands=(
-                    self.placement_y_bands
-                    if self.placement_stratification_enabled else 1))
 
-            for area in planned_areas:
-                radius = (
-                    math.sqrt(max(area, 0.0) / math.pi) - infl_r)
-                radius = min(max(
-                    radius, group.radius_min_m), group.radius_max_m)
-                placed = False
+            while True:
+                # Stop conditions
+                min_area = group.min_inflated_area_m2(infl_r)
+                remaining = budget_limit - local_spent
+                if remaining < min_area:
+                    break  # can't fit even smallest obstacle in this group
+                if consecutive_fails >= consecutive_fail_threshold:
+                    break  # too many consecutive placement failures
+
+                # Sample radius and position
+                radius = group.sample_radius(rng_state)
+                area = _inflated_area(radius)
+                if area > remaining:
+                    consecutive_fails += 1
+                    continue
+
+                height = float(rng_state.uniform(height_min, height_max))
+
+                # Sample z
+                z_min_bound = self.obstacle_region.z_min + height / 2.0
+                z_max_bound = self.obstacle_region.z_max - height / 2.0
+                if z_min_bound >= z_max_bound:
+                    z = self.obstacle_region.z_min + height / 2.0 + 0.01
+                else:
+                    z = float(rng_state.uniform(z_min_bound, z_max_bound))
+
+                # Sample (x, y) within region
+                eff_margin = radius + boundary_margin
+                x_min_bound = self.obstacle_region.x_min + eff_margin
+                x_max_bound = self.obstacle_region.x_max - eff_margin
+                y_min_bound = self.obstacle_region.y_min + eff_margin
+                y_max_bound = self.obstacle_region.y_max - eff_margin
+
+                if x_min_bound >= x_max_bound or y_min_bound >= y_max_bound:
+                    consecutive_fails += 1
+                    continue
+
+                cx = float(rng_state.uniform(x_min_bound, x_max_bound))
+                cy = float(rng_state.uniform(y_min_bound, y_max_bound))
+                center_xy = np.array([cx, cy])
+
+                # Check region boundary
+                if not self.obstacle_region.contains_cylinder(
+                        center_xy, radius, boundary_margin):
+                    consecutive_fails += 1
+                    continue
+
+                # Check pairwise inflated gap against ALL existing obstacles
+                all_obs = obstacles_list + new_obs
+                pairwise_ok = True
+                for prev in all_obs:
+                    prev_xy = prev.center_xy()
+                    d = float(np.linalg.norm(center_xy - prev_xy))
+                    # Post-inflation gap (the one that matters)
+                    post_gap = d - (radius + infl_r) - (prev.radius_m + infl_r)
+                    if post_gap < min_post_inflation_gap:
+                        pairwise_ok = False
+                        break
+                    # No overlap (hard constraint)
+                    surface_gap = d - radius - prev.radius_m
+                    if surface_gap < 0.0:
+                        pairwise_ok = False
+                        break
+
+                if not pairwise_ok:
+                    consecutive_fails += 1
+                    continue
+
+                # Accept
+                obs_id = "cylinder_{:04d}".format(local_id)
+                local_id += 1
+
+                obs = CylinderObstacleSpec(
+                    obstacle_id=obs_id,
+                    center_world=np.array([cx, cy, z]),
+                    radius_m=radius,
+                    height_m=height,
+                )
+                new_obs.append(obs)
+                local_spent += area
                 consecutive_fails = 0
-                while (attempts_used < self.max_obs_attempts and
-                       consecutive_fails <
-                       group.consecutive_fail_threshold):
-                    height = float(rng.uniform(height_min, height_max))
-                    z_min_bound = (
-                        self.obstacle_region.z_min + height / 2.0)
-                    z_max_bound = (
-                        self.obstacle_region.z_max - height / 2.0)
-                    if z_min_bound > z_max_bound + 1.0e-9:
-                        return None, local_spent, local_id
-                    if abs(z_max_bound - z_min_bound) <= 1.0e-9:
-                        z = 0.5 * (z_min_bound + z_max_bound)
-                    else:
-                        z = float(rng.uniform(
-                            z_min_bound, z_max_bound))
 
-                    effective_margin = radius + boundary_margin
-                    sampled_xy = sampler.draw(
-                        self.obstacle_region.x_min + effective_margin,
-                        self.obstacle_region.x_max - effective_margin,
-                        self.obstacle_region.y_min + effective_margin,
-                        self.obstacle_region.y_max - effective_margin)
-                    attempts_used += 1
-                    if sampled_xy is None:
-                        return None, local_spent, local_id
-                    cx, cy = sampled_xy
-                    center_xy = np.array(
-                        [cx, cy], dtype=np.float64)
+            return local_spent, new_obs, local_id
 
-                    pairwise_ok = True
-                    for previous in obstacles_list + new_obs:
-                        distance = float(np.linalg.norm(
-                            center_xy - previous.center_xy()))
-                        surface_gap = (
-                            distance - radius - previous.radius_m)
-                        post_gap = surface_gap - 2.0 * infl_r
-                        if (surface_gap + 1.0e-9 <
-                                min_surface_gap or
-                                post_gap + 1.0e-9 <
-                                min_post_inflation_gap):
-                            pairwise_ok = False
-                            break
-                    if not pairwise_ok:
-                        consecutive_fails += 1
-                        continue
+        # ── Place large obstacles ──
+        spent_large, large_obs, obstacle_id_counter = _try_place(
+            g_large, spent_large, large_budget, obstacles,
+            g_large.consecutive_fail_threshold, rng, obstacle_id_counter)
+        obstacles.extend(large_obs)
 
-                    new_obs.append(CylinderObstacleSpec(
-                        obstacle_id="cylinder_{:04d}".format(local_id),
-                        center_world=np.array(
-                            [cx, cy, z], dtype=np.float64),
-                        radius_m=radius,
-                        height_m=height))
-                    local_id += 1
-                    local_spent += _inflated_area(radius)
-                    placed = True
-                    break
-                if not placed:
-                    return None, local_spent, local_id
+        # Remaining large budget → medium
+        remaining_large = max(0.0, large_budget - spent_large)
+        medium_budget += remaining_large
 
-            return new_obs, local_spent, local_id
+        # ── Place medium obstacles ──
+        spent_medium, medium_obs, obstacle_id_counter = _try_place(
+            g_medium, spent_medium, medium_budget, obstacles,
+            g_medium.consecutive_fail_threshold, rng, obstacle_id_counter)
+        obstacles.extend(medium_obs)
 
-        placed_by_group = OrderedDict()
-        for group, budget in zip(groups, budgets):
-            group_obstacles, _spent, obstacle_id_counter = _try_place(
-                group, budget, obstacles, obstacle_id_counter)
-            if group_obstacles is None:
-                return (
-                    [],
-                    "DENSITY_DRIVEN_GROUP_MINIMUM_PLACEMENT_FAILED_{}".format(
-                        group.name.upper()),
-                    target_density,
-                    "inflated_occupancy")
-            obstacles.extend(group_obstacles)
-            placed_by_group[group.name] = len(group_obstacles)
+        # Remaining medium budget → small (regardless of medium success)
+        remaining_medium = max(0.0, medium_budget - spent_medium)
+        small_budget += remaining_medium
 
+        # ── Place small obstacles ──
+        spent_small, small_obs, obstacle_id_counter = _try_place(
+            g_small, spent_small, small_budget, obstacles,
+            g_small.consecutive_fail_threshold, rng, obstacle_id_counter)
+        obstacles.extend(small_obs)
+
+        # ── Post-generation: any obstacles at all? ──
+        if len(obstacles) == 0:
+            return ([], "DENSITY_DRIVEN_NO_OBSTACLES_PLACED",
+                    target_density, "inflated_occupancy")
+
+        # ── Density report ──
         actual_density = compute_inflated_occupancy(
             obstacles, region_area,
             profile.vehicle_radius_m, profile.safety_margin_m)
-        achievement_ratio = (
-            actual_density / target_density
-            if target_density > 1.0e-12 else 1.0)
-        if (achievement_ratio + 1.0e-9 <
-                self.minimum_density_achievement_ratio):
-            rospy.logwarn(
-                "[DensityDriven] profile='%s' scene=%d rejected: "
-                "density %.4f / %.4f = %.1f%%, required %.1f%%",
-                profile.name, scene_index_in_profile,
-                actual_density, target_density,
-                100.0 * achievement_ratio,
-                100.0 * self.minimum_density_achievement_ratio)
-            return ([], "DENSITY_DRIVEN_TARGET_DENSITY_UNDERSHOT",
-                    target_density, "inflated_occupancy")
-
-        rospy.loginfo(
-            "[DensityDriven] profile='%s' scene=%d: placed %d obstacles "
-            "(L=%d M=%d S=%d), density=%.3f (target=%.3f, %.1f%%), "
-            "capacity=(%.2f,%.2f,%.2f), budget=(%.1f,%.1f,%.1f) m2",
-            profile.name, scene_index_in_profile, len(obstacles),
-            placed_by_group.get("large", 0),
-            placed_by_group.get("medium", 0),
-            placed_by_group.get("small", 0),
-            actual_density, target_density, 100.0 * achievement_ratio,
-            groups[0].capacity_fraction,
-            groups[1].capacity_fraction,
-            groups[2].capacity_fraction,
-            large_budget, medium_budget, small_budget)
+        rospy.loginfo("[DensityDriven] profile='%s' scene=%d: placed %d obstacles "
+                      "(L=%d M=%d S=%d), density=%.3f (target=%.3f), "
+                      "budget: L=%.1f M=%.1f S=%.1f m²",
+                      profile.name, scene_index_in_profile, len(obstacles),
+                      len(large_obs), len(medium_obs), len(small_obs),
+                      actual_density, target_density,
+                      large_budget, medium_budget, small_budget)
 
         return (obstacles, "", target_density, "inflated_occupancy")
 
@@ -1232,9 +1606,7 @@ class StartGoalTaskGenerator:
     """Generate and validate start-goal task pairs."""
 
     def __init__(self, config):
-        cfg = config.get("global", {}).get(
-            "scene_generation", {}).get(
-                "common_task_generation", {})
+        cfg = config.get("global", {}).get("scene_generation", {}).get("task_generation", {})
         self._cfg = cfg
 
         self.max_attempts = int(cfg.get("max_task_sampling_attempts", 1000))
@@ -1262,387 +1634,109 @@ class StartGoalTaskGenerator:
         self.max_detour = float(cfg.get("maximum_detour_ratio", 1.80))
         self.fixed_tasks = list(cfg.get("fixed_tasks", []))
 
-        start_sampling_regions = cfg.get("start_sampling_regions", [
-            {"x_min": -12.0, "x_max": -8.0,
-             "y_min": -8.0, "y_max": 8.0},
-        ])
-        goal_sampling_regions = cfg.get("goal_sampling_regions", [
-            {"x_min": 8.0, "x_max": 12.0,
-             "y_min": -8.0, "y_max": 8.0},
-        ])
-        self.start_regions = [
-            _region_from_dict(
-                region, self.start_h_min, self.start_h_max)
-            for region in start_sampling_regions
-        ]
-        self.goal_regions = [
-            _region_from_dict(
-                region, self.goal_h_min, self.goal_h_max)
-            for region in goal_sampling_regions
-        ]
+        sr = cfg.get("start_sampling_region", {})
+        self.start_regions = [ObstacleRegion(
+            x_min=float(sr.get("x_min", -12.0)),
+            x_max=float(sr.get("x_max", -8.0)),
+            y_min=float(sr.get("y_min", -8.0)),
+            y_max=float(sr.get("y_max", 8.0)),
+            z_min=float(cfg.get("start_height_min_m", 1.8)),
+            z_max=float(cfg.get("start_height_max_m", 2.2)),
+        )]
+        gr = cfg.get("goal_sampling_region", {})
+        self.goal_regions = [ObstacleRegion(
+            x_min=float(gr.get("x_min", 8.0)),
+            x_max=float(gr.get("x_max", 12.0)),
+            y_min=float(gr.get("y_min", -8.0)),
+            y_max=float(gr.get("y_max", 8.0)),
+            z_min=float(cfg.get("goal_height_min_m", 1.8)),
+            z_max=float(cfg.get("goal_height_max_m", 2.2)),
+        )]
 
-        self._coverage_density_tier = "default"
-        self._configure_coverage(
-            cfg.get("coverage_balancing", {}),
-            density_tier=self._coverage_density_tier)
+        # Multi-region support (v6) — overwrites single if present
+        srs = cfg.get("start_sampling_regions", None)
+        grs = cfg.get("goal_sampling_regions", None)
+        if srs is not None and grs is not None:
+            self.start_regions = [_region_from_dict(r, self.start_h_min, self.start_h_max) for r in srs]
+            self.goal_regions = [_region_from_dict(r, self.goal_h_min, self.goal_h_max) for r in grs]
 
-    @staticmethod
-    def _normalise_weights(raw, allowed, field_name):
-        if not isinstance(raw, dict):
-            raise ValueError("{} must be a mapping".format(field_name))
-        weights = OrderedDict()
-        for key, value in raw.items():
-            name = str(key)
-            if name not in allowed:
-                raise ValueError(
-                    "{} contains unsupported bucket '{}'".format(
-                        field_name, name))
-            weight = float(value)
-            if weight < 0.0:
-                raise ValueError(
-                    "{} weight '{}' must be >= 0".format(field_name, name))
-            if weight > 0.0:
-                weights[name] = weight
-        if not weights:
-            raise ValueError("{} needs at least one positive weight".format(
-                field_name))
-        return weights
+    def set_tasks_per_scene(self, n):
+        """Override the number of tasks to generate per scene.
 
-    def _configure_coverage(self, coverage_cfg, density_tier="default"):
-        """Resolve configurable task-coverage quotas.
-
-        The buckets are geometric proxies available before a trajectory is
-        flown.  They intentionally do not claim to be exact Guide labels.
+        Used by profile mode to apply profile-specific tasks_per_scene.
         """
-        cfg = copy.deepcopy(coverage_cfg) if isinstance(coverage_cfg, dict) else {}
-        self.coverage_enabled = bool(cfg.get("enabled", False))
-        self._coverage_density_tier = str(
-            density_tier or "default").lower()
-        self.coverage_rotate_region_pairs = bool(
-            cfg.get("rotate_region_pairs_by_seed", True))
-        self.coverage_center_lateral_fraction = float(
-            cfg.get("center_lateral_fraction", 0.25))
-        if not 0.0 <= self.coverage_center_lateral_fraction <= 1.0:
-            raise ValueError(
-                "coverage_balancing.center_lateral_fraction must be in [0, 1]")
-
-        type_defaults = OrderedDict([
-            ("clear", 0.25),
-            ("single_left", 0.20),
-            ("single_right", 0.20),
-            ("single_center", 0.15),
-            ("multi_blocker", 0.20),
-        ])
-        by_tier = cfg.get("task_type_weights_by_density_tier", {})
-        raw_type_weights = (
-            by_tier.get(self._coverage_density_tier)
-            if isinstance(by_tier, dict) else None)
-        if raw_type_weights is None and isinstance(by_tier, dict):
-            raw_type_weights = by_tier.get("default")
-        if raw_type_weights is None:
-            raw_type_weights = cfg.get("task_type_weights", type_defaults)
-        self.coverage_task_type_weights = self._normalise_weights(
-            raw_type_weights,
-            {"any", "clear", "single_left", "single_right",
-             "single_center", "multi_blocker"},
-            "coverage_balancing.task_type_weights")
-        if self._coverage_density_tier == "sparse":
-            self.coverage_task_type_weights.pop("multi_blocker", None)
-        elif self._coverage_density_tier == "dense":
-            self.coverage_task_type_weights.pop("clear", None)
-        if not self.coverage_task_type_weights:
-            raise ValueError(
-                "coverage task weights are empty after density-tier "
-                "feasibility filtering")
-
-        raw_distance_bands = cfg.get(
-            "blocker_distance_bands_m",
-            OrderedDict([
-                ("near", [0.0, 6.0]),
-                ("middle", [6.0, 15.0]),
-                ("far", [15.0, 1000.0]),
-            ]))
-        if not isinstance(raw_distance_bands, dict):
-            raise ValueError(
-                "coverage_balancing.blocker_distance_bands_m must be a mapping")
-        self.coverage_distance_bands = OrderedDict()
-        for name, limits in raw_distance_bands.items():
-            if not isinstance(limits, (list, tuple)) or len(limits) != 2:
-                raise ValueError(
-                    "blocker distance band '{}' must be [min, max]".format(
-                        name))
-            lower, upper = float(limits[0]), float(limits[1])
-            if lower < 0.0 or upper <= lower:
-                raise ValueError(
-                    "invalid blocker distance band '{}': {}".format(
-                        name, limits))
-            self.coverage_distance_bands[str(name)] = (lower, upper)
-        distance_weights_by_tier = cfg.get(
-            "blocker_distance_weights_by_density_tier", {})
-        raw_distance_weights = (
-            distance_weights_by_tier.get(self._coverage_density_tier)
-            if isinstance(distance_weights_by_tier, dict) else None)
-        if raw_distance_weights is None and isinstance(
-                distance_weights_by_tier, dict):
-            raw_distance_weights = distance_weights_by_tier.get("default")
-        if raw_distance_weights is None:
-            raw_distance_weights = cfg.get(
-                "blocker_distance_weights",
-                OrderedDict([
-                    ("near", 0.40),
-                    ("middle", 0.40),
-                    ("far", 0.20),
-                ]))
-        self.coverage_distance_weights = self._normalise_weights(
-            raw_distance_weights,
-            set(self.coverage_distance_bands),
-            "coverage_balancing.blocker_distance_weights")
-        if self._coverage_density_tier == "dense":
-            self.coverage_distance_weights.pop("far", None)
-        if not self.coverage_distance_weights:
-            raise ValueError(
-                "coverage distance weights are empty after density-tier "
-                "feasibility filtering")
-
-        self.coverage_level_height_delta_max = float(
-            cfg.get("level_height_delta_max_m", 0.25))
-        self.coverage_nonlevel_height_delta_min = float(
-            cfg.get("minimum_nonlevel_height_delta_m", 0.75))
-        if (self.coverage_level_height_delta_max < 0.0 or
-                self.coverage_nonlevel_height_delta_min <=
-                self.coverage_level_height_delta_max):
-            raise ValueError(
-                "coverage height thresholds need 0 <= level_max < nonlevel_min")
-        self.coverage_height_weights = self._normalise_weights(
-            cfg.get("height_delta_weights",
-                    OrderedDict([
-                        ("level", 1.0),
-                        ("ascending", 0.0),
-                        ("descending", 0.0),
-                    ])),
-            {"any", "level", "ascending", "descending"},
-            "coverage_balancing.height_delta_weights")
-
-    @staticmethod
-    def _quota_sequence(weights, count, rng):
-        """Build an exact largest-remainder quota and shuffle deterministically."""
-        if count <= 0:
-            return []
-        names = list(weights.keys())
-        total = float(sum(weights.values()))
-        raw_counts = [float(weights[name]) / total * count for name in names]
-        counts = [int(math.floor(value)) for value in raw_counts]
-        remainder = count - sum(counts)
-        order = sorted(
-            range(len(names)),
-            key=lambda index: (raw_counts[index] - counts[index], -index),
-            reverse=True)
-        for index in order[:remainder]:
-            counts[index] += 1
-        sequence = []
-        for name, bucket_count in zip(names, counts):
-            sequence.extend([name] * bucket_count)
-        rng.shuffle(sequence)
-        return sequence
-
-    def _effective_task_type_weights(self):
-        weights = OrderedDict(self.coverage_task_type_weights)
-        if self.require_blocked:
-            weights.pop("clear", None)
-        if self.min_blockers >= 2:
-            for name in ("single_left", "single_right", "single_center"):
-                weights.pop(name, None)
-        if self.max_blockers < 2:
-            weights.pop("multi_blocker", None)
-        if not weights:
-            weights["any"] = 1.0
-        return weights
-
-    def _build_coverage_targets(self, count, seed):
-        if not self.coverage_enabled:
-            return [None] * count
-        schedule_rng = random.Random(int(seed) ^ 0x5EEDC0DE)
-        task_types = self._quota_sequence(
-            self._effective_task_type_weights(), count, schedule_rng)
-        blocked_count = sum(
-            task_type not in ("clear", "any")
-            for task_type in task_types)
-        distances = self._quota_sequence(
-            self.coverage_distance_weights, blocked_count, schedule_rng)
-        heights = self._quota_sequence(
-            self.coverage_height_weights, count, schedule_rng)
-        distance_index = 0
-        targets = []
-        for task_index, task_type in enumerate(task_types):
-            distance_band = ""
-            if task_type not in ("clear", "any"):
-                distance_band = distances[distance_index]
-                distance_index += 1
-            targets.append({
-                "task_type": task_type,
-                "blocker_distance_band": distance_band,
-                "height_band": heights[task_index],
-            })
-        return targets
-
-    def _sample_height_pair(self, rng, target_height_band):
-        last_pair = (self.start_h_min, self.goal_h_min)
-        for _ in range(64):
-            start_z = rng.uniform(self.start_h_min, self.start_h_max)
-            goal_z = rng.uniform(self.goal_h_min, self.goal_h_max)
-            last_pair = (start_z, goal_z)
-            if abs(goal_z - start_z) > self.max_h_diff:
-                continue
-            if (target_height_band in ("", "any") or
-                    self._height_band(goal_z - start_z) ==
-                    target_height_band):
-                return last_pair
-        return last_pair
-
-    def _height_band(self, height_delta):
-        if abs(float(height_delta)) <= self.coverage_level_height_delta_max:
-            return "level"
-        if float(height_delta) >= self.coverage_nonlevel_height_delta_min:
-            return "ascending"
-        if float(height_delta) <= -self.coverage_nonlevel_height_delta_min:
-            return "descending"
-        return "transition"
-
-    def _blocker_distance_band(self, distance_m):
-        if distance_m is None:
-            return ""
-        for name, (lower, upper) in self.coverage_distance_bands.items():
-            if lower <= float(distance_m) < upper:
-                return name
-        return "out_of_range"
-
-    def _classify_direct_path(self, start, goal, obstacles):
-        """Classify direct-corridor geometry, including obstacle height."""
-        start = np.asarray(start, dtype=np.float64)
-        goal = np.asarray(goal, dtype=np.float64)
-        direct = goal - start
-        direct_xy = direct[:2]
-        xy_length_sq = float(np.dot(direct_xy, direct_xy))
-        if xy_length_sq < 1.0e-12:
-            return {
-                "task_type": "clear",
-                "blockers": [],
-                "dominant": None,
-                "nearest_distance_m": None,
-                "dominant_lateral_offset_m": 0.0,
-            }
-
-        xy_length = math.sqrt(xy_length_sq)
-        e_xy = direct_xy / xy_length
-        n_xy = np.array([-e_xy[1], e_xy[0]], dtype=np.float64)
-        direct_length = float(np.linalg.norm(direct))
-        blockers = []
-        for obstacle in obstacles:
-            relative_xy = obstacle.center_xy() - start[:2]
-            fraction = float(np.dot(relative_xy, direct_xy) / xy_length_sq)
-            if not 0.0 < fraction < 1.0:
-                continue
-            closest_xy = start[:2] + fraction * direct_xy
-            lateral_offset = float(np.dot(
-                obstacle.center_xy() - closest_xy, n_xy))
-            lateral_distance = abs(lateral_offset)
-            path_z = float(start[2] + fraction * direct[2])
-            half_height = 0.5 * float(obstacle.height_m)
-            obstacle_bottom = float(obstacle.center_world[2]) - half_height
-            obstacle_top = float(obstacle.center_world[2]) + half_height
-            vertical_gap = max(
-                obstacle_bottom - path_z, path_z - obstacle_top, 0.0)
-            lateral_surface_gap = max(
-                lateral_distance - float(obstacle.radius_m), 0.0)
-            if math.hypot(lateral_surface_gap, vertical_gap) > self.corridor_r:
-                continue
-            blockers.append({
-                "obstacle": obstacle,
-                "fraction": fraction,
-                "distance_m": fraction * direct_length,
-                "lateral_offset_m": lateral_offset,
-            })
-
-        blockers.sort(key=lambda item: item["distance_m"])
-        if not blockers:
-            task_type = "clear"
-            dominant = None
-            nearest_distance = None
-            lateral_offset = 0.0
-        elif len(blockers) >= 2:
-            task_type = "multi_blocker"
-            dominant = blockers[0]
-            nearest_distance = dominant["distance_m"]
-            lateral_offset = dominant["lateral_offset_m"]
-        else:
-            dominant = blockers[0]
-            nearest_distance = dominant["distance_m"]
-            lateral_offset = dominant["lateral_offset_m"]
-            normalizer = (
-                float(dominant["obstacle"].radius_m) + self.corridor_r)
-            centered = (
-                abs(lateral_offset) <=
-                self.coverage_center_lateral_fraction * normalizer)
-            if centered:
-                task_type = "single_center"
-            elif lateral_offset > 0.0:
-                task_type = "single_left"
-            else:
-                task_type = "single_right"
-
-        return {
-            "task_type": task_type,
-            "blockers": blockers,
-            "dominant": dominant,
-            "nearest_distance_m": nearest_distance,
-            "dominant_lateral_offset_m": lateral_offset,
-        }
-
-    def _matches_coverage_target(self, target, classification, start, goal):
-        if target is None:
-            return True
-        task_type = target.get("task_type", "any")
-        if (task_type != "any" and
-                classification["task_type"] != task_type):
-            return False
-        distance_band = target.get("blocker_distance_band", "")
-        if (distance_band and self._blocker_distance_band(
-                classification["nearest_distance_m"]) != distance_band):
-            return False
-        height_band = target.get("height_band", "any")
-        if (height_band != "any" and
-                self._height_band(float(goal[2]) - float(start[2])) !=
-                height_band):
-            return False
-        return True
-
-    def _annotate_coverage_result(
-            self, result, target, classification, start, goal,
-            region_pair_index):
-        if target is None:
-            return
-        result.coverage_target_task_type = target.get("task_type", "")
-        result.coverage_actual_task_type = classification["task_type"]
-        result.coverage_target_blocker_distance_band = target.get(
-            "blocker_distance_band", "")
-        result.coverage_actual_blocker_distance_band = (
-            self._blocker_distance_band(
-                classification["nearest_distance_m"]))
-        result.coverage_target_height_band = target.get("height_band", "")
-        result.coverage_actual_height_band = self._height_band(
-            float(goal[2]) - float(start[2]))
-        result.coverage_region_pair_index = int(region_pair_index)
-        result.nearest_direct_blocker_distance_m = float(
-            classification["nearest_distance_m"] or 0.0)
+        self.tasks_per_scene = int(n)
 
     def configure_from_profile(self, profile):
-        """Select density-tier coverage weights for the active profile."""
+        """Apply all profile-specific task generation parameters.
+
+        Called before generate_tasks() when running in profile mode.
+        This fixes the bug where profile-level start_sampling_region,
+        goal_sampling_region, height ranges, distance limits, and
+        blocking requirements were parsed but never applied at runtime.
+
+        Args:
+            profile: SceneGenerationProfile or None.
+        """
         if profile is None:
             return
-        self._configure_coverage(
-            profile.coverage_balancing,
-            density_tier=profile.density_tier)
 
+        # ── Task count ──────────────────────────────────────────
+        self.tasks_per_scene = int(profile.tasks_per_scene)
+
+        # ── Height ranges ───────────────────────────────────────
+        self.start_h_min = float(profile.start_height_min_m)
+        self.start_h_max = float(profile.start_height_max_m)
+        self.goal_h_min = float(profile.goal_height_min_m)
+        self.goal_h_max = float(profile.goal_height_max_m)
+        self.max_h_diff = float(profile.maximum_start_goal_height_difference_m)
+
+        # ── Distance limits ─────────────────────────────────────
+        self.min_dist = float(profile.minimum_start_goal_distance_m)
+        self.max_dist = float(profile.maximum_start_goal_distance_m)
+
+        # ── Blocked-path requirements ───────────────────────────
+        self.require_blocked = bool(profile.require_direct_path_blocked)
+        self.min_blockers = int(profile.minimum_direct_blocker_count)
+        self.max_blockers = int(profile.maximum_direct_blocker_count)
+
+        # ── A* reachability ─────────────────────────────────────
+        self.require_astar = bool(profile.require_astar_reachable)
+        self.min_detour = float(profile.minimum_detour_ratio)
+        self.max_detour = float(profile.maximum_detour_ratio)
+
+        # ── Sampling regions (v6: multi-region) ────────────────
+        if profile.start_sampling_regions:
+            self.start_regions = [
+                _region_from_dict(r, self.start_h_min, self.start_h_max)
+                for r in profile.start_sampling_regions
+            ]
+        elif profile.start_sampling_region:
+            sr = profile.start_sampling_region
+            self.start_regions = [ObstacleRegion(
+                x_min=float(sr.get("x_min", self.start_regions[0].x_min)),
+                x_max=float(sr.get("x_max", self.start_regions[0].x_max)),
+                y_min=float(sr.get("y_min", self.start_regions[0].y_min)),
+                y_max=float(sr.get("y_max", self.start_regions[0].y_max)),
+                z_min=self.start_h_min,
+                z_max=self.start_h_max,
+            )]
+
+        if profile.goal_sampling_regions:
+            self.goal_regions = [
+                _region_from_dict(r, self.goal_h_min, self.goal_h_max)
+                for r in profile.goal_sampling_regions
+            ]
+        elif profile.goal_sampling_region:
+            gr = profile.goal_sampling_region
+            self.goal_regions = [ObstacleRegion(
+                x_min=float(gr.get("x_min", self.goal_regions[0].x_min)),
+                x_max=float(gr.get("x_max", self.goal_regions[0].x_max)),
+                y_min=float(gr.get("y_min", self.goal_regions[0].y_min)),
+                y_max=float(gr.get("y_max", self.goal_regions[0].y_max)),
+                z_min=self.goal_h_min,
+                z_max=self.goal_h_max,
+            )]
 
     def generate_tasks(self, obstacles, esdf, esdf_origin, esdf_res,
                        astar_planner_fn, seed=0):
@@ -1687,83 +1781,39 @@ class StartGoalTaskGenerator:
                 tasks.append((start.tolist(), goal.tolist(), result))
             return tasks
 
-        targets = self._build_coverage_targets(
-            self.tasks_per_scene, seed)
-        pair_count = min(len(self.start_regions), len(self.goal_regions))
-        if pair_count <= 0:
-            raise ValueError(
-                "Task generation needs at least one start/goal region pair")
-        pair_offset = 0
-        if self.coverage_enabled and self.coverage_rotate_region_pairs:
-            pair_offset = int(seed) % pair_count
-
-        def draw_candidate(start_region, goal_region, height_band):
-            sx = rng.uniform(start_region.x_min, start_region.x_max)
-            sy = rng.uniform(start_region.y_min, start_region.y_max)
-            gx = rng.uniform(goal_region.x_min, goal_region.x_max)
-            gy = rng.uniform(goal_region.y_min, goal_region.y_max)
-            sz, gz = self._sample_height_pair(rng, height_band)
-            return (np.array([sx, sy, sz], dtype=np.float64),
-                    np.array([gx, gy, gz], dtype=np.float64))
-
         for task_idx in range(self.tasks_per_scene):
             accepted = False
-            target = targets[task_idx]
-            initial_pair_idx = (task_idx + pair_offset) % pair_count
-            target_height = (
-                target.get("height_band", "any")
-                if target is not None else "any")
-
-            # Strict phase: cheap geometric classification happens before A*,
-            # so quota retries do not repeatedly invoke the expensive planner.
-            # Rotate through every region pair instead of permanently binding
-            # a bucket to one direction that may be structurally infeasible.
-            for _attempt in range(self.max_attempts):
-                pair_idx = (
-                    initial_pair_idx + _attempt) % pair_count
+            for attempt in range(self.max_attempts):
+                # Round-robin distribution across region pairs (v6)
+                # Ensures tasks are evenly spread across all start/goal pairs.
+                pair_idx = task_idx % len(self.start_regions)
                 start_r = self.start_regions[pair_idx]
-                goal_r = self.goal_regions[pair_idx]
-                start, goal = draw_candidate(
-                    start_r, goal_r, target_height)
-                classification = self._classify_direct_path(
-                    start, goal, obstacles)
-                if not self._matches_coverage_target(
-                        target, classification, start, goal):
-                    continue
+                goal_r = self.goal_regions[min(pair_idx, len(self.goal_regions) - 1)]
+
+                sx = rng.uniform(start_r.x_min, start_r.x_max)
+                sy = rng.uniform(start_r.y_min, start_r.y_max)
+                sz = rng.uniform(self.start_h_min, self.start_h_max)
+
+                gx = rng.uniform(goal_r.x_min, goal_r.x_max)
+                gy = rng.uniform(goal_r.y_min, goal_r.y_max)
+                gz = rng.uniform(self.goal_h_min, self.goal_h_max)
+
+                start = np.array([sx, sy, sz])
+                goal = np.array([gx, gy, gz])
+
                 result = self._validate_task(
                     start, goal, obstacles, esdf, esdf_origin, esdf_res,
                     astar_planner_fn)
-                if not result.valid:
-                    continue
-                self._annotate_coverage_result(
-                    result, target, classification, start, goal,
-                    pair_idx)
-                tasks.append((start.tolist(), goal.tolist(), result))
-                accepted = True
-                break
+
+                if result.valid:
+                    tasks.append((start.tolist(), goal.tolist(), result))
+                    accepted = True
+                    break
 
             if not accepted:
-                target_description = (
-                    "{}/{}/{}".format(
-                        target.get("task_type", ""),
-                        target.get("blocker_distance_band", ""),
-                        target.get("height_band", ""))
-                    if target is not None else "unconstrained")
-                raise RuntimeError(
-                    "Task coverage target unavailable: task={} target={} "
-                    "initial_region_pair={} tried_region_pairs={} "
-                    "attempts={}; rejecting the complete "
-                    "scene instead of substituting a mismatched label"
-                    .format(
-                        task_idx, target_description, initial_pair_idx,
-                        pair_count,
-                        self.max_attempts))
+                rospy.logwarn("[TaskGen] Could not generate valid task %d after %d attempts.",
+                              task_idx, self.max_attempts)
 
-        if len(tasks) != self.tasks_per_scene:
-            raise RuntimeError(
-                "Task generation incomplete: produced {}/{} validated tasks; "
-                "rejecting the complete scene".format(
-                    len(tasks), self.tasks_per_scene))
         return tasks
 
     def _validate_task(self, start, goal, obstacles, esdf, esdf_origin, esdf_res,
@@ -1815,13 +1865,19 @@ class StartGoalTaskGenerator:
         # Always classify the direct corridor for dataset metadata.  Blocking
         # is an optional acceptance requirement, allowing both straight-flight
         # and avoidance trajectories in the same generated dataset.
-        classification = self._classify_direct_path(
-            start, goal, obstacles)
-        n_blockers = len(classification["blockers"])
+        direct_dir = direct_vec / direct_dist
+        n_blockers = 0
+        for obs in obstacles:
+            obs_xy = obs.center_xy()
+            proj = float(np.dot(
+                obs_xy - start[:2], direct_dir[:2]))
+            if 0 < proj < direct_dist:
+                closest = start[:2] + proj * direct_dir[:2]
+                lateral = float(np.linalg.norm(obs_xy - closest))
+                if lateral < obs.radius_m + self.corridor_r:
+                    n_blockers += 1
         result.direct_blocker_count = n_blockers
         result.direct_path_blocked = (n_blockers > 0)
-        result.nearest_direct_blocker_distance_m = float(
-            classification["nearest_distance_m"] or 0.0)
 
         if self.require_blocked:
             if n_blockers < self.min_blockers:
@@ -1857,14 +1913,14 @@ class StartGoalTaskGenerator:
                 return result
 
         # ── Dominant obstacle identification ──
-        dominant_info = classification["dominant"]
-        dom_obs = (
-            dominant_info["obstacle"]
-            if dominant_info is not None else None)
+        dom_obs = self._find_dominant_obstacle(start, goal, obstacles)
         if dom_obs is not None:
             result.dominant_obstacle_id = dom_obs.obstacle_id
+            # Lateral offset
+            direct_dir_xy = direct_vec[:2] / max(float(np.linalg.norm(direct_vec[:2])), 1e-6)
+            n_xy = np.array([-direct_dir_xy[1], direct_dir_xy[0]])
             result.dominant_obstacle_lateral_offset_m = float(
-                classification["dominant_lateral_offset_m"])
+                np.dot(dom_obs.center_xy() - start[:2], n_xy))
         elif self.require_blocked:
             result.rejection_reason = "TASK_NO_DOMINANT_OBSTACLE"
             return result
@@ -2149,8 +2205,6 @@ class SceneManifestWriter:
             ("direct_distance_m", validation.direct_distance_m),
             ("direct_path_blocked", validation.direct_path_blocked),
             ("direct_blocker_count", validation.direct_blocker_count),
-            ("nearest_direct_blocker_distance_m",
-             validation.nearest_direct_blocker_distance_m),
             ("astar_length_m", validation.astar_length_m),
             ("detour_ratio", validation.detour_ratio),
             ("dominant_obstacle_id", validation.dominant_obstacle_id),
@@ -2167,20 +2221,6 @@ class SceneManifestWriter:
             ("lower_cost_side", validation.lower_cost_side),
             ("side_cost_difference_ratio", validation.side_cost_difference_ratio),
             ("global_side_choice_valid", validation.global_side_choice_valid),
-            ("coverage_target_task_type",
-             validation.coverage_target_task_type),
-            ("coverage_actual_task_type",
-             validation.coverage_actual_task_type),
-            ("coverage_target_blocker_distance_band",
-             validation.coverage_target_blocker_distance_band),
-            ("coverage_actual_blocker_distance_band",
-             validation.coverage_actual_blocker_distance_band),
-            ("coverage_target_height_band",
-             validation.coverage_target_height_band),
-            ("coverage_actual_height_band",
-             validation.coverage_actual_height_band),
-            ("coverage_region_pair_index",
-             validation.coverage_region_pair_index),
         ])
         scene_dir = os.path.join(self.output_dir, "scenes", profile_name, scene_id)
         os.makedirs(scene_dir, exist_ok=True)

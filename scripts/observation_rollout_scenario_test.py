@@ -10,6 +10,7 @@ import time
 
 import numpy as np
 import rospy
+import yaml
 
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -17,10 +18,6 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from il_config import load_config
-from expert_behavior_catalog import (
-    load_scenario_catalog,
-    select_scenarios,
-)
 from il_trajectory import observation_conditioned_rollout_path
 
 
@@ -28,6 +25,30 @@ def _as_bool(value):
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _load_scenarios(path):
+    resolved = os.path.abspath(os.path.expanduser(path))
+    with open(resolved, "r") as stream:
+        catalog = yaml.safe_load(stream) or {}
+    scenarios = catalog.get("scenarios", {})
+    if not isinstance(scenarios, dict) or not scenarios:
+        raise ValueError(
+            "Scenario catalog contains no scenarios: {}".format(resolved))
+    return resolved, scenarios
+
+
+def _selected_names(selector, scenarios):
+    text = str(selector).strip()
+    if not text or text.lower() == "all":
+        return list(scenarios.keys())
+    names = [part.strip() for part in text.split(",") if part.strip()]
+    unknown = [name for name in names if name not in scenarios]
+    if unknown:
+        raise ValueError(
+            "Unknown scenarios {}. Available: {}".format(
+                unknown, list(scenarios.keys())))
+    return names
 
 
 def _build_cylinder_esdf(global_cfg, obstacles):
@@ -384,9 +405,8 @@ def main():
     fail_on_error = _as_bool(
         rospy.get_param("~fail_on_error", True))
 
-    resolved, _, scenarios, suites, _ = load_scenario_catalog(
-        scenario_file)
-    names = select_scenarios(selector, scenarios, suites)
+    resolved, scenarios = _load_scenarios(scenario_file)
+    names = _selected_names(selector, scenarios)
     rospy.loginfo(
         "[ObsRolloutTest] catalog=%s scenarios=%s planner=%s",
         resolved, names,
