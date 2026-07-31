@@ -154,12 +154,12 @@ class ExpertBehaviorFigure(object):
             ax.plot([_number(row, "x") for row in self.raw_global_path],
                     [_number(row, "y") for row in self.raw_global_path],
                     ":", color="cornflowerblue", linewidth=1.0,
-                    label="planner knots (diagnostic)")
+                    label="mission endpoints (diagnostic)")
         if self.global_path:
             ax.plot([_number(row, "x") for row in self.global_path],
                     [_number(row, "y") for row in self.global_path],
                     "--", color="tab:blue", linewidth=1.6,
-                    label="0.10 m guide/reference path")
+                    label="mission axis (not used as Guide)")
         ax.set_xlabel("world x [m]")
         ax.set_ylabel("world y [m]")
         ax.grid(True, alpha=0.25)
@@ -186,7 +186,7 @@ class ExpertBehaviorFigure(object):
                     [_number(gp_start, "y"), _number(gp_goal, "y")],
                     "-.", color="gray", linewidth=1.2, alpha=0.7,
                     label="straight line start→goal")
-        ax.set_title("1. Global reference and complete flight")
+        ax.set_title("1. Goal mission axis and complete flight")
         ax.legend(loc="best", fontsize=8)
 
     def _draw_guide(self, index):
@@ -227,7 +227,7 @@ class ExpertBehaviorFigure(object):
             return
         if ordinal is None:
             ax.set_title(
-                "3. No successful local plan associated with this frame")
+                "3. No local plan associated with this frame")
             return
         plan_id = self.plan_ids[ordinal]
         points = self.points_by_plan.get(plan_id, [])
@@ -250,17 +250,13 @@ class ExpertBehaviorFigure(object):
                        [_number(summary, "local_goal_y")],
                        marker="*", s=90, color="goldenrod",
                        label="local goal")
-            gx, gy = _number(summary, "guide_x"), _number(
-                summary, "guide_y")
-            if math.isfinite(gx) and math.isfinite(gy):
-                ax.plot([sx, gx], [sy, gy], color="tab:green",
-                        linewidth=1.8, marker="o",
-                        label="guide used by this plan")
         ax.set_title(
-            "3. Plan ordinal {} (plan_id={}, source frame={})\n"
+            "3. Plan ordinal {} (plan_id={}, source frame={}, status={})\n"
             "{} points, duration={:.2f}s, terminal scale={:.2f}".format(
                 ordinal, plan_id,
                 summary.get("source_frame_id", "?")
+                if summary is not None else "?",
+                summary.get("status", "?")
                 if summary is not None else "?",
                 len(points),
                 _number(summary, "trajectory_duration_s", 0.0)
@@ -288,7 +284,7 @@ class ExpertBehaviorFigure(object):
         else:
             self._draw_local(None)
             self.status.set_text(
-                "No successful local plan is associated with frame {}".format(
+                "No local plan is associated with frame {}".format(
                     index))
         self.fig.canvas.draw_idle()
 

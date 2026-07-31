@@ -49,7 +49,7 @@ struct LocalPlanningRequest {
 
     double previous_progress_s{0.0};
 
-    /// Guide waypoint (farthest visible A* point) — for trend labels.
+    /// Guide waypoint (farthest visible path point) — for trend labels.
     Eigen::Vector3d guide_waypoint{Eigen::Vector3d::Zero()};
     int guide_waypoint_index{-1};
 
@@ -57,13 +57,18 @@ struct LocalPlanningRequest {
     Eigen::Vector3d trajectory_terminal{Eigen::Vector3d::Zero()};
     int trajectory_terminal_index{-1};
 
-    /// A* sub-path segment for B-spline initialisation.
+    /// DEPRECATED: reference_path_segment is no longer used.
+    /// The local planner uses the terminal plus ESDF to initialize its local
+    /// B-spline (bounded local A* is used only when the direct seed is
+    /// obstructed).  This field is kept for backward compatibility but MUST
+    /// be empty.
     std::vector<Eigen::Vector3d> reference_path_segment;
 
     /// If true, use isKnownFree() instead of isFree() for collision checks.
     bool forbid_unknown_space{true};
 
-    /// If true, allow fallback to global path when optimization fails.
+    /// DEPRECATED: allow_global_map_fallback — NO LONGER SUPPORTED.
+    /// The local planner MUST NOT fall back to the global path on failure.
     bool allow_global_map_fallback{false};
 };
 

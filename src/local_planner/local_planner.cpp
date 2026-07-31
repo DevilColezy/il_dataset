@@ -1,6 +1,7 @@
 #include "il_dataset/local_planner/local_planner.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -539,32 +540,143 @@ LocalPlanner::sampleTrajectory(
         return d[degree];
     };
 
-    // Use a minimum-jerk progress law for the reference geometry.  A
-    // short-lived boundary correction represents the vehicle's current
-    // inertia without overwriting velocity independently of position.
+    // Traverse the reference geometry with a non-zero initial progress rate.
+    // A zero-slope minimum-jerk law makes the first executable prefix almost
+    // independent of the curved B-spline.  At 30 Hz every replan then resets
+    // that zero-slope prefix, indefinitely postponing avoidance even though
+    // the complete displayed trajectory bends around the obstacle.
     std::vector<Eigen::Vector3d> positions(num_samples);
-    const double braking_time = std::max(
-        0.45, std::min(2.00,
-            2.50 * start_vel.norm() /
-            std::max(0.1, config_.max_acceleration)));
-    const Eigen::Vector3d initial_acceleration =
+    constexpr double kCurveDerivativeEpsilon = 1.0e-4;
+    const Eigen::Vector3d curve_start =
+        evaluate_bspline(0.0);
+    const Eigen::Vector3d curve_epsilon =
+        evaluate_bspline(kCurveDerivativeEpsilon);
+    const Eigen::Vector3d curve_two_epsilon =
+        evaluate_bspline(2.0 * kCurveDerivativeEpsilon);
+    const Eigen::Vector3d curve_three_epsilon =
+        evaluate_bspline(3.0 * kCurveDerivativeEpsilon);
+    const Eigen::Vector3d curve_derivative =
+        (curve_epsilon - curve_start) /
+        kCurveDerivativeEpsilon;
+    const Eigen::Vector3d curve_second_derivative =
+        (curve_two_epsilon -
+         2.0 * curve_epsilon +
+         curve_start) /
+        (kCurveDerivativeEpsilon *
+         kCurveDerivativeEpsilon);
+    const Eigen::Vector3d curve_third_derivative =
+        (curve_three_epsilon -
+         3.0 * curve_two_epsilon +
+         3.0 * curve_epsilon -
+         curve_start) /
+        std::pow(kCurveDerivativeEpsilon, 3);
+    const double curve_derivative_norm = curve_derivative.norm();
+    const Eigen::Vector3d endpoint_delta = goal_pos - start_pos;
+    const Eigen::Vector3d initial_curve_tangent =
+        curve_derivative_norm > 1.0e-9
+            ? curve_derivative / curve_derivative_norm
+            : (endpoint_delta.norm() > 1.0e-9
+                   ? endpoint_delta.normalized()
+                   : Eigen::Vector3d::UnitX());
+    const double forward_speed = std::max(
+        0.0, start_vel.dot(initial_curve_tangent));
+    // path_u is dimensionless and time is normalized to [0, 1].
+    // Clamp only to preserve a monotone quintic for unusually large incoming
+    // speeds; normal flight uses a rate close to one.
+    const double initial_progress_rate = std::max(
+        0.0, std::min(
+            2.5,
+            curve_derivative_norm > 1.0e-9
+                ? forward_speed * total_time / curve_derivative_norm
+                : 0.0));
+    const double progress_a3 =
+        10.0 - 6.0 * initial_progress_rate;
+    const double progress_a4 =
+        -15.0 + 8.0 * initial_progress_rate;
+    const double progress_a5 =
+        6.0 - 3.0 * initial_progress_rate;
+    const Eigen::Vector3d initial_curve_velocity =
+        curve_derivative *
+        (initial_progress_rate / total_time);
+    const Eigen::Vector3d initial_curve_acceleration =
+        curve_second_derivative *
+        std::pow(
+            initial_progress_rate / total_time, 2);
+    const Eigen::Vector3d initial_curve_jerk =
+        curve_third_derivative *
+            std::pow(
+                initial_progress_rate / total_time, 3) +
+        curve_derivative *
+            (6.0 * progress_a3 /
+             std::pow(total_time, 3));
+    const Eigen::Vector3d residual_velocity =
+        start_vel - initial_curve_velocity;
+    // Preserve the measured velocity exactly at t=0, then release only the
+    // residual component quickly enough that B-spline curvature affects the
+    // 80 ms control label.  The lower bound keeps the implied acceleration
+    // finite.  It also grows with an auto-timed trajectory, so extending the
+    // duration can actually reduce boundary jerk instead of repeatedly
+    // reproducing the same fixed transient.
+    const double boundary_correction_time = std::max(
+        0.50, std::min(
+            1.20,
+            std::max(
+                2.2 * residual_velocity.norm() /
+                    std::max(
+                        0.1,
+                        config_.max_acceleration),
+                0.12 * total_time)));
+    const Eigen::Vector3d bounded_initial_acceleration =
         desired_initial_acceleration(total_time);
-    const Eigen::Vector3d correction_quadratic =
-        initial_acceleration +
-        2.0 * start_vel / braking_time +
-        6.0 * start_vel / total_time;
+    const double correction_decay_rate =
+        1.0 / boundary_correction_time +
+        3.0 / total_time;
+    // For correction(t) = (v_r*t + 0.5*a_r*t^2)*decay(t),
+    // correction''(0) = a_r - 2*decay_rate*v_r.  Choose a_r so the
+    // complete B-spline trajectory starts at the bounded acceleration
+    // instead of producing a fixed >5 m/s^2 transient that cannot be
+    // removed by stretching the total trajectory duration.
+    const Eigen::Vector3d residual_acceleration =
+        bounded_initial_acceleration -
+        initial_curve_acceleration +
+        2.0 * correction_decay_rate *
+            residual_velocity;
+    const double correction_second_decay =
+        correction_decay_rate * correction_decay_rate -
+        3.0 / (total_time * total_time);
+    // Extend the same boundary identity by one derivative.  For
+    // P(t)=v_r*t+0.5*a_r*t^2+j_r*t^3/6 and decay g(t):
+    // (P*g)'''(0)=j_r-3*k*a_r+3*g''(0)*v_r.
+    // A zero initial jerk leaves ample margin below max_jerk while the
+    // subsequent curve still begins inside the executable prefix.
+    const Eigen::Vector3d residual_jerk =
+        -initial_curve_jerk +
+        3.0 * correction_decay_rate *
+            residual_acceleration -
+        3.0 * correction_second_decay *
+            residual_velocity;
     for (int i = 0; i < num_samples; ++i) {
         const double t = i * dt;
         const double u = std::min(1.0, t / total_time);
         const double u2 = u * u;
         const double u3 = u2 * u;
-        const double path_u =
-            10.0 * u3 - 15.0 * u3 * u + 6.0 * u3 * u2;
+        const double u4 = u3 * u;
+        const double u5 = u4 * u;
+        const double path_u = std::max(
+            0.0, std::min(
+                1.0,
+                initial_progress_rate * u +
+                progress_a3 * u3 +
+                progress_a4 * u4 +
+                progress_a5 * u5));
         const double end_taper = std::pow(1.0 - u, 3);
         const Eigen::Vector3d inertia_correction =
-            (start_vel * t +
-             0.5 * correction_quadratic * t * t) *
-            std::exp(-t / braking_time) * end_taper;
+            (residual_velocity * t +
+             0.5 * residual_acceleration * t * t +
+             (1.0 / 6.0) * residual_jerk *
+                 t * t * t) *
+            std::exp(-t / boundary_correction_time) *
+            end_taper;
         positions[i] = evaluate_bspline(path_u) + inertia_correction;
     }
     positions.front() = start_pos;
@@ -752,46 +864,145 @@ double LocalPlanner::computeCost(
     }
     cost += config_.weight_jerk * jerk_cost;
 
-    // J_guide: distance of control points to global reference segment
-    double guide_cost = 0.0;
-    for (const auto& cp : control_points) {
-        double min_dist_sq = std::numeric_limits<double>::max();
-        for (size_t j = 0; j + 1 < global_ref_segment.size(); ++j) {
-            const Eigen::Vector3d& a = global_ref_segment[j];
-            const Eigen::Vector3d& b = global_ref_segment[j + 1];
-            Eigen::Vector3d ab = b - a;
-            double ab_len_sq = ab.squaredNorm();
-            double t = ab_len_sq > 1e-12 ? (cp - a).dot(ab) / ab_len_sq : 0.0;
-            t = std::max(0.0, std::min(1.0, t));
-            Eigen::Vector3d proj = a + t * ab;
-            double dist_sq = (cp - proj).squaredNorm();
-            min_dist_sq = std::min(min_dist_sq, dist_sq);
+    // J_guide: optional straight-chord proximity.  Production sets this to
+    // zero because the exact Guide endpoint already constrains the macro
+    // direction; intermediate control points must remain free to avoid early.
+    if (config_.weight_guide > 0.0) {
+        double guide_cost = 0.0;
+        for (const auto& cp : control_points) {
+            double min_dist_sq = std::numeric_limits<double>::max();
+            for (size_t j = 0; j + 1 < global_ref_segment.size(); ++j) {
+                const Eigen::Vector3d& a = global_ref_segment[j];
+                const Eigen::Vector3d& b = global_ref_segment[j + 1];
+                Eigen::Vector3d ab = b - a;
+                double ab_len_sq = ab.squaredNorm();
+                double t = ab_len_sq > 1e-12
+                    ? (cp - a).dot(ab) / ab_len_sq
+                    : 0.0;
+                t = std::max(0.0, std::min(1.0, t));
+                Eigen::Vector3d proj = a + t * ab;
+                double dist_sq = (cp - proj).squaredNorm();
+                min_dist_sq = std::min(min_dist_sq, dist_sq);
+            }
+            guide_cost += min_dist_sq;
         }
-        guide_cost += min_dist_sq;
+        cost += config_.weight_guide * guide_cost;
     }
-    cost += config_.weight_guide * guide_cost;
 
     // J_obstacle: ESDF-based penalty
     double obs_cost = 0.0;
-    double spacing = config_.collision_check_spacing;
-    for (int i = 0; i < n - 1; ++i) {
-        Eigen::Vector3d seg = control_points[i + 1] - control_points[i];
-        double seg_len = seg.norm();
-        int steps = std::max(2, static_cast<int>(seg_len / spacing) + 1);
-        steps = std::min(steps,
-                         std::max(2, config_.max_cost_samples_per_segment));
-        for (int s = 0; s <= steps; ++s) {
-            double alpha = static_cast<double>(s) / steps;
-            Eigen::Vector3d pt = control_points[i] * (1.0 - alpha) + control_points[i + 1] * alpha;
-            double clearance = esdf_.getValue(pt.x(), pt.y(), pt.z());
-            if (clearance < config_.target_clearance) {
-                double deficit = config_.target_clearance - clearance;
-                obs_cost += deficit * deficit;
+    // Evaluate the same clamped B-spline geometry used by sampleTrajectory().
+    // Penalizing the control polygon allowed the smoothed curve to cut inside
+    // a safe-looking corner and fail only during final trajectory validation.
+    const int obstacle_degree = std::min(3, n - 1);
+    std::vector<double> obstacle_knots(
+        n + obstacle_degree + 1, 0.0);
+    const int obstacle_internal_spans = n - obstacle_degree;
+    for (int i = obstacle_degree + 1; i < n; ++i) {
+        obstacle_knots[i] =
+            static_cast<double>(i - obstacle_degree) /
+            obstacle_internal_spans;
+    }
+    for (int i = n;
+         i < static_cast<int>(obstacle_knots.size()); ++i) {
+        obstacle_knots[i] = 1.0;
+    }
+    auto evaluate_obstacle_bspline = [&](double u) {
+        u = std::max(0.0, std::min(1.0, u));
+        int span = n - 1;
+        if (u < 1.0) {
+            auto upper = std::upper_bound(
+                obstacle_knots.begin() + obstacle_degree,
+                obstacle_knots.begin() + n + 1, u);
+            span = std::max(
+                obstacle_degree,
+                std::min(
+                    n - 1,
+                    static_cast<int>(
+                        upper - obstacle_knots.begin()) - 1));
+        }
+        std::vector<Eigen::Vector3d> values(
+            obstacle_degree + 1);
+        for (int j = 0; j <= obstacle_degree; ++j) {
+            values[j] =
+                control_points[span - obstacle_degree + j];
+        }
+        for (int r = 1; r <= obstacle_degree; ++r) {
+            for (int j = obstacle_degree; j >= r; --j) {
+                const int idx =
+                    span - obstacle_degree + j;
+                const double denominator =
+                    obstacle_knots[
+                        idx + obstacle_degree - r + 1] -
+                    obstacle_knots[idx];
+                const double alpha =
+                    denominator > 1.0e-12
+                        ? (u - obstacle_knots[idx]) / denominator
+                        : 0.0;
+                values[j] =
+                    (1.0 - alpha) * values[j - 1] +
+                    alpha * values[j];
             }
-            // Hard constraint penalty
-            if (clearance <= config_.min_clearance) {
-                obs_cost += 1000.0;  // large penalty for violation
-            }
+        }
+        return values[obstacle_degree];
+    };
+    double obstacle_polygon_length = 0.0;
+    for (int i = 1; i < n; ++i) {
+        obstacle_polygon_length +=
+            (control_points[i] -
+             control_points[i - 1]).norm();
+    }
+    const int obstacle_samples = std::max(
+        2, std::min(
+            std::max(
+                2,
+                (n - 1) *
+                    std::max(
+                        2,
+                        config_.max_cost_samples_per_segment)),
+            static_cast<int>(
+                obstacle_polygon_length /
+                std::max(
+                    0.01,
+                    config_.collision_check_spacing)) +
+                1));
+    for (int sample = 0; sample <= obstacle_samples; ++sample) {
+        const double u =
+            static_cast<double>(sample) / obstacle_samples;
+        const Eigen::Vector3d point =
+            evaluate_obstacle_bspline(u);
+        const double clearance = esdf_.getValue(
+            point.x(), point.y(), point.z());
+        if (clearance < config_.target_clearance) {
+            const double deficit =
+                config_.target_clearance - clearance;
+            // Normalize by the available soft-clearance band.  In metre
+            // units deficit^2 is numerically tiny (0.15 m -> 0.0225), so
+            // guide/smoothness costs previously pulled a safe seed back
+            // toward the straight chord.  The hard threshold is unchanged.
+            const double clearance_band = std::max(
+                0.05,
+                config_.target_clearance -
+                    config_.min_clearance);
+            const double normalized_deficit =
+                deficit / clearance_band;
+            obs_cost +=
+                normalized_deficit * normalized_deficit;
+        }
+        if (clearance <= config_.min_clearance) {
+            const double hard_deficit =
+                config_.min_clearance - clearance;
+            const double resolution_scale =
+                std::max(0.01, esdf_.resolution());
+            // This is a hard feasibility boundary, not another soft
+            // preference.  Without a fixed barrier an only-slightly unsafe
+            // sample (for example 0.013 m with a 0.02 m limit) contributes a
+            // surprisingly small metre-squared penalty.  SBPLX can then trade
+            // it for guide/smoothness improvement and return an invalid
+            // incumbent when its time budget expires.
+            obs_cost += 1000.0 + 1000.0 *
+                (hard_deficit * hard_deficit +
+                 resolution_scale * hard_deficit);
         }
     }
     cost += config_.weight_obstacle * obs_cost;
@@ -848,23 +1059,173 @@ bool LocalPlanner::optimizeControlPoints(
 
     const auto optimization_start = std::chrono::steady_clock::now();
     const double budget_ms = std::max(1.0, config_.planning_time_budget_ms);
+    const double optimization_budget_ms =
+        std::max(1.0, budget_ms - 2.0);
     const auto budget_exhausted = [&]() {
         return std::chrono::duration<double, std::milli>(
-                   std::chrono::steady_clock::now() - optimization_start).count() >= budget_ms;
+                   std::chrono::steady_clock::now() -
+                   optimization_start).count() >= optimization_budget_ms;
     };
+
+    // A straight path through an obstacle is a poor initial condition for a
+    // high-dimensional derivative-free optimizer: ESDF gradients on opposite
+    // sides of the obstacle cancel and hundreds of evaluations can be spent
+    // before a coherent bypass direction appears.  First form an elastic-band
+    // seed using one consistent ESDF ascent direction.  This is deterministic,
+    // bounded, and normally costs only a few hundred ESDF queries.
+    if (n > 2) {
+        Eigen::Vector3d bypass_direction = Eigen::Vector3d::Zero();
+        const Eigen::Vector3d guide_delta = local_goal - start_pos;
+        const Eigen::Vector3d guide_direction =
+            guide_delta.norm() > 1.0e-9
+                ? guide_delta.normalized()
+                : Eigen::Vector3d::UnitX();
+        constexpr int kClearanceSeedIterations = 24;
+        for (int iteration = 0;
+             iteration < kClearanceSeedIterations && !budget_exhausted();
+             ++iteration) {
+            double worst_clearance =
+                std::numeric_limits<double>::infinity();
+            Eigen::Vector3d worst_point = start_pos;
+            bool has_clearance_deficit = false;
+
+            for (int i = 0; i < n - 1 && !budget_exhausted(); ++i) {
+                const Eigen::Vector3d segment =
+                    control_points[i + 1] - control_points[i];
+                const int steps = std::max(
+                    2, std::min(
+                        std::max(2, config_.max_cost_samples_per_segment),
+                        static_cast<int>(
+                            segment.norm() /
+                            std::max(0.01, config_.collision_check_spacing)) +
+                            1));
+                for (int sample = 0; sample <= steps; ++sample) {
+                    const double alpha =
+                        static_cast<double>(sample) / steps;
+                    const Eigen::Vector3d point =
+                        (1.0 - alpha) * control_points[i] +
+                        alpha * control_points[i + 1];
+                    const double clearance = esdf_.getValue(
+                        point.x(), point.y(), point.z());
+                    if (clearance < worst_clearance) {
+                        worst_clearance = clearance;
+                        worst_point = point;
+                    }
+                    if (clearance >= config_.target_clearance) continue;
+
+                    has_clearance_deficit = true;
+                }
+            }
+
+            if (!has_clearance_deficit) break;
+
+            if (bypass_direction.norm() <= 0.5) {
+                double ignored_clearance = worst_clearance;
+                Eigen::Vector3d gradient = esdf_.getGradient(
+                    worst_point.x(), worst_point.y(), worst_point.z(),
+                    &ignored_clearance);
+                // Only the component normal to travel produces an actual
+                // bend; a tangential push merely bunches control points.
+                gradient -= gradient.dot(guide_direction) * guide_direction;
+                if (gradient.norm() > 1.0e-6) {
+                    bypass_direction = gradient.normalized();
+                } else {
+                    // At the exact ESDF medial axis the gradient may be zero.
+                    // Probe a deterministic orthogonal basis and choose the
+                    // side whose nearby clearance increases most.
+                    Eigen::Vector3d axis =
+                        std::abs(guide_direction.z()) < 0.8
+                            ? Eigen::Vector3d::UnitZ()
+                            : Eigen::Vector3d::UnitY();
+                    Eigen::Vector3d side =
+                        guide_direction.cross(axis).normalized();
+                    Eigen::Vector3d vertical =
+                        guide_direction.cross(side).normalized();
+                    const double probe =
+                        std::max(0.10, 2.0 * esdf_.resolution());
+                    const std::array<Eigen::Vector3d, 4> candidates{
+                        side, -side, vertical, -vertical};
+                    double best_clearance =
+                        -std::numeric_limits<double>::infinity();
+                    for (const auto& candidate : candidates) {
+                        const Eigen::Vector3d probe_point =
+                            worst_point + probe * candidate;
+                        const double candidate_clearance = esdf_.getValue(
+                            probe_point.x(), probe_point.y(), probe_point.z());
+                        if (candidate_clearance > best_clearance) {
+                            best_clearance = candidate_clearance;
+                            bypass_direction = candidate;
+                        }
+                    }
+                }
+
+                // The first pass only located the worst point.  Re-run it
+                // with the selected direction so forces cannot cancel.
+                continue;
+            }
+
+            // Apply one broad, smooth bump rather than moving only the
+            // already-dangerous control points.  The displacement ramps up
+            // from zero at the current state, reaches its maximum at the
+            // worst ESDF location, then smoothly rejoins the exact Guide.
+            // This creates lateral velocity before reaching the obstacle and
+            // avoids the former "follow the chord, then make a sharp hook"
+            // behaviour.
+            const double guide_length_sq = guide_delta.squaredNorm();
+            double obstacle_fraction =
+                guide_length_sq > 1.0e-9
+                    ? (worst_point - start_pos).dot(guide_delta) /
+                          guide_length_sq
+                    : 0.5;
+            obstacle_fraction = std::max(
+                0.10, std::min(0.90, obstacle_fraction));
+            const double peak_update = std::min(
+                0.12,
+                0.70 * std::max(
+                    0.0, config_.target_clearance - worst_clearance));
+            auto smooth_step = [](double value) {
+                value = std::max(0.0, std::min(1.0, value));
+                return value * value * (3.0 - 2.0 * value);
+            };
+            double maximum_update = 0.0;
+            for (int i = 1; i < n - 1; ++i) {
+                const double fraction =
+                    static_cast<double>(i) / (n - 1);
+                const double phase =
+                    fraction <= obstacle_fraction
+                        ? fraction / obstacle_fraction
+                        : (1.0 - fraction) /
+                              (1.0 - obstacle_fraction);
+                const Eigen::Vector3d update =
+                    peak_update * smooth_step(phase) *
+                    bypass_direction;
+                control_points[i] += update;
+                maximum_update = std::max(maximum_update, update.norm());
+            }
+            control_points.front() = start_pos;
+            control_points.back() = local_goal;
+            if (maximum_update < 1.0e-4) break;
+        }
+    }
 
 #ifdef IL_DATASET_HAS_NLOPT
     if (config_.optimizer == "auto" || config_.optimizer == "nlopt") {
-        const int variable_count = (n - 1) * 3;
+        if (budget_exhausted()) return true;
+        // Both endpoints are boundary conditions.  Optimizing the terminal
+        // and then overwriting it with local_goal wastes three dimensions and
+        // can invalidate the optimizer's reported optimum.
+        const int variable_count = std::max(0, n - 2) * 3;
+        if (variable_count == 0) return true;
         std::vector<double> x(variable_count);
-        for (int i = 1; i < n; ++i)
+        for (int i = 1; i < n - 1; ++i)
             for (int d = 0; d < 3; ++d)
                 x[(i - 1) * 3 + d] = control_points[i][d];
 
         auto unpack = [&](const std::vector<double>& values,
                           std::vector<Eigen::Vector3d>& points) {
             points[0] = start_pos;
-            for (int i = 1; i < n; ++i)
+            points[n - 1] = local_goal;
+            for (int i = 1; i < n - 1; ++i)
                 for (int d = 0; d < 3; ++d)
                     points[i][d] = values[(i - 1) * 3 + d];
         };
@@ -956,7 +1317,7 @@ bool LocalPlanner::optimizeControlPoints(
             corridor_min = corridor_min.cwiseMax(map_min);
             corridor_max = corridor_max.cwiseMin(map_max);
             std::vector<double> lower(variable_count), upper(variable_count);
-            for (int i = 1; i < n; ++i) {
+            for (int i = 1; i < n - 1; ++i) {
                 for (int d = 0; d < 3; ++d) {
                     const int j = (i - 1) * 3 + d;
                     lower[j] = corridor_min[d];
@@ -968,7 +1329,15 @@ bool LocalPlanner::optimizeControlPoints(
             nlopt_set_upper_bounds(opt, upper.data());
             nlopt_set_min_objective(opt, objective_trampoline, &context);
             nlopt_set_maxeval(opt, std::max(1, config_.max_iterations));
-            nlopt_set_maxtime(opt, budget_ms * 0.001);
+            const double elapsed_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() -
+                    optimization_start).count();
+            // Preserve time for unpacking and dense final validation inside
+            // the caller's strict 30 Hz planning tick.
+            const double remaining_ms =
+                std::max(0.5, optimization_budget_ms - elapsed_ms);
+            nlopt_set_maxtime(opt, remaining_ms * 0.001);
             nlopt_set_initial_step1(
                 opt, std::max(config_.minimum_step_size,
                               config_.initial_step_size));
@@ -1000,11 +1369,11 @@ bool LocalPlanner::optimizeControlPoints(
 
     for (int iter = 0; iter < config_.max_iterations; ++iter) {
         if (budget_exhausted()) break;
-        // Numerical gradient for each free control point (indices 1 .. n-1)
+        // Numerical gradient for each free interior control point.
         std::vector<Eigen::Vector3d> grad(n, Eigen::Vector3d::Zero());
         double eps = 1e-4;
 
-        for (int i = 1; i < n; ++i) {
+        for (int i = 1; i < n - 1; ++i) {
             for (int d = 0; d < 3; ++d) {
                 if (budget_exhausted()) return true;
                 double orig = control_points[i][d];
@@ -1029,18 +1398,11 @@ bool LocalPlanner::optimizeControlPoints(
 
         for (int bt = 0; bt < 10; ++bt) {
             if (budget_exhausted()) return true;
-            for (int i = 1; i < n; ++i) {
+            for (int i = 1; i < n - 1; ++i) {
                 candidate[i] = control_points[i] - trial_step * grad[i];
             }
-
-            // Ensure endpoint moves toward local_goal
-            const Eigen::Vector3d endpoint_error = control_points.back() - local_goal;
-            const double endpoint_distance = endpoint_error.norm();
-            if (endpoint_distance > 1e-9) {
-                candidate.back() = control_points.back() -
-                                   trial_step * (endpoint_error / endpoint_distance) *
-                                   std::min(trial_step * 10.0, endpoint_distance * 0.5);
-            }
+            candidate.front() = start_pos;
+            candidate.back() = local_goal;
 
             double new_cost = computeCost(candidate, start_pos, start_vel,
                                           local_goal, global_ref_segment,
@@ -1146,7 +1508,17 @@ ValidationResult LocalPlanner::validateTrajectory(
                 recovery_non_degrading = false;
             }
 
-            result.min_clearance = std::min(result.min_clearance, clearance);
+            // Track the actual minimum even when it is still above the hard
+            // limit.  Final-trajectory repair deliberately builds a buffer
+            // above min_clearance, so it needs the location of the soft
+            // minimum instead of only the first hard violation.
+            if (clearance < result.min_clearance) {
+                result.min_clearance = clearance;
+                result.worst_clearance = clearance;
+                result.worst_position = pt;
+                result.worst_time =
+                    p0.t + alpha * (p1.t - p0.t);
+            }
 
             // ESDF interpolation around the threshold can differ by a few
             // floating-point ulps.  Keep a 1 mm numerical tolerance; this is
@@ -1154,11 +1526,6 @@ ValidationResult LocalPlanner::validateTrajectory(
             if (clearance < config_.min_clearance - 1e-3) {
                 result.clearance_violation_count++;
                 result.all_clear = false;
-                if (clearance < result.worst_clearance) {
-                    result.worst_clearance = clearance;
-                    result.worst_position = pt;
-                    result.worst_time = p0.t + alpha * (p1.t - p0.t);
-                }
             }
             if (clearance <= 0.0) {
                 result.any_collision = true;
@@ -1336,7 +1703,9 @@ LocalPlanResult LocalPlanner::planLocal(
             for (int s = 0; s <= steps && direct_clear; ++s) {
                 double a = static_cast<double>(s) / steps;
                 Eigen::Vector3d pt = current_state.position + a * dir;
-                if (!esdf_.isFree(pt.x(), pt.y(), pt.z(), config_.min_clearance)) {
+                if (!esdf_.isFree(
+                        pt.x(), pt.y(), pt.z(),
+                        config_.target_clearance)) {
                     direct_clear = false;
                 }
             }
@@ -1549,6 +1918,11 @@ LocalPlanResult LocalPlanner::planLocal(
 LocalPlanResult LocalPlanner::planLocalWithRequest(
     const LocalPlanningRequest& request) const {
 
+    // The explicit-Guide data-collection path uses the compact production
+    // spline core.  The implementation below is retained only as historical
+    // legacy code while planLocal() still serves the old asynchronous API.
+    return planSplineWithRequest(request);
+
     auto t_start = std::chrono::steady_clock::now();
 
     LocalPlanResult result;
@@ -1585,7 +1959,11 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
 
     // Use externally-provided terminal as the optimization target
     Eigen::Vector3d terminal = request.trajectory_terminal;
-    bool near_final_goal = false;
+    const bool near_final_goal =
+        request.guide_waypoint_index >= 0 &&
+        !global_path_.empty() &&
+        request.guide_waypoint_index >=
+            static_cast<int>(global_path_.size()) - 1;
 
     // If no explicit terminal, fall back to horizon-distance forward point
     if ((terminal - cs.position).norm() < 1e-6) {
@@ -1617,7 +1995,9 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
             for (int s = 0; s <= steps && direct_clear; ++s) {
                 double a = static_cast<double>(s) / steps;
                 Eigen::Vector3d pt = cs.position + a * dir;
-                if (!isFreeCheck(pt.x(), pt.y(), pt.z(), config_.min_clearance)) {
+                if (!isFreeCheck(
+                        pt.x(), pt.y(), pt.z(),
+                        config_.target_clearance)) {
                     direct_clear = false;
                 }
             }
@@ -1627,6 +2007,7 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
     std::vector<TrajectoryPoint> traj;
     bool optimized = false;
     bool used_global_fallback = false;
+    int final_clearance_repairs = 0;
     std::vector<Eigen::Vector3d> reference_control_points;
 
     if (direct_clear) {
@@ -1644,95 +2025,31 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
         }
     }
     if (!direct_clear) {
-        // ── Initialize control points from reference path segment ──
-        const auto& ref_seg = request.reference_path_segment;
-        std::vector<double> ref_arc;
-        double ref_total = (terminal - cs.position).norm();
-        if (ref_seg.size() >= 2) {
-            // Compute cumulative arc-length on reference segment
-            ref_arc.push_back(0.0);
-            for (size_t i = 1; i < ref_seg.size(); ++i) {
-                ref_arc.push_back(ref_arc.back() +
-                    (ref_seg[i] - ref_seg[i - 1]).norm());
-            }
-            ref_total = std::max(ref_total, ref_arc.back());
-        }
-
+        // ── Initialize control points as STRAIGHT LINE from start to terminal ──
+        // NO reference_path_segment — the global path only provides the visible
+        // waypoint; the local planner optimizes its own shape via ESDF.
         const double desired_cp_spacing = std::max(
             2.0 * config_.collision_check_spacing,
             config_.control_point_spacing);
+        const double straight_dist = (terminal - cs.position).norm();
         const int density_cp =
-            static_cast<int>(std::ceil(ref_total / desired_cp_spacing)) + 1;
+            static_cast<int>(std::ceil(straight_dist / desired_cp_spacing)) + 1;
         const int n_cp = std::max(
             2, std::min(
                 std::max(2, config_.max_reference_points),
                 std::max(config_.control_points, density_cp)));
         std::vector<Eigen::Vector3d> control_points(n_cp);
-        const double sampling_ref_total =
-            ref_arc.empty() ? 0.0 : ref_arc.back();
 
-        if (ref_seg.size() >= 2) {
-            // Fix first control point to start position
-            control_points[0] = cs.position;
-
-            if (sampling_ref_total > 1e-6) {
-                // Sample control points at uniform arc-length along reference
-                for (int i = 1; i < n_cp; ++i) {
-                    double frac = static_cast<double>(i) / (n_cp - 1);
-                    double target_s = frac * sampling_ref_total;
-                    auto it = std::lower_bound(ref_arc.begin(), ref_arc.end(), target_s);
-                    int idx = std::min(static_cast<int>(it - ref_arc.begin()),
-                                       static_cast<int>(ref_seg.size()) - 1);
-                    if (idx == 0) {
-                        control_points[i] = ref_seg[0];
-                    } else {
-                        double s0 = ref_arc[idx - 1];
-                        double s1 = ref_arc[idx];
-                        double alpha = (s1 > s0 + 1e-12) ?
-                            (target_s - s0) / (s1 - s0) : 0.0;
-                        alpha = std::max(0.0, std::min(1.0, alpha));
-                        control_points[i] = ref_seg[idx - 1] * (1.0 - alpha) +
-                                           ref_seg[idx] * alpha;
-                    }
-                }
-            } else {
-                // Degenerate: linear interpolation
-                for (int i = 1; i < n_cp; ++i) {
-                    double alpha = static_cast<double>(i) / (n_cp - 1);
-                    control_points[i] = cs.position * (1.0 - alpha) +
-                                        terminal * alpha;
-                }
-            }
-        } else {
-            // No reference segment: linear from start to terminal
-            control_points[0] = cs.position;
-            for (int i = 1; i < n_cp; ++i) {
-                double alpha = static_cast<double>(i) / (n_cp - 1);
-                control_points[i] = cs.position * (1.0 - alpha) +
-                                    terminal * alpha;
-            }
+        // Straight-line initialization: current position → terminal
+        control_points[0] = cs.position;
+        for (int i = 1; i < n_cp; ++i) {
+            double alpha = static_cast<double>(i) / (n_cp - 1);
+            control_points[i] = cs.position * (1.0 - alpha) +
+                                terminal * alpha;
         }
         control_points.front() = cs.position;
         control_points.back() = terminal;
         reference_control_points = control_points;
-
-        // Build reference segment from A* sub-path (or fallback)
-        std::vector<Eigen::Vector3d> ref_for_cost = ref_seg;
-        if (ref_for_cost.size() < 2) {
-            ref_for_cost = {cs.position, terminal};
-        }
-        if (ref_for_cost.size() > static_cast<size_t>(
-                std::max(2, config_.max_reference_points))) {
-            const size_t keep = static_cast<size_t>(
-                std::max(2, config_.max_reference_points));
-            std::vector<Eigen::Vector3d> bounded;
-            bounded.reserve(keep);
-            for (size_t k = 0; k < keep; ++k) {
-                const size_t idx = k * (ref_for_cost.size() - 1) / (keep - 1);
-                bounded.push_back(ref_for_cost[idx]);
-            }
-            ref_for_cost.swap(bounded);
-        }
 
         // ── Optimize ───────────────────────────────────────────
         // Guide reference: uniformly-spaced points on the straight
@@ -1756,19 +2073,294 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
             control_points, cs.position, cs.velocity,
             cs.acceleration, terminal, cs.yaw);
 
+        // computeCost() shapes the clamped B-spline geometry, whereas the
+        // executable trajectory additionally contains the current-state
+        // continuity correction and an automatically selected duration.
+        // Close to an obstacle that final transformation can move an
+        // otherwise acceptable curve back across the configured hard margin.
+        // Close the loop on the object that is actually executed: use its
+        // worst ESDF sample to apply a broad, coherent bump, then re-time and
+        // revalidate.  This is not a global-path fallback and the exact Guide
+        // remains the fixed endpoint.
+        auto repaired_validation = validateTrajectory(traj);
+        Eigen::Vector3d repair_direction = Eigen::Vector3d::Zero();
+        const double desired_repair_clearance = std::min(
+            config_.target_clearance,
+            config_.min_clearance + 0.05);
+        const double trajectory_start_clearance = esdf_.getValue(
+            cs.position.x(), cs.position.y(), cs.position.z());
+        // The current state is an immutable endpoint.  If tracking has
+        // already brought it inside the desired buffer, require the repaired
+        // suffix to be non-degrading instead of chasing an impossible minimum
+        // above the fixed start clearance.
+        const double repair_clearance = std::min(
+            desired_repair_clearance,
+            trajectory_start_clearance);
+        constexpr int kMaximumFinalClearanceRepairs = 10;
+        for (int repair_iteration = 0;
+             repair_iteration < kMaximumFinalClearanceRepairs &&
+             (repaired_validation.any_collision ||
+              !repaired_validation.all_clear ||
+              repaired_validation.min_clearance < repair_clearance);
+             ++repair_iteration) {
+            const double elapsed_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_start).count();
+            if (elapsed_ms >=
+                std::max(1.0, config_.planning_time_budget_ms - 3.0)) {
+                break;
+            }
+            final_clearance_repairs = repair_iteration + 1;
+
+            const Eigen::Vector3d guide_delta = terminal - cs.position;
+            const double guide_length_sq = guide_delta.squaredNorm();
+            if (guide_length_sq <= 1.0e-9) break;
+            const Eigen::Vector3d guide_direction =
+                guide_delta.normalized();
+
+            double ignored_clearance =
+                repaired_validation.worst_clearance;
+            Eigen::Vector3d current_direction = esdf_.getGradient(
+                repaired_validation.worst_position.x(),
+                repaired_validation.worst_position.y(),
+                repaired_validation.worst_position.z(),
+                &ignored_clearance);
+            current_direction -=
+                current_direction.dot(guide_direction) *
+                guide_direction;
+            if (current_direction.norm() <= 1.0e-6) {
+                if (repair_direction.norm() <= 0.5) {
+                    Eigen::Vector3d axis =
+                        std::abs(guide_direction.z()) < 0.8
+                            ? Eigen::Vector3d::UnitZ()
+                            : Eigen::Vector3d::UnitY();
+                    Eigen::Vector3d side =
+                        guide_direction.cross(axis).normalized();
+                    Eigen::Vector3d vertical =
+                        guide_direction.cross(side).normalized();
+                    const std::array<Eigen::Vector3d, 4> candidates{
+                        side, -side, vertical, -vertical};
+                    const double probe =
+                        std::max(0.10, 2.0 * esdf_.resolution());
+                    double best_clearance =
+                        -std::numeric_limits<double>::infinity();
+                    for (const auto& candidate : candidates) {
+                        const Eigen::Vector3d probe_point =
+                            repaired_validation.worst_position +
+                            probe * candidate;
+                        const double candidate_clearance = esdf_.getValue(
+                            probe_point.x(), probe_point.y(),
+                            probe_point.z());
+                        if (candidate_clearance > best_clearance) {
+                            best_clearance = candidate_clearance;
+                            current_direction = candidate;
+                        }
+                    }
+                }
+            } else {
+                current_direction.normalize();
+            }
+            if (current_direction.norm() > 0.5) {
+                // Keep one homotopy side, but update the direction as the
+                // minimum moves around the obstacle surface.  Holding the
+                // first gradient forever becomes nearly tangential after a
+                // few repairs and wastes the remaining iterations.
+                if (repair_direction.norm() > 0.5 &&
+                    current_direction.dot(repair_direction) < 0.0) {
+                    current_direction = -current_direction;
+                }
+                repair_direction = current_direction.normalized();
+            }
+            if (repair_direction.norm() <= 0.5) break;
+
+            // Locate the dangerous portion with the exact time -> path_u
+            // progress law used by sampleTrajectory().  Neither projection
+            // onto the Guide chord nor the nearest control point is a valid
+            // inverse for a clamped B-spline with non-linear auto timing; both
+            // can place the repair peak several spans after the violation.
+            const double total_time =
+                !traj.empty()
+                    ? std::max(config_.trajectory_dt, traj.back().t)
+                    : config_.horizon_time;
+            const int repair_degree = std::min(3, n_cp - 1);
+            const int repair_internal_spans =
+                n_cp - repair_degree;
+            Eigen::Vector3d initial_curve_derivative =
+                Eigen::Vector3d::Zero();
+            if (n_cp >= 2 && repair_internal_spans > 0) {
+                initial_curve_derivative =
+                    static_cast<double>(
+                        repair_degree * repair_internal_spans) *
+                    (control_points[1] - control_points[0]);
+            }
+            const double derivative_norm =
+                initial_curve_derivative.norm();
+            const Eigen::Vector3d initial_tangent =
+                derivative_norm > 1.0e-9
+                    ? initial_curve_derivative / derivative_norm
+                    : guide_direction;
+            const double forward_speed = std::max(
+                0.0, cs.velocity.dot(initial_tangent));
+            const double initial_progress_rate = std::max(
+                0.0, std::min(
+                    2.5,
+                    derivative_norm > 1.0e-9
+                        ? forward_speed * total_time /
+                              derivative_norm
+                        : 0.0));
+            const double normalized_time = std::max(
+                0.0, std::min(
+                    1.0,
+                    repaired_validation.worst_time / total_time));
+            const double time2 =
+                normalized_time * normalized_time;
+            const double time3 = time2 * normalized_time;
+            const double time4 = time3 * normalized_time;
+            const double time5 = time4 * normalized_time;
+            const double progress_a3 =
+                10.0 - 6.0 * initial_progress_rate;
+            const double progress_a4 =
+                -15.0 + 8.0 * initial_progress_rate;
+            const double progress_a5 =
+                6.0 - 3.0 * initial_progress_rate;
+            double obstacle_fraction =
+                initial_progress_rate * normalized_time +
+                progress_a3 * time3 +
+                progress_a4 * time4 +
+                progress_a5 * time5;
+            obstacle_fraction = std::max(
+                0.0, std::min(1.0, obstacle_fraction));
+
+            // Evaluate the non-zero B-spline basis functions at path_u.
+            // Moving a broad range of control points by an index-space bump
+            // is not a local repair: path_u is a knot parameter, not
+            // control_point_index/(N-1).  Repeated bumps therefore stretched
+            // the far half of the trajectory into a large hook while barely
+            // moving the actual low-clearance sample.  The minimum-norm
+            // projection below updates only the at-most degree+1 control
+            // points that truly influence this curve parameter.
+            std::vector<double> repair_knots(
+                n_cp + repair_degree + 1, 0.0);
+            for (int i = repair_degree + 1; i < n_cp; ++i) {
+                repair_knots[i] =
+                    static_cast<double>(i - repair_degree) /
+                    repair_internal_spans;
+            }
+            for (int i = n_cp;
+                 i < static_cast<int>(repair_knots.size()); ++i) {
+                repair_knots[i] = 1.0;
+            }
+            // Repair toward min_clearance + 0.05 m so interpolation and the
+            // next 30 Hz replan do not immediately fall back onto the hard
+            // boundary; target_clearance remains only the soft preference.
+            const double desired_curve_displacement = std::min(
+                0.12,
+                std::max(
+                    0.01,
+                    repair_clearance -
+                        repaired_validation.worst_clearance));
+
+            auto apply_local_basis_displacement =
+                [&](double parameter, double gain) {
+                parameter = std::max(
+                    0.0, std::min(1.0, parameter));
+                int span = n_cp - 1;
+                if (parameter < 1.0) {
+                    auto upper = std::upper_bound(
+                        repair_knots.begin() + repair_degree,
+                        repair_knots.begin() + n_cp + 1,
+                        parameter);
+                    span = std::max(
+                        repair_degree,
+                        std::min(
+                            n_cp - 1,
+                            static_cast<int>(
+                                upper - repair_knots.begin()) - 1));
+                }
+                std::vector<double> basis(
+                    repair_degree + 1, 0.0);
+                std::vector<double> left(
+                    repair_degree + 1, 0.0);
+                std::vector<double> right(
+                    repair_degree + 1, 0.0);
+                basis[0] = 1.0;
+                for (int j = 1; j <= repair_degree; ++j) {
+                    left[j] =
+                        parameter -
+                        repair_knots[span + 1 - j];
+                    right[j] =
+                        repair_knots[span + j] -
+                        parameter;
+                    double saved = 0.0;
+                    for (int r = 0; r < j; ++r) {
+                        const double denominator =
+                            right[r + 1] + left[j - r];
+                        const double term =
+                            denominator > 1.0e-12
+                                ? basis[r] / denominator
+                                : 0.0;
+                        basis[r] =
+                            saved + right[r + 1] * term;
+                        saved = left[j - r] * term;
+                    }
+                    basis[j] = saved;
+                }
+                double movable_norm_sq = 0.0;
+                for (int j = 0; j <= repair_degree; ++j) {
+                    const int control_index =
+                        span - repair_degree + j;
+                    if (control_index <= 0 ||
+                        control_index >= n_cp - 1) {
+                        continue;
+                    }
+                    movable_norm_sq += basis[j] * basis[j];
+                }
+                if (movable_norm_sq <= 1.0e-12) return;
+                for (int j = 0; j <= repair_degree; ++j) {
+                    const int control_index =
+                        span - repair_degree + j;
+                    if (control_index <= 0 ||
+                        control_index >= n_cp - 1) {
+                        continue;
+                    }
+                    control_points[control_index] +=
+                        (basis[j] / movable_norm_sq) *
+                        gain * desired_curve_displacement *
+                        repair_direction;
+                }
+            };
+
+            // A single point projection produces a narrow last-moment kink.
+            // Use a finite five-anchor support: deviation starts several knot
+            // spans before the obstacle, peaks at the dangerous parameter,
+            // then rejoins more quickly after it.  The support remains local
+            // and cannot accumulate into the former whole-trajectory hook.
+            constexpr std::array<double, 5> kSupportOffsets{
+                -0.18, -0.10, 0.0, 0.08, 0.16};
+            constexpr std::array<double, 5> kSupportGains{
+                0.30, 0.60, 0.80, 0.45, 0.20};
+            for (size_t support_index = 0;
+                 support_index < kSupportOffsets.size();
+                 ++support_index) {
+                apply_local_basis_displacement(
+                    obstacle_fraction +
+                        kSupportOffsets[support_index],
+                    kSupportGains[support_index]);
+            }
+            control_points.front() = cs.position;
+            control_points.back() = terminal;
+            traj = sampleTrajectoryFeasible(
+                control_points, cs.position, cs.velocity,
+                cs.acceleration, terminal, cs.yaw);
+            repaired_validation = validateTrajectory(traj);
+        }
+
         if (!optimized) {
             auto val = validateTrajectory(traj);
             if (val.any_collision || !val.all_clear) {
-                // Phase 2: NO global map fallback.
-                // Only allow known-free A* sub-path fallback.
-                if (request.allow_global_map_fallback) {
-                    traj = generateGlobalPathFallback(
-                        cs, progress.progress_s,
-                        config_.lookahead_distance * 0.5);
-                    used_global_fallback = true;
-                }
-                // else: return the (possibly colliding) trajectory;
-                // the caller handles failure via hover/abort.
+                // NO fallback — optimization failed, return failure
+                // The caller handles failure via hover/abort, NOT via
+                // an alternative planner or global path bypass.
             }
         }
     }
@@ -1776,9 +2368,7 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
     // ── Final validation ───────────────────────────────────────
     auto validation = validateTrajectory(traj);
 
-    // Smoothing can cut a collision-free reference corner. In that case,
-    // retry the unmodified reference shape while preserving the exact Guide
-    // terminal and its automatically assigned arrival time.
+    // Retry with unmodified straight-line reference shape.
     if ((validation.any_collision || !validation.all_clear) &&
         !reference_control_points.empty()) {
         auto reference_trajectory = sampleTrajectoryFeasible(
@@ -1794,20 +2384,7 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
         }
     }
 
-    if ((validation.any_collision || !validation.all_clear) &&
-        request.allow_global_map_fallback) {
-        auto fallback = generateGlobalPathFallback(
-            cs, progress.progress_s,
-            std::max(config_.min_lookahead_distance,
-                     config_.lookahead_distance * 0.5));
-        auto fb_val = validateTrajectory(fallback);
-        if (!fb_val.any_collision && fb_val.all_clear) {
-            traj = std::move(fallback);
-            validation = fb_val;
-            used_global_fallback = true;
-            optimized = true;
-        }
-    }
+    // NO global_map_fallback — straight-line only, return failure otherwise.
 
     // Check for unknown space violations
     // Validate the actual time-scaled samples. The optimizer uses a nominal
@@ -1921,13 +2498,20 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
     if (validation.any_collision) {
         result.success = false;
         result.status = PlannerStatus::COLLISION;
-        result.message = "Trajectory has collision (clearance <= 0)";
+        result.message =
+            "Trajectory has collision (clearance <= 0) after " +
+            std::to_string(final_clearance_repairs) +
+            " final-clearance repairs, min=" +
+            std::to_string(validation.min_clearance);
     } else if (!validation.all_clear) {
         result.success = false;
         result.status = PlannerStatus::COLLISION;
         result.message = "Trajectory has " +
                          std::to_string(validation.clearance_violation_count) +
-                         " clearance violations";
+                         " clearance violations after " +
+                         std::to_string(final_clearance_repairs) +
+                         " final-clearance repairs, min=" +
+                         std::to_string(validation.min_clearance);
     } else if (!request_dynamics_feasible) {
         result.success = false;
         result.status = PlannerStatus::DYNAMICS_VIOLATION;
@@ -1948,7 +2532,13 @@ LocalPlanResult LocalPlanner::planLocalWithRequest(
     } else {
         result.success = true;
         result.status = PlannerStatus::SUCCESS;
-        result.message = used_global_fallback ? "OK (global-path fallback)" : "OK";
+        result.message =
+            final_clearance_repairs > 0
+                ? "OK (final clearance repaired " +
+                      std::to_string(final_clearance_repairs) + "x)"
+                : (used_global_fallback
+                       ? "OK (global-path fallback)"
+                       : "OK");
     }
 
     result.used_global_fallback = used_global_fallback;

@@ -1,24 +1,16 @@
 #!/usr/bin/env python3
 """
-Global Path Planning Module — line-push geometric planner with A* fallback.
+Global Path Planning Module — goal-directed branching search.
 
-=== v5: Receding-Horizon Refactor ===
-This module now ONLY provides:
-  - Grid utilities (world↔grid, ESDF lookup, coarse ESDF)
-  - A* planner (26-neighbour, corner-cutting prevention)
-  - Greedy shortcut / string pulling with adaptive ESDF segment check
-  - GlobalPathPlanner: plan_global() returns raw A* + shortcut global path
+=== v7: Goal-directed Branching Global Path ===
+This module provides the SINGLE, DETERMINISTIC global path algorithm:
+  - Advance toward the final goal in fixed collision-checked steps
+  - Branch only when the next goal-directed step violates ESDF clearance
+  - For every angular branch, use its smallest collision-free deviation
+  - Keep all branches in an A*-ordered queue and return the shortest route
+  - GlobalPathPlanner: plan_global() returns the only path or failure
 
-The following functions are DEPRECATED and MUST NOT be called by the new pipeline:
-  - smooth_trajectory
-  - smooth_position_path
-  - resample_path (as full-trajectory step)
-  - time_parameterize
-  - sample_trajectory
-  - generate_controls
-  - validate_dynamics
-
-They are kept only for backward compatibility and debugging.
+NO clearance reward, NO unconstrained smoothing, NO fallback planners.
 
 All coordinates are ROS world frame (x-fwd, y-left, z-up).
 """
@@ -580,15 +572,1399 @@ def _validate_polyline(path, esdf, origin, resolution,
     return True, worst
 
 
+# ============================================================================
+#  5.  Goal-directed branching search
+# ============================================================================
+
+def _goal_branch_state_key(position, origin, merge_resolution):
+    """Quantise a continuous search point for deterministic branch merging."""
+    scaled = (
+        (np.asarray(position, dtype=np.float64) -
+         np.asarray(origin, dtype=np.float64)) / merge_resolution)
+    return tuple(int(math.floor(value + 0.5)) for value in scaled)
+
+
+def _goal_branch_directions(goal_direction, angular_step_rad,
+                            azimuth_bins, max_deviation_rad,
+                            planar_search=False):
+    """Yield one angular ray at a time around the goal direction.
+
+    Every azimuth defines an independent potential avoidance branch.  In 3-D,
+    the caller keeps the smallest collision-free deviation on each ray.  The
+    planar search can retain multiple clear deviations on its left/right rays
+    so the shortest-path search does not lose a necessary boundary branch.
+    """
+    direction = np.asarray(goal_direction, dtype=np.float64)
+    direction_norm = float(np.linalg.norm(direction))
+    if direction_norm < 1e-9:
+        return []
+    direction = direction / direction_norm
+
+    if planar_search:
+        base_angle = math.atan2(direction[1], direction[0])
+        angle_count = max(
+            1, int(math.ceil(max_deviation_rad / angular_step_rad)))
+        rays = []
+        for side_sign in (-1.0, 1.0):
+            ray = []
+            for angle_index in range(1, angle_count + 1):
+                deviation = min(
+                    max_deviation_rad,
+                    angle_index * angular_step_rad)
+                heading = base_angle + side_sign * deviation
+                ray.append((
+                    deviation,
+                    np.array(
+                        [math.cos(heading), math.sin(heading), 0.0],
+                        dtype=np.float64)))
+            rays.append(ray)
+        return rays
+
+    # Pick the least-parallel world axis to build a stable perpendicular basis.
+    axes = (
+        np.array([1.0, 0.0, 0.0], dtype=np.float64),
+        np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        np.array([0.0, 0.0, 1.0], dtype=np.float64),
+    )
+    reference = min(axes, key=lambda axis: abs(float(np.dot(axis, direction))))
+    basis_u = np.cross(direction, reference)
+    basis_u /= max(float(np.linalg.norm(basis_u)), 1e-12)
+    basis_v = np.cross(direction, basis_u)
+    basis_v /= max(float(np.linalg.norm(basis_v)), 1e-12)
+
+    angle_count = max(
+        1, int(math.ceil(max_deviation_rad / angular_step_rad)))
+    rays = []
+    for azimuth_index in range(azimuth_bins):
+        azimuth = 2.0 * math.pi * azimuth_index / float(azimuth_bins)
+        lateral = (
+            math.cos(azimuth) * basis_u +
+            math.sin(azimuth) * basis_v)
+        ray = []
+        for angle_index in range(1, angle_count + 1):
+            angle = min(
+                max_deviation_rad, angle_index * angular_step_rad)
+            candidate = (
+                math.cos(angle) * direction +
+                math.sin(angle) * lateral)
+            candidate_norm = float(np.linalg.norm(candidate))
+            if candidate_norm > 1e-9:
+                ray.append((angle, candidate / candidate_norm))
+        rays.append(ray)
+    return rays
+
+
+def _goal_directed_branch_path_global_competition_legacy(
+        start, goal, esdf, origin, resolution,
+        min_clearance, check_spacing, config):
+    """Plan by walking toward the goal and branching only at collisions.
+
+    Search states are continuous points merged at a configurable spatial
+    resolution.  A free goal-directed step has exactly one successor.  If that
+    step is blocked, collision-free angular successors become branches.  The
+    open set is ordered by
+    ``travelled_length + Euclidean_distance_to_goal``, so all surviving
+    branches compete on complete geometric path length.
+    """
+    start = np.asarray(start, dtype=np.float64)
+    goal = np.asarray(goal, dtype=np.float64)
+    if (start.shape != (3,) or goal.shape != (3,) or
+            not np.all(np.isfinite(start)) or
+            not np.all(np.isfinite(goal))):
+        return None, {"reason": "invalid_start_or_goal"}
+
+    direct_distance = float(np.linalg.norm(goal - start))
+    if direct_distance < 1e-9:
+        return [tuple(start)], {
+            "cost": 0.0,
+            "length": 0.0,
+            "expanded_states": 0,
+            "generated_branches": 0,
+            "direct_steps": 0,
+            "branch_events": 0}
+
+    step_length = max(
+        resolution * 0.5,
+        float(config.get("step_length_m", resolution)))
+    merge_resolution = max(
+        resolution * 0.5,
+        float(config.get(
+            "state_merge_resolution_m",
+            min(resolution, step_length * 0.75))))
+    angular_step_deg = max(
+        1.0, float(config.get("angular_step_deg", 10.0)))
+    angular_step_rad = math.radians(angular_step_deg)
+    azimuth_bins = max(4, int(config.get("azimuth_bins", 12)))
+    max_deviation_deg = min(
+        179.0, max(angular_step_deg,
+                   float(config.get("maximum_deviation_deg", 120.0))))
+    max_deviation_rad = math.radians(max_deviation_deg)
+    goal_tolerance = max(
+        step_length * 0.5,
+        float(config.get("goal_tolerance_m", step_length)))
+    max_expanded_states = max(
+        1, int(config.get("maximum_expanded_states", 300000)))
+    max_planning_time_s = max(
+        0.1, float(config.get("maximum_planning_time_s", 45.0)))
+    planar_when_equal_altitude = bool(
+        config.get("planar_when_equal_altitude", True))
+    altitude_tolerance = max(
+        0.0, float(config.get(
+            "altitude_equality_tolerance_m", 0.05)))
+    planar_search = bool(
+        planar_when_equal_altitude and
+        abs(float(start[2] - goal[2])) <= altitude_tolerance)
+
+    start_clearance = _trilinear_esdf(esdf, origin, resolution, start)
+    goal_clearance = _trilinear_esdf(esdf, origin, resolution, goal)
+    if start_clearance < min_clearance - 1e-3:
+        return None, {
+            "reason": "start_below_minimum_clearance",
+            "start_clearance": float(start_clearance)}
+    if goal_clearance < min_clearance - 1e-3:
+        return None, {
+            "reason": "goal_below_minimum_clearance",
+            "goal_clearance": float(goal_clearance)}
+
+    positions = [start.copy()]
+    parents = [-1]
+    path_costs = [0.0]
+    start_key = _goal_branch_state_key(
+        start, origin, merge_resolution)
+    best_cost_by_key = {start_key: 0.0}
+
+    open_heap = []
+    heap_counter = 0
+    heapq.heappush(
+        open_heap, (direct_distance, heap_counter, 0))
+
+    best_goal_cost = float("inf")
+    best_goal_parent = -1
+    expanded_states = 0
+    generated_branches = 0
+    direct_steps = 0
+    branch_events = 0
+    stale_states = 0
+    started_at = time.time()
+
+    while open_heap:
+        if expanded_states >= max_expanded_states:
+            break
+        if time.time() - started_at > max_planning_time_s:
+            break
+
+        estimated_total, _, node_index = heapq.heappop(open_heap)
+        if estimated_total >= best_goal_cost - 1e-9:
+            break
+
+        position = positions[node_index]
+        travelled = path_costs[node_index]
+        state_key = _goal_branch_state_key(
+            position, origin, merge_resolution)
+        if travelled > best_cost_by_key.get(
+                state_key, float("inf")) + 1e-9:
+            stale_states += 1
+            continue
+
+        expanded_states += 1
+        to_goal = goal - position
+        distance_to_goal = float(np.linalg.norm(to_goal))
+        if distance_to_goal <= goal_tolerance:
+            candidate_cost = travelled + distance_to_goal
+            if candidate_cost < best_goal_cost:
+                best_goal_cost = candidate_cost
+                best_goal_parent = node_index
+            continue
+
+        goal_segment_clear, _ = _check_segment_clearance_adaptive(
+            position, goal, esdf, origin, resolution,
+            min_clearance, check_spacing)
+        if goal_segment_clear:
+            candidate_cost = travelled + distance_to_goal
+            if candidate_cost < best_goal_cost:
+                best_goal_cost = candidate_cost
+                best_goal_parent = node_index
+            continue
+
+        goal_direction = to_goal / distance_to_goal
+        actual_step = min(step_length, distance_to_goal)
+        direct_successor = position + actual_step * goal_direction
+        direct_clear, _ = _check_segment_clearance_adaptive(
+            position, direct_successor,
+            esdf, origin, resolution,
+            min_clearance, check_spacing)
+
+        successors = []
+        if direct_clear:
+            successors.append((direct_successor, actual_step))
+            direct_steps += 1
+        else:
+            branch_events += 1
+            seen_successor_keys = set()
+            direction_rays = _goal_branch_directions(
+                goal_direction, angular_step_rad,
+                azimuth_bins, max_deviation_rad,
+                planar_search=planar_search)
+            for ray in direction_rays:
+                # In 3-D, each azimuthal ray contributes its minimum-angle
+                # action.  In the planar two-sided case, retain the remaining
+                # clear angular cells as independent branches as well.  This
+                # lets the shortest-route search choose a larger immediate
+                # deviation when repeated minimum-angle steps would only
+                # oscillate against the same obstacle boundary.
+                for _, branch_direction in ray:
+                    successor = position + step_length * branch_direction
+                    clear, _ = _check_segment_clearance_adaptive(
+                        position, successor,
+                        esdf, origin, resolution,
+                        min_clearance, check_spacing)
+                    if not clear:
+                        continue
+                    successor_key = _goal_branch_state_key(
+                        successor, origin, merge_resolution)
+                    if successor_key not in seen_successor_keys:
+                        seen_successor_keys.add(successor_key)
+                        successors.append((successor, step_length))
+                    if not planar_search:
+                        break
+            generated_branches += len(successors)
+
+        for successor, edge_length in successors:
+            successor_cost = travelled + edge_length
+            successor_key = _goal_branch_state_key(
+                successor, origin, merge_resolution)
+            if successor_cost >= best_cost_by_key.get(
+                    successor_key, float("inf")) - 1e-9:
+                continue
+
+            best_cost_by_key[successor_key] = successor_cost
+            positions.append(successor)
+            parents.append(node_index)
+            path_costs.append(successor_cost)
+            successor_index = len(positions) - 1
+            heuristic = float(np.linalg.norm(goal - successor))
+            heap_counter += 1
+            heapq.heappush(
+                open_heap,
+                (successor_cost + heuristic,
+                 heap_counter, successor_index))
+
+    if best_goal_parent < 0:
+        reason = (
+            "maximum_expanded_states_reached"
+            if expanded_states >= max_expanded_states
+            else "planning_time_limit_reached"
+            if time.time() - started_at > max_planning_time_s
+            else "no_branch_reaches_goal")
+        return None, {
+            "reason": reason,
+            "expanded_states": expanded_states,
+            "generated_branches": generated_branches,
+            "direct_steps": direct_steps,
+            "branch_events": branch_events,
+            "stale_states": stale_states,
+            "planning_time_sec": float(time.time() - started_at)}
+
+    reverse_indices = []
+    cursor = best_goal_parent
+    while cursor >= 0:
+        reverse_indices.append(cursor)
+        cursor = parents[cursor]
+    reverse_indices.reverse()
+    path = [tuple(positions[index]) for index in reverse_indices]
+    if float(np.linalg.norm(np.asarray(path[-1]) - goal)) > 1e-9:
+        path.append(tuple(goal))
+
+    valid, worst_clearance = _validate_polyline(
+        np.asarray(path, dtype=np.float64),
+        esdf, origin, resolution,
+        min_clearance, check_spacing)
+    if not valid:
+        return None, {
+            "reason": "final_path_validation_failed",
+            "expanded_states": expanded_states,
+            "worst_clearance": float(worst_clearance)}
+
+    length = sum(
+        float(np.linalg.norm(
+            np.asarray(path[index]) -
+            np.asarray(path[index - 1])))
+        for index in range(1, len(path)))
+    return path, {
+        "cost": float(length),
+        "length": float(length),
+        "worst_clearance": float(worst_clearance),
+        "expanded_states": expanded_states,
+        "generated_branches": generated_branches,
+        "direct_steps": direct_steps,
+        "branch_events": branch_events,
+        "stale_states": stale_states,
+        "search_nodes": len(positions),
+        "step_length_m": float(step_length),
+        "state_merge_resolution_m": float(merge_resolution),
+        "angular_step_deg": float(angular_step_deg),
+        "azimuth_bins": int(azimuth_bins),
+        "maximum_deviation_deg": float(max_deviation_deg),
+        "planar_search": bool(planar_search),
+        "planning_time_sec": float(time.time() - started_at)}
+
+
+def _goal_directed_branch_path_event_length_legacy(
+        start, goal, esdf, origin, resolution,
+        min_clearance, check_spacing, config):
+    """Walk toward the goal and solve each blocked step independently.
+
+    The normal state has exactly one action: one fixed step toward the goal.
+    If that step is blocked, a temporary avoidance search branches over clear
+    angular steps.  A branch is complete as soon as its next goal-directed
+    step is clear.  The shortest completed avoidance segment is committed
+    immediately; later obstacles cannot change that decision.  Equal-length
+    planar branches prefer the right side.
+    """
+    start = np.asarray(start, dtype=np.float64)
+    goal = np.asarray(goal, dtype=np.float64)
+    if (start.shape != (3,) or goal.shape != (3,) or
+            not np.all(np.isfinite(start)) or
+            not np.all(np.isfinite(goal))):
+        return None, {"reason": "invalid_start_or_goal"}
+
+    direct_distance = float(np.linalg.norm(goal - start))
+    if direct_distance < 1e-9:
+        return [tuple(start)], {
+            "cost": 0.0,
+            "length": 0.0,
+            "expanded_states": 0,
+            "generated_branches": 0,
+            "direct_steps": 0,
+            "branch_events": 0,
+            "right_tie_breaks": 0}
+
+    step_length = max(
+        resolution * 0.5,
+        float(config.get("step_length_m", resolution)))
+    merge_resolution = max(
+        resolution * 0.5,
+        float(config.get(
+            "state_merge_resolution_m",
+            min(resolution, step_length * 0.75))))
+    angular_step_deg = max(
+        1.0, float(config.get("angular_step_deg", 10.0)))
+    angular_step_rad = math.radians(angular_step_deg)
+    azimuth_bins = max(4, int(config.get("azimuth_bins", 12)))
+    max_deviation_deg = min(
+        179.0, max(
+            angular_step_deg,
+            float(config.get("maximum_deviation_deg", 120.0))))
+    max_deviation_rad = math.radians(max_deviation_deg)
+    goal_tolerance = max(
+        step_length * 0.5,
+        float(config.get("goal_tolerance_m", step_length)))
+    max_expanded_states = max(
+        1, int(config.get("maximum_expanded_states", 300000)))
+    max_planning_time_s = max(
+        0.1, float(config.get("maximum_planning_time_s", 45.0)))
+    planar_when_equal_altitude = bool(
+        config.get("planar_when_equal_altitude", True))
+    altitude_tolerance = max(
+        0.0, float(config.get(
+            "altitude_equality_tolerance_m", 0.05)))
+    planar_search = bool(
+        planar_when_equal_altitude and
+        abs(float(start[2] - goal[2])) <= altitude_tolerance)
+
+    start_clearance = _trilinear_esdf(
+        esdf, origin, resolution, start)
+    goal_clearance = _trilinear_esdf(
+        esdf, origin, resolution, goal)
+    if start_clearance < min_clearance - 1e-3:
+        return None, {
+            "reason": "start_below_minimum_clearance",
+            "start_clearance": float(start_clearance)}
+    if goal_clearance < min_clearance - 1e-3:
+        return None, {
+            "reason": "goal_below_minimum_clearance",
+            "goal_clearance": float(goal_clearance)}
+
+    path = [start.copy()]
+    current = start.copy()
+    expanded_states = 0
+    generated_branches = 0
+    direct_steps = 0
+    branch_events = 0
+    right_selected_events = 0
+    left_selected_events = 0
+    other_selected_events = 0
+    started_at = time.time()
+
+    while float(np.linalg.norm(goal - current)) > goal_tolerance:
+        if expanded_states >= max_expanded_states:
+            return None, {
+                "reason": "maximum_expanded_states_reached",
+                "expanded_states": expanded_states,
+                "generated_branches": generated_branches,
+                "direct_steps": direct_steps,
+                "branch_events": branch_events}
+        if time.time() - started_at > max_planning_time_s:
+            return None, {
+                "reason": "planning_time_limit_reached",
+                "expanded_states": expanded_states,
+                "generated_branches": generated_branches,
+                "direct_steps": direct_steps,
+                "branch_events": branch_events}
+
+        # Connecting the complete remaining chord is only a compact form of
+        # repeatedly taking the same goal-directed action.
+        goal_segment_clear, _ = _check_segment_clearance_adaptive(
+            current, goal, esdf, origin, resolution,
+            min_clearance, check_spacing)
+        if goal_segment_clear:
+            path.append(goal.copy())
+            current = goal.copy()
+            break
+
+        to_goal = goal - current
+        distance_to_goal = float(np.linalg.norm(to_goal))
+        goal_direction = to_goal / distance_to_goal
+        actual_step = min(step_length, distance_to_goal)
+        direct_successor = current + actual_step * goal_direction
+        direct_clear, _ = _check_segment_clearance_adaptive(
+            current, direct_successor,
+            esdf, origin, resolution,
+            min_clearance, check_spacing)
+        if direct_clear:
+            path.append(direct_successor.copy())
+            current = direct_successor
+            direct_steps += 1
+            continue
+
+        # A blocked normal action starts one self-contained avoidance event.
+        # Search cost is ONLY distance travelled since this event's anchor.
+        branch_events += 1
+        anchor = current.copy()
+        positions = [anchor]
+        parents = [-1]
+        episode_costs = [0.0]
+        first_side_ranks = [2]
+        angle_costs = [0.0]
+        start_key = _goal_branch_state_key(
+            anchor, origin, merge_resolution)
+        best_by_key = {start_key: (0.0, 2, 0.0)}
+        open_heap = []
+        heap_counter = 0
+        heapq.heappush(open_heap, (0.0, 2, 0.0, heap_counter, 0))
+        selected_index = -1
+        selected_side_rank = 2
+
+        while open_heap:
+            if expanded_states >= max_expanded_states:
+                break
+            if time.time() - started_at > max_planning_time_s:
+                break
+
+            (travelled, side_rank, angle_cost,
+             _, node_index) = heapq.heappop(open_heap)
+            position = positions[node_index]
+            state_key = _goal_branch_state_key(
+                position, origin, merge_resolution)
+            state_score = (travelled, side_rank, angle_cost)
+            if state_score > best_by_key.get(
+                    state_key,
+                    (float("inf"), 3, float("inf"))):
+                continue
+
+            expanded_states += 1
+            to_goal = goal - position
+            distance_to_goal = float(np.linalg.norm(to_goal))
+            if distance_to_goal <= goal_tolerance:
+                selected_index = node_index
+                selected_side_rank = side_rank
+                break
+
+            goal_direction = to_goal / distance_to_goal
+            direct_successor = (
+                position +
+                min(step_length, distance_to_goal) * goal_direction)
+            direct_clear, _ = _check_segment_clearance_adaptive(
+                position, direct_successor,
+                esdf, origin, resolution,
+                min_clearance, check_spacing)
+
+            # The anchor is known to be blocked.  For every other state, one
+            # clear goal-directed step ends this avoidance event immediately.
+            if node_index != 0 and direct_clear:
+                selected_index = node_index
+                selected_side_rank = side_rank
+                break
+
+            direction_rays = _goal_branch_directions(
+                goal_direction, angular_step_rad,
+                azimuth_bins, max_deviation_rad,
+                planar_search=planar_search)
+            seen_successor_keys = set()
+            for ray_index, ray in enumerate(direction_rays):
+                # Once a planar avoidance branch has chosen RIGHT or LEFT,
+                # keep that side for the lifetime of this event.  Allowing a
+                # branch to swap sides at every blocked step creates a short
+                # alternating zig-zag rather than a coherent bypass.
+                if (planar_search and node_index != 0 and
+                        ray_index != side_rank):
+                    continue
+                for deviation, branch_direction in ray:
+                    successor = (
+                        position + step_length * branch_direction)
+                    clear, _ = _check_segment_clearance_adaptive(
+                        position, successor,
+                        esdf, origin, resolution,
+                        min_clearance, check_spacing)
+                    if not clear:
+                        continue
+
+                    successor_key = _goal_branch_state_key(
+                        successor, origin, merge_resolution)
+                    if successor_key in seen_successor_keys:
+                        continue
+                    seen_successor_keys.add(successor_key)
+
+                    if node_index == 0:
+                        # _goal_branch_directions emits clockwise/right first
+                        # in planar mode.  In 3-D the azimuth order is simply a
+                        # deterministic tie-break because "right" is undefined.
+                        successor_side_rank = (
+                            ray_index if planar_search else ray_index + 2)
+                    else:
+                        successor_side_rank = side_rank
+                    successor_cost = travelled + step_length
+                    successor_angle_cost = angle_cost + deviation
+                    successor_score = (
+                        successor_cost,
+                        successor_side_rank,
+                        successor_angle_cost)
+                    if successor_score >= best_by_key.get(
+                            successor_key,
+                            (float("inf"), 1000000, float("inf"))):
+                        continue
+
+                    best_by_key[successor_key] = successor_score
+                    positions.append(successor)
+                    parents.append(node_index)
+                    episode_costs.append(successor_cost)
+                    first_side_ranks.append(successor_side_rank)
+                    angle_costs.append(successor_angle_cost)
+                    successor_index = len(positions) - 1
+                    heap_counter += 1
+                    heapq.heappush(
+                        open_heap,
+                        (successor_cost,
+                         successor_side_rank,
+                         successor_angle_cost,
+                         heap_counter,
+                         successor_index))
+                    generated_branches += 1
+
+        if selected_index < 0:
+            reason = (
+                "maximum_expanded_states_reached"
+                if expanded_states >= max_expanded_states
+                else "planning_time_limit_reached"
+                if time.time() - started_at > max_planning_time_s
+                else "no_avoidance_branch_restores_goal_step")
+            return None, {
+                "reason": reason,
+                "expanded_states": expanded_states,
+                "generated_branches": generated_branches,
+                "direct_steps": direct_steps,
+                "branch_events": branch_events}
+
+        reverse_indices = []
+        cursor = selected_index
+        while cursor > 0:
+            reverse_indices.append(cursor)
+            cursor = parents[cursor]
+        reverse_indices.reverse()
+        if not reverse_indices:
+            return None, {
+                "reason": "empty_avoidance_branch",
+                "expanded_states": expanded_states,
+                "branch_events": branch_events}
+        for index in reverse_indices:
+            path.append(positions[index].copy())
+        current = positions[selected_index].copy()
+
+        if planar_search and selected_side_rank == 0:
+            right_selected_events += 1
+        elif planar_search and selected_side_rank == 1:
+            left_selected_events += 1
+        else:
+            other_selected_events += 1
+
+    if float(np.linalg.norm(np.asarray(path[-1]) - goal)) > 1e-9:
+        path.append(goal.copy())
+
+    valid, worst_clearance = _validate_polyline(
+        np.asarray(path, dtype=np.float64),
+        esdf, origin, resolution,
+        min_clearance, check_spacing)
+    if not valid:
+        return None, {
+            "reason": "final_path_validation_failed",
+            "expanded_states": expanded_states,
+            "worst_clearance": float(worst_clearance)}
+
+    length = sum(
+        float(np.linalg.norm(path[index] - path[index - 1]))
+        for index in range(1, len(path)))
+    return [tuple(point) for point in path], {
+        "cost": float(length),
+        "length": float(length),
+        "avoidance_score": "segment_length_only",
+        "equal_length_tie_break": "right",
+        "worst_clearance": float(worst_clearance),
+        "expanded_states": expanded_states,
+        "generated_branches": generated_branches,
+        "direct_steps": direct_steps,
+        "branch_events": branch_events,
+        "right_selected_events": right_selected_events,
+        "left_selected_events": left_selected_events,
+        "other_selected_events": other_selected_events,
+        "step_length_m": float(step_length),
+        "state_merge_resolution_m": float(merge_resolution),
+        "angular_step_deg": float(angular_step_deg),
+        "azimuth_bins": int(azimuth_bins),
+        "maximum_deviation_deg": float(max_deviation_deg),
+        "planar_search": bool(planar_search),
+        "planning_time_sec": float(time.time() - started_at)}
+
+
+def _rotate_horizontal(direction, signed_angle):
+    """Rotate a 3-D direction in world XY while preserving its elevation."""
+    direction = np.asarray(direction, dtype=np.float64)
+    horizontal_norm = float(np.linalg.norm(direction[:2]))
+    if horizontal_norm < 1e-9:
+        return None
+    heading = math.atan2(direction[1], direction[0]) + signed_angle
+    rotated = np.array([
+        horizontal_norm * math.cos(heading),
+        horizontal_norm * math.sin(heading),
+        direction[2]], dtype=np.float64)
+    norm = float(np.linalg.norm(rotated))
+    return rotated / norm if norm > 1e-9 else None
+
+
+def _visible_corridor_clear(position, direction, length,
+                            esdf, origin, resolution,
+                            min_clearance, check_spacing):
+    """Check one finite swept corridor available to the local observation.
+
+    The ESDF already has vehicle radius subtracted, so testing the candidate
+    centreline at ``min_clearance`` is equivalent to checking a capsule with
+    vehicle radius plus the requested safety margin.  Only the finite segment
+    inside the simulated depth range is queried; geometry beyond it cannot
+    influence the decision.
+    """
+    if length <= 1e-9:
+        return True, float("inf")
+    endpoint = (
+        np.asarray(position, dtype=np.float64) +
+        float(length) * np.asarray(direction, dtype=np.float64))
+    return _check_segment_clearance_adaptive(
+        position, endpoint, esdf, origin, resolution,
+        min_clearance, check_spacing)
+
+
+def observation_conditioned_rollout_path(
+        start, goal, esdf, origin, resolution,
+        min_clearance, check_spacing, config):
+    """Generate a global reference by rolling out a local-observation policy.
+
+    The complete ESDF acts as an offline sensor simulator and final safety
+    oracle.  Direction decisions query only finite swept corridors inside the
+    configured depth range and horizontal FOV.  At the first blocked forward
+    corridor, LEFT and RIGHT are compared by their minimum visible safe
+    deviation; equal deviations choose RIGHT.  The selected side is retained
+    until the forward corridor becomes locally clear again.
+    """
+    start = np.asarray(start, dtype=np.float64)
+    goal = np.asarray(goal, dtype=np.float64)
+    if (start.shape != (3,) or goal.shape != (3,) or
+            not np.all(np.isfinite(start)) or
+            not np.all(np.isfinite(goal))):
+        return None, {"reason": "invalid_start_or_goal"}
+
+    direct_distance = float(np.linalg.norm(goal - start))
+    if direct_distance < 1e-9:
+        return [tuple(start)], {
+            "cost": 0.0,
+            "length": 0.0,
+            "decision_events": [],
+            "right_selected_events": 0,
+            "left_selected_events": 0}
+
+    step_length = max(
+        resolution * 0.5,
+        float(config.get("step_length_m", resolution)))
+    angular_step_deg = max(
+        0.25, float(config.get("angular_step_deg", 2.0)))
+    angular_step_rad = math.radians(angular_step_deg)
+    deviation_tie_tolerance_deg = max(
+        0.0, float(config.get(
+            "deviation_tie_tolerance_deg", angular_step_deg)))
+    deviation_tie_tolerance_rad = math.radians(
+        deviation_tie_tolerance_deg)
+    observation_range = max(
+        step_length,
+        float(config.get("observation_range_m", 5.0)))
+    horizontal_fov_deg = min(
+        179.0, max(
+            1.0, float(config.get("horizontal_fov_deg", 90.0))))
+    fov_margin_deg = max(
+        0.0, float(config.get("fov_margin_deg", 3.0)))
+    visible_half_fov_deg = max(
+        angular_step_deg,
+        horizontal_fov_deg * 0.5 - fov_margin_deg)
+    maximum_deviation_deg = min(
+        179.0,
+        max(
+            angular_step_deg,
+            float(config.get("maximum_deviation_deg", 120.0))))
+    maximum_angle_index = max(
+        1, int(math.floor(
+            maximum_deviation_deg / angular_step_deg + 1e-9)))
+    goal_tolerance = max(
+        step_length * 0.5,
+        float(config.get("goal_tolerance_m", step_length)))
+    maximum_rollout_steps = max(
+        1, int(config.get("maximum_rollout_steps", 10000)))
+    maximum_planning_time_s = max(
+        0.1, float(config.get("maximum_planning_time_s", 45.0)))
+
+    start_clearance = _trilinear_esdf(
+        esdf, origin, resolution, start)
+    goal_clearance = _trilinear_esdf(
+        esdf, origin, resolution, goal)
+    if start_clearance < min_clearance - 1e-3:
+        return None, {
+            "reason": "start_below_minimum_clearance",
+            "start_clearance": float(start_clearance)}
+    if goal_clearance < min_clearance - 1e-3:
+        return None, {
+            "reason": "goal_below_minimum_clearance",
+            "goal_clearance": float(goal_clearance)}
+
+    path = [start.copy()]
+    current = start.copy()
+    camera_direction = (goal - start) / direct_distance
+    committed_side = None
+    commitment_anchor = None
+    commitment_right_normal = None
+    decision_events = []
+    right_selected_events = 0
+    left_selected_events = 0
+    direct_steps = 0
+    avoidance_steps = 0
+    corridor_checks = 0
+    started_at = time.time()
+
+    def corridor_length(distance_to_goal):
+        return min(observation_range, distance_to_goal)
+
+    def direction_in_camera_fov(direction):
+        candidate_heading = math.atan2(direction[1], direction[0])
+        camera_heading = math.atan2(
+            camera_direction[1], camera_direction[0])
+        delta = math.atan2(
+            math.sin(candidate_heading - camera_heading),
+            math.cos(candidate_heading - camera_heading))
+        return abs(math.degrees(delta)) <= visible_half_fov_deg + 1e-9
+
+    def minimum_safe_deviation(position, goal_direction,
+                               distance_to_goal, side):
+        nonlocal corridor_checks
+        side_sign = -1.0 if side == "RIGHT" else 1.0
+        length = corridor_length(distance_to_goal)
+        for angle_index in range(1, maximum_angle_index + 1):
+            deviation = angle_index * angular_step_rad
+            direction = _rotate_horizontal(
+                goal_direction, side_sign * deviation)
+            if direction is None:
+                continue
+            if not direction_in_camera_fov(direction):
+                continue
+            corridor_checks += 1
+            clear, worst = _visible_corridor_clear(
+                position, direction, length,
+                esdf, origin, resolution,
+                min_clearance, check_spacing)
+            if not clear:
+                continue
+            # Validate the actually executed prefix independently. Sampling a
+            # long corridor and a 0.1 m prefix uses different sample phases;
+            # both must accept the direction at the hard boundary.
+            prefix_length = min(step_length, distance_to_goal)
+            prefix_clear, prefix_worst = _visible_corridor_clear(
+                position, direction, prefix_length,
+                esdf, origin, resolution,
+                min_clearance, check_spacing)
+            if prefix_clear:
+                return (
+                    deviation, direction,
+                    min(float(worst), float(prefix_worst)))
+        return None, None, None
+
+    def minimum_safe_committed_direction(
+            position, goal_direction, distance_to_goal):
+        """Find the smallest turn that stays on the committed path side."""
+        nonlocal corridor_checks
+        length = corridor_length(distance_to_goal)
+        preferred_sign = -1.0 if committed_side == "RIGHT" else 1.0
+        for angle_index in range(1, maximum_angle_index + 1):
+            deviation = angle_index * angular_step_rad
+            for side_sign in (preferred_sign, -preferred_sign):
+                direction = _rotate_horizontal(
+                    goal_direction, side_sign * deviation)
+                if direction is None:
+                    continue
+                if not direction_in_camera_fov(direction):
+                    continue
+                prefix_length = min(step_length, distance_to_goal)
+                successor = position + prefix_length * direction
+                lateral = float(np.dot(
+                    successor[:2] - commitment_anchor[:2],
+                    commitment_right_normal))
+                if committed_side == "RIGHT" and lateral < -1e-6:
+                    continue
+                if committed_side == "LEFT" and lateral > 1e-6:
+                    continue
+
+                corridor_checks += 1
+                clear, worst = _visible_corridor_clear(
+                    position, direction, length,
+                    esdf, origin, resolution,
+                    min_clearance, check_spacing)
+                if not clear:
+                    continue
+                prefix_clear, prefix_worst = _visible_corridor_clear(
+                    position, direction, prefix_length,
+                    esdf, origin, resolution,
+                    min_clearance, check_spacing)
+                if prefix_clear:
+                    return (
+                        deviation, direction,
+                        min(float(worst), float(prefix_worst)))
+        return None, None, None
+
+    for rollout_step in range(maximum_rollout_steps):
+        if time.time() - started_at > maximum_planning_time_s:
+            return None, {
+                "reason": "planning_time_limit_reached",
+                "rollout_steps": rollout_step,
+                "decision_events": decision_events,
+                "corridor_checks": corridor_checks}
+
+        to_goal = goal - current
+        distance_to_goal = float(np.linalg.norm(to_goal))
+        if distance_to_goal <= goal_tolerance:
+            path.append(goal.copy())
+            current = goal.copy()
+            break
+        goal_direction = to_goal / distance_to_goal
+        local_length = corridor_length(distance_to_goal)
+        forward_clear = False
+        if direction_in_camera_fov(goal_direction):
+            corridor_checks += 1
+            forward_clear, _ = _visible_corridor_clear(
+                current, goal_direction, local_length,
+                esdf, origin, resolution,
+                min_clearance, check_spacing)
+        if forward_clear:
+            prefix_clear, _ = _visible_corridor_clear(
+                current, goal_direction,
+                min(step_length, distance_to_goal),
+                esdf, origin, resolution,
+                min_clearance, check_spacing)
+            forward_clear = bool(prefix_clear)
+
+        if forward_clear:
+            committed_side = None
+            commitment_anchor = None
+            commitment_right_normal = None
+            direction = goal_direction
+            direct_steps += 1
+        else:
+            if committed_side is None:
+                right = minimum_safe_deviation(
+                    current, goal_direction, distance_to_goal, "RIGHT")
+                left = minimum_safe_deviation(
+                    current, goal_direction, distance_to_goal, "LEFT")
+                right_angle, right_direction, right_worst = right
+                left_angle, left_direction, left_worst = left
+
+                if right_angle is None and left_angle is None:
+                    return None, {
+                        "reason": "no_visible_safe_avoidance_direction",
+                        "rollout_steps": rollout_step,
+                        "position": [float(v) for v in current],
+                        "decision_events": decision_events,
+                        "corridor_checks": corridor_checks}
+                if right_angle is None:
+                    committed_side = "LEFT"
+                    direction = left_direction
+                    selection_reason = "right_unavailable"
+                elif left_angle is None:
+                    committed_side = "RIGHT"
+                    direction = right_direction
+                    selection_reason = "left_unavailable"
+                elif (left_angle <
+                      right_angle - deviation_tie_tolerance_rad - 1e-12):
+                    committed_side = "LEFT"
+                    direction = left_direction
+                    selection_reason = "smaller_visible_deviation"
+                elif (right_angle <
+                      left_angle - deviation_tie_tolerance_rad - 1e-12):
+                    committed_side = "RIGHT"
+                    direction = right_direction
+                    selection_reason = "smaller_visible_deviation"
+                else:
+                    # One angular bin is the measurement resolution, not a
+                    # meaningful geometric difference. RIGHT wins such ties.
+                    committed_side = "RIGHT"
+                    direction = right_direction
+                    selection_reason = (
+                        "equal_visible_deviation_choose_right")
+
+                if committed_side == "RIGHT":
+                    right_selected_events += 1
+                else:
+                    left_selected_events += 1
+                commitment_anchor = current.copy()
+                forward_xy = goal_direction[:2]
+                forward_xy_norm = float(np.linalg.norm(forward_xy))
+                if forward_xy_norm < 1e-9:
+                    return None, {
+                        "reason": "horizontal_side_choice_is_undefined",
+                        "rollout_steps": rollout_step,
+                        "decision_events": decision_events}
+                forward_xy = forward_xy / forward_xy_norm
+                commitment_right_normal = np.array(
+                    [forward_xy[1], -forward_xy[0]],
+                    dtype=np.float64)
+                decision_events.append({
+                    "path_index": len(path) - 1,
+                    "position": [
+                        round(float(v), 4) for v in current],
+                    "right_min_deviation_deg": (
+                        None if right_angle is None
+                        else round(math.degrees(right_angle), 4)),
+                    "left_min_deviation_deg": (
+                        None if left_angle is None
+                        else round(math.degrees(left_angle), 4)),
+                    "right_corridor_worst_clearance": (
+                        None if right_worst is None
+                        else round(float(right_worst), 4)),
+                    "left_corridor_worst_clearance": (
+                        None if left_worst is None
+                        else round(float(left_worst), 4)),
+                    "selected_side": committed_side,
+                    "selection_reason": selection_reason})
+            else:
+                deviation = minimum_safe_committed_direction(
+                    current, goal_direction, distance_to_goal)
+                _, direction, _ = deviation
+                if direction is None:
+                    return None, {
+                        "reason": "committed_side_has_no_visible_safe_direction",
+                        "committed_side": committed_side,
+                        "rollout_steps": rollout_step,
+                        "position": [float(v) for v in current],
+                        "decision_events": decision_events,
+                        "corridor_checks": corridor_checks}
+            avoidance_steps += 1
+
+        actual_step = min(step_length, distance_to_goal)
+        successor = current + actual_step * direction
+        step_clear, step_worst = _check_segment_clearance_adaptive(
+            current, successor, esdf, origin, resolution,
+            min_clearance, check_spacing)
+        if not step_clear:
+            return None, {
+                "reason": "selected_visible_direction_failed_truth_check",
+                "rollout_steps": rollout_step,
+                "step_worst_clearance": float(step_worst),
+                "decision_events": decision_events}
+        path.append(successor.copy())
+        current = successor
+        camera_direction = direction.copy()
+    else:
+        return None, {
+            "reason": "maximum_rollout_steps_reached",
+            "rollout_steps": maximum_rollout_steps,
+            "decision_events": decision_events,
+            "corridor_checks": corridor_checks}
+
+    if float(np.linalg.norm(np.asarray(path[-1]) - goal)) > 1e-9:
+        path.append(goal.copy())
+    valid, worst_clearance = _validate_polyline(
+        np.asarray(path, dtype=np.float64),
+        esdf, origin, resolution,
+        min_clearance, check_spacing)
+    if not valid:
+        return None, {
+            "reason": "final_path_validation_failed",
+            "worst_clearance": float(worst_clearance),
+            "decision_events": decision_events}
+
+    length = sum(
+        float(np.linalg.norm(path[index] - path[index - 1]))
+        for index in range(1, len(path)))
+    return [tuple(point) for point in path], {
+        "cost": float(length),
+        "length": float(length),
+        "policy": "minimum_visible_safe_deviation",
+        "equal_deviation_tie_break": "right",
+        "observation_source": "finite_esdf_swept_corridors",
+        "observation_range_m": float(observation_range),
+        "horizontal_fov_deg": float(horizontal_fov_deg),
+        "fov_margin_deg": float(fov_margin_deg),
+        "maximum_deviation_deg": float(maximum_deviation_deg),
+        "angular_step_deg": float(angular_step_deg),
+        "deviation_tie_tolerance_deg": float(
+            deviation_tie_tolerance_deg),
+        "step_length_m": float(step_length),
+        "worst_clearance": float(worst_clearance),
+        "rollout_steps": len(path) - 1,
+        "direct_steps": direct_steps,
+        "avoidance_steps": avoidance_steps,
+        "corridor_checks": corridor_checks,
+        "right_selected_events": right_selected_events,
+        "left_selected_events": left_selected_events,
+        "decision_events": decision_events,
+        "planning_time_sec": float(time.time() - started_at)}
+
+
+# ============================================================================
+#  6.  Legacy LinePush implementation (not used by GlobalPathPlanner)
+# ============================================================================
+#  Retained for compatibility with old offline tools. Runtime global planning
+#  no longer calls this implementation.
+#
+#  Algorithm:
+#    1. Generate initial control points on the straight line start→goal.
+#    2. Group consecutive control points with ESDF < 0.3 into violation intervals.
+#    3. For each interval, generate LEFT and RIGHT candidate paths.
+#    4. Compare complete candidate-path cost; select lower side (RIGHT on tie).
+#    5. For every adjacent pair of safe control points, sample the segment at
+#       check_spacing; if any interior sample has ESDF < 0.3, insert a NEW
+#       control point at the worst location.  NEVER move the two safe endpoints.
+#    6. Only newly-inserted control points (tagged "segment_insert") may be pushed.
+#       Original safe control points ("original") are IMMUTABLE.
+#    7. Iterate until the full polyline passes ESDF ≥ 0.3 everywhere.
+#    8. On failure: return None.  No fallback, no A*, no unsafe bypass.
+#
+#  The ESDF threshold 0.3 is the ONLY safety criterion.
+# ============================================================================
+
+# Global ESDF safety threshold — THE ONLY threshold used across all modules.
+_GLOBAL_ESDF_THRESHOLD = 0.3
+
+
+def _line_push_cost(path, esdf, origin, resolution):
+    """Compute geometric length for collision-side selection.
+
+    Clearance is a hard feasibility constraint, not a reward.  Smoothness and
+    dynamics belong to the local trajectory planner; including a curvature
+    term here can make voxel-gradient noise select a geometrically longer side
+    and would contaminate the intended pure collision-avoidance reference.
+    """
+    if len(path) < 2:
+        return float("inf")
+    length = 0.0
+    for i in range(1, len(path)):
+        length += float(np.linalg.norm(path[i] - path[i - 1]))
+    return length
+
+
+def _line_push_interval_cost(path, interval_indices, esdf, origin,
+                             resolution):
+    """Cost the complete candidate after changing one collision interval.
+
+    Unchanged intervals are identical between the left and right candidates,
+    so their contribution cancels in the comparison.  Keeping the complete
+    prefix/suffix in the objective is nevertheless essential: it accounts for
+    the distance needed to reconnect the repaired interval to the final goal
+    instead of making a myopic decision from only two adjacent samples.
+    """
+    if path is None or not interval_indices:
+        return float("inf")
+    return _line_push_cost(path, esdf, origin, resolution)
+
+
+def _compute_esdf_gradient(point, esdf, origin, resolution, eps=0.10):
+    """Compute ESDF gradient at a world point via central differences.
+
+    Gradient points in the direction of INCREASING ESDF — away from obstacles,
+    toward free space.  This is the natural "escape direction".
+
+    Args:
+        point: (3,) numpy array, world coordinates
+        esdf, origin, resolution: ESDF query parameters
+        eps: finite-difference step size (metres)
+
+    Returns:
+        (3,) numpy array — unit-norm gradient direction, or zero if flat.
+    """
+    grad = np.zeros(3, dtype=np.float64)
+    for d in range(3):
+        offset = np.zeros(3, dtype=np.float64)
+        offset[d] = eps
+        fwd = _trilinear_esdf(esdf, origin, resolution, point + offset)
+        bwd = _trilinear_esdf(esdf, origin, resolution, point - offset)
+        grad[d] = (fwd - bwd) / (2.0 * eps)
+    grad_norm = float(np.linalg.norm(grad))
+    if grad_norm < 1e-9:
+        return np.zeros(3, dtype=np.float64)
+    return grad / grad_norm
+
+
+def _gradient_push_side(start_point, esdf, origin, resolution,
+                         left_normal, side_sign, threshold=0.3,
+                         max_steps=500, step_size=0.15,
+                         max_push_distance=0.0):
+    """Push a point to safety using the ESDF gradient, biased to one side.
+
+    The gradient points toward higher ESDF (free space).  This function
+    follows it preferentially, falling back to pure side-direction push
+    when the gradient is ambiguous or temporarily points the wrong way.
+
+    KEY: the gradient determines the PREFERRED direction but does NOT
+    gate the push.  Local gradient fluctuations (common when navigating
+    around multiple obstacles) do not cause premature failure.
+
+    Args:
+        start_point: (3,) world coords of the violating point
+        left_normal: unit vector pointing LEFT of the local anchor→goal line
+        side_sign: +1.0 for LEFT, -1.0 for RIGHT
+        threshold: ESDF value to reach (0.3)
+        max_steps: iteration limit
+        step_size: metres per step
+        max_push_distance: maximum displacement from the seed; <=0 disables
+
+    Returns:
+        (final_point, success, diagnostics)
+    """
+    current = start_point.copy().astype(np.float64)
+    initial_point = current.copy()
+    side_dir = side_sign * left_normal  # +left_normal or -left_normal
+
+    initial_cl = _trilinear_esdf(
+        esdf, origin, resolution, current)
+    best_cl = initial_cl
+    best_pos = current.copy()
+    steps_since_improvement = 0
+
+    def finish(position, success, reason, steps):
+        return position, success, {
+            "reason": reason,
+            "steps": int(steps),
+            "initial_clearance": float(initial_cl),
+            "best_clearance": float(best_cl),
+            "displacement": float(np.linalg.norm(
+                np.asarray(position) - initial_point)),
+        }
+
+    for step_i in range(max_steps):
+        cl = _trilinear_esdf(esdf, origin, resolution, current)
+
+        # Track best position seen
+        if cl > best_cl:
+            best_cl = cl
+            best_pos = current.copy()
+            steps_since_improvement = 0
+        else:
+            steps_since_improvement += 1
+
+        # Success
+        if cl >= threshold:
+            return finish(
+                current, True, "reached_clearance", step_i)
+
+        # Stuck detection: no improvement for many steps
+        if steps_since_improvement > 80:
+            return finish(
+                best_pos, best_cl >= threshold,
+                "no_clearance_improvement", step_i)
+
+        # ── ESDF gradient: steepest ascent toward free space ──
+        grad = _compute_esdf_gradient(current, esdf, origin, resolution,
+                                       eps=0.10)
+        grad_norm = float(np.linalg.norm(grad))
+
+        if grad_norm < 1e-9:
+            # Flat ESDF — pure side direction push
+            step_dir = side_dir.copy()
+        else:
+            side_component = float(np.dot(grad, side_dir))
+
+            if side_component > 0.05:
+                # Gradient strongly agrees — follow it directly
+                step_dir = grad.copy()
+            elif side_component > -0.05:
+                # Gradient is roughly parallel to path or weakly opposing
+                # Blend: mostly side direction, some gradient influence
+                blend = 0.7 * side_dir + 0.3 * grad
+                blend_norm = float(np.linalg.norm(blend))
+                step_dir = (blend / blend_norm) if blend_norm > 1e-9 else side_dir.copy()
+            else:
+                # Gradient strongly opposes — but don't give up!
+                # Push pure side direction; the local gradient may be from
+                # a nearby obstacle surface that we need to push past.
+                step_dir = side_dir.copy()
+
+        current = current + step_size * step_dir
+
+        # Deeply colliding seeds need multiple steps before they become safe.
+        # Bound displacement from the seed instead of rejecting on the current
+        # signed distance alone.
+        if (max_push_distance > 0.0 and
+                float(np.linalg.norm(current - initial_point)) >
+                max_push_distance):
+            return finish(
+                best_pos, False, "max_push_distance_exceeded",
+                step_i + 1)
+
+    # Exhausted steps — return best position found
+    final_cl = _trilinear_esdf(
+        esdf, origin, resolution, current)
+    if final_cl > best_cl:
+        best_cl = final_cl
+        best_pos = current.copy()
+    if final_cl >= threshold:
+        return finish(
+            current, True, "reached_clearance", max_steps)
+    return finish(
+        best_pos, False, "max_push_steps_exhausted", max_steps)
+
+
+def _generate_left_right_candidates(violation_indices, all_points, original_tags,
+                                     delta, left_normal, esdf, origin, resolution,
+                                     max_push_distance, max_push_steps,
+                                     push_clearance):
+    """Generate LEFT and RIGHT candidate paths for a violation interval.
+
+    The start→goal straight line divides the plane into left and right.
+    For each violating point:
+      - LEFT  candidate: follow the gradient ONLY if it points leftward.
+      - RIGHT candidate: follow the gradient ONLY if it points rightward.
+      - If the gradient has equal components on both sides → RIGHT wins.
+
+    No blending weights, no preference mixing — the ESDF gradient alone
+    determines the viable escape direction(s).
+
+    Args:
+        violation_indices: list of consecutive indices where ESDF < 0.3
+        all_points: numpy array [N, 3] of all control points
+        original_tags: list of str, "original" or "segment_insert"
+        delta: start→goal vector (unused, kept for interface compat)
+        left_normal: left-pointing unit vector in XY plane
+        esdf, origin, resolution: ESDF query parameters
+        max_push_distance: maximum displacement of each pushed point
+        max_push_steps: max gradient-ascent steps per point
+        push_clearance: ESDF target for moved points (hard limit + margin)
+
+    Returns:
+        (left_path, right_path) — each is None if that side failed.
+    """
+    n = len(all_points)
+    left_path = all_points.copy()
+    right_path = all_points.copy()
+
+    left_ok = True
+    right_ok = True
+    first_left_failure = None
+    first_right_failure = None
+
+    for idx in violation_indices:
+        if original_tags[idx] not in ("segment_insert", "original_violating"):
+            continue
+
+        base_point = all_points[idx].copy()
+
+        # ── ALWAYS try both sides.  The ESDF gradient is informative
+        #     but can be misleading at a single point (e.g. narrow corridor
+        #     where the nearest wall biases the gradient).  The push itself
+        #     will determine which side actually reaches safe ESDF.
+        #     Per spec: if both succeed with equal cost → RIGHT wins.
+
+        # ── LEFT candidate ──────────────────────────────────────
+        left_safe, left_success, left_report = _gradient_push_side(
+            base_point, esdf, origin, resolution,
+            left_normal, side_sign=+1.0,
+            threshold=push_clearance,
+            max_steps=max_push_steps,
+            max_push_distance=max_push_distance)
+        if left_success:
+            left_path[idx] = left_safe
+        else:
+            left_ok = False
+            if first_left_failure is None:
+                first_left_failure = (idx, left_report)
+
+        # ── RIGHT candidate ─────────────────────────────────────
+        right_safe, right_success, right_report = _gradient_push_side(
+            base_point, esdf, origin, resolution,
+            left_normal, side_sign=-1.0,
+            threshold=push_clearance,
+            max_steps=max_push_steps,
+            max_push_distance=max_push_distance)
+        if right_success:
+            right_path[idx] = right_safe
+        else:
+            right_ok = False
+            if first_right_failure is None:
+                first_right_failure = (idx, right_report)
+
+    if not left_ok:
+        idx, report = first_left_failure
+        rospy.logwarn(
+            "[LinePush] LEFT candidate failed at point=%d: reason=%s "
+            "steps=%d initial_esdf=%.3f best_esdf=%.3f offset=%.2fm",
+            idx, report["reason"], report["steps"],
+            report["initial_clearance"], report["best_clearance"],
+            report["displacement"])
+        left_path = None
+    if not right_ok:
+        idx, report = first_right_failure
+        rospy.logwarn(
+            "[LinePush] RIGHT candidate failed at point=%d: reason=%s "
+            "steps=%d initial_esdf=%.3f best_esdf=%.3f offset=%.2fm",
+            idx, report["reason"], report["steps"],
+            report["initial_clearance"], report["best_clearance"],
+            report["displacement"])
+        right_path = None
+
+    return left_path, right_path
+
+
 def line_push_path(start, goal, esdf, origin, resolution,
                    min_clearance, check_spacing, config):
-    """Push colliding control points locally away from obstacles.
+    """THE ONLY global path planning algorithm.
 
-    Dense control points are generated on the start-goal line. Each colliding
-    point computes its current local tangent, evaluates both perpendicular
-    directions, and selects the lower local obstacle/path cost. Corrections
-    are spread only to neighbouring points for continuity, so successive
-    obstacles may independently choose different sides.
+    Straight-line initial control points + ESDF violation bilateral push.
+    Original safe control points are never displaced or bypassed.  This keeps
+    every collision-free prefix exactly on its current anchor→goal ray and
+    confines all lateral motion to actual collision intervals.
+    Segment-inserted control points are pushed left/right only.
+    No A*, no RRT, no smoothing, no shortcut.
+
+    Args:
+        start, goal: (x, y, z) tuples or arrays
+        esdf: 3D numpy array
+        origin: (ox, oy, oz)
+        resolution: voxel size
+        min_clearance: ESDF threshold (MUST be 0.3)
+        check_spacing: segment sampling spacing
+        config: line_push configuration dict
+
+    Returns:
+        (path_list, report_dict) on success, (None, report) on failure.
     """
     start = np.asarray(start, dtype=np.float64)
     goal = np.asarray(goal, dtype=np.float64)
@@ -597,6 +1973,7 @@ def line_push_path(start, goal, esdf, origin, resolution,
     if distance < 1e-6:
         return None, {"reason": "degenerate_start_goal"}
 
+    # ── Quick direct check ────────────────────────────────────────
     direct_clear, direct_worst = _check_segment_clearance_adaptive(
         start, goal, esdf, origin, resolution,
         min_clearance, check_spacing)
@@ -605,322 +1982,356 @@ def line_push_path(start, goal, esdf, origin, resolution,
             "side": "direct", "cost": distance,
             "worst_clearance": direct_worst, "iterations": 0}
 
-    xy_norm = float(np.linalg.norm(delta[:2]))
-    if xy_norm < 1e-6:
-        return None, {"reason": "vertical_line_has_no_horizontal_normal"}
-    left_normal = np.array(
-        [-delta[1] / xy_norm, delta[0] / xy_norm, 0.0],
-        dtype=np.float64)
-
+    # ── Config params ─────────────────────────────────────────────
     point_spacing = max(
         resolution * 0.5, float(config.get("point_spacing_m", 0.10)))
-    target_clearance = max(
-        min_clearance,
-        float(config.get("target_clearance_m", min_clearance + 0.10)))
-    influence_radius = max(
-        point_spacing, float(config.get("influence_radius_m", 1.50)))
-    push_margin = max(
-        0.01, float(config.get("push_margin_m", 0.10)))
-    smoothing = min(
-        0.45, max(0.0, float(config.get("smoothing_weight", 0.20))))
     max_iterations = max(1, int(config.get("max_iterations", 80)))
-    max_offset = max(
-        influence_radius, float(config.get("max_offset_m", 12.0)))
     max_control_points = max(
         16, int(config.get("max_control_points", 5000)))
-    max_refinements_per_iteration = max(
-        1, int(config.get(
-            "max_segment_refinements_per_iteration", 256)))
-    clearance_cost_weight = max(
-        0.0, float(config.get("clearance_cost_weight", 0.20)))
+    max_push_distance = max(
+        0.0, float(config.get("max_offset_m", 12.0)))
+    push_clearance = (
+        min_clearance +
+        max(0.0, float(config.get("push_margin_m", 0.0))))
+    # Gradient-ascent push steps: each step is 0.15 m, 300 steps = 45 m reach.
+    # No distance limit — push continues until ESDF >= 0.3 or steps exhausted.
+    max_push_steps = max(100, int(config.get("max_iterations", 80)) * 3)
+
+    # ── Generate initial control points on straight line ──────────
+    # min_clearance is the ESDF threshold (0.3); use it directly.
+    esdf_threshold = min_clearance  # 0.3
 
     point_count = max(3, int(math.ceil(distance / point_spacing)) + 1)
     fractions = np.linspace(0.0, 1.0, point_count)
     base = start[None, :] + fractions[:, None] * delta[None, :]
-    initial_base = base.copy()
-    arc_spacing = distance / (point_count - 1)
+    base[0] = start
+    base[-1] = goal
 
-    candidates = []
-    seed_reports = []
-    # Two seeds are used only to break perfectly symmetric local decisions.
-    # Every colliding control point is otherwise free to select its own side.
-    for seed_name, seed_sign in (("left", 1.0), ("right", -1.0)):
-        path = initial_base.copy()
-        path_anchors = fractions.copy()
-        solved_iteration = -1
-        local_side_switches = 0
-        adaptive_refinements = 0
-        previous_choice = None
+    # Tags: classify original points by their ESDF
+    #   "original_safe"      — ESDF >= 0.3, NEVER move
+    #   "original_violating" — ESDF < 0.3, pushable (the point is inside an obstacle)
+    #   "segment_insert"     — inserted later, pushable
+    tags = []
+    for i in range(point_count):
+        cl = _trilinear_esdf(esdf, origin, resolution, base[i])
+        if cl >= esdf_threshold:
+            tags.append("original_safe")
+        else:
+            tags.append("original_violating")
 
-        for iteration in range(max_iterations):
-            valid, worst = _validate_polyline(
-                path, esdf, origin, resolution,
-                min_clearance, check_spacing)
-            if valid:
-                solved_iteration = iteration
-                break
+    n_orig_safe = sum(1 for t in tags if t == "original_safe")
+    n_orig_violating = sum(1 for t in tags if t == "original_violating")
+    rospy.loginfo("[LinePush] %d initial pts: %d safe (immutable), %d violating (pushable)",
+                  point_count, n_orig_safe, n_orig_violating)
 
-            # After every push, continuously inspect every new segment. If a
-            # segment collides between its endpoints, insert a control point
-            # at its worst interior sample before performing the next push.
-            remaining_capacity = max_control_points - len(path)
-            if remaining_capacity > 0:
-                refinement_candidates = []
-                for index in range(len(path) - 1):
-                    segment = path[index + 1] - path[index]
-                    segment_length = float(np.linalg.norm(segment))
-                    if segment_length <= check_spacing * 0.75:
-                        continue
-                    steps = max(
-                        2, int(math.ceil(
-                            segment_length / check_spacing)))
-                    worst_clearance = float("inf")
-                    worst_alpha = None
-                    worst_point = None
-                    for sample_index in range(1, steps):
-                        alpha = float(sample_index) / steps
-                        point = (
-                            path[index] * (1.0 - alpha) +
-                            path[index + 1] * alpha)
-                        clearance = _trilinear_esdf(
-                            esdf, origin, resolution, point)
-                        if clearance < worst_clearance:
-                            worst_clearance = clearance
-                            worst_alpha = alpha
-                            worst_point = point
-                    if (worst_alpha is not None and
-                            worst_clearance < min_clearance):
-                        refinement_candidates.append((
-                            worst_clearance, index,
-                            worst_alpha, worst_point))
+    # The initial normal only verifies that this 2.5-D bilateral planner has a
+    # horizontal planning direction.  Each obstacle interval recomputes its
+    # own normal from the current prefix anchor to the final goal.
+    xy_norm = float(np.linalg.norm(delta[:2]))
+    if xy_norm < 1e-6:
+        return None, {"reason": "vertical_line_has_no_horizontal_normal"}
 
-                refinement_candidates.sort(key=lambda item: item[0])
-                refinement_candidates = refinement_candidates[
-                    :min(remaining_capacity,
-                         max_refinements_per_iteration)]
-                insertion_by_segment = {
-                    item[1]: item for item in refinement_candidates}
-                if insertion_by_segment:
-                    refined_path = []
-                    refined_anchors = []
-                    for index in range(len(path) - 1):
-                        refined_path.append(path[index])
-                        refined_anchors.append(path_anchors[index])
-                        insertion = insertion_by_segment.get(index)
-                        if insertion is not None:
-                            _, _, alpha, point = insertion
-                            refined_path.append(point)
-                            refined_anchors.append(
-                                path_anchors[index] * (1.0 - alpha) +
-                                path_anchors[index + 1] * alpha)
-                    refined_path.append(path[-1])
-                    refined_anchors.append(path_anchors[-1])
-                    path = np.asarray(
-                        refined_path, dtype=np.float64)
-                    path_anchors = np.asarray(
-                        refined_anchors, dtype=np.float64)
-                    adaptive_refinements += len(insertion_by_segment)
+    # ── Main iteration loop ───────────────────────────────────────
+    path = base.copy()
+    total_segment_insertions = 0
+    best_worst = float("-inf")
 
-            point_count = len(path)
-            base = (
-                start[None, :] +
-                path_anchors[:, None] * delta[None, :])
-            segment_lengths = np.linalg.norm(
-                np.diff(path, axis=0), axis=1)
-            positive_lengths = segment_lengths[
-                segment_lengths > 1.0e-9]
-            local_spacing = (
-                float(np.median(positive_lengths))
-                if positive_lengths.size else point_spacing)
-            local_spacing = max(
-                check_spacing * 0.5, local_spacing)
-            influence_points = max(
-                1, int(math.ceil(
-                    influence_radius / local_spacing)))
-            influence_points = min(
-                influence_points, max(1, point_count - 2))
-            kernel_indices = np.arange(
-                -influence_points, influence_points + 1)
-            sigma = max(1.0, influence_points * 0.5)
-            kernel = np.exp(
-                -0.5 * (kernel_indices / sigma) ** 2)
+    for iteration in range(max_iterations):
+        n = len(path)
 
-            active = []
-            for index in range(1, point_count - 1):
-                clearance = _trilinear_esdf(
-                    esdf, origin, resolution, path[index])
-                if clearance < target_clearance:
-                    active.append((
-                        index,
-                        target_clearance - clearance + push_margin))
-
-            # Continuous checking can find a collision between two otherwise
-            # clear control points. Mark both ends of every failed segment.
-            if not active:
-                marked = {}
-                for index in range(1, point_count):
-                    clear, segment_worst = \
-                        _check_segment_clearance_adaptive(
-                            path[index - 1], path[index],
-                            esdf, origin, resolution,
-                            min_clearance, check_spacing)
-                    if clear:
-                        continue
-                    deficit = (
-                        target_clearance - segment_worst + push_margin)
-                    for marked_index in (index - 1, index):
-                        if 0 < marked_index < point_count - 1:
-                            marked[marked_index] = max(
-                                marked.get(marked_index, 0.0), deficit)
-                active = sorted(marked.items())
-            if not active:
-                break
-
-            accumulated = np.zeros_like(path)
-            accumulated_weight = np.zeros(point_count, dtype=np.float64)
-            for collision_index, deficit in active:
-                tangent = (
-                    path[collision_index + 1] -
-                    path[collision_index - 1])
-                tangent_xy_norm = float(np.linalg.norm(tangent[:2]))
-                if tangent_xy_norm < 1e-9:
-                    normal = left_normal.copy()
-                else:
-                    normal = np.array(
-                        [-tangent[1] / tangent_xy_norm,
-                         tangent[0] / tangent_xy_norm, 0.0],
-                        dtype=np.float64)
-
-                step = min(
-                    0.75, max(point_spacing, float(deficit)))
-                plus = path[collision_index] + step * normal
-                minus = path[collision_index] - step * normal
-
-                def local_cost(candidate):
-                    clearance = _trilinear_esdf(
-                        esdf, origin, resolution, candidate)
-                    obstacle_cost = max(
-                        0.0, target_clearance - clearance)
-                    length_cost = (
-                        np.linalg.norm(
-                            candidate - path[collision_index - 1]) +
-                        np.linalg.norm(
-                            path[collision_index + 1] - candidate))
-                    offset_cost = 0.02 * np.linalg.norm(
-                        candidate - base[collision_index])
-                    return (
-                        length_cost + offset_cost +
-                        max(10.0, 50.0 * clearance_cost_weight) *
-                        obstacle_cost * obstacle_cost)
-
-                plus_cost = float(local_cost(plus))
-                minus_cost = float(local_cost(minus))
-                if abs(plus_cost - minus_cost) <= 1e-9:
-                    choice = seed_sign
-                else:
-                    choice = 1.0 if plus_cost < minus_cost else -1.0
-                if previous_choice is not None and choice != previous_choice:
-                    local_side_switches += 1
-                previous_choice = choice
-                correction = choice * step * normal
-
-                lo = max(1, collision_index - influence_points)
-                hi = min(
-                    point_count - 1,
-                    collision_index + influence_points + 1)
-                kernel_lo = lo - (
-                    collision_index - influence_points)
-                kernel_hi = kernel_lo + (hi - lo)
-                weights = kernel[kernel_lo:kernel_hi]
-                accumulated[lo:hi] += (
-                    weights[:, None] * correction[None, :])
-                accumulated_weight[lo:hi] += weights
-
-            movable = accumulated_weight > 1e-12
-            path[movable] += (
-                accumulated[movable] /
-                accumulated_weight[movable, None])
-            if smoothing > 0.0 and point_count > 3:
-                smoothed = path.copy()
-                smoothed[1:-1] = (
-                    (1.0 - smoothing) * path[1:-1] +
-                    0.5 * smoothing *
-                    (path[:-2] + path[2:]))
-                path = smoothed
-
-            displacement = path - base
-            displacement_norm = np.linalg.norm(
-                displacement[:, :2], axis=1)
-            over_limit = displacement_norm > max_offset
-            if np.any(over_limit):
-                displacement[over_limit, :2] *= (
-                    max_offset /
-                    displacement_norm[over_limit])[:, None]
-                path = base + displacement
-            path[0] = start
-            path[-1] = goal
-
+        # 1. Validate all points
         valid, worst = _validate_polyline(
             path, esdf, origin, resolution,
-            min_clearance, check_spacing)
-        if not valid:
-            seed_reports.append({
-                "seed": seed_name, "valid": False,
+            esdf_threshold, check_spacing)
+        if valid:
+            path_list = [tuple(point) for point in path]
+            length = sum(float(np.linalg.norm(
+                path[i] - path[i - 1])) for i in range(1, len(path)))
+            cost = _line_push_cost(path, esdf, origin, resolution)
+            rospy.loginfo("[LinePush] converged: iter=%d pts=%d len=%.1fm cost=%.2f",
+                          iteration, len(path), length, cost)
+            return path_list, {
+                "side": "bilateral_push",
+                "cost": float(cost),
+                "length": float(length),
                 "worst_clearance": float(worst),
-                "local_side_switches": local_side_switches,
-                "adaptive_refinements": adaptive_refinements,
-                "control_points": len(path)})
+                "iterations": iteration,
+                "control_points": len(path),
+                "segment_insertions": total_segment_insertions}
+
+        # 2. Identify violation points (ESDF < threshold)
+        violation_flags = [False] * n
+        for i in range(n):
+            cl = _trilinear_esdf(esdf, origin, resolution, path[i])
+            if cl < esdf_threshold:
+                violation_flags[i] = True
+
+        # 3. Find continuously unsafe segments.  Insert their actual worst
+        #    interior sample so the new segment_insert point is violating and
+        #    therefore gets pushed on the next iteration.
+        insertions_needed = []
+        for i in range(n - 1):
+            seg_clear, seg_worst = _check_segment_clearance_adaptive(
+                path[i], path[i + 1], esdf, origin, resolution,
+                esdf_threshold, check_spacing)
+            if seg_clear:
+                continue
+
+            cl_i = _trilinear_esdf(esdf, origin, resolution, path[i])
+            cl_j = _trilinear_esdf(esdf, origin, resolution, path[i + 1])
+
+            # Two violating endpoints already belong to a push interval.
+            both_violating = (cl_i < esdf_threshold and cl_j < esdf_threshold)
+            if both_violating:
+                continue
+
+            # Do not insert an ESDF ~= threshold crossing: float interpolation
+            # can classify it as safe, causing endless subdivision without a
+            # point that is eligible for pushing.
+            seg_vec = path[i + 1] - path[i]
+            seg_len = float(np.linalg.norm(seg_vec))
+            if seg_len < 1e-9:
+                continue
+
+            sample_steps = max(
+                2, int(math.ceil(seg_len / check_spacing)) + 1)
+            worst_alpha = None
+            worst_point = None
+            worst_clearance = float("inf")
+            for sample_index in range(1, sample_steps):
+                alpha = sample_index / float(sample_steps)
+                sample = path[i] + alpha * seg_vec
+                clearance = _trilinear_esdf(
+                    esdf, origin, resolution, sample)
+                if clearance < worst_clearance:
+                    worst_clearance = clearance
+                    worst_alpha = alpha
+                    worst_point = sample
+
+            if (worst_point is not None and
+                    worst_clearance < esdf_threshold):
+                insertions_needed.append(
+                    (i, worst_alpha, worst_point, worst_clearance))
+
+        if not insertions_needed and not any(violation_flags):
+            # No violations found, but polyline check failed — unexpected
+            break
+
+        # 4. Handle segment insertions first (insert new control points)
+        if insertions_needed and len(path) < max_control_points:
+            # Sort by segment index (descending so insertions don't shift indices)
+            insertions_needed.sort(key=lambda x: x[0], reverse=True)
+            # Deduplicate: at most one insertion per segment
+            seen_segments = set()
+            unique_insertions = []
+            for (seg_idx, alpha, point, worst_cl) in insertions_needed:
+                if seg_idx not in seen_segments:
+                    seen_segments.add(seg_idx)
+                    unique_insertions.append((seg_idx, alpha, point, worst_cl))
+            unique_insertions.sort(key=lambda x: x[0], reverse=True)
+
+            for (seg_idx, alpha, point, worst_cl) in unique_insertions:
+                if len(path) >= max_control_points:
+                    break
+                path = np.insert(path, seg_idx + 1, point, axis=0)
+                tags.insert(seg_idx + 1, "segment_insert")
+                total_segment_insertions += 1
+
+            # After insertions, re-validate
             continue
 
-        simplified = shortcut_path(
-            [tuple(point) for point in path],
-            esdf, origin, resolution, min_clearance, check_spacing)
-        if len(simplified) < 2:
-            continue
-        length = sum(float(np.linalg.norm(
-            np.asarray(simplified[i]) - np.asarray(simplified[i - 1])))
-                     for i in range(1, len(simplified)))
-        clearance_penalty = 0.0
-        for point in path:
-            clearance = _trilinear_esdf(
-                esdf, origin, resolution, point)
-            clearance_penalty += max(
-                0.0, target_clearance - clearance) * arc_spacing
-        cost = length + clearance_cost_weight * clearance_penalty
-        report = {
-            "side": "pointwise_{}".format(seed_name),
-            "seed": seed_name, "valid": True, "cost": float(cost),
-            "length": float(length), "worst_clearance": float(worst),
-            "iterations": solved_iteration,
-            "local_side_switches": local_side_switches,
-            "adaptive_refinements": adaptive_refinements,
-            "control_points": len(path)}
-        candidates.append((cost, simplified, report))
-        seed_reports.append(report)
+        # 5. Find violation intervals — pushable points are:
+        #    "segment_insert" and "original_violating"
+        #    "original_safe" is IMMUTABLE and breaks intervals.
+        PUSHABLE_TAGS = {"segment_insert", "original_violating"}
+        violation_intervals = []
+        in_violation = False
+        current_interval = []
+        for i in range(len(path)):
+            cl = _trilinear_esdf(esdf, origin, resolution, path[i])
+            is_violating = (cl < esdf_threshold)
+            is_pushable = (tags[i] in PUSHABLE_TAGS)
+            if is_violating and is_pushable:
+                if not in_violation:
+                    in_violation = True
+                    current_interval = [i]
+                else:
+                    current_interval.append(i)
+            else:
+                if in_violation:
+                    in_violation = False
+                    violation_intervals.append(list(current_interval))
+                    current_interval = []
+        if in_violation:
+            violation_intervals.append(list(current_interval))
 
-    if not candidates:
-        return None, {"reason": "pointwise_push_failed",
-                      "candidates": seed_reports}
-    candidates.sort(key=lambda item: item[0])
-    _, best_path, best_report = candidates[0]
-    best_report = dict(best_report)
-    best_report["candidates"] = [dict(report) for report in seed_reports]
-    return best_path, best_report
+        if not violation_intervals:
+            n_violating = sum(1 for i in range(len(path))
+                              if _trilinear_esdf(esdf, origin, resolution, path[i]) < esdf_threshold)
+            n_safe_violating = sum(1 for i in range(len(path))
+                                   if tags[i] == "original_safe"
+                                   and _trilinear_esdf(esdf, origin, resolution, path[i]) < esdf_threshold)
+            rospy.logwarn("[LinePush] iter=%d: no pushable intervals. "
+                          "total_violations=%d safe_immutable_violating=%d pts=%d insertions=%d",
+                          iteration, n_violating, n_safe_violating,
+                          len(path), total_segment_insertions)
+            break
+
+        # Diagnostic: first and every 10th iteration
+        if iteration == 0 or iteration % 10 == 0:
+            n_viol = sum(1 for iv in violation_intervals for _ in iv)
+            rospy.loginfo("[LinePush] iter=%d: %d intervals, %d violating pts, "
+                          "path=%d pts, %d insertions total",
+                          iteration, len(violation_intervals), n_viol,
+                          len(path), total_segment_insertions)
+
+        # 6. Process each violation interval — bilateral push
+        pushes_attempted = 0
+        pushes_left_win = 0
+        pushes_right_win = 0
+        pushes_both_fail = 0
+        for interval_indices in violation_intervals:
+            # Receding anchor: define LEFT/RIGHT from the last fixed point
+            # before this collision interval toward the final goal, not from
+            # the episode's original start->goal line.
+            anchor_index = max(0, int(interval_indices[0]) - 1)
+            local_delta = goal - path[anchor_index]
+            local_xy_norm = float(np.linalg.norm(local_delta[:2]))
+            if local_xy_norm < 1e-6:
+                rospy.logerr(
+                    "[LinePush] interval=[%d,%d] has no horizontal "
+                    "anchor->goal direction.",
+                    interval_indices[0], interval_indices[-1])
+                return None, {
+                    "reason": "interval_anchor_has_no_horizontal_direction",
+                    "interval": interval_indices,
+                    "iteration": iteration}
+            local_left_normal = np.array(
+                [-local_delta[1] / local_xy_norm,
+                 local_delta[0] / local_xy_norm,
+                 0.0],
+                dtype=np.float64)
+
+            left_candidate, right_candidate = _generate_left_right_candidates(
+                interval_indices, path, tags,
+                local_delta, local_left_normal, esdf, origin, resolution,
+                max_push_distance,
+                max_push_steps,
+                push_clearance)
+
+            pushes_attempted += 1
+            # Compare complete candidates.  Other not-yet-repaired intervals
+            # are unchanged between both branches and therefore cancel, while
+            # the full prefix/suffix captures reconnection distance to goal.
+            left_cost = _line_push_interval_cost(
+                left_candidate, interval_indices,
+                esdf, origin, resolution)
+            right_cost = _line_push_interval_cost(
+                right_candidate, interval_indices,
+                esdf, origin, resolution)
+
+            if left_cost == float("inf") and right_cost == float("inf"):
+                # Both sides failed — global path planning fails
+                pushes_both_fail += 1
+                rospy.logerr("[LinePush] iter=%d interval=%d pts: BOTH sides failed",
+                             iteration, len(interval_indices))
+                return None, {
+                    "reason": "bilateral_push_both_sides_failed",
+                    "interval": interval_indices,
+                    "iteration": iteration}
+
+            chosen_side = ""
+            if left_cost == float("inf"):
+                path = right_candidate
+                pushes_right_win += 1
+                chosen_side = "RIGHT"
+            elif right_cost == float("inf"):
+                path = left_candidate
+                pushes_left_win += 1
+                chosen_side = "LEFT"
+            elif abs(left_cost - right_cost) <= 1e-6:
+                # Equal cost → choose RIGHT (per spec)
+                path = right_candidate
+                pushes_right_win += 1
+                chosen_side = "RIGHT"
+            elif left_cost < right_cost:
+                path = left_candidate
+                pushes_left_win += 1
+                chosen_side = "LEFT"
+            else:
+                path = right_candidate
+                pushes_right_win += 1
+                chosen_side = "RIGHT"
+            rospy.loginfo(
+                "[LinePush] iter=%d interval=[%d,%d] anchor=%d global_cost "
+                "left=%.3f right=%.3f chosen=%s",
+                iteration, interval_indices[0], interval_indices[-1],
+                anchor_index, left_cost, right_cost, chosen_side)
+
+        if iteration == 0 or iteration % 10 == 0:
+            rospy.loginfo("[LinePush] iter=%d push results: left=%d right=%d both_fail=%d",
+                          iteration, pushes_left_win, pushes_right_win, pushes_both_fail)
+
+        # Re-validate after all interval pushes
+        valid, worst = _validate_polyline(
+            path, esdf, origin, resolution,
+            esdf_threshold, check_spacing)
+        if valid:
+            path_list = [tuple(point) for point in path]
+            length = sum(float(np.linalg.norm(
+                path[i] - path[i - 1])) for i in range(1, len(path)))
+            cost = _line_push_cost(path, esdf, origin, resolution)
+            return path_list, {
+                "side": "bilateral_push",
+                "cost": float(cost),
+                "length": float(length),
+                "worst_clearance": float(worst),
+                "iterations": iteration + 1,
+                "control_points": len(path),
+                "segment_insertions": total_segment_insertions}
+
+        best_worst = max(best_worst, worst)
+
+    # ── Max iterations reached without success ────────────────────
+    # Diagnostic: count remaining violations
+    n_pts_violating = sum(1 for i in range(len(path))
+                          if _trilinear_esdf(esdf, origin, resolution, path[i]) < esdf_threshold)
+    n_safe_violating = sum(1 for i in range(len(path))
+                           if tags[i] == "original_safe"
+                           and _trilinear_esdf(esdf, origin, resolution, path[i]) < esdf_threshold)
+    n_pushable_violating = n_pts_violating - n_safe_violating
+    rospy.logerr("[LinePush] FAILED after %d iterations: "
+                 "%d/%d points violating (safe_immutable=%d pushable=%d), "
+                 "%d total insertions, worst ESDF=%.3f",
+                 max_iterations, n_pts_violating, len(path),
+                 n_safe_violating, n_pushable_violating,
+                 total_segment_insertions, float(best_worst))
+    return None, {
+        "reason": "max_iterations_reached",
+        "iterations": max_iterations,
+        "control_points": len(path),
+        "worst_clearance": float(best_worst),
+        "segment_insertions": total_segment_insertions,
+        "points_violating": n_pts_violating,
+        "safe_immutable_violating": n_safe_violating}
 
 
 # ============================================================================
-#  6.  GlobalPathPlanner — A* + shortcut only, no full-trajectory smoothing
+#  7.  GlobalPathPlanner — observation-conditioned rollout only
 # ============================================================================
 
 class GlobalPathPlanner:
-    """Global path planner: two-sided line-push with weighted-A* fallback.
-    
+    """Global path planner: local-observation policy rollout ONLY.
+
+    This is the SINGLE, DETERMINISTIC global path algorithm.
+    There is NO LinePush fallback, NO RRT, and NO unconstrained smoothing.
+
     This class ONLY produces a global reference path. It does NOT:
     - Smooth the entire path iteratively
     - Time-parameterize
     - Sample at control rate
     - Generate controls
-    
+
     Those steps are handled by the online C++ local planner.
     """
     
@@ -931,204 +2342,109 @@ class GlobalPathPlanner:
         self.cfg = config
         
         gp_cfg = config.get("planning", {}).get("global_planner", {})
-        self.coarse_factor = gp_cfg.get("coarse_factor", 2)
-        self.epsilon = gp_cfg.get("epsilon", 1.2)
-        self.max_iter_coarse = gp_cfg.get("max_iterations_coarse", 300000)
-        self.max_iter_full = gp_cfg.get("max_iterations_full", 800000)
-        self.max_time_coarse = gp_cfg.get("max_planning_time_coarse_s", 8.0)
-        self.max_time_full = gp_cfg.get("max_planning_time_full_s", 45.0)
-        self.cost_weight = gp_cfg.get("cost_weight", 0.35)
-        self.clearance_target = gp_cfg.get("clearance_target", 0.20)
-        self.min_clearance = gp_cfg.get("min_clearance", 0.10)
+        self.min_clearance = gp_cfg.get("min_clearance", 0.30)
         self.algorithm = str(
-            gp_cfg.get("algorithm", "line_push")).lower()
-        self.line_push_config = gp_cfg.get("line_push", {})
-        self.fallback_to_astar = bool(
-            self.line_push_config.get("fallback_to_astar", True))
-        self.shortcut_enabled = gp_cfg.get("shortcut_enabled", True)
-        self.shortcut_check_spacing = gp_cfg.get("shortcut_check_spacing", 0.05)
+            gp_cfg.get(
+                "algorithm", "observation_rollout")).lower()
+        self.observation_rollout_config = dict(
+            gp_cfg.get("observation_rollout", {}))
+        depth_cfg = config.get("depth", {})
+        self.observation_rollout_config.setdefault(
+            "horizontal_fov_deg", float(depth_cfg.get("fov", 90.0)))
+        self.observation_rollout_config.setdefault(
+            "observation_range_m", float(depth_cfg.get("max_m", 5.0)))
+        self.collision_check_spacing = gp_cfg.get(
+            "collision_check_spacing_m", 0.05)
         self.reference_spacing = float(
             gp_cfg.get("reference_resample_spacing_m", 0.10))
         
         # Ensure check spacing <= resolution / 2
-        self.shortcut_check_spacing = min(
-            self.shortcut_check_spacing, self.esdf_res * 0.5)
+        self.collision_check_spacing = min(
+            self.collision_check_spacing, self.esdf_res * 0.5)
         
-        self.a_star = AStarPlanner(
-            esdf, esdf_resolution, esdf_origin,
-            cost_weight=self.cost_weight,
-            clearance_target=self.clearance_target)
-
-    def _run_astar(self, start, goal):
-        """Run the existing weighted A* as a robust fallback."""
-        if self.coarse_factor <= 1:
-            rospy.loginfo("[GlobalPath] Full-resolution A* fallback.")
-            return self.a_star.plan(
-                start, goal, min_clearance=self.min_clearance,
-                max_iterations=self.max_iter_full, epsilon=self.epsilon,
-                max_time_sec=self.max_time_full)
-
-        coarse_esdf = make_coarse_esdf(
-            self.esdf, factor=self.coarse_factor)
-        coarse_res = self.esdf_res * self.coarse_factor
-        coarse_astar = AStarPlanner(
-            coarse_esdf, coarse_res, self.esdf_origin,
-            cost_weight=self.cost_weight,
-            clearance_target=self.clearance_target)
-        result = coarse_astar.plan(
-            start, goal, min_clearance=self.min_clearance,
-            max_iterations=self.max_iter_coarse, epsilon=self.epsilon,
-            max_time_sec=self.max_time_coarse)
-        if (not result.reached_goal and
-                result.failure_reason != "shutdown_requested"):
-            rospy.loginfo(
-                "[GlobalPath] Coarse A* failed (%s), trying full-res...",
-                result.failure_reason)
-            result = self.a_star.plan(
-                start, goal, min_clearance=self.min_clearance,
-                max_iterations=self.max_iter_full, epsilon=self.epsilon,
-                max_time_sec=self.max_time_full)
-        return result
+        # No fallback planner is created.
+        self.a_star = None
     
     def plan_global(self, start, goal):
         """Plan a global reference path from start to goal.
-        
+
+        Uses ONLY an observation-conditioned rollout. No LinePush fallback.
+
         Returns dict:
-            start, goal, raw_path, global_path, valid, 
-            validation_report, raw_path_points, shortcut_path_points,
+            start, goal, raw_path, global_path, valid,
+            validation_report, raw_path_points, global_path_points,
             global_path_length
-        Returns None on total A* failure.
+        Returns None on planning failure.
         """
         t0 = time.time()
-        result = None
         geometric_report = {}
-        algorithm_used = "weighted_astar"
+        algorithm_used = "observation_rollout"
 
-        if self.algorithm == "line_push":
-            geometric_path, geometric_report = line_push_path(
-                start, goal, self.esdf, self.esdf_origin, self.esdf_res,
-                self.min_clearance, self.shortcut_check_spacing,
-                self.line_push_config)
-            if geometric_path is not None:
-                result = PlanResult(
-                    path=geometric_path, reached_goal=True,
-                    iterations=int(geometric_report.get("iterations", 0)))
-                algorithm_used = "line_push"
-                rospy.loginfo(
-                    "[GlobalPath] line-push selected side=%s cost=%.2f.",
-                    geometric_report.get("side", "?"),
-                    geometric_report.get("cost", 0.0))
-            elif not self.fallback_to_astar:
-                rospy.logwarn(
-                    "[GlobalPath] line-push failed and fallback is disabled: %s",
-                    geometric_report.get("reason", "unknown"))
-                return None
-            else:
-                rospy.logwarn(
-                    "[GlobalPath] line-push failed (%s); falling back to "
-                    "weighted A*.",
-                    geometric_report.get("reason", "unknown"))
-        
-        # ── Coarse A* first ────────────────────────────────────
-        # factor=1 already means full resolution.  Do not search the identical
-        # grid twice after hitting the first iteration limit.
-        if result is None and self.coarse_factor <= 1:
-            rospy.loginfo("[GlobalPath] Full-resolution A* (single pass).")
-            result = self.a_star.plan(
-                start, goal, min_clearance=self.min_clearance,
-                max_iterations=self.max_iter_full, epsilon=self.epsilon,
-                max_time_sec=self.max_time_full)
-        elif result is None:
-            coarse_esdf = make_coarse_esdf(
-                self.esdf, factor=self.coarse_factor)
-            coarse_res = self.esdf_res * self.coarse_factor
-            coarse_astar = AStarPlanner(
-                coarse_esdf, coarse_res, self.esdf_origin,
-                cost_weight=self.cost_weight,
-                clearance_target=self.clearance_target)
+        # ── THE ONLY global path algorithm ────────────────────────
+        geometric_path, geometric_report = (
+            observation_conditioned_rollout_path(
+            start, goal, self.esdf, self.esdf_origin, self.esdf_res,
+            self.min_clearance, self.collision_check_spacing,
+            self.observation_rollout_config))
 
-            result = coarse_astar.plan(
-                start, goal, min_clearance=self.min_clearance,
-                max_iterations=self.max_iter_coarse, epsilon=self.epsilon,
-                max_time_sec=self.max_time_coarse)
-
-            if (not result.reached_goal
-                    and result.failure_reason != "shutdown_requested"):
-                rospy.loginfo(
-                    "[GlobalPath] Coarse A* failed (%s), trying full-res...",
-                    result.failure_reason)
-                result = self.a_star.plan(
-                    start, goal, min_clearance=self.min_clearance,
-                    max_iterations=self.max_iter_full, epsilon=self.epsilon,
-                    max_time_sec=self.max_time_full)
-        
-        if not result.reached_goal:
-            rospy.logwarn("[GlobalPath] A* FAILED: %s (iter=%d, goal_err=%.2f m)",
-                          result.failure_reason, result.iterations,
-                          result.goal_error if result.goal_error else -1)
+        if geometric_path is None:
+            rospy.logerr(
+                "[GlobalPath] observation rollout FAILED: %s. "
+                "No fallback available; global planning failed.",
+                geometric_report.get("reason", "unknown"))
             return None
-        
-        # Restore exact start/goal endpoints
-        raw_path = list(result.path)
-        raw_path[0] = tuple(start)
-        raw_path[-1] = tuple(goal)
-        
-        # ── Shortcut (greedy string-pulling) ────────────────────
-        if self.shortcut_enabled and len(raw_path) > 2:
-            global_path = shortcut_path(
-                raw_path, self.esdf, self.esdf_origin, self.esdf_res,
-                self.min_clearance, self.shortcut_check_spacing)
-        else:
-            global_path = list(raw_path)
-        # Guide indexing and local reference extraction require a stable,
-        # fixed arc-length discretisation, independent of A* grid resolution.
+
+        rospy.loginfo(
+            "[GlobalPath] observation rollout SUCCESS: "
+            "cost=%.2f pts=%d decisions=%d corridor_checks=%d.",
+            geometric_report.get("cost", 0.0),
+            len(geometric_path),
+            len(geometric_report.get("decision_events", [])),
+            geometric_report.get("corridor_checks", 0))
+
+        raw_path = geometric_path
+        global_path = list(raw_path)
+
+        # ── Resample to uniform spacing (for stable guide indexing) ─
+        # This does NOT move points — it just adds intermediate points
+        # on straight segments for uniform arc-length spacing.
         global_path = resample_path(global_path, self.reference_spacing)
-        
+
         # ── Compute path length ─────────────────────────────────
         global_path_length = 0.0
         for i in range(1, len(global_path)):
             global_path_length += np.linalg.norm(
                 np.array(global_path[i]) - np.array(global_path[i-1]))
-        
+
         # ── Validate global path ────────────────────────────────
         has_path = len(global_path) >= 2
         all_clear = has_path
         worst_cl = float("inf")
         violations = 0
         any_collision = False
-        
+
         for i in range(1, len(global_path)):
             clear, wc = _check_segment_clearance_adaptive(
                 global_path[i-1], global_path[i],
                 self.esdf, self.esdf_origin, self.esdf_res,
-                self.min_clearance, self.shortcut_check_spacing)
+                self.min_clearance, self.collision_check_spacing)
             worst_cl = min(worst_cl, wc)
             if not clear:
                 all_clear = False
                 violations += 1
             if wc <= 0:
                 any_collision = True
-        
+
         if not has_path:
             worst_cl = -1.0
         valid = all_clear and not any_collision and has_path
-        
+
         # ── Build validation report ─────────────────────────────
         report = {
             "planner_algorithm": algorithm_used,
-            "line_push": geometric_report,
-            "astar_reached_goal": (
-                result.reached_goal if algorithm_used == "weighted_astar"
-                else False),
-            "astar_iterations": (
-                result.iterations if algorithm_used == "weighted_astar"
-                else 0),
-            "astar_failure_reason": (
-                result.failure_reason
-                if algorithm_used == "weighted_astar" and
-                not result.reached_goal else ""),
+            "observation_rollout": geometric_report,
             "raw_path_points": len(raw_path),
-            "shortcut_path_points": len(global_path),
+            "reference_path_points": len(global_path),
             "global_path_length_m": round(global_path_length, 3),
             "all_segments_clear": all_clear,
             "worst_clearance": round(float(worst_cl), 4),
@@ -1141,7 +2457,7 @@ class GlobalPathPlanner:
         if not valid:
             reasons = []
             if not has_path:
-                reasons.append("shortcut_failed_no_safe_edge")
+                reasons.append("no_valid_path")
             elif not all_clear:
                 reasons.append("clearance_violations={}".format(violations))
             if any_collision:

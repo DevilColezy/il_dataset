@@ -49,6 +49,27 @@ class FlightmareDynamicsBridge {
     return quadrotor_->reset(state);
   }
 
+  bool setStatePreserveMotors(
+      const Eigen::Vector3d& position,
+      const Eigen::Vector4d& quaternion_wxyz,
+      const Eigen::Vector3d& velocity,
+      const Eigen::Vector3d& angular_velocity) {
+    flightlib::QuadState state;
+    if (!quadrotor_->getState(&state)) {
+      return false;
+    }
+    // Quadrotor::setState updates only the rigid-body state.  Unlike
+    // reset(), it deliberately preserves the already spun-up motor state.
+    state.p = position.cast<float>();
+    state.qx = quaternion_wxyz.cast<float>();
+    state.qx.normalize();
+    state.v = velocity.cast<float>();
+    state.w = angular_velocity.cast<float>();
+    state.a.setZero();
+    state.tau.setZero();
+    return quadrotor_->setState(state);
+  }
+
   bool run(double collective_thrust,
            const Eigen::Vector3d& body_rates,
            double dt) {
@@ -90,6 +111,10 @@ PYBIND11_MODULE(_il_local_planner, m) {
   py::class_<FlightmareDynamicsBridge>(m, "FlightmareDynamics")
     .def(py::init<>())
     .def("reset", &FlightmareDynamicsBridge::reset,
+         py::arg("position"), py::arg("quaternion_wxyz"),
+         py::arg("velocity"), py::arg("angular_velocity"))
+    .def("set_state_preserve_motors",
+         &FlightmareDynamicsBridge::setStatePreserveMotors,
          py::arg("position"), py::arg("quaternion_wxyz"),
          py::arg("velocity"), py::arg("angular_velocity"))
     .def("run", &FlightmareDynamicsBridge::run,
@@ -227,10 +252,14 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("minimum_step_size", &LocalPlannerConfig::minimum_step_size)
         .def_readwrite("max_cost_samples_per_segment",
                        &LocalPlannerConfig::max_cost_samples_per_segment)
+        .def_readwrite("seed_trust_radius",
+                       &LocalPlannerConfig::seed_trust_radius)
         .def_readwrite("min_clearance", &LocalPlannerConfig::min_clearance)
         .def_readwrite("target_clearance", &LocalPlannerConfig::target_clearance)
         .def_readwrite("collision_check_spacing",
                        &LocalPlannerConfig::collision_check_spacing)
+        .def_readwrite("weight_path_length",
+                       &LocalPlannerConfig::weight_path_length)
         .def_readwrite("weight_smooth", &LocalPlannerConfig::weight_smooth)
         .def_readwrite("weight_jerk", &LocalPlannerConfig::weight_jerk)
         .def_readwrite("weight_guide", &LocalPlannerConfig::weight_guide)

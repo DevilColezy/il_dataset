@@ -94,10 +94,21 @@ global:
   scene_generation:
     enabled: true
 
-    source: "procedural_profiles"
+    source: "density_driven"
     obstacle_type: "cylinder"
 
     seed: 12345
+
+    coverage_balancing:
+      enabled: true
+      require_density_tier_mix: true
+      density_tier_mix_scope: "full_catalog"
+      required_density_tiers: [sparse, medium, dense]
+      minimum_scene_fraction_per_density_tier: 0.15
+      maximum_scene_fraction_per_density_tier: 0.60
+      density_tier_thresholds:
+        sparse_max: 0.06
+        medium_max: 0.14
 
     # ── Execution control ──────────────────────────────────────────
     execution:
@@ -124,6 +135,20 @@ global:
       radius_m: 0.30
       safety_margin_m: 0.10
 
+    post_inflation_gap_m: 0.20
+    region_boundary_margin_m: 0.30
+    allow_overlap: false
+    forbid_enclosed_free_components: true
+    forbid_inflated_component_merging: true
+
+    generation_quality:
+      minimum_density_achievement_ratio: 0.97
+
+    placement_stratification:
+      enabled: true
+      x_bands: 4
+      y_bands: 6
+
     # ── Common cylinder parameters ─────────────────────────────────
     common_cylinder:
       height_min_m: 8.0
@@ -133,25 +158,23 @@ global:
       region_boundary_margin_m: 0.30
 
       minimum_surface_gap_m: 0.0
-      minimum_post_inflation_gap_m: 0.15
+      minimum_post_inflation_gap_m: 0.20
 
       allow_overlap: false
 
     # ── Common task generation ─────────────────────────────────────
     common_task_generation:
       tasks_per_scene: 10
+      max_task_sampling_attempts: 2000
+      start_clearance_m: 0.40
+      goal_clearance_m: 0.40
+      direct_path_corridor_radius_m: 0.55
 
-      start_sampling_region:
-        x_min: 0.0
-        x_max: 4.0
-        y_min: -1.5
-        y_max: -0.5
+      start_sampling_regions:
+        - {x_min: 0.0, x_max: 4.0, y_min: -1.5, y_max: -0.5}
 
-      goal_sampling_region:
-        x_min: 0.0
-        x_max: 4.0
-        y_min: 31.0
-        y_max: 32.0
+      goal_sampling_regions:
+        - {x_min: 0.0, x_max: 4.0, y_min: 31.0, y_max: 32.0}
 
       start_height_min_m: 1.8
       start_height_max_m: 2.2
@@ -164,7 +187,7 @@ global:
       minimum_start_goal_distance_m: 28.0
       maximum_start_goal_distance_m: 40.0
 
-      require_direct_path_blocked: true
+      require_direct_path_blocked: false
       minimum_direct_blocker_count: 1
       maximum_direct_blocker_count: 3
 
@@ -173,29 +196,35 @@ global:
       minimum_detour_ratio: 1.03
       maximum_detour_ratio: 2.00
 
-    # ── Legacy single-profile compatibility (unchanged for reference) ──
-    # When source == "procedural_yaml" the fields below are still read by
-    # YamlCylinderSceneGenerator for backward compatibility.  They are
-    # ignored when source == "procedural_profiles".
-    cylinder:
-      count_min: 6
-      count_max: 10
-
-      radius_min_m: 0.30
-      radius_max_m: 2.0
-
-      height_min_m: 8.0
-      height_max_m: 8.0
-
-      require_full_vertical_blocking: true
-
-      region_boundary_margin_m: 0.30
-
-      minimum_surface_gap_m: 0.80      # deprecated — use common_cylinder version
-      minimum_inflated_gap_m: 0.40     # deprecated — use minimum_post_inflation_gap_m
-
-      allow_overlap: false
-      allow_inflated_component_merging: false
+      coverage_balancing:
+        enabled: true
+        rotate_region_pairs_by_seed: true
+        center_lateral_fraction: 0.25
+        task_type_weights_by_density_tier:
+          default:
+            {clear: 0.20, single_left: 0.20, single_right: 0.20,
+             single_center: 0.20, multi_blocker: 0.20}
+          sparse:
+            {clear: 0.55, single_left: 0.15, single_right: 0.15,
+             single_center: 0.15, multi_blocker: 0.00}
+          medium:
+            {clear: 0.20, single_left: 0.20, single_right: 0.20,
+             single_center: 0.20, multi_blocker: 0.20}
+          dense:
+            {clear: 0.00, single_left: 0.15, single_right: 0.15,
+             single_center: 0.10, multi_blocker: 0.60}
+        blocker_distance_bands_m:
+          near: [0.0, 6.0]
+          middle: [6.0, 15.0]
+          far: [15.0, 1000.0]
+        blocker_distance_weights_by_density_tier:
+          sparse: {near: 0.35, middle: 0.40, far: 0.25}
+          medium: {near: 0.45, middle: 0.45, far: 0.10}
+          dense: {near: 0.60, middle: 0.40, far: 0.00}
+        level_height_delta_max_m: 0.25
+        minimum_nonlevel_height_delta_m: 0.75
+        height_delta_weights:
+          {level: 1.0, ascending: 0.0, descending: 0.0}
 
     topology_validation:
       enabled: true
@@ -219,47 +248,6 @@ global:
 
       dead_end_probe_spacing_m: 0.50
       dead_end_minimum_depth_m: 1.50
-
-    task_generation:
-      enabled: true
-
-      max_task_sampling_attempts: 1000
-      tasks_per_scene: 5
-
-      start_height_min_m: 1.8
-      start_height_max_m: 2.2
-      goal_height_min_m: 1.8
-      goal_height_max_m: 2.2
-      maximum_start_goal_height_difference_m: 0.20
-
-      start_clearance_m: 0.60
-      goal_clearance_m: 0.60
-
-      minimum_start_goal_distance_m: 8.0
-      maximum_start_goal_distance_m: 40.0
-
-      require_direct_path_blocked: true
-      direct_path_corridor_radius_m: 0.35
-
-      minimum_direct_blocker_count: 1
-      maximum_direct_blocker_count: 3
-
-      require_astar_reachable: true
-
-      minimum_detour_ratio: 1.05
-      maximum_detour_ratio: 1.80
-
-      start_sampling_region:
-        x_min: -8.0
-        x_max: 10.0
-        y_min: -2.0
-        y_max: -1.0
-
-      goal_sampling_region:
-        x_min: -8.0
-        x_max: 10.0
-        y_min: 30.0
-        y_max: 32.0
 
     side_cost:
       enabled: false
@@ -289,214 +277,136 @@ global:
         enabled: true
         scene_count: 1
         seed_offset: 1010
-
-        cylinder:
-          radius_min_m: 0.10
-          radius_max_m: 0.35
-          count_min: 8
-          count_max: 16
-
-        density:
-          enabled: true
-          mode: "inflated_occupancy"
-          target_min: 0.015
-          target_max: 0.035
+        density_min: 0.01
+        density_max: 0.02
+        size_groups:
+          large: {radius_min_m: 0.35, radius_max_m: 0.50, capacity_fraction: 0.333333, consecutive_fail_threshold: 30}
+          medium: {radius_min_m: 0.20, radius_max_m: 0.35, capacity_fraction: 0.333333, consecutive_fail_threshold: 80}
+          small: {radius_min_m: 0.10, radius_max_m: 0.20, capacity_fraction: 0.333334, consecutive_fail_threshold: 150}
 
       - name: "S02_small_medium"
         enabled: true
         scene_count: 1
         seed_offset: 1020
-
-        cylinder:
-          radius_min_m: 0.30
-          radius_max_m: 0.60
-          count_min: 10
-          count_max: 18
-
-        density:
-          enabled: true
-          mode: "inflated_occupancy"
-          target_min: 0.04
-          target_max: 0.07
+        density_min: 0.035
+        density_max: 0.055
+        size_groups:
+          large: {radius_min_m: 0.35, radius_max_m: 0.50, capacity_fraction: 0.333333, consecutive_fail_threshold: 40}
+          medium: {radius_min_m: 0.20, radius_max_m: 0.35, capacity_fraction: 0.333333, consecutive_fail_threshold: 100}
+          small: {radius_min_m: 0.10, radius_max_m: 0.20, capacity_fraction: 0.333334, consecutive_fail_threshold: 180}
 
       - name: "S03_small_dense"
         enabled: true
         scene_count: 1
         seed_offset: 1030
-
-        cylinder:
-          radius_min_m: 0.50
-          radius_max_m: 0.80
-          count_min: 12
-          count_max: 20
-
-        density:
-          enabled: true
-          mode: "inflated_occupancy"
-          target_min: 0.07
-          target_max: 0.12
+        density_min: 0.10
+        density_max: 0.14
+        size_groups:
+          large: {radius_min_m: 0.35, radius_max_m: 0.50, capacity_fraction: 0.333333, consecutive_fail_threshold: 50}
+          medium: {radius_min_m: 0.20, radius_max_m: 0.35, capacity_fraction: 0.333333, consecutive_fail_threshold: 120}
+          small: {radius_min_m: 0.10, radius_max_m: 0.20, capacity_fraction: 0.333334, consecutive_fail_threshold: 200}
 
       # ── S04–S06: Medium-scale (0.80–2.00 m) ──────────────────
       - name: "S04_medium_sparse"
         enabled: true
         scene_count: 1
         seed_offset: 2010
-
-        cylinder:
-          radius_min_m: 0.80
-          radius_max_m: 1.20
-          count_min: 5
-          count_max: 10
-
-        density:
-          enabled: true
-          mode: "inflated_occupancy"
-          target_min: 0.05
-          target_max: 0.10
+        density_min: 0.025
+        density_max: 0.045
+        size_groups:
+          large: {radius_min_m: 1.00, radius_max_m: 1.50, capacity_fraction: 0.333333, consecutive_fail_threshold: 40}
+          medium: {radius_min_m: 0.50, radius_max_m: 1.00, capacity_fraction: 0.333333, consecutive_fail_threshold: 80}
+          small: {radius_min_m: 0.10, radius_max_m: 0.50, capacity_fraction: 0.333334, consecutive_fail_threshold: 150}
 
       - name: "S05_medium_medium"
         enabled: true
         scene_count: 1
         seed_offset: 2020
-
-        cylinder:
-          radius_min_m: 1.10
-          radius_max_m: 1.60
-          count_min: 6
-          count_max: 12
-
-        density:
-          enabled: true
-          mode: "inflated_occupancy"
-          target_min: 0.08
-          target_max: 0.14
+        density_min: 0.07
+        density_max: 0.10
+        size_groups:
+          large: {radius_min_m: 1.00, radius_max_m: 1.50, capacity_fraction: 0.333333, consecutive_fail_threshold: 50}
+          medium: {radius_min_m: 0.50, radius_max_m: 1.00, capacity_fraction: 0.333333, consecutive_fail_threshold: 100}
+          small: {radius_min_m: 0.10, radius_max_m: 0.50, capacity_fraction: 0.333334, consecutive_fail_threshold: 180}
 
       - name: "S06_medium_dense"
         enabled: true
         scene_count: 1
         seed_offset: 2030
-
-        cylinder:
-          radius_min_m: 1.50
-          radius_max_m: 2.00
-          count_min: 8
-          count_max: 14
-
-        density:
-          enabled: true
-          mode: "inflated_occupancy"
-          target_min: 0.12
-          target_max: 0.18
+        density_min: 0.14
+        density_max: 0.18
+        size_groups:
+          large: {radius_min_m: 1.00, radius_max_m: 1.50, capacity_fraction: 0.333333, consecutive_fail_threshold: 50}
+          medium: {radius_min_m: 0.50, radius_max_m: 1.00, capacity_fraction: 0.333333, consecutive_fail_threshold: 120}
+          small: {radius_min_m: 0.10, radius_max_m: 0.50, capacity_fraction: 0.333334, consecutive_fail_threshold: 200}
 
       # ── S07–S09: Large-scale (2.00–3.50 m) ───────────────────
       - name: "S07_large_sparse"
         enabled: true
         scene_count: 1
         seed_offset: 3010
-
-        cylinder:
-          radius_min_m: 2.00
-          radius_max_m: 2.50
-          count_min: 2
-          count_max: 6
-
-        density:
-          enabled: true
-          mode: "inflated_occupancy"
-          target_min: 0.06
-          target_max: 0.12
+        density_min: 0.04
+        density_max: 0.06
+        size_groups:
+          large: {radius_min_m: 1.60, radius_max_m: 2.50, capacity_fraction: 0.333333, consecutive_fail_threshold: 40}
+          medium: {radius_min_m: 0.80, radius_max_m: 1.60, capacity_fraction: 0.333333, consecutive_fail_threshold: 80}
+          small: {radius_min_m: 0.10, radius_max_m: 0.80, capacity_fraction: 0.333334, consecutive_fail_threshold: 150}
 
       - name: "S08_large_medium"
         enabled: true
         scene_count: 1
         seed_offset: 3020
-
-        cylinder:
-          radius_min_m: 2.40
-          radius_max_m: 3.00
-          count_min: 3
-          count_max: 7
-
-        density:
-          enabled: true
-          mode: "inflated_occupancy"
-          target_min: 0.10
-          target_max: 0.18
+        density_min: 0.08
+        density_max: 0.12
+        size_groups:
+          large: {radius_min_m: 1.60, radius_max_m: 2.50, capacity_fraction: 0.333333, consecutive_fail_threshold: 50}
+          medium: {radius_min_m: 0.80, radius_max_m: 1.60, capacity_fraction: 0.333333, consecutive_fail_threshold: 100}
+          small: {radius_min_m: 0.10, radius_max_m: 0.80, capacity_fraction: 0.333334, consecutive_fail_threshold: 180}
 
       - name: "S09_large_dense"
         enabled: true
         scene_count: 1
         seed_offset: 3030
-
-        cylinder:
-          radius_min_m: 2.90
-          radius_max_m: 3.50
-          count_min: 4
-          count_max: 8
-
-        density:
-          enabled: true
-          mode: "inflated_occupancy"
-          target_min: 0.14
-          target_max: 0.22
+        density_min: 0.15
+        density_max: 0.20
+        size_groups:
+          large: {radius_min_m: 1.60, radius_max_m: 2.50, capacity_fraction: 0.333333, consecutive_fail_threshold: 50}
+          medium: {radius_min_m: 0.80, radius_max_m: 1.60, capacity_fraction: 0.333333, consecutive_fail_threshold: 120}
+          small: {radius_min_m: 0.10, radius_max_m: 0.80, capacity_fraction: 0.333334, consecutive_fail_threshold: 200}
 
       # ── S10–S12: Mixed-scale (0.10–3.50 m, multi-range) ──────
       - name: "S10_mixed_small_heavy"
         enabled: true
         scene_count: 1
         seed_offset: 4010
-
-        cylinder:
-          ranges:
-            - {min: 0.10, max: 0.80, weight: 0.50}
-            - {min: 0.80, max: 2.00, weight: 0.30}
-            - {min: 2.00, max: 3.50, weight: 0.20}
-          count_min: 6
-          count_max: 12
-
-        density:
-          enabled: true
-          mode: "inflated_occupancy"
-          target_min: 0.08
-          target_max: 0.15
+        density_min: 0.06
+        density_max: 0.09
+        size_groups:
+          large: {radius_min_m: 2.20, radius_max_m: 3.50, capacity_fraction: 0.15, consecutive_fail_threshold: 40}
+          medium: {radius_min_m: 1.00, radius_max_m: 2.20, capacity_fraction: 0.25, consecutive_fail_threshold: 80}
+          small: {radius_min_m: 0.10, radius_max_m: 1.00, capacity_fraction: 0.60, consecutive_fail_threshold: 150}
 
       - name: "S11_mixed_balanced"
         enabled: true
         scene_count: 1
         seed_offset: 4020
-
-        cylinder:
-          ranges:
-            - {min: 0.10, max: 0.80, weight: 0.33}
-            - {min: 0.80, max: 2.00, weight: 0.34}
-            - {min: 2.00, max: 3.50, weight: 0.33}
-          count_min: 6
-          count_max: 12
-
-        density:
-          enabled: true
-          mode: "inflated_occupancy"
-          target_min: 0.08
-          target_max: 0.15
+        density_min: 0.10
+        density_max: 0.14
+        size_groups:
+          large: {radius_min_m: 2.20, radius_max_m: 3.50, capacity_fraction: 0.333333, consecutive_fail_threshold: 50}
+          medium: {radius_min_m: 1.00, radius_max_m: 2.20, capacity_fraction: 0.333333, consecutive_fail_threshold: 100}
+          small: {radius_min_m: 0.10, radius_max_m: 1.00, capacity_fraction: 0.333334, consecutive_fail_threshold: 180}
 
       - name: "S12_mixed_large_heavy"
         enabled: true
         scene_count: 1
         seed_offset: 4030
-
-        cylinder:
-          ranges:
-            - {min: 0.10, max: 0.80, weight: 0.20}
-            - {min: 0.80, max: 2.00, weight: 0.30}
-            - {min: 2.00, max: 3.50, weight: 0.50}
-          count_min: 5
-          count_max: 10
-
-        density:
-          enabled: true
-          mode: "inflated_occupancy"
-          target_min: 0.08
-          target_max: 0.15
+        density_min: 0.16
+        density_max: 0.21
+        size_groups:
+          large: {radius_min_m: 2.20, radius_max_m: 3.50, capacity_fraction: 0.60, consecutive_fail_threshold: 50}
+          medium: {radius_min_m: 1.00, radius_max_m: 2.20, capacity_fraction: 0.25, consecutive_fail_threshold: 120}
+          small: {radius_min_m: 0.10, radius_max_m: 1.00, capacity_fraction: 0.15, consecutive_fail_threshold: 200}
 
   # ── Phase 4: ESDF Cache ────────────────────────────────────────────
   esdf_cache:
@@ -594,6 +504,7 @@ global:
       maximum_acceleration_mps2: [4.0, 4.0, 2.0]
       maximum_tilt_deg: 35.0
       maximum_yaw_rate_rps: 2.0
+      maximum_yaw_acceleration_rps2: 4.0
       attitude_gain: 6.0
       maximum_body_rate_rps: 6.0
 
@@ -629,33 +540,21 @@ global:
   # ── Trajectory planning & dynamics constraints ───────────────────────
   planning:
     # ═══════════════════════════════════════════════════════════════════
-    #  Global path planner (A* on ESDF) — ONE call per start→goal pair
+    #  Goal-directed branch planner — ONE call per start→goal pair
     # ═══════════════════════════════════════════════════════════════════
     global_planner:
-      algorithm: "line_push"
-      line_push:
-        point_spacing_m: 0.10
-        target_clearance_m: 0.25
-        influence_radius_m: 1.50
-        push_margin_m: 0.10
-        smoothing_weight: 0.20
-        max_iterations: 80
-        max_offset_m: 12.0
-        max_control_points: 5000
-        max_segment_refinements_per_iteration: 256
-        clearance_cost_weight: 0.20
-        fallback_to_astar: true
-      coarse_factor: 1                 # full resolution; min-pooling can close narrow corridors
-      epsilon: 1.10                    # <=10% weighted-A* bound; avoids 800k-node failures
-      max_iterations_coarse: 300000
-      max_iterations_full: 800000       # 0.10 m grid has ~3.4x the 0.15 m voxel count
-      max_planning_time_coarse_s: 8.0  # wall-clock guard for downsampled search
-      max_planning_time_full_s: 45.0   # bounded guard sized for the 0.10 m grid
-      cost_weight: 0.0                 # geometric shortest feasible path, no perimeter bias
-      clearance_target: 0.25           # preserve tracking reserve around the global guide
-      min_clearance: 0.20              # 0.20 m body radius + 0.15 m hard surface margin
-      shortcut_enabled: true
-      shortcut_check_spacing: 0.05
+      algorithm: "observation_rollout"
+      observation_rollout:
+        step_length_m: 0.10
+        angular_step_deg: 2.0
+        deviation_tie_tolerance_deg: 2.0
+        fov_margin_deg: 3.0
+        maximum_deviation_deg: 120.0
+        goal_tolerance_m: 0.10
+        maximum_rollout_steps: 10000
+        maximum_planning_time_s: 45.0
+      min_clearance: 0.20
+      collision_check_spacing_m: 0.05
       reference_resample_spacing_m: 0.10
 
     # ═══════════════════════════════════════════════════════════════════
@@ -675,7 +574,7 @@ global:
       yaw_tracking_gain: 3.0             # [1/s] align nose to commanded velocity
       yaw_speed_threshold: 0.10          # [m/s] hold yaw below this horizontal speed
       max_plan_age: 0.75                 # measured from request state, never completion time
-      planning_time_budget_ms: 40.0
+      planning_time_budget_ms: 30.0
 
       lookahead_distance: 4.0
       min_lookahead_distance: 2.0
@@ -687,19 +586,19 @@ global:
 
       control_points: 12
       control_point_spacing: 0.20
-      max_iterations: 200
+      max_iterations: 10000
       convergence_tolerance: 1.0e-4
       initial_step_size: 0.1
       minimum_step_size: 1.0e-4
       max_cost_samples_per_segment: 64   # bounds every objective evaluation
 
-      min_clearance: 0.15
+      min_clearance: 0.02
       target_clearance: 0.25
       collision_check_spacing: 0.05
 
       weight_smooth: 1.0
       weight_jerk: 0.2
-      weight_guide: 0.8
+      weight_guide: 0.0
       weight_obstacle: 4.0
       weight_goal: 2.0
       weight_dynamics: 1.0
@@ -743,7 +642,7 @@ global:
   # ── Data format ──────────────────────────────────────────────────────
   data:
     coordinate_frame: "CAMERA_FLU"
-    schema_version: 15
+    schema_version: 16
     collection_mode: "deterministic_lockstep"
     image_write_queue_size: 16
     label_lookahead_time_s: 0.08
@@ -787,7 +686,19 @@ global:
 
   # ── Guide selector (Phase 2) ─────────────────────────────────────────
   guide_selector:
+    selection_mode: local_goal_explorer
     max_range_m: 5.0
+
+    explorer_angle_step_deg: 3.0
+    explorer_refine_step_deg: 1.0
+    explorer_refine_half_width_deg: 3.0
+    explorer_max_angle_deg: 55.0
+    explorer_min_advance_m: 1.0
+    explorer_escape_min_advance_m: 0.40
+    explorer_max_clearance_drop_m: 0.02
+    explorer_recovery_turn_deg: 25.0
+    explorer_depth_step: 6
+    explorer_obstacle_margin_m: 0.05
 
     horizontal_fov_margin_deg: 3.0
     vertical_fov_margin_deg: 3.0
@@ -801,10 +712,6 @@ global:
 
     path_search_max_points: 200
 
-    terminal_horizon_s: 1.5
-    terminal_acceleration_limit_mps2: 3.0
-    terminal_min_distance_m: 0.40
-
     use_depth_projection_visibility: true
     use_known_free_corridor: false
 
@@ -813,11 +720,6 @@ global:
     control_rate_hz: 30.0
     record_rate_hz: 30.0
     # v13: planner runs at record rate (30 Hz). planner_rate_hz removed.
-
-    planner_retry:
-      terminal_scale_sequence: [1.0, 0.75, 0.50, 0.30]
-      recovery_initial_terminal_scales: [0.30, 0.50]
-      # speed_scale_sequence removed — C++ pybind does not export speed_scale
 
     trajectory_cache:
       max_plan_age_s: 0.20
@@ -862,7 +764,3 @@ global:
     strict_collision_policy: true          # reject trajectory on ANY collision
     atomic_rename:           true          # use .inprogress → rename commit
 
-# ── Scene definitions (legacy — superseded by scene_generation.profiles) ────
-# The legacy scenes: list is disabled when source == "procedural_profiles".
-# To use legacy mode, set scene_generation.source to "procedural_yaml".
-scenes: []

@@ -362,6 +362,7 @@ class PlannerMode(Enum):
     FRESH_PLAN = "FRESH_PLAN"
     CACHED_PLAN = "CACHED_PLAN"
     RECOVERY = "RECOVERY"
+    GOAL_HOLD = "GOAL_HOLD"
     ABORT = "ABORT"
 
 
@@ -369,6 +370,7 @@ class ControlMode(Enum):
     """Per-step control generation mode."""
     TRACK_TRAJECTORY = "TRACK_TRAJECTORY"
     ROTATE_IN_PLACE = "ROTATE_IN_PLACE"
+    HOLD_POSITION = "HOLD_POSITION"
     EMERGENCY_STOP = "EMERGENCY_STOP"
 
 
@@ -376,6 +378,7 @@ class TrendMode(Enum):
     """Trend label generation mode."""
     TRACK_GUIDE = "TRACK_GUIDE"
     RECOVERY = "RECOVERY"
+    GOAL_HOLD = "GOAL_HOLD"
 
 
 # ── Trend horizontal class constants (13 classes) ───────────────────
@@ -387,6 +390,76 @@ TREND_RECOVER_RIGHT_CLASS = 12
 
 # Vertical bins unchanged
 TREND_VERTICAL_CLASS_COUNT = 7
+
+
+def update_goal_hold_latch(is_latched, current_position_world,
+                           goal_position_world, goal_tolerance_m,
+                           current_speed_mps=None,
+                           goal_speed_tolerance_mps=None):
+    """Latch terminal HOLD as soon as the vehicle enters goal tolerance.
+
+    While the vehicle is still moving, the latch deliberately does not clear
+    if inertia carries it just outside the tolerance.  This prevents a
+    behind-camera goal from being mislabeled as Recovery during braking.
+    If the vehicle has already stopped outside the tolerance, the optional
+    speed arguments release the latch so the planner can reacquire the goal
+    instead of waiting forever.
+    """
+    tolerance = float(goal_tolerance_m)
+    current = np.asarray(current_position_world, dtype=np.float64)
+    goal = np.asarray(goal_position_world, dtype=np.float64)
+    if tolerance < 0.0 or not np.isfinite(tolerance):
+        raise ValueError("goal_tolerance_m must be finite and non-negative")
+    if current.shape != (3,) or goal.shape != (3,):
+        raise ValueError("goal hold positions must have shape (3,)")
+    if not np.all(np.isfinite(current)) or not np.all(np.isfinite(goal)):
+        raise ValueError("goal hold positions must be finite")
+    distance = float(np.linalg.norm(current - goal))
+
+    if bool(is_latched):
+        if ((current_speed_mps is None) !=
+                (goal_speed_tolerance_mps is None)):
+            raise ValueError(
+                "current_speed_mps and goal_speed_tolerance_mps must be "
+                "provided together")
+        if current_speed_mps is not None:
+            speed = float(current_speed_mps)
+            speed_tolerance = float(goal_speed_tolerance_mps)
+            if (not np.isfinite(speed) or speed < 0.0 or
+                    not np.isfinite(speed_tolerance) or
+                    speed_tolerance < 0.0):
+                raise ValueError(
+                    "goal hold speeds must be finite and non-negative")
+            if (distance > tolerance + 1.0e-9 and
+                    speed <= speed_tolerance + 1.0e-9):
+                return False
+        return True
+    return bool(distance <= tolerance + 1.0e-9)
+
+
+def goal_hold_guide_labels(
+        normal_horizontal_bin_count=TREND_NORMAL_HORIZONTAL_BIN_COUNT,
+        vertical_bin_count=TREND_VERTICAL_CLASS_COUNT):
+    """Return the deterministic center-Guide targets for terminal HOLD."""
+    normal_count = int(normal_horizontal_bin_count)
+    vertical_count = int(vertical_bin_count)
+    if normal_count <= 0 or normal_count % 2 == 0:
+        raise ValueError(
+            "normal_horizontal_bin_count must be a positive odd integer")
+    if vertical_count <= 0 or vertical_count % 2 == 0:
+        raise ValueError("vertical_bin_count must be a positive odd integer")
+
+    horizontal_class = (
+        TREND_NORMAL_CLASS_OFFSET + normal_count // 2)
+    vertical_class = vertical_count // 2
+    horizontal_soft = np.zeros(
+        TREND_HORIZONTAL_CLASS_COUNT, dtype=np.float64)
+    vertical_soft = np.zeros(vertical_count, dtype=np.float64)
+    horizontal_soft[horizontal_class] = 1.0
+    vertical_soft[vertical_class] = 1.0
+    return (
+        horizontal_class, vertical_class,
+        horizontal_soft, vertical_soft)
 
 
 @dataclass(frozen=True)
@@ -405,6 +478,7 @@ class LocalPlanSnapshot:
 
     guide_world: np.ndarray
     guide_path_index: int
+    guide_is_final: bool
 
     terminal_world: np.ndarray
     terminal_path_index: int
@@ -528,8 +602,41 @@ class RuntimeDecision:
             raise ValueError("trajectory_feedback_velocity_flu must be finite")
 
 
+def make_goal_hold_decision(current_position_world, goal_position_world,
+                            goal_path_index, plan_snapshot=None):
+    """Build the single-source-of-truth zero command for terminal HOLD."""
+    current = np.asarray(current_position_world, dtype=np.float64)
+    goal = np.asarray(goal_position_world, dtype=np.float64)
+    if current.shape != (3,) or goal.shape != (3,):
+        raise ValueError("goal hold positions must have shape (3,)")
+    if not np.all(np.isfinite(current)) or not np.all(np.isfinite(goal)):
+        raise ValueError("goal hold positions must be finite")
+    zero = np.zeros(3, dtype=np.float64)
+    return RuntimeDecision(
+        planner_mode=PlannerMode.GOAL_HOLD.value,
+        trend_mode=TrendMode.GOAL_HOLD.value,
+        control_mode=ControlMode.HOLD_POSITION.value,
+        guide_source="goal_tolerance_hold",
+        guide_target_world=current.copy(),
+        guide_target_path_index=int(goal_path_index),
+        recovery_direction="",
+        recovery_azimuth_rad=0.0,
+        plan_snapshot=plan_snapshot,
+        recovery_target_world=goal.copy(),
+        recovery_target_path_index=int(goal_path_index),
+        trajectory_sample_time_s=-1.0,
+        trajectory_reference_velocity_flu=zero.copy(),
+        trajectory_feedback_velocity_flu=zero.copy(),
+        expert_velocity_flu=zero.copy(),
+        expert_yaw_rate=0.0,
+        selected_velocity_flu=zero.copy(),
+        selected_yaw_rate=0.0,
+        selected_actor="goal_hold",
+    )
+
+
 # ============================================================================
-#  Vehicle / camera builders  (KEPT EXACTLY AS ORIGINAL – compatibility)
+#  Vehicle / camera builders  (KEPT EXACTLY AS ORIGINAL — compatibility)
 # ============================================================================
 
 def make_depth_vehicle(ros_pos, yaw, depth_cfg, quaternion_xyzw=None):

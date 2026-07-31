@@ -20,7 +20,7 @@ struct LocalPlannerConfig {
     double horizon_time = 2.5;
     double execute_prefix_time = 0.60;
     double max_plan_age = 0.75;
-    double planning_time_budget_ms = 40.0;
+    double planning_time_budget_ms = 30.0;
     double trajectory_dt = 0.04;
 
     // Lookahead / local goal
@@ -36,21 +36,27 @@ struct LocalPlannerConfig {
     std::string optimizer = "auto";  // auto | nlopt | native
     int control_points = 12;
     double control_point_spacing = 0.20;
-    int max_iterations = 60;
+    int max_iterations = 10000;
     double convergence_tolerance = 1.0e-4;
     double initial_step_size = 0.1;
     double minimum_step_size = 1.0e-4;
     int max_cost_samples_per_segment = 64;
+    // Each free control point stays near the corresponding collision-free
+    // seed point.  This preserves the seed homotopy without attracting the
+    // trajectory to the straight Guide chord.
+    double seed_trust_radius = 0.75;
 
-    // Clearance
-    double min_clearance = 0.10;
+    // ESDF already subtracts the vehicle radius.  This is only the extra
+    // local hard margin; target_clearance remains the soft preference.
+    double min_clearance = 0.02;
     double target_clearance = 0.20;
     double collision_check_spacing = 0.05;
 
     // Cost weights
+    double weight_path_length = 0.05;
     double weight_smooth = 1.0;
     double weight_jerk = 0.2;
-    double weight_guide = 0.8;
+    double weight_guide = 0.0;
     double weight_obstacle = 4.0;
     double weight_goal = 2.0;
     double weight_dynamics = 1.0;
@@ -137,8 +143,9 @@ public:
                               double previous_progress_s) const;
 
     /// Plan a local trajectory with explicit request (Phase 2).
-    /// Uses guide_waypoint for reference, trajectory_terminal as optimization
-    /// target, and reference_path_segment for B-spline initialisation.
+    /// Uses guide_waypoint/trajectory_terminal as the exact local target.
+    /// The deprecated reference_path_segment is ignored; an obstructed direct
+    /// seed is initialized by a bounded local ESDF search.
     /// Collision checks use isKnownFree() when forbid_unknown_space is true.
     /// @param request  full planning request
     /// @return  LocalPlanResult with trajectory and metadata
@@ -243,6 +250,12 @@ private:
         const VehicleState& current_state,
         double progress_s,
         double lookahead) const;
+
+    /// Production explicit-Guide planner.  Uses one cubic B-spline for
+    /// optimization, sampling and validation; the legacy planner remains
+    /// available through planLocal().
+    LocalPlanResult planSplineWithRequest(
+        const LocalPlanningRequest& request) const;
 
     // Precomputed arc-lengths for global path segments.
     void recomputeArcLengths();

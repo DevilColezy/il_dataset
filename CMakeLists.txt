@@ -6,6 +6,28 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Keep Eigen's architecture-dependent ABI consistent with flightlib.  The
+# pybind module allocates flightlib::Quadrotor and also exchanges Eigen-bearing
+# local-planner types with il_local_planner_lib, so every il_dataset C++ target
+# must use the same architecture flags as flightlib.
+if("${CMAKE_HOST_SYSTEM_PROCESSOR}" STREQUAL "armv7l")
+  set(IL_DATASET_ARCH_FLAGS
+    -Wno-psabi
+    -march=armv7-a
+    -mfpu=neon
+    -mfloat-abi=hard
+    -funsafe-math-optimizations
+  )
+elseif("${CMAKE_HOST_SYSTEM_PROCESSOR}" STREQUAL "aarch64")
+  set(IL_DATASET_ARCH_FLAGS
+    -Wno-psabi
+    -march=armv8-a+crypto
+    -mcpu=cortex-a57+crypto
+  )
+else()
+  set(IL_DATASET_ARCH_FLAGS -march=native)
+endif()
+
 # ── Catkin ──────────────────────────────────────────────────────
 find_package(catkin REQUIRED COMPONENTS
   flightlib
@@ -69,10 +91,16 @@ include_directories(
 set(LOCAL_PLANNER_SOURCES
   src/local_planner/esdf_grid.cpp
   src/local_planner/local_planner.cpp
+  src/local_planner/spline_planner.cpp
 )
 
 add_library(il_local_planner_lib STATIC ${LOCAL_PLANNER_SOURCES})
-target_compile_options(il_local_planner_lib PRIVATE -O3 -Wall -Wextra)
+set_target_properties(il_local_planner_lib PROPERTIES
+  POSITION_INDEPENDENT_CODE ON
+)
+target_compile_options(il_local_planner_lib PRIVATE
+  -O3 -Wall -Wextra ${IL_DATASET_ARCH_FLAGS}
+)
 target_link_libraries(il_local_planner_lib ${catkin_LIBRARIES})
 if(NLopt_FOUND)
   target_compile_definitions(il_local_planner_lib PRIVATE IL_DATASET_HAS_NLOPT=1)
@@ -108,12 +136,34 @@ pybind11_add_module(_il_local_planner
   src/local_planner/pybind_module.cpp
   src/local_planner/depth_integrator.cpp
 )
-target_compile_options(_il_local_planner PRIVATE -O3 -Wall -Wextra)
+target_compile_options(_il_local_planner PRIVATE
+  -O3 -Wall -Wextra ${IL_DATASET_ARCH_FLAGS}
+)
 target_link_libraries(_il_local_planner PRIVATE
   il_local_planner_lib
   ${catkin_LIBRARIES}
   stdc++fs
 )
+
+if(CATKIN_ENABLE_TESTING)
+  add_executable(
+    il_local_planner_trajectory_test
+    tests/test_trajectory_consistency.cpp
+  )
+  target_compile_options(
+    il_local_planner_trajectory_test PRIVATE
+    -O2 -Wall -Wextra ${IL_DATASET_ARCH_FLAGS}
+  )
+  target_link_libraries(
+    il_local_planner_trajectory_test
+    il_local_planner_lib
+    ${catkin_LIBRARIES}
+  )
+  add_test(
+    NAME il_local_planner_trajectory_test
+    COMMAND il_local_planner_trajectory_test
+  )
+endif()
 
 # Place the .so next to the Python scripts so "import _il_local_planner" works
 set_target_properties(_il_local_planner PROPERTIES
@@ -127,8 +177,11 @@ catkin_package(
 )
 
 catkin_install_python(PROGRAMS
+  scripts/expert_behavior_catalog.py
+  scripts/expert_behavior_suite.py
   scripts/expert_behavior_test.py
   scripts/expert_behavior_visualizer.py
+  scripts/observation_rollout_scenario_test.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
