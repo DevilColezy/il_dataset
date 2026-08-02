@@ -62,6 +62,9 @@ def _configure_fixed_scenario(cfg, scenario_name, scenario_file,
         "enabled": True,
         "tasks_per_scene": 1,
         "max_task_sampling_attempts": 1,
+        # Manual obstacle-response cases must start aligned with the mission
+        # axis; random heading recovery would confound the comparison.
+        "initial_yaw_randomization_deg": 0.0,
         "fixed_tasks": [{"start": start, "goal": goal}],
         "start_height_min_m": float(start[2]),
         "start_height_max_m": float(start[2]),

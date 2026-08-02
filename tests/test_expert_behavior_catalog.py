@@ -174,6 +174,8 @@ class ExpertBehaviorCatalogTest(unittest.TestCase):
             common = scene_cfg["common_task_generation"]
             self.assertEqual(common["tasks_per_scene"], 1)
             self.assertEqual(
+                common["initial_yaw_randomization_deg"], 0.0)
+            self.assertEqual(
                 common["fixed_tasks"][0]["start"],
                 self.scenarios["open_baseline"]["start"])
         finally:

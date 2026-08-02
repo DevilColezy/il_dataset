@@ -1,24 +1,14 @@
 # ============================================================================
-#  Imitation Learning Dataset Collection — Configuration  v5
+#  Imitation Learning Dataset Collection — strict schema v16
 # ============================================================================
-#  Obstacle regimes:
-#    small_only           – radius 0.15 – 1.0 m   (diameter 0.3 – 2.0 m)
-#    small_medium         – radius 0.15 – 2.5 m   (diameter 0.3 – 5.0 m)
-#    large_medium_small   – radius 0.15 – 4.0 m   (diameter 0.3 – 8.0 m)
+#  Sole collection flow:
+#    density-balanced cylinder scene → quota-balanced task generation →
+#    causal local Guide exploration → C++ receding-horizon Control →
+#    deterministic lockstep recording → whole-episode validation/commit.
 #
-#  Workflow  (state machine):
-#    BOOT → WAIT_UNITY → GEN_OBSTACLES → WAIT_SCENE → EXPORT_PC →
-#    WAIT_PC → BUILD_ESDF → GEN_PAIRS → PLAN_GLOBAL_PATHS →
-#    VALIDATE_GLOBAL_PATHS → RESET_DRONE → WAIT_STABLE →
-#    INIT_LOCAL_PLANNER → START_RECORDING → ONLINE_PLAN_AND_RECORD →
-#    STOP_RECORDING → VALIDATE_AND_COMMIT → NEXT_TRAJ / NEXT_CONFIG
-#
-#  Schema version: 5
-#    - v1: il_pipeline.py     (global.flight, global.connect_timeout, scene.trajectories)
-#    - v2: il_manager.py      (global.fsm, global.control, global.start_goal)
-#    - v3: il_manager.py v3   (sync diagnostics, atomic commit, validated config)
-#    - v4: added vel_source, body_frame_convention metadata
-#    - v5: receding-horizon local planner, C++ pybind11 backend, global A* only
+#  This is a 2.5D validation setup: the network interfaces remain 3D, while
+#  every obstacle spans the complete z range so avoidance labels are planar.
+#  Removed schemas and fallback planners are intentionally unsupported.
 # ============================================================================
 
 # ── Global settings ──────────────────────────────────────────────────────────
@@ -51,14 +41,14 @@ global:
   pointcloud:
     range:      [30.0, 50.0, 8.0]
     origin:     [0.0, 20.0, 3.5]
-    # A 0.40 m-wide vehicle spans four samples at 0.10 m.  Keep point-cloud
+    # A 0.60 m-wide vehicle spans six samples at 0.10 m.  Keep point-cloud
     # and ESDF resolution equal so voxelisation cannot create surface holes.
     resolution: 0.10
   esdf:
     resolution:    0.10
-    drone_radius:  0.20              # 0.40 m physical vehicle width
+    drone_radius:  0.30              # matches scene_generation.vehicle.radius_m
 
-  # ── Control & recording (async: high-freq control, lower-freq save) ──
+  # ── Deterministically scheduled control and recording rates ─────────
   control:
     # Keep command and capture clocks aligned.  At 640x480 the Unity depth
     # pipeline did not consume 50 Hz reliably, which caused queued poses to be
@@ -67,28 +57,6 @@ global:
     # Windows Unity + WSL transport target.  640x480 RFloat depth is about
     # 1.2 MiB/frame, so 30 Hz remains practical while looking smooth.
     record_hz:  30.0
-
-  # ── Obstacle generation shared defaults ──────────────────────────────
-  obstacle:
-    area_x:  [-9.0, 11.0]
-    area_y:  [0.0, 30.0]
-    height:   8.0
-    # SmartObstacleSampler produces an obstacle surface gap of:
-    # min_gap + 2*drone_radius + safety_margin = 0.80 m.  A 0.40 m vehicle
-    # therefore has 0.40 m total spare width in every generated pairwise gap.
-    min_gap:        0.20
-    drone_radius:   0.20
-    safety_margin:  0.20
-    border_margin:  0.20               # avoids creating an oversized perimeter corridor
-    candidate_attempts: 60
-    shrink_on_fail:  true
-    shrink_factor:    0.85
-    size_interval:    0.5
-    scale_weights: [0.72, 0.23, 0.05]   # small / medium / large; large is rare
-    avoid_x:      0.0
-    avoid_y:      0.0
-    avoid_radius: 0.0
-    ground_z:     0.0
 
   # ── Phase 3: Scene & Task Generation ───────────────────────────────
   scene_generation:
@@ -112,12 +80,8 @@ global:
 
     # ── Execution control ──────────────────────────────────────────
     execution:
-      profile_order: "sequential"
-      stop_after_all_profiles: true
-
       max_generation_attempts_per_scene: 500
       max_obstacle_sampling_attempts: 5000
-      max_task_sampling_attempts_per_scene: 500
 
     # ── Obstacle region ────────────────────────────────────────────
     obstacle_region:
@@ -135,9 +99,6 @@ global:
       radius_m: 0.30
       safety_margin_m: 0.10
 
-    post_inflation_gap_m: 0.20
-    region_boundary_margin_m: 0.30
-    allow_overlap: false
     forbid_enclosed_free_components: true
     forbid_inflated_component_merging: true
 
@@ -153,19 +114,19 @@ global:
     common_cylinder:
       height_min_m: 8.0
       height_max_m: 8.0
-
-      require_full_vertical_blocking: true
       region_boundary_margin_m: 0.30
 
       minimum_surface_gap_m: 0.0
       minimum_post_inflation_gap_m: 0.20
 
-      allow_overlap: false
 
     # ── Common task generation ─────────────────────────────────────
     common_task_generation:
       tasks_per_scene: 10
       max_task_sampling_attempts: 2000
+      # Initial nose offsets are stratified across this symmetric range for
+      # every scene, then deterministically permuted across its tasks.
+      initial_yaw_randomization_deg: 90.0
       start_clearance_m: 0.40
       goal_clearance_m: 0.40
       direct_path_corridor_radius_m: 0.55
@@ -227,27 +188,8 @@ global:
           {level: 1.0, ascending: 0.0, descending: 0.0}
 
     topology_validation:
-      enabled: true
-
       grid_resolution_m: 0.10
       validation_halo_m: 3.0
-
-      vehicle_radius_m: 0.20
-      safety_margin_m: 0.10
-
-      forbid_enclosed_free_components: true
-      forbid_dead_ends: false
-      forbid_u_shapes: false
-
-      minimum_navigable_corridor_width_m: 0.60   # deprecated — replaced by post_inflation_gap
-
-      escape_ray_count: 24
-      minimum_escape_sector_width_deg: 35.0
-      minimum_separated_escape_sectors: 2
-      minimum_escape_sector_separation_deg: 80.0
-
-      dead_end_probe_spacing_m: 0.50
-      dead_end_minimum_depth_m: 1.50
 
     side_cost:
       enabled: false
@@ -491,9 +433,6 @@ global:
 
     deterministic_time: true
 
-    allow_legacy_kinematic_backend: true
-    legacy_backend_explicit_only: true
-
     velocity_controller:
       use_existing_flightmare_controller: true
 
@@ -514,28 +453,6 @@ global:
       settle_time_s: 0.30
       initial_velocity_noise_std_mps: [0.0, 0.0, 0.0]
       initial_angular_velocity_noise_std_rps: [0.0, 0.0, 0.0]
-
-  # ── Start / goal random generation ───────────────────────────────────
-  start_goal:
-    num_pairs_per_config: 3            # fewer pairs for quick test
-    candidate_pair_multiplier: 2       # replace failed A* candidates when possible
-    start_zone:
-      x: [-8.0, 8.0]
-      y: [-2.0, -1.0]
-      z_min: 2.0
-      z_max: 4.0
-    goal_zone:
-      x: [-8.0, 8.0]
-      y: [31.0, 32.0]
-      z_min: 2.0
-      z_max: 4.0
-    min_start_goal_distance: 15.0
-    max_attempts: 200
-    min_esdf_clearance_at_endpoints: 0.20
-    # v11: random yaw offset applied to initial drone heading.
-    # 0 = always face along the first global-path segment.
-    # e.g. 30 = uniformly random offset in [-30°, +30°].
-    initial_yaw_randomization_deg: 90.0
 
   # ── Trajectory planning & dynamics constraints ───────────────────────
   planning:
@@ -568,7 +485,6 @@ global:
 
       planner_hz: 30.0
       horizon_time: 2.5                 # nominal optimizer horizon; sampled duration is auto-scaled
-      execute_prefix_time: 0.60          # legacy field; position prefixes are no longer replayed
       velocity_command_lookahead_time: 0.08  # shorter preview reduces corner cutting
       velocity_tracking_gain: 2.0        # [1/s] feedback toward the collision-checked local path
       yaw_tracking_gain: 3.0             # [1/s] align nose to commanded velocity
@@ -632,12 +548,6 @@ global:
       minimum_rows: 10
       maximum_none_depth_ratio: 0.20
       command_compare_atol: 1.0e-5
-
-    # ── DEPRECATED (kept for backward compat; NOT used by new pipeline) ──
-    # esdf_optimize, pos_smooth_window, resample_spacing, time_param,
-    # control_lookahead, control_yaw_smooth — these have been superseded
-    # by the local planner.  They remain in the file only so old config
-    # loaders do not crash; il_config.py will emit deprecation warnings.
 
   # ── Data format ──────────────────────────────────────────────────────
   data:

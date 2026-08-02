@@ -177,6 +177,57 @@ def _density_config(minimum_achievement_ratio=0.85):
     }
 
 
+class ScenarioGeometryContractTest(unittest.TestCase):
+    def test_2p5d_profile_requires_cylinders_to_span_region_height(self):
+        config = _density_config()
+        scene_cfg = config["global"]["scene_generation"]
+        scene_cfg["common_cylinder"]["height_min_m"] = 7.5
+        with self.assertRaisesRegex(ValueError, "must fully cover"):
+            _SCENARIO.load_scene_profiles(config)
+
+    def test_fixed_obstacle_must_span_the_complete_vertical_region(self):
+        config = _density_config()
+        scene_cfg = config["global"]["scene_generation"]
+        scene_cfg["source"] = "fixed_scenario"
+        scene_cfg["fixed_obstacles"] = [{
+            "id": "short",
+            "center": [10.0, 10.0, 4.0],
+            "radius_m": 0.5,
+            "height_m": 7.0,
+        }]
+        generator = _SCENARIO.YamlCylinderSceneGenerator(config)
+        obstacles, reason = generator.generate_scene()
+        self.assertEqual(obstacles, [])
+        self.assertEqual(reason, "FIXED_OBSTACLE_NOT_FULL_HEIGHT")
+
+    def test_all_geometry_consumers_use_scene_vehicle_only(self):
+        config = {
+            "global": {
+                "scene_generation": {
+                    "vehicle": {
+                        "radius_m": 0.41,
+                        "safety_margin_m": 0.17,
+                    },
+                    "topology_validation": {
+                        "vehicle_radius_m": 9.0,
+                        "safety_margin_m": 8.0,
+                        "grid_resolution_m": 0.12,
+                    },
+                    "side_cost": {},
+                    "observability_audit": {},
+                },
+            },
+        }
+        validator = _SCENARIO.CylinderSceneValidator(config)
+        side_cost = _SCENARIO.SideCostEvaluator(config)
+        auditor = _SCENARIO.ObstacleVisibilityAuditor(config)
+        self.assertAlmostEqual(validator.vehicle_r, 0.41)
+        self.assertAlmostEqual(validator.safety_m, 0.17)
+        self.assertAlmostEqual(side_cost.vehicle_r, 0.41)
+        self.assertAlmostEqual(side_cost.safety_m, 0.17)
+        self.assertAlmostEqual(auditor.inflation, 0.58)
+
+
 class CoverageBalancedTaskTest(unittest.TestCase):
     def test_largest_remainder_quota_is_exact_and_deterministic(self):
         cfg = _task_config(tasks_per_scene=8)
@@ -514,6 +565,8 @@ class SceneDensityMixTest(unittest.TestCase):
             {profile.density_tier for profile in profiles},
             {"sparse", "medium", "dense"})
         tiers = {profile.name: profile.density_tier for profile in profiles}
+        self.assertEqual(tiers["S02_small_medium"], "sparse")
+        self.assertEqual(tiers["S03_small_dense"], "medium")
         self.assertEqual(tiers["S04_medium_sparse"], "sparse")
         self.assertEqual(tiers["S06_medium_dense"], "dense")
 
@@ -579,10 +632,25 @@ class SceneDensityMixTest(unittest.TestCase):
                     "r", encoding="utf-8") as stream:
                 loaded = yaml.safe_load(stream)
             _CONFIG._validate_config(loaded)
+            self.assertEqual(loaded["global"]["data"]["schema_version"], 16)
+            self.assertEqual(
+                loaded["global"]["data"]["collection_mode"],
+                "deterministic_lockstep")
+            self.assertNotIn("obstacle", loaded["global"])
+            self.assertNotIn("start_goal", loaded["global"])
             scene_cfg = loaded["global"]["scene_generation"]
             self.assertEqual(scene_cfg["source"], "density_driven")
             self.assertNotIn("cylinder", scene_cfg)
             self.assertNotIn("task_generation", scene_cfg)
+            self.assertNotIn(
+                "require_full_vertical_blocking",
+                scene_cfg["common_cylinder"])
+            self.assertEqual(
+                set(scene_cfg["topology_validation"]),
+                {"grid_resolution_m", "validation_halo_m"})
+            self.assertEqual(
+                scene_cfg["vehicle"]["radius_m"],
+                loaded["global"]["esdf"]["drone_radius"])
             self.assertNotIn("scenes", loaded)
             self.assertEqual(len(scene_cfg["profiles"]), 12)
             self.assertEqual(
@@ -599,10 +667,20 @@ class SceneDensityMixTest(unittest.TestCase):
         profiles = _SCENARIO.load_scene_profiles(dense_only)
         self.assertEqual(len(profiles), 2)
 
+    def test_removed_global_obstacle_schema_is_rejected(self):
+        old_style = copy.deepcopy(self.config)
+        old_style["global"]["obstacle"] = {
+            "drone_radius": 0.30,
+            "min_gap": 0.20,
+        }
+        with self.assertRaisesRegex(ValueError, "global.obstacle was removed"):
+            _CONFIG._validate_config(old_style)
+
     def test_full_catalog_without_density_mix_is_rejected(self):
         dense_only = copy.deepcopy(self.config)
         for profile in dense_only["global"]["scene_generation"]["profiles"]:
-            profile["density_tier"] = "dense"
+            profile["density_min"] = 0.20
+            profile["density_max"] = 0.22
         with self.assertRaisesRegex(ValueError, "missing"):
             _SCENARIO.load_scene_profiles(dense_only)
 

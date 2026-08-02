@@ -1,21 +1,10 @@
 <?xml version="1.0"?>
 <!-- ===================================================================
-  Imitation-Learning Dataset Collection  v5  —  State-Machine Manager
+  Strict schema-v16 imitation-learning dataset collection.
 
-  Launches the IL manager node which runs a formal FSM:
-    BOOT → WAIT_UNITY → GEN_OBSTACLES → WAIT_SCENE → EXPORT_PC →
-    WAIT_PC → BUILD_ESDF → GEN_PAIRS → PLAN_GLOBAL_PATHS →
-    VALIDATE_GLOBAL_PATHS → RESET_DRONE → WAIT_STABLE →
-    INIT_LOCAL_PLANNER → START_RECORDING → ONLINE_PLAN_AND_RECORD →
-    STOP_RECORDING → VALIDATE_AND_COMMIT → NEXT_TRAJ / NEXT_CONFIG
-
-  Key v5 changes:
-    - Global A* serves as reference path only (no full-trajectory smoothing)
-    - C++ receding-horizon local planner with pybind11 bindings
-    - Online re-planning with execute-prefix model
-    - Extended data.csv columns for planner metadata
-    - global_path.csv and local_plans.csv sidecar files
-    - Schema version 5
+  The manager runs the sole supported pipeline: balanced 2.5D scene/task
+  generation, causal Guide selection, C++ receding-horizon Control,
+  deterministic lockstep recording, and whole-episode validation.
 
   AvoidBench / Unity must be started manually BEFORE launching:
     cd ~/flightmare_ws/RPG_Flightmare/AvoidBench_x

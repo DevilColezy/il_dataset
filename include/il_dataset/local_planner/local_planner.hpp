@@ -18,7 +18,6 @@ struct LocalPlannerConfig {
     // Timing
     double planner_hz = 10.0;
     double horizon_time = 2.5;
-    double execute_prefix_time = 0.60;
     double max_plan_age = 0.75;
     double planning_time_budget_ms = 30.0;
     double trajectory_dt = 0.04;

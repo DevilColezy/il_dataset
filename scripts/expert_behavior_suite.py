@@ -13,6 +13,8 @@ import os
 import subprocess
 import sys
 
+import rospy
+
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 PACKAGE_DIR = os.path.dirname(SCRIPT_DIR)
 if SCRIPT_DIR not in sys.path:
@@ -36,7 +38,7 @@ def _as_bool(value):
         "expected true/false, got '{}'".format(value))
 
 
-def _parse_args():
+def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Run the deterministic expert avoidance regression suite.")
     parser.add_argument(
@@ -64,7 +66,11 @@ def _parse_args():
         help="Stop launching scenarios after the first failure.")
     parser.add_argument(
         "--debug", nargs="?", const=True, default=False, type=_as_bool)
-    return parser.parse_args()
+    # roslaunch appends private remapping arguments such as
+    # ``__name:=expert_behavior_suite`` and ``__log:=...``.  They belong to
+    # ROS, not this CLI, and strict argparse must never see them.
+    raw_argv = sys.argv if argv is None else argv
+    return parser.parse_args(rospy.myargv(argv=raw_argv)[1:])
 
 
 def _newest_metadata(run_dir):

@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""
-Imitation-Learning Dataset Manager  —  State-Machine Orchestrator  v5
-===========================================================================
+"""Schema-v16 imitation-learning dataset collection manager.
 
-Controls the full data-collection workflow via a formal finite-state
-machine.  Each state performs its action, waits for a condition (with
-timeout), then transitions to the next state.
-
-Key improvements over v4:
-  - Receding-horizon local planner (C++ pybind11 backend)
-  - Online re-planning with execute-prefix model
-  - Global A* serves as reference path only
-  - Planner worker thread with GIL release
-  - Extended data.csv columns for planner metadata
-  - global_path.csv and local_plans.csv sidecar files
-  - Schema version 5
+The sole production flow generates a quota-balanced 2.5D cylinder scene and
+task set, derives causal local Guide labels from the current observation,
+executes Control through the Flightmare/C++ receding-horizon stack, records in
+deterministic lockstep, and commits only wholly valid episodes.
 
 Usage:
     roslaunch il_dataset il_dataset_collect.launch
@@ -34,7 +24,7 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
-# Also add flightmare_dataset_tools scripts dir (for SmartObstacleSampler, legacy)
+# Also add flightmare_dataset_tools scripts dir for point-cloud utilities.
 _rp = rospkg.RosPack()
 try:
     _ft_scripts = os.path.join(_rp.get_path("flightmare_dataset_tools"), "scripts")
@@ -73,12 +63,12 @@ from il_common import (
     UnityBridge, ESDFBuilder, SyncBuffer,
     make_depth_vehicle, make_dummy_vehicle,
     load_ply, wait_for_stable_file,
-    integrate_velocity_command, yaw_rate_for_world_velocity,
+    yaw_rate_for_world_velocity,
     quantize_bounded_vector,
-    body_rfu_to_flu, body_flu_to_rfu, world_vector_to_body_flu,
+    body_rfu_to_flu, body_flu_to_rfu,
     world_vector_to_body_flu_quat,
     body_flu_to_world_quat,
-    # v11: runtime enums, constants & plan snapshot
+    # Runtime enums, constants, and immutable plan snapshot.
     PlannerMode, ControlMode, TrendMode,
     LocalPlanSnapshot, RuntimeDecision,
     update_goal_hold_latch, goal_hold_guide_labels,
@@ -113,16 +103,15 @@ try:
         YamlCylinderSceneGenerator, CylinderSceneValidator,
         StartGoalTaskGenerator, SideCostEvaluator,
         SceneManifestWriter, SceneGenerationFailureManifestWriter,
-        ObstacleVisibilityAuditor,
-        SceneGenerationProfile, load_scene_profiles,
-        compute_density, compute_raw_occupancy, compute_inflated_occupancy,
+        ObstacleVisibilityAuditor, load_scene_profiles,
+        compute_raw_occupancy, compute_inflated_occupancy,
         compute_obstacles_per_100m2, compute_region_area,
-        compute_pairwise_min_gaps, DensityMode,
+        compute_pairwise_min_gaps,
     )
     _SCENARIO_AVAILABLE = True
 except ImportError:
     _SCENARIO_AVAILABLE = False
-    CylinderObstacleSpec = None  # fallback
+    CylinderObstacleSpec = None
 
 # Phase 4: ESDF cache, DAgger, dynamics
 try:
@@ -142,7 +131,7 @@ except ImportError:
 try:
     from il_dynamics import (
         create_dynamics_backend, DynamicsState, DynamicsBackend,
-        FlightmareDynamicsBackend, LegacyKinematicBackend)
+        FlightmareDynamicsBackend)
     _DYNAMICS_AVAILABLE = True
 except ImportError:
     _DYNAMICS_AVAILABLE = False
@@ -157,8 +146,6 @@ _il_traj_spec = _importlib_util.spec_from_file_location("il_trajectory", _il_tra
 _il_traj = _importlib_util.module_from_spec(_il_traj_spec)
 sys.modules["il_trajectory"] = _il_traj  # register before exec to prevent re-import
 _il_traj_spec.loader.exec_module(_il_traj)
-GlobalPathPlanner = _il_traj.GlobalPathPlanner
-TrajectoryPlanner = _il_traj.TrajectoryPlanner  # for backward compat
 
 # ── C++ local planner (optional — will be None if not available) ─────
 _CPP_PLANNER_AVAILABLE = False
@@ -660,20 +647,12 @@ class ILManager:
                           self._dagger_ctrl.round_id, self._dagger_ctrl.current_beta)
 
         self._dynamics = None
-        dyn_cfg = self.g.get("dynamics", {})
-        if _DYNAMICS_AVAILABLE:
-            try:
-                self._dynamics = create_dynamics_backend(config)
-                rospy.loginfo("[Manager] Phase 4: Dynamics backend = %s.",
-                              self._dynamics.backend_name)
-            except RuntimeError as e:
-                rospy.logerr("[Manager] Dynamics init failed: %s", e)
-                if dyn_cfg.get("backend", "flightmare") == "flightmare":
-                    raise
-                rospy.logerr("[Manager] Explicit legacy backend initialization failed.")
-        elif dyn_cfg.get("backend", "flightmare") != "legacy_kinematic":
-            rospy.logwarn("[Manager] Phase 4 dynamics module not available; "
-                          "using kinematic integration (debug only).")
+        if not _DYNAMICS_AVAILABLE:
+            raise RuntimeError(
+                "Flightmare dynamics module is required for collection")
+        self._dynamics = create_dynamics_backend(config)
+        rospy.loginfo("[Manager] Phase 4: Dynamics backend = %s.",
+                      self._dynamics.backend_name)
 
         # Scene/task tracking
         self._current_scene_obstacles = []  # list of CylinderObstacleSpec
@@ -763,7 +742,6 @@ class ILManager:
         cfg = _LocalPlannerConfig()
         cfg.planner_hz = float(lp_cfg.get("planner_hz", 10.0))
         cfg.horizon_time = float(lp_cfg.get("horizon_time", 2.5))
-        cfg.execute_prefix_time = float(lp_cfg.get("execute_prefix_time", 0.60))
         cfg.max_plan_age = float(lp_cfg.get("max_plan_age", 0.75))
         cfg.planning_time_budget_ms = float(
             lp_cfg.get("planning_time_budget_ms", 30.0))
@@ -877,10 +855,18 @@ class ILManager:
             rospy.loginfo("  Profiles: %d  |  Total scenes: %d",
                           len(self._enabled_scene_profiles), total_scenes)
             for p in self._enabled_scene_profiles:
-                rospy.loginfo("    • %s: %d scenes (density=%s r=%.2f–%.2f m count=%d–%d)",
-                              p.name, p.scene_count, p.density_mode,
-                              p.radius_min_m, p.radius_max_m,
-                              p.count_min, p.count_max)
+                size_summary = ", ".join(
+                    "{}={:.2f}-{:.2f}m".format(
+                        group.name,
+                        group.radius_min_m,
+                        group.radius_max_m)
+                    for group in p.size_groups)
+                rospy.loginfo(
+                    "    - %s: %d scenes (density=%s/%.3f-%.3f, "
+                    "tier=%s, sizes=[%s])",
+                    p.name, p.scene_count, p.density_mode,
+                    p.total_density_min, p.total_density_max,
+                    p.density_tier, size_summary)
         elif self._use_scene_gen:
             fixed_name = str(self.g.get("scene_generation", {}).get(
                 "fixed_scene_name", "")).strip()
@@ -1276,6 +1262,18 @@ class ILManager:
     #  FSM state handlers
     # ═══════════════════════════════════════════════════════════════
 
+    def _scene_geometry_contract(self):
+        """Return the sole configured vehicle and cylinder-gap contract."""
+        scene_cfg = self.g["scene_generation"]
+        vehicle_cfg = scene_cfg["vehicle"]
+        cylinder_cfg = scene_cfg["common_cylinder"]
+        return (
+            float(vehicle_cfg["radius_m"]),
+            float(vehicle_cfg["safety_margin_m"]),
+            float(cylinder_cfg["minimum_surface_gap_m"]),
+            float(cylinder_cfg["minimum_post_inflation_gap_m"]),
+        )
+
     def _st_boot(self):
         self._enter_state(State.WAIT_UNITY_CONNECTED,
                           self.g["fsm"]["connect_timeout"])
@@ -1425,8 +1423,7 @@ class ILManager:
         # ── Diagnostic collection: deterministic fixed scenario ─────
         if (self._use_scene_gen and self._scene_generator is not None and
                 self._scene_generation_source == "fixed_scenario"):
-            if self.scene_idx >= int(self.g.get("scene_generation", {}).get(
-                    "max_scene_generation_attempts", 1)):
+            if self.scene_idx >= 1:
                 self._enter_state(State.DONE)
                 return
 
@@ -1702,6 +1699,59 @@ class ILManager:
             traceback.print_exc()
             self._enter_state(State.ERROR)
 
+    def _reject_current_scene_for_task_failure(self, reason_code, detail):
+        """Reject a whole scene when its final task quota is unavailable.
+
+        Task generation and every task-level post-filter are part of one
+        atomic scene acceptance decision.  A density-driven scene therefore
+        retries with the next layout attempt; a fixed diagnostic scene cannot
+        change its layout and fails immediately.
+        """
+        detail = str(detail)
+        reason = "{}:{}".format(str(reason_code), detail)
+        if self._use_profile_mode:
+            # _current_scene_attempt is the accepted layout's one-based
+            # attempt number and therefore also the next zero-based attempt
+            # index consumed by _st_generate_obstacle_config.
+            next_attempt = int(self._current_scene_attempt)
+            max_attempts = int(self._scene_generator.max_scene_attempts)
+            if next_attempt < max_attempts:
+                self._scene_generation_retry_offset = next_attempt
+                rospy.logwarn(
+                    "[TaskGen] Rejecting profile '%s' scene %d layout "
+                    "attempt %d: %s. Regenerating with attempt %d/%d.",
+                    self._current_profile_name,
+                    self._scene_index_in_profile,
+                    next_attempt, detail,
+                    next_attempt + 1, max_attempts)
+                self._enter_state(State.GENERATE_OBSTACLE_CONFIG)
+                return
+
+            rospy.logerr(
+                "[TaskGen] Profile '%s' scene %d exhausted %d layout "
+                "attempts: %s",
+                self._current_profile_name,
+                self._scene_index_in_profile,
+                max_attempts, detail)
+            if self._failure_manifest_writer is not None:
+                self._failure_manifest_writer.write_failure_manifest(
+                    self._current_profile_name,
+                    self._scene_profile_index,
+                    self._scene_index_in_profile,
+                    self._current_effective_scene_seed,
+                    reason,
+                    max_attempts)
+            self._enter_state(State.ERROR)
+            return
+
+        fixed_scene_name = str(
+            self.g.get("scene_generation", {}).get(
+                "fixed_scene_name", "unnamed")).strip()
+        rospy.logerr(
+            "[TaskGen] Fixed scenario '%s' is invalid and cannot regenerate "
+            "its layout: %s", fixed_scene_name or "unnamed", detail)
+        self._enter_state(State.ERROR)
+
     def _st_generate_start_goal_pairs(self):
         # Phase 3: new task generation pipeline
         if (self._use_scene_gen and self._task_generator is not None and
@@ -1742,43 +1792,8 @@ class ILManager:
                     astar_fn,
                     seed=self._current_scene_subseed)
             except (RuntimeError, ValueError) as exc:
-                if self._use_profile_mode:
-                    next_attempt = int(self._current_scene_attempt)
-                    max_attempts = int(
-                        self._scene_generator.max_scene_attempts)
-                    reason = "TASK_COVERAGE_UNAVAILABLE:{}".format(exc)
-                    if next_attempt < max_attempts:
-                        self._scene_generation_retry_offset = next_attempt
-                        rospy.logwarn(
-                            "[TaskGen] Rejecting profile '%s' scene %d "
-                            "layout attempt %d: %s. Regenerating with "
-                            "attempt %d/%d.",
-                            self._current_profile_name,
-                            self._scene_index_in_profile,
-                            next_attempt, exc,
-                            next_attempt + 1, max_attempts)
-                        self._enter_state(
-                            State.GENERATE_OBSTACLE_CONFIG)
-                        return
-                    rospy.logerr(
-                        "[TaskGen] Profile '%s' scene %d exhausted %d "
-                        "layout attempts: %s",
-                        self._current_profile_name,
-                        self._scene_index_in_profile,
-                        max_attempts, exc)
-                    if self._failure_manifest_writer is not None:
-                        self._failure_manifest_writer.write_failure_manifest(
-                            self._current_profile_name,
-                            self._scene_profile_index,
-                            self._scene_index_in_profile,
-                            self._current_effective_scene_seed,
-                            reason,
-                            max_attempts)
-                    self._enter_state(State.ERROR)
-                    return
-                rospy.logerr(
-                    "[TaskGen] Fixed scenario is invalid: %s", exc)
-                self._enter_state(State.ERROR)
+                self._reject_current_scene_for_task_failure(
+                    "TASK_COVERAGE_UNAVAILABLE", exc)
                 return
 
             # For blocked tasks, evaluate configured left/right portal costs
@@ -1818,6 +1833,15 @@ class ILManager:
                                       side.rejection_reason)
                 tasks = side_validated_tasks
 
+            expected_task_count = int(self._task_generator.tasks_per_scene)
+            if len(tasks) != expected_task_count:
+                self._reject_current_scene_for_task_failure(
+                    "TASK_POSTFILTER_QUOTA_UNAVAILABLE",
+                    "side-cost/observability prerequisites retained {} of "
+                    "{} required tasks".format(
+                        len(tasks), expected_task_count))
+                return
+
             # Convert to current_pairs format
             self.current_pairs = []
             for task_index, (start, goal, task_val) in enumerate(tasks):
@@ -1854,8 +1878,9 @@ class ILManager:
                 region = self._scene_generator.obstacle_region
                 region_area = (region.x_max - region.x_min) * (region.y_max - region.y_min)
                 actual_raw = compute_raw_occupancy(obstacles, region_area) if obstacles else 0.0
-                vehicle_r = float(self._scene_generator.vehicle_r)
-                safety_m = float(self._scene_generator.safety_m)
+                (vehicle_r, safety_m,
+                 common_req_sg, common_req_pg) = (
+                    self._scene_geometry_contract())
                 actual_inflated = compute_inflated_occupancy(obstacles, region_area, vehicle_r, safety_m)
                 actual_per_100m2 = compute_obstacles_per_100m2(obstacles, region_area)
 
@@ -1870,8 +1895,8 @@ class ILManager:
                     profile_name = self._current_profile_name
                     seed_offset = self._current_profile.seed_offset
                 else:
-                    req_sg = float(self._scene_generator.min_surface_gap)
-                    req_pg = float(self._scene_generator.min_inflated_gap)
+                    req_sg = common_req_sg
+                    req_pg = common_req_pg
                     profile_index = 0
                     profile_name = "fixed_scenario"
                     seed_offset = 0
@@ -1899,7 +1924,8 @@ class ILManager:
                     req_pg,
                     min_sg,
                     min_pg,
-                    generation_status="accepted")
+                    generation_status="accepted",
+                    profile_seed_offset=seed_offset)
 
                 # Write task manifests
                 self._current_task_manifest_paths = []
@@ -1922,15 +1948,7 @@ class ILManager:
         self._enter_state(State.ERROR)
 
     def _st_plan_global_paths(self):
-        """Prepare either a legacy global path or a goal-only mission axis."""
-        guide_mode = str(self.g.get("guide_selector", {}).get(
-            "selection_mode", "local_goal_explorer")).strip().lower()
-        use_goal_explorer = guide_mode == "local_goal_explorer"
-        planner = None
-        if not use_goal_explorer:
-            planner = GlobalPathPlanner(
-                self.current_esdf, self.current_esdf_origin,
-                self.g["esdf"]["resolution"], self.g)
+        """Prepare the goal-only mission axis used by the local explorer."""
 
         for pi, pair in enumerate(self.current_pairs):
             if rospy.is_shutdown():
@@ -1951,10 +1969,7 @@ class ILManager:
                 self._debug_plot_esdf(
                     "plan_{:02d}_pre".format(pi + 1), start, goal, None, None)
 
-            if use_goal_explorer:
-                plan = self._build_goal_explorer_mission_axis(start, goal)
-            else:
-                plan = planner.plan_global(start, goal)
+            plan = self._build_goal_explorer_mission_axis(start, goal)
             if plan is None:
                 rospy.logwarn(
                     "  Global planner FAILED for start→goal pair %d",
@@ -1966,8 +1981,6 @@ class ILManager:
                                               "global_planner_failed"]},
                     "raw_path": [], "global_path": [],
                     "global_path_length": 0.0,
-                    "sampled_traj": [], "controls": [],
-                    "optimised_path": None, "total_time": 0.0,
                 }
             plan["_task_validation"] = pair.get("_task_validation")
             plan["task_id"] = pair.get("task_id", "task_{:03d}".format(pi))
@@ -2024,10 +2037,6 @@ class ILManager:
             "raw_path": [start_np.tolist(), goal_np.tolist()],
             "global_path": axis,
             "global_path_length": distance,
-            "sampled_traj": [],
-            "controls": [],
-            "optimised_path": None,
-            "total_time": 0.0,
         }
 
     def _st_validate_global_paths(self):
@@ -2046,13 +2055,14 @@ class ILManager:
         self._enter_state(State.RESET_DRONE)
 
     def _get_current_initial_yaw(self):
-        """v11: Return initial yaw from global path direction with optional random offset.
+        """Return mission-axis yaw plus a scene-stratified offset.
 
         The base yaw points the drone nose along the first path segment.
-        A uniformly-distributed random offset within
+        The tasks in one scene cover equal-width bins across
         ``scene_generation.common_task_generation.
-        initial_yaw_randomization_deg`` is added for diversity.
-        The offset is seeded per-trajectory for reproducibility.
+        initial_yaw_randomization_deg``.  A scene-seeded permutation removes
+        correlation with task order while guaranteeing symmetric catalog
+        coverage and exact reproducibility.
         """
         plan = self.current_planned[self.traj_idx]
         global_path = plan.get("global_path", [])
@@ -2063,17 +2073,21 @@ class ILManager:
         else:
             base_yaw = 0.0
 
-        # Apply random offset if configured
+        # Apply one centre-of-bin offset from a deterministic scene-wide
+        # stratification.  Bin centres avoid the exact +/-limit endpoints.
         task_cfg = self.g["scene_generation"]["common_task_generation"]
         max_offset_deg = float(task_cfg["initial_yaw_randomization_deg"])
         if max_offset_deg > 0.0:
             max_offset_rad = math.radians(max_offset_deg)
-            # Deterministic seed: scene + trajectory index
-            rng = random.Random()
-            seed_str = "{}_traj_{}".format(
-                self.scene_label, self.traj_idx)
-            rng.seed(seed_str)
-            offset = rng.uniform(-max_offset_rad, max_offset_rad)
+            bin_count = max(1, len(self.current_planned))
+            bin_order = list(range(bin_count))
+            rng = random.Random("{}_initial_yaw_bins".format(
+                self.scene_label))
+            rng.shuffle(bin_order)
+            bin_index = bin_order[self.traj_idx % bin_count]
+            bin_fraction = (
+                (float(bin_index) + 0.5) / float(bin_count))
+            offset = -max_offset_rad + 2.0 * max_offset_rad * bin_fraction
             base_yaw += offset
             base_yaw = math.atan2(math.sin(base_yaw), math.cos(base_yaw))  # wrap
 
@@ -2255,7 +2269,9 @@ class ILManager:
                     self._enter_state(State.ERROR)
                     return
         else:
-            rospy.loginfo("[FSM] No C++ planner; using kinematic pass-through mode.")
+            rospy.logerr("[FSM] Required C++ local planner is unavailable.")
+            self._enter_state(State.ERROR)
+            return
 
         # ── Just-in-time dynamics reset (after planner init) ─────
         # The Flightmare sim falls whenever no hover command is active.
@@ -2409,10 +2425,7 @@ class ILManager:
         online_rt = self.g.get("online_runtime", {})
         label_lookahead_time_s = float(data_cfg.get("label_lookahead_time_s", 0.08))
         max_guide_range = float(
-            self._guide_selector.explorer_usable_range_m
-            if self._guide_selector is not None and
-            self._guide_selector.selection_mode == "local_goal_explorer"
-            else self._depth_cfg["max_m"])
+            self._guide_selector.explorer_usable_range_m)
 
         lp_cfg = self.g.get("planning", {}).get("local_planner", {})
         nominal_speed = float(lp_cfg.get("nominal_speed", 1.8))
@@ -3879,23 +3892,15 @@ class ILManager:
 
         while elapsed < duration_s - epsilon:
             step_dt = min(dt_ctrl, duration_s - elapsed)
-            if self._dynamics.backend_name == "flightmare":
-                if not self._dynamics.step_velocity_command(
-                        cmd_vel_flu, cmd_yaw_rate, step_dt):
-                    raise RuntimeError("Flightmare step failed")
-                ds = self._dynamics.get_state()
-                pos, vel = ds.position_world.copy(), ds.velocity_world.copy()
-                qx, qy, qz, qw = ds.quaternion_world_body
-                yaw = math.atan2(2.0 * (qw*qz + qx*qy),
-                                 1.0 - 2.0 * (qy*qy + qz*qz))
-                yr = float(ds.angular_velocity_body[2])
-            else:
-                desired_vel_world = body_flu_to_world_quat(
-                    cmd_vel_flu,
-                    self._dynamics.get_state().quaternion_world_body)
-                pos, vel, yaw, yr = integrate_velocity_command(
-                    pos, vel, yaw, desired_vel_world, step_dt,
-                    max_velocity, max_acceleration, max_yaw_rate)
+            if not self._dynamics.step_velocity_command(
+                    cmd_vel_flu, cmd_yaw_rate, step_dt):
+                raise RuntimeError("Flightmare step failed")
+            ds = self._dynamics.get_state()
+            pos, vel = ds.position_world.copy(), ds.velocity_world.copy()
+            qx, qy, qz, qw = ds.quaternion_world_body
+            yaw = math.atan2(2.0 * (qw*qz + qx*qy),
+                             1.0 - 2.0 * (qy*qy + qz*qz))
+            yr = float(ds.angular_velocity_body[2])
             total_yaw_change += yr * step_dt
             elapsed += step_dt
 
@@ -4444,20 +4449,15 @@ class ILManager:
 
         while elapsed < dt_sample - epsilon:
             step_dt = min(dt_ctrl, dt_sample - elapsed)
-            if self._dynamics.backend_name == "flightmare":
-                if not self._dynamics.step_velocity_command(
-                        np.zeros(3, dtype=np.float64), yr_cmd, step_dt):
-                    raise RuntimeError("Flightmare rotate step failed")
-                ds = self._dynamics.get_state()
-                pos, vel = ds.position_world.copy(), ds.velocity_world.copy()
-                qx, qy, qz, qw = ds.quaternion_world_body
-                yaw = math.atan2(2.0 * (qw * qz + qx * qy),
-                                 1.0 - 2.0 * (qy * qy + qz * qz))
-                yr = float(ds.angular_velocity_body[2])
-            else:
-                pos, vel, yaw, yr = integrate_velocity_command(
-                    pos, vel, yaw, np.zeros(3, dtype=np.float64), step_dt,
-                    max_velocity, max_acceleration, max_yaw_rate)
+            if not self._dynamics.step_velocity_command(
+                    np.zeros(3, dtype=np.float64), yr_cmd, step_dt):
+                raise RuntimeError("Flightmare rotate step failed")
+            ds = self._dynamics.get_state()
+            pos, vel = ds.position_world.copy(), ds.velocity_world.copy()
+            qx, qy, qz, qw = ds.quaternion_world_body
+            yaw = math.atan2(2.0 * (qw * qz + qx * qy),
+                             1.0 - 2.0 * (qy * qy + qz * qz))
+            yr = float(ds.angular_velocity_body[2])
             total_yaw_change += yr * step_dt
             elapsed += step_dt
 
@@ -4532,22 +4532,16 @@ class ILManager:
             epsilon = 1e-9
             while elapsed < dt_sample - epsilon:
                 step_dt = min(dt_ctrl, dt_sample - elapsed)
-                if self._dynamics.backend_name == "flightmare":
-                    if not self._dynamics.step_velocity_command(
-                            np.zeros(3, dtype=np.float64), 0.0, step_dt):
-                        raise RuntimeError("Flightmare hover step failed")
-                    ds = self._dynamics.get_state()
-                    pos, vel = ds.position_world.copy(), ds.velocity_world.copy()
-                    qx, qy, qz, qw = ds.quaternion_world_body
-                    new_yaw = math.atan2(2.0 * (qw*qz + qx*qy),
-                                         1.0 - 2.0 * (qy*qy + qz*qz))
-                    yr = ds.angular_velocity_body[2]
-                    yaw = new_yaw
-                else:
-                    desired_vel = np.zeros(3, dtype=np.float64)
-                    pos, vel, yaw, yr = integrate_velocity_command(
-                        pos, vel, yaw, desired_vel, step_dt,
-                        max_velocity, max_acceleration, max_yaw_rate)
+                if not self._dynamics.step_velocity_command(
+                        np.zeros(3, dtype=np.float64), 0.0, step_dt):
+                    raise RuntimeError("Flightmare hover step failed")
+                ds = self._dynamics.get_state()
+                pos, vel = ds.position_world.copy(), ds.velocity_world.copy()
+                qx, qy, qz, qw = ds.quaternion_world_body
+                new_yaw = math.atan2(2.0 * (qw*qz + qx*qy),
+                                     1.0 - 2.0 * (qy*qy + qz*qz))
+                yr = ds.angular_velocity_body[2]
+                yaw = new_yaw
                 total_yaw_change += yr * step_dt
                 elapsed += step_dt
             avg_yaw_rate = total_yaw_change / max(dt_sample, 1e-9)
@@ -4594,29 +4588,21 @@ class ILManager:
             yaw_rate_cmd = yaw_rate_for_world_velocity(
                 yaw, desired_vel_world, yaw_tracking_gain,
                 max_yaw_rate, yaw_speed_threshold)
-            if self._dynamics.backend_name == "flightmare":
-                command_state = self._dynamics.get_state()
-                desired_vel_flu = world_vector_to_body_flu_quat(
-                    desired_vel_world,
-                    command_state.quaternion_world_body)
-                last_command_flu = desired_vel_flu.copy()
-                last_command_yaw_rate = float(yaw_rate_cmd)
-                if not self._dynamics.step_velocity_command(
-                        desired_vel_flu, yaw_rate_cmd, step_dt):
-                    raise RuntimeError("Flightmare trajectory step failed")
-                ds = self._dynamics.get_state()
-                pos, vel = ds.position_world.copy(), ds.velocity_world.copy()
-                qx, qy, qz, qw = ds.quaternion_world_body
-                yaw = math.atan2(2.0 * (qw*qz + qx*qy),
-                                 1.0 - 2.0 * (qy*qy + qz*qz))
-                yr = float(ds.angular_velocity_body[2])
-            else:
-                last_command_flu = world_vector_to_body_flu(
-                    desired_vel_world, yaw)
-                last_command_yaw_rate = float(yaw_rate_cmd)
-                pos, vel, yaw, yr = integrate_velocity_command(
-                    pos, vel, yaw, desired_vel_world, step_dt,
-                    max_velocity, max_acceleration, max_yaw_rate)
+            command_state = self._dynamics.get_state()
+            desired_vel_flu = world_vector_to_body_flu_quat(
+                desired_vel_world,
+                command_state.quaternion_world_body)
+            last_command_flu = desired_vel_flu.copy()
+            last_command_yaw_rate = float(yaw_rate_cmd)
+            if not self._dynamics.step_velocity_command(
+                    desired_vel_flu, yaw_rate_cmd, step_dt):
+                raise RuntimeError("Flightmare trajectory step failed")
+            ds = self._dynamics.get_state()
+            pos, vel = ds.position_world.copy(), ds.velocity_world.copy()
+            qx, qy, qz, qw = ds.quaternion_world_body
+            yaw = math.atan2(2.0 * (qw*qz + qx*qy),
+                             1.0 - 2.0 * (qy*qy + qz*qz))
+            yr = float(ds.angular_velocity_body[2])
             total_yaw_change += yr * step_dt
             elapsed += step_dt
 
@@ -4642,21 +4628,15 @@ class ILManager:
 
         while elapsed < dt_sample - epsilon:
             step_dt = min(dt_ctrl, dt_sample - elapsed)
-            if self._dynamics.backend_name == "flightmare":
-                if not self._dynamics.step_velocity_command(
-                        np.zeros(3, dtype=np.float64), 0.0, step_dt):
-                    raise RuntimeError("Flightmare hover step failed")
-                ds = self._dynamics.get_state()
-                pos, vel = ds.position_world.copy(), ds.velocity_world.copy()
-                qx, qy, qz, qw = ds.quaternion_world_body
-                yaw = math.atan2(2.0 * (qw*qz + qx*qy),
-                                 1.0 - 2.0 * (qy*qy + qz*qz))
-                yr = float(ds.angular_velocity_body[2])
-            else:
-                desired_vel = np.zeros(3, dtype=np.float64)
-                pos, vel, yaw, yr = integrate_velocity_command(
-                    pos, vel, yaw, desired_vel, step_dt,
-                    max_velocity, max_acceleration, max_yaw_rate)
+            if not self._dynamics.step_velocity_command(
+                    np.zeros(3, dtype=np.float64), 0.0, step_dt):
+                raise RuntimeError("Flightmare hover step failed")
+            ds = self._dynamics.get_state()
+            pos, vel = ds.position_world.copy(), ds.velocity_world.copy()
+            qx, qy, qz, qw = ds.quaternion_world_body
+            yaw = math.atan2(2.0 * (qw*qz + qx*qy),
+                             1.0 - 2.0 * (qy*qy + qz*qz))
+            yr = float(ds.angular_velocity_body[2])
             total_yaw_change += yr * step_dt
             elapsed += step_dt
 
@@ -5184,8 +5164,6 @@ class ILManager:
         return row
 
     # ═══════════════════════════════════════════════════════════════
-    #  v5 legacy: ONLINE_PLAN_AND_RECORD (async planner worker)
-    #  Renamed from _st_online_plan_and_record for backward compat.
     # ═══════════════════════════════════════════════════════════════
 
     def _st_finish_recording(self):
@@ -5195,6 +5173,8 @@ class ILManager:
         rec_hz = self.g["control"]["record_hz"]
         data_cfg = self.g["data"]
         schema_version = int(data_cfg["schema_version"])
+        scene_vehicle_r, scene_safety_m, _, _ = (
+            self._scene_geometry_contract())
 
         # Compute planner stats
         avg_plan_ms = (sum(self._planning_times_ms) / max(len(self._planning_times_ms), 1)
@@ -5430,8 +5410,8 @@ class ILManager:
                     self._current_scene_obstacles,
                     compute_region_area(self._scene_generator.obstacle_region)
                     if self._scene_generator is not None else 1.0,
-                    float(self._scene_generator.vehicle_r) if self._scene_generator is not None else 0.30,
-                    float(self._scene_generator.safety_m) if self._scene_generator is not None else 0.10)
+                    scene_vehicle_r,
+                    scene_safety_m)
                 if self._current_scene_obstacles else 0.0),
             "scene_actual_obstacles_per_100m2": (
                 compute_obstacles_per_100m2(

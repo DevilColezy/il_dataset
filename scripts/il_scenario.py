@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-il_scenario.py  —  Scene & Task Generation for IL Dataset  v9 (Phase 3 + Profiles)
+il_scenario.py — Scene and task generation for the IL dataset.
 
 Provides:
   - CylinderObstacleSpec dataclass
   - ObstacleRegion definition
   - SceneGenerationProfile dataclass
-  - DensityMode enum
   - SceneValidationResult / TaskValidationResult dataclasses
   - YamlCylinderSceneGenerator: procedural cylinder scene generation
-  - CylinderSceneValidator: 2D topology, U-shape, dead-end checks
+  - CylinderSceneValidator: 2D free-space topology checks
   - StartGoalTaskGenerator: task sampling with constraint enforcement
   - SideCostEvaluator: left/right portal path cost comparison
   - SceneManifestWriter: YAML/JSON manifest for reproducibility
@@ -20,10 +19,10 @@ Conventions:
   - All world coordinates: ROS frame (X-fwd, Y-left, Z-up).
   - Cylinder centers: (x, y, z) with z = cylinder centre height.
   - Height semantics: cylinder extends from (z - height/2) to (z + height/2).
-  - Obstacle region: only limits where cylinder centres may appear.
+  - Obstacle region: limits cylinder XY placement and the full blocked Z span.
   - Space outside obstacle region is freely traversable.
 
-Only cylinder obstacles are generated.
+Only full-height cylinder obstacles are generated for the current 2.5D flow.
 The obstacle generation region is not treated as a wall or flight boundary.
 Space outside the obstacle generation region remains traversable.
 """
@@ -34,28 +33,8 @@ import math, os, time, random, copy, yaml, json
 import numpy as np
 from dataclasses import dataclass, field
 from collections import OrderedDict
-from enum import Enum
 
 import rospy
-
-
-# ============================================================================
-#  Density modes and helpers
-# ============================================================================
-
-class DensityMode(Enum):
-    INFLATED_OCCUPANCY = "inflated_occupancy"
-    RAW_OCCUPANCY = "raw_occupancy"
-    OBSTACLES_PER_100M2 = "obstacles_per_100m2"
-    FIXED_COUNT = "fixed_count"
-
-    @staticmethod
-    def from_string(s):
-        for mode in DensityMode:
-            if mode.value == s:
-                return mode
-        raise ValueError("Unknown density mode: '{}'. Supported: {}".format(
-            s, [m.value for m in DensityMode]))
 
 
 def compute_region_area(region):
@@ -91,20 +70,6 @@ def compute_obstacles_per_100m2(obstacles, region_area):
     return len(obstacles) / region_area * 100.0
 
 
-def compute_density(obstacles, region_area, mode, vehicle_r=0.30, safety_m=0.10):
-    """Compute the requested density metric for a set of obstacles."""
-    if mode == DensityMode.RAW_OCCUPANCY:
-        return compute_raw_occupancy(obstacles, region_area)
-    elif mode == DensityMode.INFLATED_OCCUPANCY:
-        return compute_inflated_occupancy(obstacles, region_area, vehicle_r, safety_m)
-    elif mode == DensityMode.OBSTACLES_PER_100M2:
-        return compute_obstacles_per_100m2(obstacles, region_area)
-    elif mode == DensityMode.FIXED_COUNT:
-        return float(len(obstacles))
-    else:
-        raise ValueError("Unsupported density mode: {}".format(mode))
-
-
 def compute_pairwise_min_gaps(obstacles, vehicle_r, safety_m):
     """Compute min surface gap and min post-inflation gap across all pairs.
 
@@ -133,26 +98,8 @@ def compute_pairwise_min_gaps(obstacles, vehicle_r, safety_m):
     return (min_surface, min_post)
 
 
-def _deep_merge_dict(base, override):
-    """Return a recursive copy of ``base`` updated by ``override``."""
-    merged = copy.deepcopy(base) if isinstance(base, dict) else {}
-    if not isinstance(override, dict):
-        return merged
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dict(merged[key], value)
-        else:
-            merged[key] = copy.deepcopy(value)
-    return merged
-
-
-def _infer_density_tier(profile_name, density_min, density_max, sg_cfg):
-    """Classify a profile as sparse/medium/dense for coverage scheduling."""
-    name = str(profile_name).lower()
-    for tier in ("sparse", "medium", "dense"):
-        if name.endswith("_{}".format(tier)):
-            return tier
-
+def _infer_density_tier(density_min, density_max, sg_cfg):
+    """Classify a profile only from its configured occupancy range."""
     coverage_cfg = sg_cfg.get("coverage_balancing", {})
     thresholds = coverage_cfg.get("density_tier_thresholds", {})
     sparse_max = float(thresholds.get("sparse_max", 0.16))
@@ -163,6 +110,32 @@ def _infer_density_tier(profile_name, density_min, density_max, sg_cfg):
     if midpoint <= medium_max:
         return "medium"
     return "dense"
+
+
+def _validate_2p5d_cylinder_height(scene_generation_cfg):
+    """Return the full-height cylinder value required by the 2.5D contract."""
+    region = scene_generation_cfg.get("obstacle_region", {})
+    common = scene_generation_cfg.get("common_cylinder", {})
+    z_min = float(region.get("z_min", 0.0))
+    z_max = float(region.get("z_max", 8.0))
+    height_min = float(common.get("height_min_m", 8.0))
+    height_max = float(common.get("height_max_m", 8.0))
+    values = (z_min, z_max, height_min, height_max)
+    if not all(np.isfinite(value) for value in values):
+        raise ValueError(
+            "2.5D obstacle-region and cylinder heights must be finite")
+    vertical_span = z_max - z_min
+    if vertical_span <= 0.0:
+        raise ValueError("obstacle_region.z_max must be greater than z_min")
+    tolerance = 1.0e-6
+    if (abs(height_min - vertical_span) > tolerance or
+            abs(height_max - vertical_span) > tolerance):
+        raise ValueError(
+            "2.5D cylinders must fully cover obstacle_region z range: "
+            "height_min_m and height_max_m must both equal {:.6f} m, "
+            "got {:.6f} and {:.6f}".format(
+                vertical_span, height_min, height_max))
+    return vertical_span
 
 
 class _StratifiedGridSampler:
@@ -393,9 +366,14 @@ class SceneGenerationProfile:
             profile_dict.get("density_min", 0.05))
         total_density_max = float(
             profile_dict.get("density_max", 0.15))
+        if "density_tier" in profile_dict:
+            raise ValueError(
+                "profile '{}' must not override density_tier; it is derived "
+                "from density_min/density_max".format(name))
 
         common_cylinder = scene_generation_cfg.get(
             "common_cylinder", {})
+        _validate_2p5d_cylinder_height(scene_generation_cfg)
         vehicle = scene_generation_cfg.get("vehicle", {})
         common_task = scene_generation_cfg.get(
             "common_task_generation", {})
@@ -425,11 +403,9 @@ class SceneGenerationProfile:
             vehicle_radius_m=float(vehicle.get("radius_m", 0.30)),
             safety_margin_m=float(
                 vehicle.get("safety_margin_m", 0.10)),
-            density_tier=str(profile_dict.get(
-                "density_tier",
-                _infer_density_tier(
-                    name, total_density_min, total_density_max,
-                    scene_generation_cfg))),
+            density_tier=_infer_density_tier(
+                total_density_min, total_density_max,
+                scene_generation_cfg),
             coverage_balancing=dict(
                 common_task.get("coverage_balancing", {})),
         )
@@ -686,6 +662,7 @@ class YamlCylinderSceneGenerator:
             z_min=float(region.get("z_min", 0.0)),
             z_max=float(region.get("z_max", 6.0)),
         )
+        self.full_cylinder_height_m = _validate_2p5d_cylinder_height(cfg)
 
         execution = cfg.get("execution", {})
         self.max_scene_attempts = int(execution.get(
@@ -770,10 +747,7 @@ class YamlCylinderSceneGenerator:
                 "generate_scene is only valid for source='fixed_scenario'")
 
         fixed_specs = self._cfg.get("fixed_obstacles", [])
-        common_cylinder = self._cfg.get("common_cylinder", {})
-        default_height = 0.5 * (
-            float(common_cylinder.get("height_min_m", 8.0)) +
-            float(common_cylinder.get("height_max_m", 8.0)))
+        default_height = self.full_cylinder_height_m
 
         obstacles = []
         seen_ids = set()
@@ -793,11 +767,11 @@ class YamlCylinderSceneGenerator:
             if not self.obstacle_region.contains_cylinder(
                     center[:2], radius, self.region_margin):
                 return [], "FIXED_OBSTACLE_OUTSIDE_REGION"
-            if (center[2] - 0.5 * height <
-                    self.obstacle_region.z_min - 1.0e-6 or
-                    center[2] + 0.5 * height >
-                    self.obstacle_region.z_max + 1.0e-6):
-                return [], "FIXED_OBSTACLE_OUTSIDE_VERTICAL_REGION"
+            bottom = center[2] - 0.5 * height
+            top = center[2] + 0.5 * height
+            if (abs(bottom - self.obstacle_region.z_min) > 1.0e-6 or
+                    abs(top - self.obstacle_region.z_max) > 1.0e-6):
+                return [], "FIXED_OBSTACLE_NOT_FULL_HEIGHT"
             seen_ids.add(obstacle_id)
             obstacles.append(CylinderObstacleSpec(
                 obstacle_id=obstacle_id,
@@ -1056,17 +1030,14 @@ class CylinderSceneValidator:
 
         self.res = float(topo.get("grid_resolution_m", 0.10))
         self.halo_m = float(topo.get("validation_halo_m", 3.0))
-        self.vehicle_r = float(vehicle_cfg.get("radius_m",
-            topo.get("vehicle_radius_m", 0.30)))
-        self.safety_m = float(vehicle_cfg.get("safety_margin_m",
-            topo.get("safety_margin_m", 0.10)))
+        self.vehicle_r = float(vehicle_cfg.get("radius_m", 0.30))
+        self.safety_m = float(vehicle_cfg.get("safety_margin_m", 0.10))
         self.inflated_extra = self.vehicle_r + self.safety_m
 
-        # Simplified flags (read from density_driven config or topo compat)
-        self.forbid_enclosed = bool(cfg.get("forbid_enclosed_free_components",
-            topo.get("forbid_enclosed_free_components", True)))
-        self.forbid_merge = bool(cfg.get("forbid_inflated_component_merging",
-            not cfg.get("cylinder", {}).get("allow_inflated_component_merging", False)))
+        self.forbid_enclosed = bool(
+            cfg.get("forbid_enclosed_free_components", True))
+        self.forbid_merge = bool(
+            cfg.get("forbid_inflated_component_merging", True))
 
     def validate(self, obstacles, obstacle_region):
         """Run simplified topology validation. Returns SceneValidationResult."""
@@ -1433,9 +1404,17 @@ class StartGoalTaskGenerator:
         raw_counts = [float(weights[name]) / total * count for name in names]
         counts = [int(math.floor(value)) for value in raw_counts]
         remainder = count - sum(counts)
+        # Equal fractional remainders used to be resolved permanently by YAML
+        # order.  That produced a catalog-wide side bias (for example, the
+        # medium tier always awarded its extra single-obstacle sample to the
+        # first lateral bucket).  A seed-owned tie breaker preserves exact
+        # reproducibility within a scene while distributing extras across
+        # labels over independent scene seeds.
+        tie_breakers = [rng.random() for _ in names]
         order = sorted(
             range(len(names)),
-            key=lambda index: (raw_counts[index] - counts[index], -index),
+            key=lambda index: (
+                raw_counts[index] - counts[index], tie_breakers[index]),
             reverse=True)
         for index in order[:remainder]:
             counts[index] += 1
@@ -1903,9 +1882,10 @@ class SideCostEvaluator:
     """Compute left/right portal path costs around the dominant obstacle."""
 
     def __init__(self, config):
-        cfg = config.get("global", {}).get("scene_generation", {}).get("side_cost", {})
+        scene_cfg = config.get("global", {}).get("scene_generation", {})
+        cfg = scene_cfg.get("side_cost", {})
         self._cfg = cfg
-        topo = config.get("global", {}).get("scene_generation", {}).get("topology_validation", {})
+        vehicle_cfg = scene_cfg.get("vehicle", {})
 
         self.min_cost_diff_ratio = float(cfg.get("minimum_cost_difference_ratio", 0.15))
         self.portal_lat_clearance = float(cfg.get("portal_lateral_clearance_m", 0.60))
@@ -1913,8 +1893,8 @@ class SideCostEvaluator:
         self.require_both = bool(cfg.get("require_both_sides_feasible", False))
         self.reject_equal = bool(cfg.get("reject_nearly_equal_sides", True))
 
-        self.vehicle_r = float(topo.get("vehicle_radius_m", 0.30))
-        self.safety_m = float(topo.get("safety_margin_m", 0.10))
+        self.vehicle_r = float(vehicle_cfg.get("radius_m", 0.30))
+        self.safety_m = float(vehicle_cfg.get("safety_margin_m", 0.10))
         self.inflated_extra = self.vehicle_r + self.safety_m
 
     def evaluate(self, start, goal, dominant_obstacle, obstacles,
@@ -2073,7 +2053,8 @@ class SceneManifestWriter:
                               min_post_inflation_gap_required_m,
                               min_surface_gap_actual_m,
                               min_post_inflation_gap_actual_m,
-                              generation_status="accepted"):
+                              generation_status="accepted",
+                              profile_seed_offset=0):
         """Write scene_manifest.json with full metadata."""
         radius_list = [o.radius_m for o in obstacles] if obstacles else [0.0]
         manifest = OrderedDict([
@@ -2082,7 +2063,7 @@ class SceneManifestWriter:
             ("scene_profile_index", profile_index),
             ("scene_index_in_profile", scene_index_in_profile),
             ("base_seed", base_seed),
-            ("profile_seed_offset", 0),  # filled by caller
+            ("profile_seed_offset", int(profile_seed_offset)),
             ("effective_scene_seed", effective_scene_seed),
             ("obstacle_type", "cylinder"),
             ("obstacle_region", OrderedDict([
@@ -2239,15 +2220,16 @@ class ObstacleVisibilityAuditor:
             obs_cfg.get("maximum_invalid_frames_before_reject", 5))
         self.reject_inconsistent = bool(
             obs_cfg.get("reject_episode_on_inconsistent_side_choice", True))
-        topo = config.get("global", {}).get("scene_generation", {}).get(
-            "topology_validation", {})
-        side_cfg = config.get("global", {}).get("scene_generation", {}).get(
-            "side_cost", {})
-        self.inflation = (float(topo.get("vehicle_radius_m", 0.30)) +
-                          float(topo.get("safety_margin_m", 0.10)))
+        scene_cfg = config.get("global", {}).get("scene_generation", {})
+        topology_cfg = scene_cfg.get("topology_validation", {})
+        vehicle_cfg = scene_cfg.get("vehicle", {})
+        side_cfg = scene_cfg.get("side_cost", {})
+        self.inflation = (float(vehicle_cfg.get("radius_m", 0.30)) +
+                          float(vehicle_cfg.get("safety_margin_m", 0.10)))
         self.portal_clearance = float(
             side_cfg.get("portal_lateral_clearance_m", 0.60))
-        self.corridor_spacing = float(topo.get("grid_resolution_m", 0.10))
+        self.corridor_spacing = float(
+            topology_cfg.get("grid_resolution_m", 0.10))
 
     def audit(self, global_lower_cost_side, observed_map, observed_esdf,
               dominant_obstacle, current_position_world, current_yaw,

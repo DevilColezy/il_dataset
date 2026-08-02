@@ -224,7 +224,6 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def(py::init<>())
         .def_readwrite("planner_hz", &LocalPlannerConfig::planner_hz)
         .def_readwrite("horizon_time", &LocalPlannerConfig::horizon_time)
-        .def_readwrite("execute_prefix_time", &LocalPlannerConfig::execute_prefix_time)
         .def_readwrite("max_plan_age", &LocalPlannerConfig::max_plan_age)
         .def_readwrite("planning_time_budget_ms",
                        &LocalPlannerConfig::planning_time_budget_ms)

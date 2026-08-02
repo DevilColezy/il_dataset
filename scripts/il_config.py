@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-il_config.py  —  Configuration loader with validation and migration.
+Strict configuration loader for the IL dataset collection flow.
 
-Loads YAML config, applies ROS parameter overrides, validates all fields,
-and warns about deprecated/unused fields.
-
-Old config structure (il_pipeline.py) is detected and a migration warning
-is issued.  The canonical structure is the v2 YAML used by il_manager.py.
+Only the schema-v16 deterministic-lockstep pipeline is accepted.  Removed
+configuration layouts are rejected instead of being migrated silently, so a
+collection run cannot mix old task, obstacle, dynamics, or label semantics.
 """
 
 from __future__ import print_function, division
 
-import os, sys, math, copy
+import os, sys, math
 
 import rospy
 import rospkg
@@ -42,7 +40,7 @@ except ImportError:
 REQUIRED_GLOBAL_KEYS = [
     "scene_id", "pub_port", "sub_port", "output_dir",
     "fsm", "depth", "pointcloud", "esdf", "control",
-    "obstacle", "planning", "data",
+    "scene_generation", "planning", "dynamics", "data",
 ]
 
 REQUIRED_FSM_KEYS = [
@@ -57,33 +55,9 @@ REQUIRED_PC_KEYS = ["range", "origin", "resolution"]
 REQUIRED_ESDF_KEYS = ["resolution", "drone_radius"]
 REQUIRED_CONTROL_KEYS = ["control_hz", "record_hz"]
 
-# Keys that exist in the current YAML but are NOT actually used by
-# il_manager.py v5 – we warn about these so the user knows they're dead.
-UNUSED_KEYS = {}
-
-# v1 → v2 migration map (old il_pipeline.py config keys)
-V1_TO_V2_MIGRATION = {
-    "global.connect_timeout": "global.fsm.connect_timeout",
-    "global.flight.speed": "global.planning.time_param.nominal_speed",
-    "global.flight.data_hz": "global.control.record_hz",
-    "global.flight.settle_time": "global.control.settle_time (note: unused)",
-    "global.flight.keep_alive_period": "global.fsm.keep_alive_period",
-}
-
-
 def _resolve_path(pkg_rel):
     """Resolve a path relative to the il_dataset package."""
     return os.path.join(rospkg.RosPack().get_path("il_dataset"), pkg_rel)
-
-
-def _get_nested(d, *keys, default=None):
-    """Safely get a nested dict value."""
-    for k in keys:
-        if isinstance(d, dict):
-            d = d.get(k, {})
-        else:
-            return default
-    return d if d != {} else default
 
 
 def _validate_positive(name, value):
@@ -148,9 +122,6 @@ def load_config(config_path=None, validate=True):
     if cfg is None:
         raise ValueError("Config file is empty: {}".format(config_path))
 
-    # ── Detect v1 config (old il_pipeline.py format) ────────────
-    _warn_v1_migration(cfg)
-
     # ── ROS parameter overrides ─────────────────────────────────
     _apply_ros_overrides(cfg)
 
@@ -168,40 +139,11 @@ def load_config(config_path=None, validate=True):
     if validate:
         _validate_config(cfg)
 
-    # ── Warn about unused keys ──────────────────────────────────
-    _warn_unused_keys(cfg)
-
     return cfg
 
 
-def _warn_v1_migration(cfg):
-    """Detect v1 config structure and warn."""
-    g = cfg.get("global", {})
-    v1_markers = []
-
-    # v1 uses global.flight instead of global.control
-    if "flight" in g:
-        v1_markers.append("global.flight (v1) — should be global.control (v2)")
-
-    # v1 uses global.connect_timeout instead of global.fsm.connect_timeout
-    if "connect_timeout" in g:
-        v1_markers.append("global.connect_timeout (v1) — should be global.fsm.connect_timeout (v2)")
-
-    if v1_markers:
-        rospy.logwarn("=" * 60)
-        rospy.logwarn("  CONFIG MIGRATION:  v1 (il_pipeline.py) → v2 (il_manager.py)")
-        for m in v1_markers:
-            rospy.logwarn("    • %s", m)
-        rospy.logwarn("  Please update your config to the v2 schema.")
-        rospy.logwarn("  See config/il_dataset_config.yaml for the canonical format.")
-        rospy.logwarn("=" * 60)
-
-
 def _apply_ros_overrides(cfg):
-    """Apply ROS parameter overrides to the config.
-
-    Compatible with both v1 and v2 key paths.
-    """
+    """Apply the small set of supported ROS parameter overrides."""
     g = cfg["global"]
 
     # Standard overrides
@@ -215,15 +157,6 @@ def _apply_ros_overrides(cfg):
         fsm = g.setdefault("fsm", {})
         fsm["connect_timeout"] = val
         rospy.loginfo("[Config] Override fsm.connect_timeout = %.1f", val)
-
-    # fly_speed override
-    if rospy.has_param("~fly_speed"):
-        val = float(rospy.get_param("~fly_speed"))
-        planning = g.setdefault("planning", {})
-        tp = planning.setdefault("time_param", {})
-        tp["nominal_speed"] = val
-        rospy.loginfo("[Config] Override nominal_speed = %.1f", val)
-
 
 def _validate_config(cfg):
     """Full schema validation. Raises ValueError on problems."""
@@ -296,6 +229,17 @@ def _validate_config(cfg):
             ctrl["record_hz"], ctrl["control_hz"]))
 
     # ── Data (the only supported production schema) ────────────
+    removed_global_keys = {
+        "obstacle": "scene_generation.common_cylinder/profiles",
+        "start_goal": "scene_generation.common_task_generation",
+        "flight": "control/planning/dynamics",
+        "connect_timeout": "fsm.connect_timeout",
+    }
+    for removed_key, replacement in removed_global_keys.items():
+        if removed_key in g:
+            errors.append(
+                "global.{} was removed; use global.{}".format(
+                    removed_key, replacement))
     data = g.get("data", {})
     schema_version = data.get("schema_version")
     if schema_version != 16:
@@ -390,11 +334,10 @@ def _validate_config(cfg):
     if gs:
         selection_mode = str(
             gs.get("selection_mode", "local_goal_explorer")).strip().lower()
-        if selection_mode not in (
-                "local_goal_explorer", "global_path_visible"):
+        if selection_mode != "local_goal_explorer":
             errors.append(
                 "guide_selector.selection_mode must be "
-                "local_goal_explorer or global_path_visible, got {}".format(
+                "local_goal_explorer, got {}".format(
                     selection_mode))
         mr = gs.get("max_range_m", 5.0)
         dmax = depth.get("max_m", 5.0)
@@ -419,18 +362,17 @@ def _validate_config(cfg):
         if gs.get("explorer_min_advance_m", 1.0) <= 0:
             errors.append(
                 "guide_selector.explorer_min_advance_m must be > 0")
-        if selection_mode == "local_goal_explorer":
-            local_cfg = g.get("planning", {}).get("local_planner", {})
-            required_radius = max(
-                float(gs.get("corridor_radius_m", 0.35)),
-                float(g.get("esdf", {}).get("drone_radius", 0.30)) +
-                float(local_cfg.get("target_clearance", 0.20)) +
-                0.5 * float(g.get("esdf", {}).get("resolution", 0.10)))
-            if dmax - required_radius < float(
-                    gs.get("explorer_min_advance_m", 1.0)):
-                errors.append(
-                    "depth.max_m must exceed explorer_min_advance_m plus "
-                    "the vehicle/clearance observation reserve")
+        local_cfg = g.get("planning", {}).get("local_planner", {})
+        required_radius = max(
+            float(gs.get("corridor_radius_m", 0.35)),
+            float(g.get("esdf", {}).get("drone_radius", 0.30)) +
+            float(local_cfg.get("target_clearance", 0.20)) +
+            0.5 * float(g.get("esdf", {}).get("resolution", 0.10)))
+        if dmax - required_radius < float(
+                gs.get("explorer_min_advance_m", 1.0)):
+            errors.append(
+                "depth.max_m must exceed explorer_min_advance_m plus "
+                "the vehicle/clearance observation reserve")
         if not gs.get("use_depth_projection_visibility", True):
             errors.append(
                 "formal collection requires guide_selector."
@@ -473,8 +415,25 @@ def _validate_config(cfg):
                     "scene_generation.{} is no longer supported; use "
                     "common_cylinder/common_task_generation"
                     .format(legacy_key))
-        outside_policy = sg_cfg.get("outside_region_policy",
-                                     sg_cfg.get("outside_obstacle_region_policy", "free"))
+        execution = sg_cfg.get("execution", {})
+        for removed_key in (
+                "profile_order", "stop_after_all_profiles",
+                "max_task_sampling_attempts_per_scene"):
+            if removed_key in execution:
+                errors.append(
+                    "scene_generation.execution.{} was removed".format(
+                        removed_key))
+        for key in ("max_generation_attempts_per_scene",
+                    "max_obstacle_sampling_attempts"):
+            if int(execution.get(key, 0)) <= 0:
+                errors.append(
+                    "scene_generation.execution.{} must be > 0".format(
+                        key))
+        if "outside_obstacle_region_policy" in sg_cfg:
+            errors.append(
+                "scene_generation.outside_obstacle_region_policy was "
+                "removed; use outside_region_policy")
+        outside_policy = sg_cfg.get("outside_region_policy", "free")
         if outside_policy != "free":
             errors.append("outside_region_policy must be 'free'")
 
@@ -500,6 +459,19 @@ def _validate_config(cfg):
                 float(common_cyl.get("height_max_m", 0.0))):
             errors.append(
                 "common_cylinder.height_min_m > height_max_m")
+        if "require_full_vertical_blocking" in common_cyl:
+            errors.append(
+                "common_cylinder.require_full_vertical_blocking was removed; "
+                "full-height 2.5D blocking is now mandatory")
+        region_height = float(oreg.get("z_max", 0.0)) - float(
+            oreg.get("z_min", 0.0))
+        for key in ("height_min_m", "height_max_m"):
+            height = float(common_cyl.get(key, 0.0))
+            if abs(height - region_height) > 1.0e-6:
+                errors.append(
+                    "common_cylinder.{} ({}) must equal obstacle-region "
+                    "height ({}) for strict 2.5D collection".format(
+                        key, height, region_height))
         for key in ("minimum_surface_gap_m",
                     "minimum_post_inflation_gap_m"):
             if float(common_cyl.get(key, -1.0)) < 0.0:
@@ -512,12 +484,18 @@ def _validate_config(cfg):
             errors.append("topology_validation.grid_resolution_m must be > 0")
         if topo.get("validation_halo_m", 0) <= 0:
             errors.append("topology_validation.validation_halo_m must be > 0")
-        if "escape_ray_count" in topo and topo.get("escape_ray_count", 0) < 8:
-            errors.append("topology_validation.escape_ray_count must be >= 8")
-        if "minimum_escape_sector_width_deg" in topo and topo.get("minimum_escape_sector_width_deg", 0) <= 0:
-            errors.append("topology_validation.minimum_escape_sector_width_deg must be > 0")
-        if "minimum_separated_escape_sectors" in topo and topo.get("minimum_separated_escape_sectors", 0) < 1:
-            errors.append("minimum_separated_escape_sectors must be >= 1")
+        for removed_key in (
+                "enabled", "vehicle_radius_m", "safety_margin_m",
+                "forbid_enclosed_free_components", "forbid_dead_ends",
+                "forbid_u_shapes", "minimum_navigable_corridor_width_m",
+                "escape_ray_count", "minimum_escape_sector_width_deg",
+                "minimum_separated_escape_sectors",
+                "minimum_escape_sector_separation_deg",
+                "dead_end_probe_spacing_m", "dead_end_minimum_depth_m"):
+            if removed_key in topo:
+                errors.append(
+                    "topology_validation.{} was removed".format(
+                        removed_key))
 
         # One task schema for both formal and fixed-scenario flows.
         tg = sg_cfg.get("common_task_generation", {})
@@ -688,10 +666,24 @@ def _validate_config(cfg):
                         errors.append(
                             "fixed_obstacles[{}].radius_m must be > 0"
                             .format(obstacle_index))
-                    if float(obstacle.get("height_m", 0.0)) <= 0.0:
+                    height_m = float(obstacle.get("height_m", 0.0))
+                    if height_m <= 0.0:
                         errors.append(
                             "fixed_obstacles[{}].height_m must be > 0"
                             .format(obstacle_index))
+                    elif (isinstance(center, (list, tuple)) and
+                          len(center) == 3 and
+                          all(isinstance(v, (int, float)) for v in center)):
+                        lower_z = float(center[2]) - 0.5 * height_m
+                        upper_z = float(center[2]) + 0.5 * height_m
+                        if (abs(lower_z - float(oreg.get("z_min", 0.0))) >
+                                1.0e-6 or
+                                abs(upper_z - float(
+                                    oreg.get("z_max", 0.0))) > 1.0e-6):
+                            errors.append(
+                                "fixed_obstacles[{}] must cover the complete "
+                                "obstacle-region z range for strict 2.5D "
+                                "collection".format(obstacle_index))
             fixed_tasks = tg.get("fixed_tasks", [])
             if not isinstance(fixed_tasks, list) or not fixed_tasks:
                 errors.append(
@@ -791,74 +783,64 @@ def _validate_config(cfg):
             errors.append("TREND_NORMAL_CLASS_OFFSET must be 1")
 
     # ── Obstacle ────────────────────────────────────────────────
-    obs = g.get("obstacle", {})
-    if "area_x" in obs:
-        _validate_list_of_n("global.obstacle.area_x", obs["area_x"], 2)
-    if "area_y" in obs:
-        _validate_list_of_n("global.obstacle.area_y", obs["area_y"], 2)
-
     # ── Planning (v5: new local_planner validation) ──────────────
     planning = g.get("planning", {})
+    if "time_param" in planning:
+        errors.append(
+            "global.planning.time_param was removed; use local_planner "
+            "dynamics limits")
     validation_cfg = planning.get("validation", {})
     _validate_positive(
         "global.planning.validation.command_compare_atol",
         validation_cfg.get("command_compare_atol", 1.0e-5))
 
-    # New v5 sections
     gp = planning.get("global_planner", {})
     lp = planning.get("local_planner", {})
     if lp.get("backend", "cpp_pybind") != "cpp_pybind":
         errors.append("formal collection requires local_planner.backend=cpp_pybind")
 
-    # Keep all geometry parameters on one physical scale.  The point cloud
-    # must not be sparser than the ESDF, and obstacle generation must use the
-    # same body radius that ESDF inflation subtracts.
+    # Keep all geometry parameters on one physical scale.  The scene vehicle
+    # is the sole obstacle-inflation source and must match the ESDF body
+    # radius.  Its guaranteed corridor must support the local planner's hard
+    # clearance (the target clearance is a soft optimisation objective).
     pc_res = float(pc.get("resolution", 0.0) or 0.0)
     esdf_res = float(esdf.get("resolution", 0.0) or 0.0)
     esdf_radius = float(esdf.get("drone_radius", 0.0) or 0.0)
-    obstacle_radius = float(obs.get("drone_radius", esdf_radius) or 0.0)
+    scene_cfg = g.get("scene_generation", {})
+    scene_vehicle = scene_cfg.get("vehicle", {})
+    scene_radius = float(scene_vehicle.get("radius_m", 0.0) or 0.0)
+    scene_safety = float(scene_vehicle.get("safety_margin_m", -1.0))
+    if scene_radius <= 0.0:
+        errors.append("scene_generation.vehicle.radius_m must be > 0")
+    if scene_safety < 0.0:
+        errors.append(
+            "scene_generation.vehicle.safety_margin_m must be >= 0")
     if pc_res > esdf_res + 1e-9:
         errors.append("pointcloud resolution ({}) > esdf resolution ({}) may create surface holes".format(
             pc_res, esdf_res))
     if esdf_res > 0.5 * esdf_radius + 1e-9:
         errors.append("esdf resolution ({}) must be <= half drone_radius ({})".format(
             esdf_res, esdf_radius))
-    if abs(obstacle_radius - esdf_radius) > 1e-9:
-        errors.append("obstacle.drone_radius ({}) != esdf.drone_radius ({})".format(
-            obstacle_radius, esdf_radius))
-
-    hard_margin = max(float(gp.get("min_clearance", 0.0) or 0.0),
-                      float(lp.get("min_clearance", 0.0) or 0.0))
-    generated_gap = (float(obs.get("min_gap", 0.0) or 0.0)
-                     + 2.0 * obstacle_radius
-                     + float(obs.get("safety_margin", 0.0) or 0.0))
-    required_gap = 2.0 * (esdf_radius + hard_margin)
-    if generated_gap + 1e-9 < required_gap:
-        errors.append("generated obstacle surface gap ({}) < planner-required width ({})".format(
-            generated_gap, required_gap))
-    # Density-driven scenes use their own vehicle inflation and guaranteed
-    # post-inflation gap.  A corridor can only guarantee half that remaining
-    # gap, in addition to the scene's safety inflation, on each side.
-    scene_cfg = g.get("scene_generation", {})
-    scene_vehicle = scene_cfg.get("vehicle", {})
-    scene_safety = float(
-        scene_vehicle.get("safety_margin_m", 0.0) or 0.0)
-    post_inflation_gap = float(
-        scene_cfg.get("post_inflation_gap_m", 0.0) or 0.0)
-    guaranteed_planner_margin = (
-        scene_safety + 0.5 * post_inflation_gap)
-    if (scene_cfg.get("enabled", False) and
-            "post_inflation_gap_m" in scene_cfg and
-            hard_margin > guaranteed_planner_margin + 1e-9):
+    if abs(scene_radius - esdf_radius) > 1e-9:
         errors.append(
-            "planner hard clearance ({}) exceeds the density-driven "
-            "scene corridor guarantee ({})".format(
-                hard_margin, guaranteed_planner_margin))
-    scale_weights = obs.get("scale_weights", [0.70, 0.25, 0.05])
-    if (not isinstance(scale_weights, list) or len(scale_weights) != 3 or
-            any(not isinstance(w, (int, float)) or w < 0 for w in scale_weights) or
-            sum(scale_weights) <= 0):
-        errors.append("global.obstacle.scale_weights must be three non-negative values with positive sum")
+            "scene_generation.vehicle.radius_m ({}) must equal "
+            "esdf.drone_radius ({})".format(scene_radius, esdf_radius))
+
+    common_cyl = scene_cfg.get("common_cylinder", {})
+    minimum_surface_gap = float(
+        common_cyl.get("minimum_surface_gap_m", -1.0))
+    minimum_post_gap = float(
+        common_cyl.get("minimum_post_inflation_gap_m", -1.0))
+    guaranteed_surface_gap = max(
+        minimum_surface_gap,
+        2.0 * (scene_radius + scene_safety) + minimum_post_gap)
+    hard_margin = float(lp.get("min_clearance", 0.0) or 0.0)
+    required_surface_gap = 2.0 * (esdf_radius + hard_margin)
+    if guaranteed_surface_gap + 1e-9 < required_surface_gap:
+        errors.append(
+            "scene obstacle surface-gap guarantee ({}) is smaller than "
+            "the local-planner requirement ({})".format(
+                guaranteed_surface_gap, required_surface_gap))
 
     # Validate global_planner
     for key in ("min_clearance", "collision_check_spacing_m",
@@ -899,14 +881,12 @@ def _validate_config(cfg):
         except (TypeError, ValueError):
             pass
 
-    # Validate local_planner (if present and backend != python_fallback)
-    if lp and lp.get("backend") != "python_fallback":
+    # Validate the sole supported C++ local planner.
+    if lp:
         _validate_positive("global.planning.local_planner.planner_hz",
                            lp.get("planner_hz", 10.0))
         _validate_positive("global.planning.local_planner.horizon_time",
                            lp.get("horizon_time", 2.5))
-        _validate_positive("global.planning.local_planner.execute_prefix_time",
-                           lp.get("execute_prefix_time", 0.12))
         _validate_positive("global.planning.local_planner.velocity_command_lookahead_time",
                            lp.get("velocity_command_lookahead_time", 0.12))
         _validate_positive("global.planning.local_planner.velocity_tracking_gain",
@@ -948,12 +928,6 @@ def _validate_config(cfg):
             errors.append("control.record_hz ({}) > control.control_hz ({})".format(
                 record_hz_val, control_hz))
 
-        exec_prefix = lp.get("execute_prefix_time", 0.12)
-        horizon = lp.get("horizon_time", 2.5)
-        if exec_prefix >= horizon:
-            errors.append("execute_prefix_time ({}) >= horizon_time ({})".format(
-                exec_prefix, horizon))
-
         min_look = lp.get("min_lookahead_distance", 2.0)
         look = lp.get("lookahead_distance", 4.0)
         max_look = lp.get("max_lookahead_distance", 6.0)
@@ -984,7 +958,7 @@ def _validate_config(cfg):
                     acceleration_warm_blend))
 
         # Validate all positive
-        for key in ("planner_hz", "horizon_time", "execute_prefix_time",
+        for key in ("planner_hz", "horizon_time",
                      "velocity_command_lookahead_time", "max_plan_age",
                      "velocity_tracking_gain",
                      "planner_acceleration_filter_time_constant_s",
@@ -1005,13 +979,6 @@ def _validate_config(cfg):
                 val = lp[key]
                 if isinstance(val, (int, float)) and val <= 0:
                     errors.append("local_planner.{} must be > 0, got {}".format(key, val))
-
-    # ── Legacy time_param validation (deprecated but still in file) ──
-    tp = planning.get("time_param", {})
-    for key in ("nominal_speed", "max_velocity", "max_acceleration",
-                "max_yaw_rate", "min_obstacle_clearance"):
-        if key in tp:
-            _validate_positive("global.planning.time_param.{}".format(key), tp[key])
 
     # ── Phase 4: ESDF cache validation ──────────────────────────
     esdf_cache = g.get("esdf_cache", {})
@@ -1077,10 +1044,13 @@ def _validate_config(cfg):
     dyn_cfg = g.get("dynamics", {})
     if dyn_cfg:
         backend = dyn_cfg.get("backend", "flightmare")
-        if backend not in ("flightmare", "legacy_kinematic"):
-            errors.append("dynamics.backend must be flightmare or legacy_kinematic")
         if backend != "flightmare":
-            errors.append("dynamics.backend should be flightmare for production data")
+            errors.append("dynamics.backend must be flightmare")
+        for removed_key in (
+                "allow_legacy_kinematic_backend",
+                "legacy_backend_explicit_only"):
+            if removed_key in dyn_cfg:
+                errors.append("dynamics.{} was removed".format(removed_key))
         sim_hz = dyn_cfg.get("simulation_hz", 0)
         ctrl_hz_dyn = dyn_cfg.get("control_hz", 0)
         render_hz = dyn_cfg.get("render_hz", 0)
@@ -1127,10 +1097,8 @@ def _validate_profiles(sg_cfg, errors):
     seen_names = set()
     any_enabled = False
     vehicle_cfg = sg_cfg.get("vehicle", {})
-    vehicle_r = float(vehicle_cfg.get("radius_m",
-        sg_cfg.get("topology_validation", {}).get("vehicle_radius_m", 0.30)))
-    safety_m = float(vehicle_cfg.get("safety_margin_m",
-        sg_cfg.get("topology_validation", {}).get("safety_margin_m", 0.10)))
+    vehicle_r = float(vehicle_cfg.get("radius_m", 0.0))
+    safety_m = float(vehicle_cfg.get("safety_margin_m", -1.0))
 
     for i, p in enumerate(profiles):
         name = str(p.get("name", ""))
@@ -1153,6 +1121,11 @@ def _validate_profiles(sg_cfg, errors):
         seed_offset = p.get("seed_offset", 0)
         if not isinstance(seed_offset, int):
             errors.append("profiles[{}] ('{}'): seed_offset must be an integer".format(i, name))
+        if "density_tier" in p:
+            errors.append(
+                "profiles[{}] ('{}'): density_tier is derived from the "
+                "numeric density interval and must not be overridden".format(
+                    i, name))
 
         if source == "density_driven":
             groups = p.get("size_groups", {})
@@ -1243,18 +1216,3 @@ def _validate_profiles(sg_cfg, errors):
         errors.append("common_task_generation.minimum_detour_ratio must be >= 1.0")
     if max_detour < min_detour:
         errors.append("common_task_generation.maximum_detour_ratio < minimum_detour_ratio")
-
-
-def _warn_unused_keys(cfg):
-    """Warn about config keys that are declared but not used."""
-    for key_path, msg in UNUSED_KEYS.items():
-        parts = key_path.split(".")
-        val = cfg
-        for p in parts:
-            if isinstance(val, dict):
-                val = val.get(p)
-            else:
-                val = None
-                break
-        if val is not None:
-            rospy.logwarn("[Config] UNUSED KEY '%s' — %s", key_path, msg)

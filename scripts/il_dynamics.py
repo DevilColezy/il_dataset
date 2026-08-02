@@ -6,13 +6,10 @@ Provides:
   - DynamicsState dataclass
   - DynamicsBackend abstract interface
   - FlightmareDynamicsBackend: uses real Flightmare quadrotor dynamics
-  - LegacyKinematicBackend: uses integrate_velocity_command() for debug only
   - VelocityYawRateController: converts velocity/yaw-rate commands
     to low-level control inputs
 
-The default execution backend is Flightmare dynamics, not manual kinematic
-integration.  The legacy kinematic backend is only available when explicitly
-configured via backend: legacy_kinematic.
+Flightmare dynamics is the only supported execution backend.
 """
 
 from __future__ import print_function, division
@@ -23,7 +20,7 @@ from dataclasses import dataclass, field
 
 import rospy
 
-from il_common import (integrate_velocity_command, world_vector_to_body_flu,
+from il_common import (world_vector_to_body_flu,
                        world_vector_to_body_flu_quat,
                        body_flu_to_flightlib_body)
 
@@ -462,136 +459,15 @@ class VelocityYawRateController:
 
 
 # ============================================================================
-#  Legacy Kinematic Backend (debug only)
-# ============================================================================
-
-class LegacyKinematicBackend(DynamicsBackend):
-    """Kinematic velocity integrator (debug/CI only).
-
-    Uses integrate_velocity_command() from il_common.  This backend
-    MUST NOT be used for production data collection.  It is only
-    available when explicitly configured via backend: legacy_kinematic.
-    """
-
-    def __init__(self, config):
-        dyn_cfg = config.get("global", {}).get("dynamics", {})
-        lp_cfg = config.get("global", {}).get("planning", {}).get(
-            "local_planner", {})
-
-        self._sim_hz = float(dyn_cfg.get("simulation_hz", 200.0))
-        self._control_hz = float(dyn_cfg.get("control_hz", 50.0))
-        self._render_hz = float(dyn_cfg.get("render_hz", 20.0))
-
-        self._max_vel = float(lp_cfg.get("max_velocity", 2.5))
-        self._max_accel = float(lp_cfg.get("max_acceleration", 3.5))
-        self._max_yaw_rate = float(lp_cfg.get("max_yaw_rate", 2.0))
-
-        self._pos = np.zeros(3, dtype=np.float64)
-        self._vel = np.zeros(3, dtype=np.float64)
-        self._yaw = 0.0
-        self._sim_time = 0.0
-
-    @property
-    def backend_name(self):
-        return "legacy_kinematic"
-
-    def reset(self, initial_position, initial_yaw,
-              initial_velocity=None, initial_angular_velocity=None):
-        if initial_velocity is None:
-            initial_velocity = np.zeros(3, dtype=np.float64)
-        self._pos = np.asarray(initial_position, dtype=np.float64)
-        self._yaw = float(initial_yaw)
-        self._vel = np.asarray(initial_velocity, dtype=np.float64)
-        self._sim_time = 0.0
-
-    def get_state(self):
-        flu_vel = world_vector_to_body_flu(self._vel, self._yaw)
-        return DynamicsState(
-            position_world=self._pos.copy(),
-            quaternion_world_body=np.array(
-                [0.0, 0.0, math.sin(self._yaw / 2.0), math.cos(self._yaw / 2.0)],
-                dtype=np.float64),
-            velocity_world=self._vel.copy(),
-            velocity_flu=flu_vel,
-            angular_velocity_body=np.zeros(3, dtype=np.float64),
-            acceleration_world=np.zeros(3, dtype=np.float64),
-            acceleration_flu=np.zeros(3, dtype=np.float64),
-            simulation_time_s=self._sim_time,
-        )
-
-    def restore_state_keep_motors(
-            self, position, yaw, velocity=None, angular_velocity=None):
-        del angular_velocity
-        self._pos = np.asarray(position, dtype=np.float64).copy()
-        self._vel = (
-            np.zeros(3, dtype=np.float64)
-            if velocity is None
-            else np.asarray(velocity, dtype=np.float64).copy())
-        self._yaw = float(yaw)
-        return True
-
-    def step_velocity_command(self, velocity_command_flu, yaw_rate_command,
-                               duration_s):
-        """Step using kinematic integration."""
-        if duration_s <= 0:
-            return True
-
-        elapsed = 0.0
-        dt_ctrl = 1.0 / self._control_hz
-        epsilon = 1e-9
-
-        cmd_flu = np.asarray(velocity_command_flu, dtype=np.float64)
-        # Convert FLU desired to world frame for integrate_velocity_command
-        cos_y = math.cos(self._yaw)
-        sin_y = math.sin(self._yaw)
-        desired_world = np.array([
-            cmd_flu[0] * cos_y - cmd_flu[1] * sin_y,
-            cmd_flu[0] * sin_y + cmd_flu[1] * cos_y,
-            cmd_flu[2]
-        ], dtype=np.float64)
-
-        while elapsed < duration_s - epsilon:
-            step_dt = min(dt_ctrl, duration_s - elapsed)
-            self._pos, self._vel, self._yaw, yr = integrate_velocity_command(
-                self._pos, self._vel, self._yaw, desired_world, step_dt,
-                self._max_vel, self._max_accel, self._max_yaw_rate)
-            self._sim_time += step_dt
-            elapsed += step_dt
-
-        return True
-
-    def close(self):
-        pass
-
-
-# ============================================================================
 #  Factory function
 # ============================================================================
 
 def create_dynamics_backend(config):
-    """Create the appropriate dynamics backend from configuration.
-
-    Raises RuntimeError if flightmare is requested but unavailable.
-    """
+    """Create the sole supported Flightmare dynamics backend."""
     dyn_cfg = config.get("global", {}).get("dynamics", {})
     backend_name = str(dyn_cfg.get("backend", "flightmare"))
-    allow_legacy = bool(dyn_cfg.get("allow_legacy_kinematic_backend", True))
-    legacy_explicit = bool(dyn_cfg.get("legacy_backend_explicit_only", True))
-
-    if backend_name == "legacy_kinematic":
-        if legacy_explicit:
-            rospy.logwarn("[Dynamics] Using LEGACY kinematic backend (debug only). "
-                          "NOT suitable for production data collection.")
-        return LegacyKinematicBackend(config)
-
-    if backend_name == "flightmare":
-        try:
-            return FlightmareDynamicsBackend(config)
-        except RuntimeError:
-            rospy.logerr(
-                "[Dynamics] Flightmare backend failed to initialize. "
-                "legacy_kinematic is available but NOT auto-selected. "
-                "Set backend: legacy_kinematic explicitly for debug.")
-            raise
-
-    raise ValueError("Unknown dynamics backend: {}".format(backend_name))
+    if backend_name != "flightmare":
+        raise ValueError(
+            "Only the flightmare dynamics backend is supported, got '{}'"
+            .format(backend_name))
+    return FlightmareDynamicsBackend(config)
