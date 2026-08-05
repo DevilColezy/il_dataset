@@ -131,6 +131,79 @@ std::unique_ptr<LocalPlanner> makePlanner(
     return planner;
 }
 
+double distanceToSegment2D(
+    double x, double y,
+    const Eigen::Vector3d& from,
+    const Eigen::Vector3d& to) {
+    const Eigen::Vector2d point{x, y};
+    const Eigen::Vector2d a = from.head<2>();
+    const Eigen::Vector2d delta = to.head<2>() - a;
+    const double denominator = delta.squaredNorm();
+    const double alpha = denominator > 1.0e-12
+        ? std::max(0.0, std::min(
+              1.0, (point - a).dot(delta) / denominator))
+        : 0.0;
+    return (point - (a + alpha * delta)).norm();
+}
+
+std::unique_ptr<LocalPlanner> makeObservedDetourPlanner(
+    const std::vector<Eigen::Vector3d>& safe_path) {
+    LocalPlannerConfig config;
+    config.trajectory_dt = 0.02;
+    config.max_iterations = 10000;
+    config.planning_time_budget_ms = 30.0;
+    config.control_points = 16;
+    config.horizontal_avoidance_only = true;
+    auto planner = std::make_unique<LocalPlanner>(config);
+
+    constexpr int gx = 81;
+    constexpr int gy = 61;
+    constexpr int gz = 31;
+    constexpr double resolution = 0.1;
+    constexpr double origin_x = -1.0;
+    constexpr double origin_y = -2.0;
+    constexpr double origin_z = 0.0;
+    std::vector<float> esdf(gx * gy * gz, 5.0f);
+    std::vector<uint8_t> known(gx * gy * gz, 0);
+    for (int ix = 0; ix < gx; ++ix) {
+        for (int iy = 0; iy < gy; ++iy) {
+            const double x =
+                origin_x + (static_cast<double>(ix) + 0.5) * resolution;
+            const double y =
+                origin_y + (static_cast<double>(iy) + 0.5) * resolution;
+            double distance = std::numeric_limits<double>::infinity();
+            for (size_t segment = 1; segment < safe_path.size(); ++segment) {
+                distance = std::min(
+                    distance,
+                    distanceToSegment2D(
+                        x, y, safe_path[segment - 1], safe_path[segment]));
+            }
+            if (distance > 0.55) continue;
+            for (int iz = 0; iz < gz; ++iz) {
+                known[(ix * gy + iy) * gz + iz] = 1;
+            }
+        }
+    }
+    if (!planner->setObservedESDF(
+            esdf.data(), known.data(), gx, gy, gz,
+            origin_x, origin_y, origin_z, resolution, false)) {
+        throw std::runtime_error("setObservedESDF failed");
+    }
+
+    std::vector<double> flat_path;
+    flat_path.reserve(safe_path.size() * 3);
+    for (const auto& point : safe_path) {
+        flat_path.push_back(point.x());
+        flat_path.push_back(point.y());
+        flat_path.push_back(point.z());
+    }
+    if (!planner->setGlobalPath(
+            flat_path.data(), static_cast<int>(safe_path.size()))) {
+        throw std::runtime_error("setGlobalPath failed");
+    }
+    return planner;
+}
+
 LocalPlanningRequest makeRequest(
     const std::vector<Eigen::Vector3d>& path,
     const Eigen::Vector3d& velocity) {
@@ -177,6 +250,50 @@ int main() {
         std::cerr << "direct trajectory failed: " << direct.message
                   << ", residual=" << direct_residual << '\n';
         return 1;
+    }
+
+    // A bounded-A* Guide accepted through observed space must remain valid
+    // after B-spline smoothing.  The direct chord below is unknown; only the
+    // raised detour corridor is observed.  This reproduces the dataset
+    // failure where the old optimizer assigned a constant unknown penalty
+    // with no gradient and then cut back across the unknown chord.
+    const std::vector<Eigen::Vector3d> observed_detour{
+        {0.0, 0.0, 1.0},
+        {1.0, 0.0, 1.0},
+        {1.0, 1.2, 1.0},
+        {4.0, 1.2, 1.0},
+        {4.0, 0.0, 1.0},
+        {5.0, 0.0, 1.0}};
+    auto observed_planner = makeObservedDetourPlanner(observed_detour);
+    LocalPlanningRequest observed_request = makeRequest(
+        observed_detour, {0.4, 0.0, 0.0});
+    observed_request.forbid_unknown_space = true;
+    const double certified_observed_distance =
+        observed_planner->findReachableGuideDistance(
+            observed_request.state, Eigen::Vector3d::UnitX(),
+            5.0, 0.5, 0.2, true);
+    const auto observed_plan =
+        observed_planner->planLocalWithRequest(observed_request);
+    double observed_max_lateral = 0.0;
+    bool observed_trajectory_known = !observed_plan.trajectory.empty();
+    for (const auto& point : observed_plan.trajectory) {
+        observed_max_lateral = std::max(
+            observed_max_lateral, std::abs(point.position.y()));
+        observed_trajectory_known = observed_trajectory_known &&
+            observed_planner->esdf().isKnown(
+                point.position.x(), point.position.y(), point.position.z());
+    }
+    if (certified_observed_distance < 4.99 ||
+        !observed_plan.success ||
+        observed_plan.status != PlannerStatus::SUCCESS ||
+        !observed_trajectory_known ||
+        observed_max_lateral < 0.50) {
+        std::cerr << "observed detour smoothing failed: "
+                  << observed_plan.message
+                  << ", certified_distance="
+                  << certified_observed_distance
+                  << ", max_lateral=" << observed_max_lateral << '\n';
+        return 12;
     }
 
     // Regression for a lockstep failure recorded in scale_transition.  The

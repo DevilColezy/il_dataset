@@ -4,7 +4,7 @@
 ///   - VehicleState, TrajectoryPoint, LocalPlanResult, ValidationResult
 ///   - LocalPlannerConfig, LocalPlanner, PlannerStatus
 ///
-/// The planLocal() method releases the GIL so that Python control
+/// The planLocalWithRequest() method releases the GIL so that Python control
 /// and depth-receive threads can continue while optimization runs.
 
 #include <pybind11/pybind11.h>
@@ -24,6 +24,7 @@
 #include "il_dataset/local_planner/esdf_grid.hpp"
 #include "il_dataset/local_planner/local_planner.hpp"
 #include "il_dataset/local_planner/depth_integrator.hpp"
+#include "il_dataset/local_planner/observed_map_ops.hpp"
 
 namespace py = pybind11;
 
@@ -122,6 +123,17 @@ PYBIND11_MODULE(_il_local_planner, m) {
     .def("state", &FlightmareDynamicsBridge::state);
     m.doc() = "C++ receding-horizon local planner for IL dataset collection";
 
+    m.def("build_observed_esdf", &build_observed_esdf,
+          py::arg("occupancy"), py::arg("resolution"),
+          py::arg("max_distance_m"), py::arg("vehicle_radius_m"),
+          "Build observed ESDF and conservative known-space mask in C++.");
+    m.def("sample_known_free_corridor", &sample_known_free_corridor,
+          py::arg("occupancy"), py::arg("origin_world"),
+          py::arg("resolution"), py::arg("start_world"),
+          py::arg("end_world"), py::arg("radius_m"),
+          py::arg("spacing_m"), py::arg("min_clearance_m") = 0.0,
+          "Score a complete spherical swept volume against known FREE voxels.");
+
     // ── Enums ────────────────────────────────────────────────────
     py::enum_<PlannerStatus>(m, "PlannerStatus",
         "Status codes returned by the local planner.")
@@ -161,6 +173,10 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &LocalPlanningRequest::trajectory_terminal)
         .def_readwrite("trajectory_terminal_index",
                        &LocalPlanningRequest::trajectory_terminal_index)
+        .def_readwrite("has_target_yaw",
+                       &LocalPlanningRequest::has_target_yaw)
+        .def_readwrite("target_yaw",
+                       &LocalPlanningRequest::target_yaw)
         .def_readwrite("reference_path_segment",
                        &LocalPlanningRequest::reference_path_segment)
         .def_readwrite("forbid_unknown_space",
@@ -253,6 +269,8 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &LocalPlannerConfig::max_cost_samples_per_segment)
         .def_readwrite("seed_trust_radius",
                        &LocalPlannerConfig::seed_trust_radius)
+        .def_readwrite("horizontal_avoidance_only",
+                       &LocalPlannerConfig::horizontal_avoidance_only)
         .def_readwrite("min_clearance", &LocalPlannerConfig::min_clearance)
         .def_readwrite("target_clearance", &LocalPlannerConfig::target_clearance)
         .def_readwrite("collision_check_spacing",
@@ -369,7 +387,7 @@ PYBIND11_MODULE(_il_local_planner, m) {
                  return self.setGlobalPath(ptr, n);
              },
              py::arg("path"),
-             "Set the global reference path (A* shortcut output). "
+             "Set an optional legacy global path for diagnostics only. "
              "path: float64 numpy array [N, 3].")
 
         // reset
@@ -377,19 +395,6 @@ PYBIND11_MODULE(_il_local_planner, m) {
              &LocalPlanner::reset,
              py::arg("initial_state"),
              "Reset planner state for a new trajectory.")
-
-        // plan_local – RELEASES GIL
-        .def("plan_local",
-             [](const LocalPlanner& self,
-                const VehicleState& current_state,
-                double previous_progress_s) -> LocalPlanResult {
-                 py::gil_scoped_release release;
-                 return self.planLocal(current_state, previous_progress_s);
-             },
-             py::arg("current_state"),
-             py::arg("previous_progress_s"),
-             "Plan a local trajectory from the current state. "
-             "Releases the Python GIL during optimization.")
 
         // plan_local_with_request: Phase 2
         .def("plan_local_with_request",
@@ -399,8 +404,30 @@ PYBIND11_MODULE(_il_local_planner, m) {
                  return self.planLocalWithRequest(request);
              },
              py::arg("request"),
-             "Phase 2: Plan with explicit guide/terminal/reference segment. "
+             "Teacher-only planning from complete guide to full trajectory. "
              "Releases the Python GIL during optimization.")
+
+        .def("find_reachable_guide_distance",
+             [](const LocalPlanner& self,
+                const VehicleState& state,
+                const Eigen::Vector3d& direction_world,
+                double desired_distance,
+                double minimum_distance,
+                double distance_step,
+                bool forbid_unknown_space) -> double {
+                 py::gil_scoped_release release;
+                 return self.findReachableGuideDistance(
+                     state, direction_world, desired_distance,
+                     minimum_distance, distance_step,
+                     forbid_unknown_space);
+             },
+             py::arg("state"), py::arg("direction_world"),
+             py::arg("desired_distance"), py::arg("minimum_distance"),
+             py::arg("distance_step"),
+             py::arg("forbid_unknown_space") = true,
+             "Return the farthest hard-safe Guide distance reachable in the "
+             "observed ESDF, using bounded local A* when needed. Full "
+             "trajectory optimization is performed by the 30 Hz planner.")
 
         // validate_trajectory
         .def("validate_trajectory",
@@ -410,7 +437,7 @@ PYBIND11_MODULE(_il_local_planner, m) {
 
         // is_ready
         .def("is_ready", &LocalPlanner::isReady,
-             "Return whether the planner has been initialized with ESDF and global path.")
+             "Return whether the planner has an initialized ESDF.")
 
         // current_plan_id
         .def("current_plan_id", &LocalPlanner::currentPlanId,

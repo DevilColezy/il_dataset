@@ -43,19 +43,26 @@ enum class PlannerStatus : int {
     UNKNOWN_SPACE = 9  // Phase 2: trajectory enters unknown space
 };
 
-/// Phase 2: Explicit planning request with guide/terminal separation.
+/// Teacher-only local trajectory-planning request.
 struct LocalPlanningRequest {
     VehicleState state;
 
     double previous_progress_s{0.0};
 
-    /// Guide waypoint (farthest visible path point) — for trend labels.
+    /// World endpoint reconstructed from the complete macro guide. It may
+    /// lie outside the latest FOV when known by the causal rolling map.
     Eigen::Vector3d guide_waypoint{Eigen::Vector3d::Zero()};
     int guide_waypoint_index{-1};
 
-    /// Trajectory terminal (dynamically reachable) — optimization target.
+    /// Hard optimization endpoint for the complete teacher trajectory.
     Eigen::Vector3d trajectory_terminal{Eigen::Vector3d::Zero()};
     int trajectory_terminal_index{-1};
+
+    /// World-frame yaw intent supplied by the complete macro guide.  The
+    /// teacher planner time-parameterizes this together with translation so
+    /// the local expert only tracks one coherent SE(2.5) trajectory.
+    bool has_target_yaw{false};
+    double target_yaw{0.0};
 
     /// DEPRECATED: reference_path_segment is no longer used.
     /// The local planner uses the terminal plus ESDF to initialize its local
@@ -83,9 +90,9 @@ struct LocalPlanResult {
 
     double planning_time_ms = 0.0;
     double min_clearance = 0.0;    ///< minimum ESDF clearance along the planned trajectory
-    double progress_s = 0.0;       ///< current progress along global path (arc-length)
-    int progress_index = -1;       ///< global-path waypoint index for progress_s
-    int local_goal_index = -1;     ///< global-path waypoint index of the local goal
+    double progress_s = 0.0;       ///< legacy progress diagnostic
+    int progress_index = -1;       ///< legacy waypoint-index diagnostic
+    int local_goal_index = -1;     ///< legacy terminal-index diagnostic
     Eigen::Vector3d local_goal{Eigen::Vector3d::Zero()};
     uint64_t plan_id = 0;          ///< monotonically increasing plan identifier
 

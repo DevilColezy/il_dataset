@@ -43,7 +43,10 @@ struct LocalPlannerConfig {
     // Each free control point stays near the corresponding collision-free
     // seed point.  This preserves the seed homotopy without attracting the
     // trajectory to the straight Guide chord.
-    double seed_trust_radius = 0.75;
+    double seed_trust_radius = 0.35;
+    // Search/optimize obstacle detours only in x-y. Height follows the direct
+    // start-to-terminal profile and is never selected as an avoidance axis.
+    bool horizontal_avoidance_only = true;
 
     // ESDF already subtracts the vehicle radius.  This is only the extra
     // local hard margin; target_clearance remains the soft preference.
@@ -63,8 +66,8 @@ struct LocalPlannerConfig {
     // Dynamics limits
     double nominal_speed = 1.8;
     double max_velocity = 2.5;
-    double max_acceleration = 3.5;
-    double max_jerk = 15.0;
+    double max_acceleration = 8.0;
+    double max_jerk = 50.0;
     double max_yaw_rate = 2.0;
 
     // Goal conditions
@@ -80,10 +83,10 @@ struct LocalPlannerConfig {
 
 /// Receding-horizon local trajectory planner.
 ///
-/// Thread safety: setESDF() and setGlobalPath() are NOT thread-safe and
-/// should be called before planning begins.  planLocal() and
+/// Thread safety: map/path setters are NOT thread-safe and
+/// should be called before planning begins.  planLocalWithRequest() and
 /// validateTrajectory() are const from the data perspective and can be
-/// called from multiple threads if the ESDF/global path are not being
+/// called from multiple threads if the ESDF/optional diagnostics are not being
 /// modified concurrently.
 class LocalPlanner {
 public:
@@ -120,7 +123,7 @@ public:
                          double resolution,
                          bool unknown_is_free);
 
-    /// Set the global reference path (A* shortcut output).
+    /// Set an optional legacy global reference path for diagnostics only.
     /// Data is COPIED once.
     /// @param path  float64 numpy array, shape [N, 3], C-order
     /// @param n_points  number of waypoints
@@ -133,14 +136,6 @@ public:
 
     // ── Online planning (MUST be called with GIL released) ─────────
 
-    /// Plan a local trajectory from the current drone state (legacy).
-    /// Uses internal selectLocalGoal() and global ESDF.
-    /// @param current_state  latest kinematic state
-    /// @param previous_progress_s  progress along global path from last plan
-    /// @return  LocalPlanResult with trajectory and metadata
-    LocalPlanResult planLocal(const VehicleState& current_state,
-                              double previous_progress_s) const;
-
     /// Plan a local trajectory with explicit request (Phase 2).
     /// Uses guide_waypoint/trajectory_terminal as the exact local target.
     /// The deprecated reference_path_segment is ignored; an obstructed direct
@@ -150,6 +145,19 @@ public:
     /// @return  LocalPlanResult with trajectory and metadata
     LocalPlanResult planLocalWithRequest(
         const LocalPlanningRequest& request) const;
+
+    /// Return the farthest candidate distance whose terminal is hard-safe
+    /// and reachable through the causal observed ESDF. A bounded local A*
+    /// search is used when the direct segment is blocked. Full B-spline and
+    /// dynamics optimization is intentionally performed only by the formal
+    /// 30 Hz local planner after the macro Guide has been selected.
+    double findReachableGuideDistance(
+        const VehicleState& state,
+        const Eigen::Vector3d& direction_world,
+        double desired_distance,
+        double minimum_distance,
+        double distance_step,
+        bool forbid_unknown_space) const;
 
     /// Validate a trajectory for collisions and clearance.
     /// @param trajectory  the trajectory to validate
@@ -163,7 +171,7 @@ public:
     const std::vector<Eigen::Vector3d>& globalPath() const { return global_path_; }
     const LocalPlannerConfig& config() const { return config_; }
 
-    /// Return whether the planner has been initialized with ESDF and global path.
+    /// Return whether the planner has an initialized ESDF.
     bool isReady() const;
 
     /// Get the current plan ID counter.
@@ -183,76 +191,8 @@ private:
     ProgressResult computeProgress(const Eigen::Vector3d& position,
                                    double previous_progress_s) const;
 
-    /// Select a local goal on the global path given progress and lookahead.
-    /// @deprecated Phase 2: use external GuideSelector instead. Kept for legacy.
-    struct LocalGoalResult {
-        Eigen::Vector3d position{Eigen::Vector3d::Zero()};
-        int waypoint_index = -1;
-        double arc_length_from_start = 0.0;
-        bool is_final_goal = false;
-        bool valid = false;
-    };
-    [[deprecated("Phase 2: use external GuideSelector. Kept for legacy async mode.")]]
-    LocalGoalResult selectLocalGoal(double progress_s,
-                                    const Eigen::Vector3d& current_position,
-                                    double current_speed) const;
-
-    /// Generate yaw from trajectory tangent.
-    static double yawFromTangent(const Eigen::Vector3d& direction);
-
-    /// Wrap angle to [-pi, pi].
-    static double wrapAngle(double angle);
-
-    /// Densely sample a trajectory from control points (B-spline or minimum-jerk).
-    std::vector<TrajectoryPoint> sampleTrajectory(
-        const std::vector<Eigen::Vector3d>& control_points,
-        const Eigen::Vector3d& start_pos,
-        const Eigen::Vector3d& start_vel,
-        const Eigen::Vector3d& start_acc,
-        const Eigen::Vector3d& goal_pos,
-        double start_yaw,
-        double dt,
-        int num_samples) const;
-
-    /// Sample with an automatically allocated duration, lengthening time
-    /// until finite-difference velocity/acceleration limits are satisfied.
-    std::vector<TrajectoryPoint> sampleTrajectoryFeasible(
-        const std::vector<Eigen::Vector3d>& control_points,
-        const Eigen::Vector3d& start_pos,
-        const Eigen::Vector3d& start_vel,
-        const Eigen::Vector3d& start_acc,
-        const Eigen::Vector3d& goal_pos,
-        double start_yaw) const;
-
-    /// Compute total cost for a set of control points.
-    double computeCost(const std::vector<Eigen::Vector3d>& control_points,
-                       const Eigen::Vector3d& start_pos,
-                       const Eigen::Vector3d& start_vel,
-                       const Eigen::Vector3d& local_goal,
-                       const std::vector<Eigen::Vector3d>& global_ref_segment,
-                       bool near_final_goal) const;
-
-    /// Optimize control points via gradient descent with line search.
-    bool optimizeControlPoints(std::vector<Eigen::Vector3d>& control_points,
-                               const Eigen::Vector3d& start_pos,
-                               const Eigen::Vector3d& start_vel,
-                               const Eigen::Vector3d& local_goal,
-                               const std::vector<Eigen::Vector3d>& global_ref_segment,
-                               bool near_final_goal) const;
-
-    /// Generate an emergency hold/brake trajectory.
-    std::vector<TrajectoryPoint> generateEmergencyHold(
-        const VehicleState& current_state) const;
-
-    /// Generate a conservative fallback from global path segment.
-    std::vector<TrajectoryPoint> generateGlobalPathFallback(
-        const VehicleState& current_state,
-        double progress_s,
-        double lookahead) const;
-
     /// Production explicit-Guide planner.  Uses one cubic B-spline for
-    /// optimization, sampling and validation; the legacy planner remains
-    /// available through planLocal().
+    /// optimization, sampling and validation.
     LocalPlanResult planSplineWithRequest(
         const LocalPlanningRequest& request) const;
 

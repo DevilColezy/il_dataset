@@ -309,6 +309,7 @@ class PlannerMode(Enum):
     """Online planner operational mode."""
     FRESH_PLAN = "FRESH_PLAN"
     CACHED_PLAN = "CACHED_PLAN"
+    ACTIVE_SCAN = "ACTIVE_SCAN"
     RECOVERY = "RECOVERY"
     GOAL_HOLD = "GOAL_HOLD"
     ABORT = "ABORT"
@@ -323,21 +324,47 @@ class ControlMode(Enum):
 
 
 class TrendMode(Enum):
-    """Trend label generation mode."""
+    """Legacy runtime label mode retained for schema-v17 diagnostics."""
     TRACK_GUIDE = "TRACK_GUIDE"
     RECOVERY = "RECOVERY"
     GOAL_HOLD = "GOAL_HOLD"
 
 
-# ── Trend horizontal class constants (13 classes) ───────────────────
-TREND_NORMAL_HORIZONTAL_BIN_COUNT = 11   # number of normal FOV bins (unchanged)
-TREND_HORIZONTAL_CLASS_COUNT = 13        # total classes: recover_left + 11 normal + recover_right
-TREND_RECOVER_LEFT_CLASS = 0
-TREND_NORMAL_CLASS_OFFSET = 1            # old 0–10  →  new 1–11
-TREND_RECOVER_RIGHT_CLASS = 12
+# ── Schema version ──────────────────────────────────────────────────
+DATA_SCHEMA_VERSION = 17   # continuous macro guide, no discrete trend labels
 
-# Vertical bins unchanged
+# Legacy runtime/debug label layout retained in schema-v17 CSVs.  The network
+# macro target is continuous; these classes are diagnostics and recovery-mode
+# compatibility fields only.
+TREND_NORMAL_HORIZONTAL_BIN_COUNT = 11
+TREND_HORIZONTAL_CLASS_COUNT = TREND_NORMAL_HORIZONTAL_BIN_COUNT + 2
+TREND_RECOVER_LEFT_CLASS = 0
+TREND_NORMAL_CLASS_OFFSET = 1
+TREND_RECOVER_RIGHT_CLASS = TREND_HORIZONTAL_CLASS_COUNT - 1
 TREND_VERTICAL_CLASS_COUNT = 7
+
+
+def goal_hold_guide_labels(normal_horizontal_bins, vertical_bins):
+    """Return deterministic centered diagnostic labels for GOAL_HOLD.
+
+    Horizontal class zero and the final class are reserved for recovery, so
+    the centered normal-direction class has an offset of one.  GOAL_HOLD uses
+    one-hot distributions and zero guide distance; it never represents an
+    avoidance action.
+    """
+    horizontal_bins = int(normal_horizontal_bins)
+    vertical_count = int(vertical_bins)
+    if horizontal_bins <= 0 or vertical_count <= 0:
+        raise ValueError("guide label bin counts must be positive")
+    horizontal_class_count = horizontal_bins + 2
+    horizontal_class = 1 + horizontal_bins // 2
+    vertical_class = vertical_count // 2
+    horizontal_soft = np.zeros(horizontal_class_count, dtype=np.float64)
+    vertical_soft = np.zeros(vertical_count, dtype=np.float64)
+    horizontal_soft[horizontal_class] = 1.0
+    vertical_soft[vertical_class] = 1.0
+    return (horizontal_class, vertical_class,
+            horizontal_soft, vertical_soft)
 
 
 def update_goal_hold_latch(is_latched, current_position_world,
@@ -383,31 +410,6 @@ def update_goal_hold_latch(is_latched, current_position_world,
                 return False
         return True
     return bool(distance <= tolerance + 1.0e-9)
-
-
-def goal_hold_guide_labels(
-        normal_horizontal_bin_count=TREND_NORMAL_HORIZONTAL_BIN_COUNT,
-        vertical_bin_count=TREND_VERTICAL_CLASS_COUNT):
-    """Return the deterministic center-Guide targets for terminal HOLD."""
-    normal_count = int(normal_horizontal_bin_count)
-    vertical_count = int(vertical_bin_count)
-    if normal_count <= 0 or normal_count % 2 == 0:
-        raise ValueError(
-            "normal_horizontal_bin_count must be a positive odd integer")
-    if vertical_count <= 0 or vertical_count % 2 == 0:
-        raise ValueError("vertical_bin_count must be a positive odd integer")
-
-    horizontal_class = (
-        TREND_NORMAL_CLASS_OFFSET + normal_count // 2)
-    vertical_class = vertical_count // 2
-    horizontal_soft = np.zeros(
-        TREND_HORIZONTAL_CLASS_COUNT, dtype=np.float64)
-    vertical_soft = np.zeros(vertical_count, dtype=np.float64)
-    horizontal_soft[horizontal_class] = 1.0
-    vertical_soft[vertical_class] = 1.0
-    return (
-        horizontal_class, vertical_class,
-        horizontal_soft, vertical_soft)
 
 
 @dataclass(frozen=True)
@@ -471,34 +473,58 @@ class LocalPlanSnapshot:
 
 @dataclass(frozen=True)
 class RuntimeDecision:
-    """Immutable per-frame decision — single source of truth (v13).
+    """Immutable per-frame decision — schema v17 continuous guide.
 
-    All modes, labels, and commands for a single 30 Hz record tick
-    are finalized here.  The row builder and executor both read from
-    this object; neither recomputes any control logic.
+    No discrete trend labels.  The macro guide is a continuous FLU vector.
+    Recovery is now handled by the macro expert's ACTIVE_SCAN/ACTIVE_PEEK
+    states; the local level only reports local_feasible/progress_rate.
     """
-    planner_mode: str      # PlannerMode value
-    trend_mode: str         # TrendMode value
-    control_mode: str       # ControlMode value
+
+    planner_mode: str          # PlannerMode value
+    trend_mode: str            # TrendMode value (diagnostic compatibility)
+    control_mode: str          # ControlMode value
+
+    # ── Macro guide (continuous, FLU) ────────────────────────────
+    macro_update: int           # 1 if this is a 5 Hz macro tick
+    macro_label_valid: int      # 1 if macro guide is valid
+    macro_mode: str             # MacroState value
+    macro_committed_side: int   # +1 left, 0 none, -1 right (FLU y sign)
+    macro_move_dir_x_flu: float
+    macro_move_dir_y_flu: float
+    macro_move_dir_z_flu: float
+    macro_move_distance_m: float
+    macro_move_distance_norm: float
+    macro_yaw_dir_x_flu: float
+    macro_yaw_dir_y_flu: float
+    macro_target_x_world: float
+    macro_target_y_world: float
+    macro_target_z_world: float
+    macro_look_target_x_world: float
+    macro_look_target_y_world: float
+    macro_look_target_z_world: float
+    macro_decision_reason: str
+
+    # ── Local expert diagnostics ─────────────────────────────────
+    local_feasible: int         # 1 if local planner currently feasible
+    local_progress_rate: float  # estimated progress rate [0, 1]
+    local_blocked_reason: str   # "" or reason string
+
+    # ── Observed map stats ───────────────────────────────────────
+    macro_map_revision: int
+    macro_known_free_count: int
+    macro_occupied_count: int
+    macro_unknown_count: int
 
     guide_source: str
     guide_target_world: np.ndarray
     guide_target_path_index: int
-
     recovery_direction: str
     recovery_azimuth_rad: float
-
-    plan_snapshot: Optional[LocalPlanSnapshot]
-
     recovery_target_world: np.ndarray
     recovery_target_path_index: int
+    plan_snapshot: Optional[LocalPlanSnapshot]
 
-    # ── trajectory decomposition ──
-    trajectory_sample_time_s: float
-    trajectory_reference_velocity_flu: np.ndarray
-    trajectory_feedback_velocity_flu: np.ndarray
-
-    # ── final commands ──
+    # ── Final commands (FLU) ─────────────────────────────────────
     expert_velocity_flu: np.ndarray
     expert_yaw_rate: float
 
@@ -506,14 +532,19 @@ class RuntimeDecision:
     selected_yaw_rate: float
     selected_actor: str
 
+    # ── Trajectory decomposition ─────────────────────────────────
+    trajectory_sample_time_s: float
+    trajectory_reference_velocity_flu: np.ndarray
+    trajectory_feedback_velocity_flu: np.ndarray
+
     def __post_init__(self):
         array_fields = (
             "guide_target_world",
             "recovery_target_world",
-            "trajectory_reference_velocity_flu",
-            "trajectory_feedback_velocity_flu",
             "expert_velocity_flu",
             "selected_velocity_flu",
+            "trajectory_reference_velocity_flu",
+            "trajectory_feedback_velocity_flu",
         )
         for field_name in array_fields:
             value = np.asarray(
@@ -524,35 +555,23 @@ class RuntimeDecision:
             object.__setattr__(self, field_name, value)
         if (self.plan_snapshot is not None and
                 not isinstance(self.plan_snapshot, LocalPlanSnapshot)):
-            raise TypeError(
-                "plan_snapshot must be LocalPlanSnapshot or None")
+            raise TypeError("plan_snapshot must be LocalPlanSnapshot or None")
         if not self.selected_actor:
             raise ValueError("selected_actor must be non-empty")
-        if not np.all(np.isfinite(self.guide_target_world)):
-            raise ValueError("guide_target_world must be finite")
-        if not np.all(np.isfinite(self.recovery_target_world)):
-            raise ValueError("recovery_target_world must be finite")
-        if not np.all(np.isfinite(self.expert_velocity_flu)):
-            raise ValueError("expert_velocity_flu must be finite")
-        if not np.isfinite(self.expert_yaw_rate):
-            raise ValueError("expert_yaw_rate must be finite")
-        if not np.isfinite(self.recovery_azimuth_rad):
-            raise ValueError("recovery_azimuth_rad must be finite")
-        if not np.isfinite(self.trajectory_sample_time_s):
-            raise ValueError("trajectory_sample_time_s must be finite")
-        if not np.all(np.isfinite(self.selected_velocity_flu)):
-            raise ValueError("selected_velocity_flu must be finite")
-        if not np.isfinite(self.selected_yaw_rate):
-            raise ValueError("selected_yaw_rate must be finite")
-        if not np.all(np.isfinite(self.trajectory_reference_velocity_flu)):
-            raise ValueError("trajectory_reference_velocity_flu must be finite")
-        if not np.all(np.isfinite(self.trajectory_feedback_velocity_flu)):
-            raise ValueError("trajectory_feedback_velocity_flu must be finite")
+        for name in ("expert_velocity_flu", "selected_velocity_flu",
+                      "trajectory_reference_velocity_flu",
+                      "trajectory_feedback_velocity_flu"):
+            if not np.all(np.isfinite(getattr(self, name))):
+                raise ValueError(f"{name} must be finite")
+        for name in ("recovery_azimuth_rad", "expert_yaw_rate", "selected_yaw_rate",
+                      "trajectory_sample_time_s"):
+            if not np.isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite")
 
 
 def make_goal_hold_decision(current_position_world, goal_position_world,
                             goal_path_index, plan_snapshot=None):
-    """Build the single-source-of-truth zero command for terminal HOLD."""
+    """Build the single-source-of-truth zero command for terminal HOLD (v17)."""
     current = np.asarray(current_position_world, dtype=np.float64)
     goal = np.asarray(goal_position_world, dtype=np.float64)
     if current.shape != (3,) or goal.shape != (3,):
@@ -564,14 +583,36 @@ def make_goal_hold_decision(current_position_world, goal_position_world,
         planner_mode=PlannerMode.GOAL_HOLD.value,
         trend_mode=TrendMode.GOAL_HOLD.value,
         control_mode=ControlMode.HOLD_POSITION.value,
+        macro_update=0,
+        macro_label_valid=1,
+        macro_mode="GOAL_HOLD",
+        macro_committed_side=0,
+        macro_move_dir_x_flu=1.0, macro_move_dir_y_flu=0.0, macro_move_dir_z_flu=0.0,
+        macro_move_distance_m=0.0,
+        macro_move_distance_norm=0.0,
+        macro_yaw_dir_x_flu=1.0, macro_yaw_dir_y_flu=0.0,
+        macro_target_x_world=float(current[0]),
+        macro_target_y_world=float(current[1]),
+        macro_target_z_world=float(current[2]),
+        macro_look_target_x_world=float(current[0]),
+        macro_look_target_y_world=float(current[1]),
+        macro_look_target_z_world=float(current[2]),
+        macro_decision_reason="goal_hold",
+        local_feasible=1,
+        local_progress_rate=0.0,
+        local_blocked_reason="",
+        macro_map_revision=0,
+        macro_known_free_count=0,
+        macro_occupied_count=0,
+        macro_unknown_count=0,
         guide_source="goal_tolerance_hold",
         guide_target_world=current.copy(),
         guide_target_path_index=int(goal_path_index),
         recovery_direction="",
         recovery_azimuth_rad=0.0,
-        plan_snapshot=plan_snapshot,
         recovery_target_world=goal.copy(),
         recovery_target_path_index=int(goal_path_index),
+        plan_snapshot=plan_snapshot,
         trajectory_sample_time_s=-1.0,
         trajectory_reference_velocity_flu=zero.copy(),
         trajectory_feedback_velocity_flu=zero.copy(),

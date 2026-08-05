@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <!-- ===================================================================
-  Strict schema-v16 imitation-learning dataset collection.
+  Strict schema-v17 macro/local imitation-learning dataset collection.
 
   The manager runs the sole supported pipeline: balanced 2.5D scene/task
   generation, causal Guide selection, C++ receding-horizon Control,

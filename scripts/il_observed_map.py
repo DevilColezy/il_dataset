@@ -127,13 +127,16 @@ class RollingObservedOccupancyMap:
         self.size_x_m = float(cfg.get("size_x_m", 12.0))
         self.size_y_m = float(cfg.get("size_y_m", 12.0))
         self.size_z_m = float(cfg.get("size_z_m", 5.0))
-        self.history_seconds = float(cfg.get("history_seconds", 4.0))
+        self.history_seconds = float(cfg.get("history_seconds", 3.0))
         self.occ_endpoint_margin = float(cfg.get("occupied_endpoint_margin_m", 0.05))
         self.unknown_is_free = bool(cfg.get("unknown_is_free", False))
         self.min_known_free_ratio = float(cfg.get("min_known_free_ratio", 0.95))
-        self.depth_step = int(cfg.get("depth_integration_step", 4))
+        self.depth_step = int(cfg.get("depth_integration_step", 2))
+        self.vehicle_radius_m = float(
+            config.get("global", {}).get("esdf", {}).get(
+                "drone_radius", 0.30))
         self.free_space_spacing = float(cfg.get(
-            "free_space_sample_spacing_m", self.resolution * 5.0))
+            "free_space_sample_spacing_m", self.resolution))
         depth_cfg = config.get("global", {}).get("depth", {})
         self.horizontal_fov_rad = math.radians(float(depth_cfg.get("fov", 90.0)))
         self.max_depth_m = float(depth_cfg.get("max_m", 5.0))
@@ -282,9 +285,86 @@ class RollingObservedOccupancyMap:
                     points_world, points_cam, cam_pos, timestamp_s):
                 changed = True
 
+        # The collision-free current vehicle volume is known by state, even
+        # though a forward camera cannot observe behind its own optical
+        # centre.  Mark only this local bubble; all other unobserved voxels
+        # remain UNKNOWN.
+        if self._mark_vehicle_free_bubble(cam_pos, timestamp_s):
+            changed = True
+
         if changed:
             self._revision += 1
         self.total_integrations += 1
+
+    def _mark_vehicle_free_bubble(self, center_world, timestamp_s):
+        """Mark the collision-free vehicle volume as observed FREE.
+
+        The bubble uses the true Euclidean distance from each voxel centre to
+        the continuous drone position.  A conservative radius guarantees that
+        every sub-voxel position of the drone centre lies in the safe-known
+        mask and that all eight trilinear-interpolation voxels of
+        ESDFGrid::isKnown() are fully inside the known-support region after
+        the vehicle_radius erosion in ObservedESDF.rebuild().
+
+        Conservative radius derivation
+        ------------------------------
+        Let res = map resolution, R = vehicle_radius.
+        The eight interpolation voxels span {⌊g⌋, ⌊g⌋+1} in each dimension.
+        The farthest centre of these eight from the drone is at most
+        √3 · res away (when the drone is exactly at a grid-line intersection
+        in continuous index space).  After the bubble marks these voxels FREE,
+        the ESDF safe-known erosion discards any voxel whose distance to the
+        nearest UNKNOWN is < R.  Therefore the bubble must extend at least
+        R + √3 · res from the drone centre so that every interpolation voxel
+        retains ≥ R of known FREE support in all directions.
+
+        |drone − voxel_centre| ≤ √3 · res  →  R_bubble ≥ R + √3 · res
+
+        With R = 0.30 m and res = 0.10 m this gives ≥ 0.473 m.  OCCUPIED
+        voxels are never overwritten.
+        """
+        import math as _math
+        center = np.asarray(center_world, dtype=np.float64).reshape(3)
+        # Conservative radius: vehicle body + worst-case interpolation span
+        bubble_radius_m = (
+            self.vehicle_radius_m +
+            _math.sqrt(3.0) * self.resolution)
+        radius_voxels = int(_math.ceil(bubble_radius_m / self.resolution))
+        center_grid_float = self.world_to_grid(center)  # continuous
+        changed = False
+        cx = center_grid_float[0]
+        cy = center_grid_float[1]
+        cz = center_grid_float[2]
+        ix0 = int(_math.floor(cx))
+        iy0 = int(_math.floor(cy))
+        iz0 = int(_math.floor(cz))
+        for dx in range(-radius_voxels, radius_voxels + 1):
+            for dy in range(-radius_voxels, radius_voxels + 1):
+                for dz in range(-radius_voxels, radius_voxels + 1):
+                    ix = ix0 + dx
+                    iy = iy0 + dy
+                    iz = iz0 + dz
+                    if not self._in_bounds(ix, iy, iz):
+                        continue
+                    # Voxel centre in continuous grid space
+                    vx = float(ix) + 0.5
+                    vy = float(iy) + 0.5
+                    vz = float(iz) + 0.5
+                    dist2 = ((vx - cx) * (vx - cx) +
+                             (vy - cy) * (vy - cy) +
+                             (vz - cz) * (vz - cz))
+                    if dist2 * self.resolution * self.resolution > (
+                            bubble_radius_m * bubble_radius_m + 1.0e-9):
+                        continue
+                    # Never overwrite OCCUPIED — an observed obstacle is real.
+                    if self._occ[ix, iy, iz] == OCCUPIED:
+                        continue
+                    if self._occ[ix, iy, iz] == UNKNOWN:
+                        self._occ[ix, iy, iz] = FREE
+                        changed = True
+                    if self._occ[ix, iy, iz] == FREE:
+                        self._last_obs_time[ix, iy, iz] = timestamp_s
+        return changed
 
     def _integrate_depth_python(self, points_world, points_cam, cam_pos,
                                 timestamp_s):
@@ -339,9 +419,14 @@ class RollingObservedOccupancyMap:
         self._last_obs_time[expired] = -1.0
         return changed
 
-    def get_occupancy(self):
-        """Return the occupancy grid (gx, gy, gz) uint8."""
-        return self._occ.copy()
+    def get_occupancy(self, copy=True):
+        """Return the occupancy grid (gx, gy, gz) uint8.
+
+        Runtime ESDF construction requests a read-only-by-convention view to
+        avoid copying the complete rolling grid every frame.  Public callers
+        retain the defensive-copy default.
+        """
+        return self._occ.copy() if copy else self._occ
 
     def get_known_mask(self):
         """Return boolean mask where voxels are known (FREE or OCCUPIED)."""
@@ -388,8 +473,7 @@ class RollingObservedOccupancyMap:
             min_clearance_m=0.0):
         """Sample points along a corridor and compute the known-free ratio.
 
-        This is a simplified 2.5D cylinder check. For each sample point
-        along the line, we check if it is known and has sufficient clearance.
+        Samples the 3-D swept volume and returns its known-free voxel ratio.
 
         Returns:
             float in [0, 1]: fraction of samples that are known-free.
@@ -401,38 +485,75 @@ class RollingObservedOccupancyMap:
         if length < 1e-6:
             return 0.0
 
+        # Formal collection uses the C++ implementation.  Besides removing
+        # the Python triple loop, it treats UNKNOWN and out-of-bounds voxels
+        # as infeasible for every sample in the vehicle's swept volume.
+        try:
+            import _il_local_planner as _cpp_observed_ops
+        except ImportError:
+            _cpp_observed_ops = None
+        if _cpp_observed_ops is not None:
+            if not hasattr(_cpp_observed_ops, "sample_known_free_corridor"):
+                raise RuntimeError(
+                    "_il_local_planner is stale: rebuild the WSL workspace "
+                    "to enable C++ observed-map corridor scoring")
+            _cpp_corridor = _cpp_observed_ops.sample_known_free_corridor
+            return float(_cpp_corridor(
+                self._occ,
+                np.ascontiguousarray(self._origin_world, dtype=np.float64),
+                self.resolution,
+                np.ascontiguousarray(start, dtype=np.float64),
+                np.ascontiguousarray(end, dtype=np.float64),
+                float(radius_m),
+                float(spacing_m),
+                float(min_clearance_m)))
+        else:
+            # Compatibility fallback for static Windows analysis before the
+            # WSL pybind module has been rebuilt.
+            pass
+
         n_samples = max(2, int(length / spacing_m) + 1)
         n_samples = min(n_samples, 200)  # upper bound for performance
 
         known_free_count = 0
         total_samples = 0
 
-        radius_voxels = max(0, int(math.ceil(radius_m / self.resolution)))
+        body_radius_m = float(radius_m)
+        swept_radius_m = body_radius_m + float(min_clearance_m)
+        radius_voxels = max(
+            0, int(math.ceil(swept_radius_m / self.resolution)))
         offsets = []
         for dx in range(-radius_voxels, radius_voxels + 1):
             for dy in range(-radius_voxels, radius_voxels + 1):
                 for dz in range(-radius_voxels, radius_voxels + 1):
-                    if math.sqrt(dx*dx + dy*dy + dz*dz) * self.resolution <= radius_m + 1e-9:
-                        offsets.append((dx, dy, dz))
+                    if (math.sqrt(dx*dx + dy*dy + dz*dz) *
+                            self.resolution <= swept_radius_m + 1e-9):
+                        offsets.append((
+                            dx, dy, dz,
+                            math.sqrt(dx*dx + dy*dy + dz*dz) *
+                            self.resolution <= body_radius_m + 1e-9))
         if not offsets:
-            offsets = [(0, 0, 0)]
+            offsets = [(0, 0, 0, True)]
 
         for i in range(n_samples):
             frac = i / max(n_samples - 1, 1)
             center_pt = start + frac * vec
             g = self._world_to_grid_int(center_pt)
-            if not self._in_bounds(g[0], g[1], g[2]):
-                continue
-            total_samples += 1
-            corridor_free = True
-            for dx, dy, dz in offsets:
+            body_known_free = 0
+            clearance_occupied = False
+            for dx, dy, dz, inside_body in offsets:
                 ix, iy, iz = int(g[0] + dx), int(g[1] + dy), int(g[2] + dz)
-                if (not self._in_bounds(ix, iy, iz) or
-                        self._occ[ix, iy, iz] != FREE):
-                    corridor_free = False
-                    break
-            if corridor_free:
-                known_free_count += 1
+                if inside_body:
+                    total_samples += 1
+                if not self._in_bounds(ix, iy, iz):
+                    continue
+                value = self._occ[ix, iy, iz]
+                if min_clearance_m > 1e-9 and value == OCCUPIED:
+                    clearance_occupied = True
+                if inside_body and value == FREE:
+                    body_known_free += 1
+            if min_clearance_m <= 1e-9 or not clearance_occupied:
+                known_free_count += body_known_free
 
         if total_samples == 0:
             return 0.0
@@ -448,7 +569,9 @@ class ObservedESDF:
 
     def __init__(self, config):
         cfg = config.get("global", {}).get("observed_map", {})
+        esdf_cfg = config.get("global", {}).get("esdf", {})
         self.esdf_max_distance_m = float(cfg.get("esdf_max_distance_m", 5.0))
+        self.vehicle_radius_m = float(esdf_cfg.get("drone_radius", 0.30))
         self.rebuild_every_n_frames = int(cfg.get("rebuild_every_n_frames", 1))
 
         self._esdf = None  # (gx, gy, gz) float32
@@ -475,11 +598,51 @@ class ObservedESDF:
             origin_world: [ox, oy, oz] corner of voxel (0,0,0).
             resolution: voxel size in metres.
         """
+        del known_mask  # Occupancy is the single source of known/free state.
+
         try:
-            from scipy.ndimage import distance_transform_edt
+            import _il_local_planner as _cpp_observed_ops
         except ImportError:
-            raise ImportError(
-                "scipy is required for ObservedESDF. Install: pip install scipy")
+            _cpp_observed_ops = None
+        if _cpp_observed_ops is not None:
+            if not hasattr(_cpp_observed_ops, "build_observed_esdf"):
+                raise RuntimeError(
+                    "_il_local_planner is stale: rebuild the WSL workspace "
+                    "to enable the C++ observed ESDF")
+            _cpp_build_observed_esdf = (
+                _cpp_observed_ops.build_observed_esdf)
+            esdf, safe_known_mask = _cpp_build_observed_esdf(
+                np.ascontiguousarray(occupancy, dtype=np.uint8),
+                float(resolution),
+                self.esdf_max_distance_m,
+                self.vehicle_radius_m)
+            self._esdf = np.asarray(esdf, dtype=np.float32)
+            self._known_mask = np.asarray(
+                safe_known_mask, dtype=np.uint8).astype(bool, copy=False)
+            self._origin = np.asarray(origin_world, dtype=np.float64).copy()
+            self._resolution = float(resolution)
+            self._built = True
+            self._build_count += 1
+            return
+        else:
+            # Static-analysis/test fallback until the WSL extension is built.
+            try:
+                from scipy.ndimage import distance_transform_edt
+            except ImportError:
+                raise ImportError(
+                    "C++ observed-map ops are unavailable and scipy fallback "
+                    "is not installed")
+
+        known_mask = np.asarray(occupancy) != UNKNOWN
+
+        # Erode the observed support by the vehicle radius.  Merely checking
+        # that the trajectory centre is known would still allow the vehicle
+        # footprint to extend into never-observed space.
+        known_clearance = distance_transform_edt(
+            np.asarray(known_mask, dtype=bool), sampling=resolution)
+        safe_known_mask = (
+            np.asarray(known_mask, dtype=bool) &
+            (known_clearance >= self.vehicle_radius_m))
 
         # Occupied voxels for EDT
         occupied = (occupancy == OCCUPIED).astype(np.uint8)
@@ -487,14 +650,19 @@ class ObservedESDF:
         n_occ = int(occupied.sum())
         if n_occ == 0:
             # No known obstacles: all known free gets max distance
-            self._esdf = np.full_like(occupancy, self.esdf_max_distance_m,
+            self._esdf = np.full_like(
+                                      occupancy,
+                                      self.esdf_max_distance_m -
+                                      self.vehicle_radius_m,
                                       dtype=np.float32)
             # But unknown stays at 0 (not free!)
-            self._esdf[~known_mask] = 0.0
+            self._esdf[~safe_known_mask] = 0.0
         else:
             fd = distance_transform_edt(1 - occupied, sampling=resolution)
             od = distance_transform_edt(occupied, sampling=resolution)
-            esdf_raw = fd - od
+            # Planner clearance is for the vehicle centre, so inflate
+            # occupied space by subtracting the vehicle radius once here.
+            esdf_raw = fd - od - self.vehicle_radius_m
 
             # Clamp to max distance
             esdf_raw = np.clip(esdf_raw, -self.esdf_max_distance_m,
@@ -502,9 +670,9 @@ class ObservedESDF:
 
             # Unknown voxels: set to 0 (not usable as free)
             self._esdf = esdf_raw.astype(np.float32)
-            self._esdf[~known_mask] = 0.0
+            self._esdf[~safe_known_mask] = 0.0
 
-        self._known_mask = known_mask.copy()
+        self._known_mask = safe_known_mask
         self._origin = np.asarray(origin_world, dtype=np.float64).copy()
         self._resolution = float(resolution)
         self._built = True

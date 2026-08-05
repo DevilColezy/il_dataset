@@ -204,7 +204,10 @@ global:
       reject_nearly_equal_sides: true
 
     observability_audit:
-      enabled: true
+      # Global left/right cost is privileged information. Keep it out of
+      # runtime episode acceptance; causal map diagnostics are recorded by
+      # the macro expert itself.
+      enabled: false
       require_runtime_side_consistency: true
       minimum_observed_cost_difference_ratio: 0.05
       maximum_invalid_frames_before_reject: 5
@@ -635,7 +638,7 @@ global:
       reference_resample_spacing_m: 0.10
 
     # ═══════════════════════════════════════════════════════════════════
-    #  Local receding-horizon planner (C++ pybind11 backend)
+    #  Teacher-only complete-guide trajectory planner (C++ pybind11 backend)
     # ═══════════════════════════════════════════════════════════════════
     local_planner:
       backend: "cpp_pybind"
@@ -647,8 +650,8 @@ global:
       horizon_time: 2.5                 # nominal optimizer horizon; sampled duration is auto-scaled
       velocity_command_lookahead_time: 0.08  # shorter preview reduces corner cutting
       velocity_tracking_gain: 2.0        # [1/s] feedback toward the collision-checked local path
-      yaw_tracking_gain: 3.0             # [1/s] align nose to commanded velocity
-      yaw_speed_threshold: 0.10          # [m/s] hold yaw below this horizontal speed
+      yaw_tracking_gain: 3.0             # [1/s] track planner yaw generated from macro yaw intent
+      yaw_speed_threshold: 0.10          # legacy fallback only; planned yaw does not depend on speed
       max_plan_age: 0.75                 # measured from request state, never completion time
       planning_time_budget_ms: 30.0
 
@@ -681,8 +684,8 @@ global:
 
       nominal_speed: 1.8
       max_velocity: 2.5
-      max_acceleration: 3.5
-      max_jerk: 15.0
+      max_acceleration: 8.0
+      max_jerk: 50.0
       max_yaw_rate: 2.0
 
       goal_tolerance: 0.30
@@ -695,9 +698,10 @@ global:
       emergency_hold_enabled: true
 
       # ── Phase 2: observed ESDF usage ──
-      use_observed_esdf: false
-      forbid_unknown_space: false
+      use_observed_esdf: true
+      forbid_unknown_space: true
       allow_global_map_fallback: false
+      horizontal_avoidance_only: true
 
     # ═══════════════════════════════════════════════════════════════════
     #  Validation thresholds for committed data
@@ -712,7 +716,7 @@ global:
   # ── Data format ──────────────────────────────────────────────────────
   data:
     coordinate_frame: "CAMERA_FLU"
-    schema_version: 16
+    schema_version: 17
     collection_mode: "deterministic_lockstep"
     image_write_queue_size: 16
     label_lookahead_time_s: 0.08
@@ -728,7 +732,7 @@ global:
 
   # ── Observed local occupancy map (Phase 2) ───────────────────────────
   observed_map:
-    enabled: false
+    enabled: true
 
     resolution: 0.10
 
@@ -736,7 +740,7 @@ global:
     size_y_m: 12.0
     size_z_m: 5.0
 
-    history_seconds: 4.0
+    history_seconds: 8.0
 
     occupied_endpoint_margin_m: 0.05
 
@@ -748,11 +752,10 @@ global:
 
     rebuild_every_n_frames: 1
 
-    depth_integration_step: 8
+    depth_integration_step: 2
 
-    # Free-space ray sampling spacing (metres).  Coarser than voxel
-    # resolution to keep the Python ray-casting loop performant.
-    free_space_sample_spacing_m: 0.50
+    # Mark a continuous known-free ray at the occupancy resolution.
+    free_space_sample_spacing_m: 0.10
 
   # ── Guide selector (Phase 2) ─────────────────────────────────────────
   guide_selector:
@@ -786,6 +789,48 @@ global:
     use_known_free_corridor: false
 
   # ── Online runtime scheduling & recovery (v11) ──────────────────────
+  # Schema-v17 macro expert: causal local map + horizontal active perception.
+  macro_expert:
+    update_hz: 5.0
+    effective_guide_range_m: 4.45
+    map_resolution_m: 0.10
+    map_history_seconds: 8.0
+    guide_range_fraction: 0.85
+    blocked_corridor_radius_m: 0.55
+    minimum_corridor_score: 0.45
+    symmetric_score_tolerance: 0.03
+    preferred_symmetric_side: "left"
+    bypass_goal_weight: 0.45
+    minimum_guide_distance_m: 0.50
+    frontier_candidate_limit: 8
+    frontier_angular_bin_deg: 10.0
+    frontier_standoff_m: 0.45
+    frontier_max_backtrack_m: 0.20
+    frontier_goal_progress_weight: 1.0
+    frontier_information_weight: 0.25
+    frontier_yaw_cost_weight: 0.10
+    frontier_side_commitment_bonus: 0.15
+    enter_blocked_frames: 3
+    exit_clear_frames: 8
+    minimum_progress_rate_m_s: 0.15
+    minimum_commit_time_s: 0.8
+    active_scan_yaw_rate_rps: 2.0
+    active_scan_min_angle_deg: 15.0
+    active_scan_max_duration_s: 5.0
+    active_peek_distance_m: 2.0
+    active_peek_safety_radius_m: 0.55
+    vertical_avoidance_enabled: false
+    vertical_active_perception_enabled: false
+
+  # 30 Hz pure trajectory tracker / velocity+yaw-rate label generator.
+  local_expert:
+    update_hz: 30.0
+    nominal_speed: 1.8
+    max_velocity: 2.5
+    max_acceleration: 8.0
+    max_jerk: 50.0
+    max_yaw_rate: 2.0
+
   online_runtime:
     control_rate_hz: 30.0
     record_rate_hz: 30.0
@@ -811,7 +856,7 @@ global:
       path_projection_backtrack_points: 5
 
       yaw_deadband_rad: 0.05
-      max_yaw_rate_rps: 0.80
+      max_yaw_rate_rps: 2.0
       yaw_gain: 1.50
 
       maximum_recovery_duration_s: 3.0

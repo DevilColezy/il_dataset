@@ -95,6 +95,13 @@ try:
 except ImportError:
     _GUIDE_SELECTOR_AVAILABLE = False
 
+try:
+    from il_macro_expert import (
+        MacroExpert, MacroExpertConfig, MacroGuide, MacroState)
+    _MACRO_EXPERT_AVAILABLE = True
+except ImportError:
+    _MACRO_EXPERT_AVAILABLE = False
+
 # Phase 3: scene & task generation
 try:
     from il_scenario import (
@@ -170,74 +177,6 @@ try:
     rospy.loginfo("[Manager] C++ local planner loaded successfully.")
 except ImportError as e:
     rospy.logerr("[Manager] Required C++ local planner is unavailable: %s", e)
-
-
-class _AsyncPlannerWorker(object):
-    """Single-owner planner worker with no request backlog."""
-
-    def __init__(self, planner):
-        self._planner = planner
-        self._cv = threading.Condition()
-        self._request = None
-        self._completed = None
-        self._busy = False
-        self._stop = False
-        self._thread = threading.Thread(
-            target=self._run, name="il_local_planner_worker")
-        self._thread.daemon = True
-        self._thread.start()
-
-    def submit(self, request):
-        with self._cv:
-            if self._stop or self._busy or self._request is not None:
-                return False
-            self._request = request
-            self._cv.notify()
-            return True
-
-    def take_completed(self):
-        with self._cv:
-            completed = self._completed
-            self._completed = None
-            return completed
-
-    def busy(self):
-        with self._cv:
-            return self._busy or self._request is not None
-
-    def stop(self):
-        with self._cv:
-            self._stop = True
-            self._request = None
-            self._cv.notify_all()
-        self._thread.join()
-
-    def _run(self):
-        while True:
-            with self._cv:
-                while self._request is None and not self._stop:
-                    self._cv.wait()
-                if self._stop and self._request is None:
-                    return
-                request = self._request
-                self._request = None
-                self._busy = True
-
-            completed = dict(request)
-            try:
-                completed["result"] = self._planner.plan_local(
-                    request["state"], request["previous_progress_s"])
-                completed["exception"] = None
-            except Exception as exc:
-                completed["result"] = None
-                completed["exception"] = exc
-            completed["completed_mono"] = time.monotonic()
-
-            with self._cv:
-                # Retain only the latest completion; never build a result
-                # backlog that could later overwrite a newer vehicle state.
-                self._completed = completed
-                self._busy = False
 
 
 class _AsyncImageWriter(object):
@@ -321,7 +260,7 @@ class ILManager:
     # Row-level validity fields remain as audit invariants; per-head loss
     # masks are intentionally absent because partial supervision is not a
     # supported dataset mode.
-    DATA_SCHEMA_V16_FIELDS = [
+    DATA_SCHEMA_V17_FIELDS = [
         # -- time & matching --
         "timestamp_ns", "receive_timestamp_ns", "episode_id", "frame_id",
         "episode_frame_index", "sequence_reset", "control_dt_s",
@@ -333,25 +272,23 @@ class ILManager:
         "state_vx_flu", "state_vy_flu", "state_vz_flu",
         "state_angular_velocity_x_body", "state_angular_velocity_y_body",
         "state_angular_velocity_z_body",
-        # -- v12: FLU angular velocity (current frame, before action) --
         "state_angular_velocity_x_flu", "state_angular_velocity_y_flu",
         "state_angular_velocity_z_flu",
-        # -- v12: FLU gravity direction --
         "gravity_direction_x_flu", "gravity_direction_y_flu",
         "gravity_direction_z_flu",
-        # -- last upper-level command actually executed before depth_t --
+        # -- last executed command --
         "previous_executed_command_valid",
         "previous_executed_command_frame_id", "previous_executed_actor",
         "previous_executed_command_vx_flu",
         "previous_executed_command_vy_flu",
         "previous_executed_command_vz_flu",
         "previous_executed_command_yaw_rate",
-        # -- expert supervision (sampled from plan generated from x_t) --
+        # -- expert supervision (continuous, v17) --
         "expert_label_valid",
         "expert_vx_world", "expert_vy_world", "expert_vz_world",
         "expert_vx_flu", "expert_vy_flu", "expert_vz_flu",
         "expert_yaw_rate",
-        # -- learner output and DAgger actor selection --
+        # -- learner output and selection --
         "learner_output_valid",
         "learner_vx_flu", "learner_vy_flu", "learner_vz_flu",
         "learner_yaw_rate", "learner_inference_ms",
@@ -360,11 +297,10 @@ class ILManager:
         "selected_command_vx_flu", "selected_command_vy_flu",
         "selected_command_vz_flu", "selected_command_yaw_rate",
         "final_executed_actor",
-        # -- v12: applied command (current control interval) --
         "applied_command_vx_flu", "applied_command_vy_flu",
         "applied_command_vz_flu", "applied_command_yaw_rate",
         "applied_command_actor", "applied_command_valid",
-        # -- executed next state (x_(t+1), after dt_sample integration) --
+        # -- executed next state --
         "executed_next_x", "executed_next_y", "executed_next_z",
         "executed_next_vx_world", "executed_next_vy_world", "executed_next_vz_world",
         "executed_next_vx_flu", "executed_next_vy_flu", "executed_next_vz_flu",
@@ -376,29 +312,46 @@ class ILManager:
         "actual_angular_velocity_x", "actual_angular_velocity_y",
         "actual_angular_velocity_z", "velocity_tracking_error",
         "yaw_rate_tracking_error",
-        # -- global navigation labels --
+        # -- global navigation labels (v17: continuous only) --
         "global_direction_valid",
         "global_dir_x_flu", "global_dir_y_flu", "global_dir_z_flu",
         "global_distance_m", "global_distance_norm",
-        # -- v11: runtime mode enums --
-        "planner_mode", "control_mode", "trend_mode",
-        # -- temporary trend labels (v11: 13-class horizontal) --
-        "trend_label_valid", "guide_source", "guide_mode",
-        "guide_mode_changed", "recovery_entered", "recovery_exited",
+        # -- runtime modes and legacy diagnostic guide projection --
+        # The learned macro target is continuous. These discrete fields stay
+        # in the CSV only for runtime auditing and old visualization tools.
+        "planner_mode", "trend_mode", "control_mode",
+        "guide_mode", "guide_mode_changed",
+        "recovery_entered", "recovery_exited",
+        "trend_label_valid", "trend_horizontal_class_count",
+        "trend_horizontal_class_13", "trend_normal_horizontal_class_11",
+        "guide_source", "guide_plan_id", "guide_cache_age_s",
+        "guide_cache_valid",
+        "guide_target_x_world", "guide_target_y_world",
+        "guide_target_z_world", "guide_target_path_index",
         "guide_x_world", "guide_y_world", "guide_z_world",
-        "guide_dir_x_flu_exact", "guide_dir_y_flu_exact", "guide_dir_z_flu_exact",
+        "guide_dir_x_flu_exact", "guide_dir_y_flu_exact",
+        "guide_dir_z_flu_exact",
         "guide_distance_m", "guide_distance_norm",
         "guide_azimuth_rad", "guide_elevation_rad",
         "guide_azimuth_bin", "guide_elevation_bin",
-        # v11: 13-class trend horizontal
-        "trend_horizontal_class_13", "trend_horizontal_class_count",
-        "trend_normal_horizontal_class_11",
-        # guide_azimuth_soft_0 ... guide_azimuth_soft_12 (appended dynamically)
-        # guide_elevation_soft_0 ... guide_elevation_soft_{V-1} (appended dynamically)
-        # -- v11: guide cache fields --
-        "guide_plan_id", "guide_cache_age_s", "guide_cache_valid",
-        "guide_target_x_world", "guide_target_y_world", "guide_target_z_world",
-        "guide_target_path_index",
+        # -- macro guide (v17: continuous, 5 Hz) --
+        "macro_update",
+        "macro_label_valid",
+        "macro_mode",
+        "macro_committed_side",
+        "macro_move_dir_x_flu", "macro_move_dir_y_flu", "macro_move_dir_z_flu",
+        "macro_move_distance_m", "macro_move_distance_norm",
+        "macro_yaw_dir_x_flu", "macro_yaw_dir_y_flu",
+        "macro_target_x_world", "macro_target_y_world", "macro_target_z_world",
+        "macro_look_target_x_world", "macro_look_target_y_world", "macro_look_target_z_world",
+        "macro_decision_reason",
+        # -- local expert diagnostics (v17) --
+        "local_feasible",
+        "local_progress_rate",
+        "local_blocked_reason",
+        # -- observed map stats (v17) --
+        "macro_map_revision",
+        "macro_known_free_count", "macro_occupied_count", "macro_unknown_count",
         # -- depth & collision --
         "depth_file", "collision",
         # -- start/goal --
@@ -466,14 +419,16 @@ class ILManager:
         # Debug mode
         self.debug = rospy.get_param("~debug", False)
         self.debug_dir = None
-        if self.debug and _MPL_AVAILABLE:
+        self._debug_frames = []      # per-frame debug dicts for current trajectory
+        if self.debug:
             self.debug_dir = os.path.join(
                 self.g.get("output_dir", _resolve_path("dataset/il_data")), "_debug")
             if not os.path.isdir(self.debug_dir):
                 os.makedirs(self.debug_dir)
-            rospy.loginfo("[DEBUG] Visualisation PNGs saved to %s", self.debug_dir)
-        elif self.debug:
-            rospy.logwarn("[DEBUG] matplotlib not available.")
+            if _MPL_AVAILABLE:
+                rospy.loginfo("[DEBUG] Visualisation + data saved to %s", self.debug_dir)
+            else:
+                rospy.loginfo("[DEBUG] Data saved to %s (matplotlib unavailable for plots)", self.debug_dir)
 
         # Paths
         self.output_root = self.g["output_dir"]
@@ -513,7 +468,24 @@ class ILManager:
                 raise RuntimeError(
                     "Configured C++ local planner is unavailable; formal "
                     "collection cannot fall back to Python")
+            required_observed_ops = (
+                "build_observed_esdf", "sample_known_free_corridor")
+            missing_observed_ops = [
+                name for name in required_observed_ops
+                if not hasattr(_cpp_planner, name)]
+            if not hasattr(
+                    _LocalPlanner, "find_reachable_guide_distance"):
+                missing_observed_ops.append(
+                    "LocalPlanner.find_reachable_guide_distance")
+            if missing_observed_ops:
+                raise RuntimeError(
+                    "_il_local_planner is stale; rebuild the WSL workspace. "
+                    "Missing C++ observed-map operations: {}".format(
+                        ", ".join(missing_observed_ops)))
             self._init_cpp_planner(lp_cfg)
+            rospy.loginfo(
+                "[Manager] C++ observed ESDF, swept-corridor scoring, and "
+                "full-trajectory Guide certification enabled.")
         else:
             raise RuntimeError(
                 "Only cpp_pybind is permitted by the formal collection path")
@@ -523,10 +495,23 @@ class ILManager:
         self._use_observed_map = bool(obs_cfg.get("enabled", False))
         self._use_observed_esdf = bool(
             lp_cfg.get("use_observed_esdf", False))
+        if not self._use_observed_map or not self._use_observed_esdf:
+            raise RuntimeError(
+                "schema-v17 requires the causal observed map and observed ESDF")
+        if bool(obs_cfg.get("unknown_is_free", False)):
+            raise RuntimeError("schema-v17 must treat unknown space as unsafe")
+        if not bool(lp_cfg.get("forbid_unknown_space", True)):
+            raise RuntimeError("schema-v17 local planner must forbid unknown space")
+        if bool(lp_cfg.get("allow_global_map_fallback", False)):
+            raise RuntimeError("schema-v17 forbids global-map fallback")
+        if not bool(lp_cfg.get("horizontal_avoidance_only", True)):
+            raise RuntimeError("schema-v17 requires horizontal-only avoidance")
         self._observed_map = None
         self._observed_esdf = None
         self._camera_model = None
         self._guide_selector = None
+        self._macro_expert = None
+        self._macro_expert_config = None
         self._guide_progress_index = -1
         self._consecutive_guide_failures = 0
 
@@ -559,6 +544,124 @@ class ILManager:
         else:
             raise RuntimeError(
                 "GuideSelector and camera model are required for formal collection")
+
+        if not _MACRO_EXPERT_AVAILABLE:
+            raise RuntimeError("MacroExpert is required for schema-v17 collection")
+        macro_cfg = self.g.get("macro_expert", {})
+        local_cfg = self.g.get("local_expert", {})
+        self._macro_expert_config = MacroExpertConfig(
+            update_hz=float(macro_cfg.get("update_hz", 5.0)),
+            local_hz=float(local_cfg.get(
+                "update_hz", lp_cfg.get("planner_hz", 30.0))),
+            effective_guide_range_m=float(macro_cfg.get(
+                "effective_guide_range_m", 4.45)),
+            map_resolution_m=float(macro_cfg.get(
+                "map_resolution_m", 0.10)),
+            map_history_seconds=float(macro_cfg.get(
+                "map_history_seconds", 3.0)),
+            guide_range_fraction=float(macro_cfg.get(
+                "guide_range_fraction", 0.85)),
+            blocked_corridor_radius_m=float(macro_cfg.get(
+                "blocked_corridor_radius_m", 0.55)),
+            guide_swept_radius_m=float(macro_cfg.get(
+                "guide_swept_radius_m", 0.30)),
+            guide_obstacle_clearance_m=float(macro_cfg.get(
+                "guide_obstacle_clearance_m", 0.20)),
+            guide_corridor_min_ratio=float(macro_cfg.get(
+                "guide_corridor_min_ratio", 1.0)),
+            minimum_corridor_score=float(macro_cfg.get(
+                "minimum_corridor_score", 0.45)),
+            symmetric_score_tolerance=float(macro_cfg.get(
+                "symmetric_score_tolerance", 0.03)),
+            preferred_symmetric_side=str(macro_cfg.get(
+                "preferred_symmetric_side", "left")),
+            bypass_goal_weight=float(macro_cfg.get(
+                "bypass_goal_weight", 0.45)),
+            minimum_guide_distance_m=float(macro_cfg.get(
+                "minimum_guide_distance_m", 0.50)),
+            frontier_candidate_limit=int(macro_cfg.get(
+                "frontier_candidate_limit", 8)),
+            frontier_angular_bin_deg=float(macro_cfg.get(
+                "frontier_angular_bin_deg", 10.0)),
+            frontier_standoff_m=float(macro_cfg.get(
+                "frontier_standoff_m", 0.45)),
+            frontier_max_backtrack_m=float(macro_cfg.get(
+                "frontier_max_backtrack_m", 0.20)),
+            frontier_goal_progress_weight=float(macro_cfg.get(
+                "frontier_goal_progress_weight", 1.0)),
+            frontier_information_weight=float(macro_cfg.get(
+                "frontier_information_weight", 0.25)),
+            frontier_yaw_cost_weight=float(macro_cfg.get(
+                "frontier_yaw_cost_weight", 0.10)),
+            frontier_side_commitment_bonus=float(macro_cfg.get(
+                "frontier_side_commitment_bonus", 0.15)),
+            enter_blocked_frames=int(macro_cfg.get(
+                "enter_blocked_frames", 3)),
+            exit_clear_frames=int(macro_cfg.get("exit_clear_frames", 8)),
+            minimum_progress_rate_m_s=float(macro_cfg.get(
+                "minimum_progress_rate_m_s", 0.15)),
+            minimum_commit_time_s=float(macro_cfg.get(
+                "minimum_commit_time_s", 0.8)),
+            active_scan_yaw_rate_rps=float(macro_cfg.get(
+                "active_scan_yaw_rate_rps", 2.0)),
+            active_scan_min_angle_deg=float(macro_cfg.get(
+                "active_scan_min_angle_deg", 15.0)),
+            active_scan_max_duration_s=float(macro_cfg.get(
+                "active_scan_max_duration_s", 2.0)),
+            active_peek_distance_m=float(macro_cfg.get(
+                "active_peek_distance_m", 2.0)),
+            active_peek_safety_radius_m=float(macro_cfg.get(
+                "active_peek_safety_radius_m", 0.55)),
+            vertical_avoidance_enabled=bool(macro_cfg.get(
+                "vertical_avoidance_enabled", False)),
+            vertical_active_perception_enabled=bool(macro_cfg.get(
+                "vertical_active_perception_enabled", False)),
+        )
+        self._macro_expert_config.validate(float(self._depth_cfg["max_m"]))
+        if abs(float(obs_cfg.get("resolution", 0.10)) -
+               self._macro_expert_config.map_resolution_m) > 1.0e-9:
+            raise RuntimeError(
+                "macro_expert.map_resolution_m must match observed_map.resolution")
+        if abs(float(obs_cfg.get("history_seconds", 3.0)) -
+               self._macro_expert_config.map_history_seconds) > 1.0e-9:
+            raise RuntimeError(
+                "macro_expert.map_history_seconds must match observed_map.history_seconds")
+        density_clearances = (
+            self.g.get("scene_generation", {})
+                .get("planner_clearance_by_density", {}))
+        clearance_profiles = [lp_cfg] + list(density_clearances.values())
+        required_body_radius = float(
+            self.g.get("esdf", {}).get("drone_radius", 0.30))
+        required_search_clearance = max([
+            float(value.get("min_clearance", 0.0)) + min(
+                0.15, 0.75 * max(
+                    0.0,
+                    float(value.get("target_clearance", 0.0)) -
+                    float(value.get("min_clearance", 0.0))))
+            for value in clearance_profiles])
+        if (self._macro_expert_config.guide_swept_radius_m + 1.0e-9 <
+                required_body_radius):
+            raise RuntimeError(
+                "macro_expert.guide_swept_radius_m must cover drone_radius "
+                "({:.3f} m)".format(required_body_radius))
+        if (self._macro_expert_config.guide_obstacle_clearance_m + 1.0e-9 <
+                required_search_clearance):
+            raise RuntimeError(
+                "macro_expert.guide_obstacle_clearance_m must cover the "
+                "largest bounded-A* search clearance ({:.3f} m)".format(
+                    required_search_clearance))
+        if (bool(lp_cfg.get("forbid_unknown_space", True)) and
+                self._macro_expert_config.guide_corridor_min_ratio < 1.0):
+            raise RuntimeError(
+                "forbid_unknown_space requires "
+                "macro_expert.guide_corridor_min_ratio=1.0")
+        self._macro_expert = MacroExpert(self._macro_expert_config)
+        self._macro_expert.set_guide_reachability_checker(
+            self._find_reachable_macro_guide_distance)
+        rospy.loginfo(
+            "[Manager] Causal MacroExpert enabled (%.1f Hz macro / %.1f Hz local).",
+            self._macro_expert_config.update_hz,
+            self._macro_expert_config.local_hz)
 
         # ── Phase 3: scene & task generation ────────────────────────
         sg_cfg = self.g.get("scene_generation", {})
@@ -737,8 +840,69 @@ class ILManager:
         # Keep-alive
         self._last_keep_alive = 0.0
 
-    def _init_cpp_planner(self, lp_cfg):
-        """Initialize the C++ local planner with config."""
+    def _find_reachable_macro_guide_distance(
+            self, position_world, velocity_world, direction_world,
+            desired_distance, minimum_distance, distance_step):
+        """Expert-only bounded-A* reachability check for a macro Guide."""
+        if self._cpp_planner is None:
+            return 0.0
+        position = np.asarray(position_world, dtype=np.float64)
+        velocity = np.asarray(velocity_world, dtype=np.float64)
+        direction = np.asarray(direction_world, dtype=np.float64)
+        terminal = position + float(desired_distance) * direction
+        lp_cfg = self.g.get("planning", {}).get("local_planner", {})
+        goal = np.asarray(
+            getattr(self, "_macro_reachability_goal_world", terminal),
+            dtype=np.float64)
+        guide_is_final = bool(np.linalg.norm(terminal - goal) < 1.0e-3)
+        boundary_acceleration = self._compute_planner_boundary_acceleration(
+            measured_acceleration_world=np.asarray(
+                getattr(
+                    self, "_macro_reachability_measured_acceleration_world",
+                    np.zeros(3, dtype=np.float64)),
+                dtype=np.float64),
+            current_position_world=position,
+            current_velocity_world=velocity,
+            guide_position_world=terminal,
+            guide_is_final=guide_is_final,
+            previous_snapshot=self._latest_plan_snapshot,
+            current_time_s=float(getattr(
+                self, "_macro_reachability_time_s", 0.0)),
+            command_lookahead_time_s=float(getattr(
+                self, "_macro_reachability_command_lookahead_s", 0.08)),
+            nominal_speed=float(lp_cfg.get("nominal_speed", 1.8)),
+            max_velocity=float(lp_cfg.get("max_velocity", 2.5)),
+            max_acceleration=float(lp_cfg.get("max_acceleration", 3.5)),
+            lookahead_distance=float(lp_cfg.get("lookahead_distance", 4.0)),
+            goal_tolerance=float(lp_cfg.get("goal_tolerance", 0.3)),
+            max_plan_age_s=float(lp_cfg.get("max_plan_age", 0.75)),
+            ramp_time_s=float(lp_cfg.get(
+                "planner_velocity_ramp_time_s", 1.0)),
+            warm_start_blend=float(lp_cfg.get(
+                "planner_acceleration_warm_start_blend", 0.8)))
+        state = _VehicleState()
+        state.position = position
+        state.velocity = velocity
+        state.acceleration = boundary_acceleration
+        state.yaw = float(getattr(
+            self, "_macro_reachability_yaw", 0.0))
+        state.yaw_rate = float(getattr(
+            self, "_macro_reachability_yaw_rate", 0.0))
+        return float(self._cpp_planner.find_reachable_guide_distance(
+            state,
+            direction,
+            float(desired_distance),
+            float(minimum_distance),
+            float(distance_step),
+            True))
+
+    def _init_cpp_planner(self, lp_cfg, density_tier=None):
+        """Initialize the C++ local planner with config.
+
+        Args:
+            lp_cfg: local_planner config dict from YAML.
+            density_tier: optional density tier name for clearance override.
+        """
         cfg = _LocalPlannerConfig()
         cfg.planner_hz = float(lp_cfg.get("planner_hz", 10.0))
         cfg.horizon_time = float(lp_cfg.get("horizon_time", 2.5))
@@ -766,10 +930,31 @@ class ILManager:
         cfg.max_cost_samples_per_segment = int(
             lp_cfg.get("max_cost_samples_per_segment", 64))
         cfg.seed_trust_radius = float(
-            lp_cfg.get("seed_trust_radius", 0.75))
+            lp_cfg.get("seed_trust_radius", 0.35))
+        cfg.horizontal_avoidance_only = bool(
+            lp_cfg.get("horizontal_avoidance_only", True))
 
         cfg.min_clearance = float(lp_cfg.get("min_clearance", 0.05))
         cfg.target_clearance = float(lp_cfg.get("target_clearance", 0.20))
+
+        # ── Per-density clearance override ───────────────────────
+        if density_tier:
+            clearance_by_density = (
+                self.g.get("scene_generation", {})
+                    .get("planner_clearance_by_density", {}))
+            tier_clearance = clearance_by_density.get(density_tier, {})
+            if tier_clearance:
+                cfg.target_clearance = float(
+                    tier_clearance.get("target_clearance",
+                                       cfg.target_clearance))
+                cfg.min_clearance = float(
+                    tier_clearance.get("min_clearance",
+                                       cfg.min_clearance))
+                rospy.loginfo(
+                    "[Planner] Density tier '%s': target_clearance=%.2f "
+                    "min_clearance=%.2f",
+                    density_tier, cfg.target_clearance, cfg.min_clearance)
+
         cfg.collision_check_spacing = float(lp_cfg.get("collision_check_spacing", 0.05))
 
         cfg.weight_path_length = float(
@@ -1058,6 +1243,177 @@ class ILManager:
             ",".join(str(value) for value in values) + "\n")
         self._local_plans_file.flush()
         self._write_local_plan_points(result)
+
+    # ── Debug mode: per-frame diagnostics ──────────────────────────
+
+    @staticmethod
+    def _traj_point_to_dict(tp):
+        """Convert a C++ TrajectoryPoint to a plain dict."""
+        return {
+            "t": round(float(tp.t), 6),
+            "x": round(float(tp.position[0]), 4),
+            "y": round(float(tp.position[1]), 4),
+            "z": round(float(tp.position[2]), 4),
+            "vx": round(float(tp.velocity[0]), 4),
+            "vy": round(float(tp.velocity[1]), 4),
+            "vz": round(float(tp.velocity[2]), 4),
+            "ax": round(float(tp.acceleration[0]), 4),
+            "ay": round(float(tp.acceleration[1]), 4),
+            "az": round(float(tp.acceleration[2]), 4),
+            "yaw": round(float(tp.yaw), 4),
+            "yaw_rate": round(float(tp.yaw_rate), 4),
+            "clearance": round(float(tp.clearance), 4),
+        }
+
+    def _collect_debug_frame(
+            self, sample_index, frame_id, trajectory_time_s,
+            cur_pos, cur_vel, cur_yaw, cur_yaw_rate,
+            goal_np, goal_pt, guide_sel, decision,
+            result, planner_compute_ms, planner_status_str,
+            plan_success, plan_is_fresh, plan_cache_valid_int,
+            plan_age_s, plan_source_frame_id,
+            terminal_scale_used, planner_retry_count,
+            ref_vel_flu, fb_vel_flu, final_vel_flu, final_yr,
+            sel_actor, recovery_elapsed_s,
+            recovery_azimuth_rad, recovery_last_direction,
+            global_path, guide_progress_index):
+        """Collect one frame of debug diagnostics."""
+        frame = {
+            "sample_index": int(sample_index),
+            "frame_id": int(frame_id),
+            "trajectory_time_s": round(float(trajectory_time_s), 6),
+            # Drone state
+            "state": {
+                "x": round(float(cur_pos[0]), 4),
+                "y": round(float(cur_pos[1]), 4),
+                "z": round(float(cur_pos[2]), 4),
+                "vx": round(float(cur_vel[0]), 4),
+                "vy": round(float(cur_vel[1]), 4),
+                "vz": round(float(cur_vel[2]), 4),
+                "yaw_deg": round(math.degrees(float(cur_yaw)), 2),
+                "yaw_rate": round(float(cur_yaw_rate), 4),
+            },
+            # Goal
+            "goal": {
+                "x": round(float(goal_np[0]), 4),
+                "y": round(float(goal_np[1]), 4),
+                "z": round(float(goal_np[2]), 4),
+                "goal_pt": [round(float(v), 4) for v in goal_pt],
+            },
+            # Guide selection
+            "guide": {
+                "valid": bool(guide_sel.valid),
+                "position": [
+                    round(float(guide_sel.guide_position_world[0]), 4),
+                    round(float(guide_sel.guide_position_world[1]), 4),
+                    round(float(guide_sel.guide_position_world[2]), 4),
+                ],
+                "path_index": int(guide_sel.guide_path_index),
+                "distance_m": round(float(guide_sel.guide_distance_m), 4),
+                "azimuth_deg": round(
+                    math.degrees(float(guide_sel.azimuth_rad)), 2),
+                "elevation_deg": round(
+                    math.degrees(float(guide_sel.elevation_rad)), 2),
+                "is_final": bool(guide_sel.guide_is_final),
+                "selection_mode": str(guide_sel.selection_mode),
+                "candidate_count": int(guide_sel.candidate_count),
+                "rejection_reason": str(guide_sel.rejection_reason),
+                "avoidance_side": int(guide_sel.avoidance_side),
+                "visible": bool(getattr(guide_sel, "visible", False)),
+                "depth_visible": bool(
+                    getattr(guide_sel, "depth_visible", False)),
+                "corridor_known_free_ratio": round(
+                    float(getattr(guide_sel,
+                                  "corridor_known_free_ratio", -1.0)), 4),
+            },
+            # Planning
+            "plan": {
+                "success": bool(plan_success),
+                "is_fresh": bool(plan_is_fresh),
+                "cache_valid": bool(plan_cache_valid_int),
+                "age_s": round(float(plan_age_s), 6),
+                "source_frame_id": int(plan_source_frame_id),
+                "compute_ms": round(float(planner_compute_ms), 3),
+                "status": str(planner_status_str),
+                "retry_count": int(planner_retry_count),
+                "terminal_scale": round(float(terminal_scale_used), 4),
+            },
+            # Planner result details (if available)
+            "plan_result": None,
+            # Decision
+            "decision": {
+                "planner_mode": str(decision.planner_mode),
+                "trend_mode": str(decision.trend_mode),
+                "control_mode": str(decision.control_mode),
+                "guide_source": str(decision.guide_source),
+                "recovery_direction": str(recovery_last_direction),
+                "recovery_azimuth_deg": round(
+                    math.degrees(float(recovery_azimuth_rad)), 2),
+                "selected_actor": str(sel_actor),
+            },
+            # Command
+            "command": {
+                "ref_vx": round(float(ref_vel_flu[0]), 4),
+                "ref_vy": round(float(ref_vel_flu[1]), 4),
+                "ref_vz": round(float(ref_vel_flu[2]), 4),
+                "fb_vx": round(float(fb_vel_flu[0]), 4),
+                "fb_vy": round(float(fb_vel_flu[1]), 4),
+                "fb_vz": round(float(fb_vel_flu[2]), 4),
+                "final_vx": round(float(final_vel_flu[0]), 4),
+                "final_vy": round(float(final_vel_flu[1]), 4),
+                "final_vz": round(float(final_vel_flu[2]), 4),
+                "final_yaw_rate": round(float(final_yr), 4),
+            },
+            # Progress
+            "progress": {
+                "guide_progress_index": int(guide_progress_index),
+                "recovery_elapsed_s": round(float(recovery_elapsed_s), 4),
+            },
+        }
+        # Planner result trajectory
+        if result is not None and hasattr(result, 'trajectory'):
+            traj = result.trajectory
+            if len(traj) > 0:
+                frame["plan_result"] = {
+                    "plan_id": int(getattr(result, 'plan_id', -1)),
+                    "min_clearance": round(
+                        float(getattr(result, 'min_clearance', 0.0)), 4),
+                    "progress_s": round(
+                        float(getattr(result, 'progress_s', 0.0)), 4),
+                    "message": str(getattr(result, 'message', '')),
+                    "trajectory": [
+                        self._traj_point_to_dict(tp) for tp in traj
+                    ],
+                }
+        self._debug_frames.append(frame)
+
+    def _flush_debug_trajectory(self, traj_id, scene_dir):
+        """Write accumulated debug frames to a JSON file."""
+        if not self._debug_frames or self.debug_dir is None:
+            return
+        debug_out_dir = os.path.join(self.debug_dir, scene_dir)
+        try:
+            if not os.path.isdir(debug_out_dir):
+                os.makedirs(debug_out_dir)
+        except OSError:
+            pass
+        json_path = os.path.join(debug_out_dir, traj_id + "_debug.json")
+        try:
+            import json as _json
+            # Use compact separators but keep readability
+            payload = {
+                "traj_id": traj_id,
+                "frame_count": len(self._debug_frames),
+                "frames": self._debug_frames,
+            }
+            with open(json_path, "w", encoding="utf-8") as fh:
+                _json.dump(payload, fh, separators=(",", ":"))
+            rospy.loginfo("[DEBUG] Wrote %d frames → %s",
+                          len(self._debug_frames), json_path)
+        except Exception as exc:
+            rospy.logwarn("[DEBUG] Failed to write debug JSON: %s", exc)
+        finally:
+            self._debug_frames = []
 
     def _close_open_files(self):
         # v11: flush buffered depth images to disk before closing
@@ -2175,7 +2531,7 @@ class ILManager:
     # ═══════════════════════════════════════════════════════════════
 
     def _st_init_local_planner(self):
-        """Initialize C++ local planner with ESDF and global path for current trajectory."""
+        """Initialize the observed-map teacher planner for one episode."""
         plan = self.current_planned[self.traj_idx]
         start = plan["start"]
         init_yaw = self._get_current_initial_yaw()
@@ -2203,6 +2559,14 @@ class ILManager:
 
         if self._cpp_planner is not None:
             try:
+                # ── Per-density planner rebuild ──────────────────
+                density_tier = getattr(
+                    self._current_profile, "density_tier", None)
+                if density_tier:
+                    lp_cfg = self.g.get("planning", {}).get(
+                        "local_planner", {})
+                    self._init_cpp_planner(lp_cfg, density_tier)
+
                 # ── Phase 2: Reset observed map for new episode ──────
                 if self._use_observed_map and self._observed_map is not None:
                     self._observed_map.reset(start)
@@ -2215,6 +2579,8 @@ class ILManager:
                         self.current_esdf,
                         self.current_esdf_origin,
                         float(self.g["esdf"]["resolution"]))
+                if self._macro_expert is not None:
+                    self._macro_expert.reset()
                 if self._dagger_ctrl is not None:
                     episode_seed = ((self.scene_idx & 0xffff) << 16) + self.traj_idx
                     self._dagger_ctrl.reset_episode(episode_seed)
@@ -2225,7 +2591,10 @@ class ILManager:
                 self._guide_progress_index = -1
                 self._consecutive_guide_failures = 0
 
-                # Set ESDF and global path in C++ planner
+                # The schema-v17 local expert receives only the observed ESDF
+                # plus the macro terminal.  The offline global path is kept
+                # for task feasibility/audit files and is never uploaded to
+                # the action-generating local planner.
                 if not self._use_observed_esdf and self.current_esdf is not None:
                     esdf_c = np.ascontiguousarray(
                         self.current_esdf, dtype=np.float32)
@@ -2240,13 +2609,6 @@ class ILManager:
                         return
                     rospy.loginfo("[FSM] Uploaded global ESDF (%s) to C++ planner.",
                                   "×".join(str(d) for d in self.current_esdf.shape))
-                gp_np = np.array(global_path, dtype=np.float64, order='C')
-                ok = self._cpp_planner.set_global_path(gp_np)
-                if not ok:
-                    rospy.logerr("[FSM] Failed to set global path in C++ planner")
-                    self._enter_state(State.ERROR)
-                    return
-
                 # ── Build the planner's pre-recording reset state ──
                 # The warmed Flightmare rigid-body state is restored to this
                 # same task start below, before any frame is recorded.
@@ -2375,6 +2737,7 @@ class ILManager:
         self._emergency_hold_count = 0
         self._planning_times_ms = []
         self._executed_clearances = []
+        self._debug_frames = []  # debug per-frame data
         self._trajectory_exit_reason = "running"
         self._trajectory_reached_goal = False
         self._final_executed_position = None
@@ -2425,7 +2788,9 @@ class ILManager:
         online_rt = self.g.get("online_runtime", {})
         label_lookahead_time_s = float(data_cfg.get("label_lookahead_time_s", 0.08))
         max_guide_range = float(
-            self._guide_selector.explorer_usable_range_m)
+            self._macro_expert_config.effective_guide_range_m)
+        macro_interval_frames = max(
+            1, int(round(rec_hz / self._macro_expert_config.update_hz)))
 
         lp_cfg = self.g.get("planning", {}).get("local_planner", {})
         nominal_speed = float(lp_cfg.get("nominal_speed", 1.8))
@@ -2475,7 +2840,7 @@ class ILManager:
         v_bin_edges = np.linspace(-v_fov_rad / 2.0, v_fov_rad / 2.0, trend_v_bins)
 
         # ── Build dynamic field list with 13-class soft label columns ──
-        schema_fields = list(self.DATA_SCHEMA_V16_FIELDS)
+        schema_fields = list(self.DATA_SCHEMA_V17_FIELDS)
         # Insert soft label columns before depth_file
         depth_idx = schema_fields.index("depth_file")
         azi_soft_names = []
@@ -2571,6 +2936,12 @@ class ILManager:
         previous_command_velocity_flu = np.zeros(3, dtype=np.float64)
         previous_command_yaw_rate = 0.0
         previous_guide_mode = None
+        current_macro_guide = None
+        macro_update_int = 0
+        local_feedback_feasible = True
+        local_feedback_blocked = False
+        local_progress_rate = float(nominal_speed)
+        last_macro_goal_distance = float(np.linalg.norm(goal_np - cur_pos))
 
         # ── v11: online runtime state ────────────────────────────────
         # v13: planner runs every record tick (30 Hz = record rate)
@@ -2590,6 +2961,11 @@ class ILManager:
         recovery_max_steps = int(rec_cfg.get(
             "maximum_recovery_control_steps", 90))
         recovery_tie_break = str(rec_cfg.get("tie_break_direction", "right"))
+        active_scan_cfg = online_rt.get("active_scan", {})
+        active_scan_max_duration_s = float(active_scan_cfg.get(
+            "maximum_duration_s", 8.0))
+        active_scan_max_steps = int(active_scan_cfg.get(
+            "maximum_control_steps", 240))
 
         # v11: cached plan state
         self._latest_plan_snapshot = None  # LocalPlanSnapshot or None
@@ -2604,11 +2980,14 @@ class ILManager:
         recovery_target_world = np.zeros(3, dtype=np.float64)
         recovery_target_path_index = -1
         recovery_azimuth_rad = 0.0  # v11 FIX: computed from atan2, used for yaw-rate
+        active_scan_elapsed_s = 0.0
+        active_scan_step_count = 0
 
         # v11: episode stats
         self._fresh_plan_frame_count = 0
         self._cached_plan_frame_count = 0
         self._recovery_frame_count = 0
+        self._active_scan_frame_count = 0
         self._planner_attempt_count = 0
         self._planner_success_count = 0
         self._planner_failure_count = 0
@@ -2619,6 +2998,7 @@ class ILManager:
         self._recovery_entry_count = 0
         self._recovery_success_count = 0
         self._recovery_timeout_count = 0
+        self._active_scan_timeout_count = 0
         self._max_plan_age_s = 0.0
         self._max_guide_cache_age_s = 0.0
         self._recover_left_frame_count = 0
@@ -2751,10 +3131,9 @@ class ILManager:
                         (map_revision % self._observed_esdf.rebuild_every_n_frames == 0 or
                          not self._observed_esdf.is_built())):
                     t_esdf_start = time.monotonic()
-                    occ = self._observed_map.get_occupancy()
-                    known = self._observed_map.get_known_mask()
+                    occ = self._observed_map.get_occupancy(copy=False)
                     self._observed_esdf.rebuild(
-                        occ, known,
+                        occ, None,
                         self._observed_map.get_origin(),
                         self._observed_map.get_resolution())
                     if self._observed_esdf_cache is not None:
@@ -2763,6 +3142,22 @@ class ILManager:
                             self._observed_esdf.get_known_mask(),
                             self._observed_esdf.get_origin(),
                             self._observed_esdf.get_resolution())
+                    if self._use_observed_esdf and self._cpp_planner is not None:
+                        uploaded = self._cpp_planner.set_observed_esdf(
+                            np.ascontiguousarray(
+                                self._observed_esdf.get_esdf(),
+                                dtype=np.float32),
+                            np.ascontiguousarray(
+                                self._observed_esdf.get_known_mask(),
+                                dtype=np.uint8),
+                            np.asarray(
+                                self._observed_esdf.get_origin(),
+                                dtype=np.float64),
+                            float(self._observed_esdf.get_resolution()),
+                            False)
+                        if not uploaded:
+                            raise RuntimeError(
+                                "failed to upload observed ESDF to local planner")
                     t_esdf_ms = (time.monotonic() - t_esdf_start) * 1000.0
 
                 if (self._obs_auditor is not None and
@@ -2784,9 +3179,9 @@ class ILManager:
                     if observability_result.side_choice_consistent:
                         self._observability_consistent_count += 1
 
-            # Select Guide/Terminal from the current depth frame regardless of
-            # whether observed occupancy fusion is enabled. The quaternion is
-            # used for the full world-to-camera FLU transform.
+            # Schema-v17 MacroExpert owns Guide/Terminal selection.  The
+            # legacy GuideSelection object remains only as an adapter for the
+            # existing local-planner and diagnostic code below.
             if goal_hold_active:
                 # Terminal HOLD owns the vehicle once goal tolerance has been
                 # entered.  Do not ask GuideSelector for a direction that may
@@ -2799,19 +3194,209 @@ class ILManager:
                 guide_sel.guide_is_final = True
                 guide_sel.selection_mode = "goal_tolerance_hold"
                 self._consecutive_guide_failures = 0
-            elif self._guide_selector is not None:
+                macro_update_int = int(sample_index % macro_interval_frames == 0)
+                current_macro_guide = self._macro_expert.update(
+                    np.array([1.0, 0.0, 0.0]), 0.0, depth_m,
+                    self._observed_map, cur_pos, float(cur_yaw),
+                    dynamics_state.quaternion_world_body, cur_vel,
+                    local_blocked=False, local_progress_rate=0.0,
+                    local_feasible=True,
+                    dt_since_last_macro=macro_interval_frames * dt_sample)
+            elif self._macro_expert is not None:
                 t_guide_start = time.monotonic()
-                guide_sel = self._guide_selector.select(
-                    global_path, self._guide_progress_index,
-                    cur_pos, float(cur_yaw), cur_vel, depth_m,
-                    self._observed_map, self._observed_esdf,
-                    dynamics_state.quaternion_world_body,
-                    goal_position_world=goal_np)
+                current_goal_delta_world = goal_np - cur_pos
+                current_goal_distance = float(np.linalg.norm(
+                    current_goal_delta_world))
+                if current_goal_distance > 1.0e-9:
+                    current_goal_direction_flu = \
+                        world_vector_to_body_flu_quat(
+                            current_goal_delta_world,
+                            dynamics_state.quaternion_world_body)
+                    current_goal_direction_flu /= max(
+                        np.linalg.norm(current_goal_direction_flu), 1.0e-9)
+                else:
+                    current_goal_direction_flu = np.array(
+                        [1.0, 0.0, 0.0], dtype=np.float64)
+
+                macro_update_int = int(
+                    current_macro_guide is None or
+                    sample_index % macro_interval_frames == 0)
+                if macro_update_int:
+                    local_progress_rate = max(
+                        -max_velocity,
+                        min(max_velocity,
+                            (last_macro_goal_distance -
+                             current_goal_distance) /
+                            max(dt_sample * macro_interval_frames, 1.0e-6)))
+                    # Give the C++ macro reachability query the current state;
+                    # velocity affects bounded-A* expansion ordering. The
+                    # formal 30 Hz trajectory request below owns dynamics.
+                    self._macro_reachability_measured_acceleration_world = \
+                        np.asarray(
+                            filtered_planner_acceleration,
+                            dtype=np.float64).copy()
+                    self._macro_reachability_yaw = float(cur_yaw)
+                    self._macro_reachability_yaw_rate = float(
+                        dynamics_state.angular_velocity_body[2])
+                    self._macro_reachability_goal_world = goal_np.copy()
+                    self._macro_reachability_time_s = (
+                        sample_index * dt_sample)
+                    self._macro_reachability_command_lookahead_s = float(
+                        command_lookahead_time)
+                    current_macro_guide = self._macro_expert.update(
+                        current_goal_direction_flu,
+                        current_goal_distance,
+                        depth_m,
+                        self._observed_map,
+                        cur_pos,
+                        float(cur_yaw),
+                        dynamics_state.quaternion_world_body,
+                        cur_vel,
+                        local_blocked=local_feedback_blocked,
+                        local_progress_rate=local_progress_rate,
+                        local_feasible=local_feedback_feasible,
+                        dt_since_last_macro=(
+                            macro_interval_frames * dt_sample))
+                    last_macro_goal_distance = current_goal_distance
+                else:
+                    held = self._macro_expert.get_held_guide_flu(
+                        cur_pos, dynamics_state.quaternion_world_body)
+                    if held is None:
+                        raise RuntimeError("MacroExpert has no held guide")
+                    current_macro_guide = MacroGuide(
+                        valid=True,
+                        move_direction_flu=np.asarray(
+                            held["move_direction_flu"], dtype=np.float64),
+                        move_distance_m=float(held["move_distance_m"]),
+                        move_distance_norm=float(
+                            held["move_distance_norm"]),
+                        yaw_direction_flu_xy=np.asarray(
+                            held["yaw_direction_flu_xy"], dtype=np.float64),
+                        move_target_world=np.asarray(
+                            held["move_target_world"], dtype=np.float64),
+                        look_target_world=np.asarray(
+                            held["look_target_world"], dtype=np.float64),
+                        macro_state=str(held["macro_state"]),
+                        committed_side=int(held["committed_side"]),
+                        decision_reason="held_5hz_intent",
+                        macro_map_revision=(
+                            self._observed_map.get_revision()
+                            if self._observed_map is not None else 0),
+                        macro_known_free_count=(
+                            self._observed_map.free_voxel_count()
+                            if self._observed_map is not None else 0),
+                        macro_occupied_count=(
+                            self._observed_map.occupied_voxel_count()
+                            if self._observed_map is not None else 0),
+                        macro_unknown_count=(
+                            int(np.prod(
+                                self._observed_map.get_occupancy().shape)) -
+                            self._observed_map.known_voxel_count()
+                            if self._observed_map is not None else 0),
+                        frontier_candidate_count=int(
+                            held.get("frontier_candidate_count", 0)))
+
+                move_direction = current_macro_guide.move_direction_flu
+                move_distance = current_macro_guide.move_distance_m
+                macro_state = current_macro_guide.macro_state
+                is_scan = macro_state in (
+                    MacroState.ACTIVE_SCAN_LEFT.value,
+                    MacroState.ACTIVE_SCAN_RIGHT.value)
+                is_hold = macro_state == MacroState.GOAL_HOLD.value
+                guide_sel.valid = bool(
+                    current_macro_guide.valid and
+                    move_distance > 0.05 and not is_scan and not is_hold)
+                guide_sel.guide_position_world = \
+                    current_macro_guide.move_target_world.copy()
+                guide_sel.terminal_position_world = \
+                    current_macro_guide.move_target_world.copy()
+                guide_sel.guide_direction_flu = move_direction.copy()
+                guide_sel.guide_distance_m = float(move_distance)
+                guide_sel.guide_distance_norm = float(
+                    current_macro_guide.move_distance_norm)
+                guide_sel.terminal_distance_m = float(move_distance)
+                guide_sel.azimuth_rad = math.atan2(
+                    float(move_direction[1]), float(move_direction[0]))
+                guide_sel.elevation_rad = math.atan2(
+                    float(move_direction[2]),
+                    max(1.0e-9, float(np.linalg.norm(
+                        move_direction[:2]))))
+                guide_sel.guide_is_final = bool(
+                    np.linalg.norm(
+                        current_macro_guide.move_target_world - goal_np) <
+                    1.0e-3)
+                guide_sel.guide_path_index = (
+                    len(global_path) - 1 if guide_sel.guide_is_final else -1)
+                guide_sel.terminal_path_index = guide_sel.guide_path_index
+                guide_sel.progress_path_index = self._guide_progress_index
+                # Latest-FOV visibility is diagnostic only.  Macro endpoints
+                # are selected from the rolling map and may legitimately be
+                # known from an earlier frame even when this flag is false.
+                guide_in_latest_fov = False
+                guide_depth_visible = False
+                if guide_sel.valid and self._camera_model is not None:
+                    forward = float(move_direction[0])
+                    horizontal_angle = math.atan2(
+                        float(move_direction[1]), forward)
+                    elevation_angle = math.atan2(
+                        float(move_direction[2]),
+                        max(1.0e-9, float(np.linalg.norm(
+                            move_direction[:2]))))
+                    selector_cfg = self.g.get("guide_selector", {})
+                    h_margin = math.radians(float(selector_cfg.get(
+                        "horizontal_fov_margin_deg", 3.0)))
+                    v_margin = math.radians(float(selector_cfg.get(
+                        "vertical_fov_margin_deg", 3.0)))
+                    guide_in_latest_fov = bool(
+                        forward > 1.0e-6 and
+                        abs(horizontal_angle) <=
+                        self._camera_model.hfov / 2.0 - h_margin and
+                        abs(elevation_angle) <=
+                        self._camera_model.vfov / 2.0 - v_margin)
+                    if guide_in_latest_fov and depth_m is not None:
+                        # depth_m has already been vertically flipped by the
+                        # collector. FLU [f,l,u] projects to flipped-image
+                        # [col,row] = [cx-fx*l/f, cy+fy*u/f].
+                        col = int(round(
+                            self._camera_model.cx -
+                            self._camera_model.fx *
+                            float(move_direction[1]) / forward))
+                        row_px = int(round(
+                            self._camera_model.cy +
+                            self._camera_model.fy *
+                            float(move_direction[2]) / forward))
+                        height, width = depth_m.shape
+                        if 0 <= col < width and 0 <= row_px < height:
+                            r0, r1 = max(0, row_px - 1), min(height, row_px + 2)
+                            c0, c1 = max(0, col - 1), min(width, col + 2)
+                            patch_depth = np.asarray(
+                                depth_m[r0:r1, c0:c1], dtype=np.float64)
+                            valid_depth = patch_depth[
+                                np.isfinite(patch_depth) & (patch_depth > 0.0)]
+                            required_z_depth = forward * float(move_distance)
+                            guide_depth_visible = bool(
+                                valid_depth.size > 0 and
+                                float(np.median(valid_depth)) + 0.05 >=
+                                required_z_depth)
+                guide_sel.visible = guide_in_latest_fov
+                guide_sel.depth_visible = guide_depth_visible
+                guide_sel.corridor_check_enabled = True
+                guide_sel.corridor_known_free_ratio = (
+                    1.0 if guide_sel.valid else -1.0)
+                guide_sel.selection_mode = "macro_" + macro_state.lower()
+                guide_sel.avoidance_side = int(
+                    current_macro_guide.committed_side)
+                guide_sel.candidate_count = int(
+                    current_macro_guide.frontier_candidate_count)
+                if is_scan:
+                    guide_sel.recovery_target_valid = True
+                    guide_sel.recovery_target_world = \
+                        current_macro_guide.look_target_world.copy()
+                    guide_sel.rejection_reason = "macro_active_scan"
+                elif not guide_sel.valid:
+                    guide_sel.rejection_reason = "macro_zero_move_intent"
                 t_guide_ms = (time.monotonic() - t_guide_start) * 1000.0
                 if guide_sel.valid:
-                    self._guide_progress_index = max(
-                        self._guide_progress_index,
-                        guide_sel.progress_path_index)
                     self._consecutive_guide_failures = 0
                 else:
                     self._consecutive_guide_failures += 1
@@ -2848,9 +3433,10 @@ class ILManager:
             plan_success = False
             planner_compute_ms = 0.0
             planner_status_str = "NO_PLAN"
-            planner_used_obs = 0
+            planner_used_obs = int(self._use_observed_esdf)
             planner_used_fallback = 0
             plan_is_fresh = 0
+
             plan_cache_valid_int = 0
             plan_age_s = 0.0
             plan_source_frame_id = -1
@@ -2872,12 +3458,15 @@ class ILManager:
                     self._guide_progress_index = max(
                         self._guide_progress_index, prog_idx)
 
-                # v11: Guide visible → plan trajectory; not visible → recovery (no plan needed)
+                # Teacher-only trajectory planner: convert the current
+                # complete macro guide into a collision-free, dynamically
+                # feasible trajectory.  This trajectory is never exposed to
+                # either student branch.
                 if guide_sel.valid:
                     planner_attempted_int = 1
                     self._planner_attempt_count += 1
                     self._total_replans += 1
-                    # ── Normal: visible Guide → plan trajectory ──────
+                    # ── Complete guide → full teacher trajectory ──────
                     # Trend and Control use the exact same target. A planning
                     # failure is a label failure; never shorten the target to
                     # manufacture a different successful action.
@@ -2948,9 +3537,21 @@ class ILManager:
                                 float(scaled_terminal[1]),
                                 float(scaled_terminal[2]))
                             req.trajectory_terminal_index = scaled_terminal_idx
+                            macro_look_world = (
+                                current_macro_guide.look_target_world -
+                                cur_pos)
+                            req.has_target_yaw = bool(
+                                np.linalg.norm(macro_look_world[:2]) >
+                                1.0e-6)
+                            req.target_yaw = (
+                                math.atan2(
+                                    float(macro_look_world[1]),
+                                    float(macro_look_world[0]))
+                                if req.has_target_yaw else float(cur_yaw))
                             # reference_path_segment is NOT populated —
                             # the local planner uses straight-line initialization
-                            req.forbid_unknown_space = False
+                            req.forbid_unknown_space = bool(
+                                lp_cfg.get("forbid_unknown_space", True))
                             req.allow_global_map_fallback = False
                             result = self._cpp_planner.plan_local_with_request(req)
 
@@ -3052,11 +3653,58 @@ class ILManager:
                     else:
                         self._failed_replans += 1
                         self._planner_failure_count += 1
+                        # The held 5 Hz Guide may become infeasible as the
+                        # finite-history observed map changes between macro
+                        # ticks. Replace MOVE and Control together on this
+                        # frame, preserving a valid causal supervision pair
+                        # instead of aborting the complete episode.
+                        current_macro_guide = \
+                            self._macro_expert.force_active_scan(
+                                current_goal_direction_flu,
+                                current_goal_distance,
+                                self._observed_map,
+                                cur_pos,
+                                dynamics_state.quaternion_world_body)
+                        macro_state = current_macro_guide.macro_state
+                        is_scan = True
+                        guide_sel.valid = False
+                        guide_sel.visible = False
+                        guide_sel.depth_visible = False
+                        guide_sel.guide_position_world = \
+                            current_macro_guide.move_target_world.copy()
+                        guide_sel.terminal_position_world = \
+                            current_macro_guide.move_target_world.copy()
+                        guide_sel.guide_direction_flu = \
+                            current_macro_guide.move_direction_flu.copy()
+                        guide_sel.guide_distance_m = 0.0
+                        guide_sel.guide_distance_norm = 0.0
+                        guide_sel.terminal_distance_m = 0.0
+                        guide_sel.azimuth_rad = 0.0
+                        guide_sel.elevation_rad = 0.0
+                        guide_sel.guide_is_final = False
+                        guide_sel.guide_path_index = -1
+                        guide_sel.terminal_path_index = -1
+                        guide_sel.selection_mode = \
+                            "macro_" + macro_state.lower()
+                        guide_sel.candidate_count = 0
+                        guide_sel.corridor_known_free_ratio = -1.0
+                        guide_sel.avoidance_side = int(
+                            current_macro_guide.committed_side)
+                        guide_sel.recovery_target_valid = True
+                        guide_sel.recovery_target_world = \
+                            current_macro_guide.look_target_world.copy()
+                        recovery_target_world = \
+                            guide_sel.recovery_target_world.copy()
+                        recovery_target_path_index = \
+                            self._guide_progress_index
+                        guide_sel.rejection_reason = \
+                            "local_plan_rejected_active_scan"
+                        self._consecutive_guide_failures += 1
                 else:
-                    # ── Recovery: no visible guide → rotate in place, NO planner call ──
-                    # During an active avoidance commitment, keep exploring
-                    # toward that side.  Otherwise rotate toward the mission
-                    # goal.  No trajectory is labelled from this state.
+                    # No translational Guide: intentional active perception
+                    # or generic recovery rotates in place without a planner
+                    # call. During an avoidance commitment, keep exploring
+                    # toward that side; otherwise face the mission goal.
                     if guide_sel.recovery_target_valid:
                         recovery_target_world = \
                             guide_sel.recovery_target_world.copy()
@@ -3065,7 +3713,8 @@ class ILManager:
                     else:
                         recovery_target_world = goal_np.copy()
                         recovery_target_path_index = len(global_path) - 1
-                    planner_status_str = "RECOVERY_NO_GUIDE"
+                    planner_status_str = (
+                        "ACTIVE_SCAN" if is_scan else "RECOVERY_NO_GUIDE")
                     rospy.logwarn_throttle(
                         1.0,
                         "[GUIDE] unavailable: frame=%d reason=%s "
@@ -3090,19 +3739,31 @@ class ILManager:
                 planner_mode = PlannerMode.GOAL_HOLD
                 recovery_elapsed_s = 0.0
                 recovery_step_count = 0
+                active_scan_elapsed_s = 0.0
+                active_scan_step_count = 0
                 recovery_last_direction = ""
                 recovery_azimuth_rad = 0.0
                 recovery_target_world = goal_np.copy()
                 recovery_target_path_index = len(global_path) - 1
             elif guide_sel.valid and plan_is_fresh:
                 planner_mode = PlannerMode.FRESH_PLAN
+                active_scan_elapsed_s = 0.0
+                active_scan_step_count = 0
             elif guide_sel.valid:
                 # A visible Guide requires a fresh Control label generated
                 # from that exact Guide on this frame. Cached trajectories and
                 # RECOVERY actions are not substitute labels.
                 planner_mode = PlannerMode.ABORT
+                active_scan_elapsed_s = 0.0
+                active_scan_step_count = 0
+            elif is_scan:
+                planner_mode = PlannerMode.ACTIVE_SCAN
+                recovery_elapsed_s = 0.0
+                recovery_step_count = 0
             elif recovery_enabled:
                 planner_mode = PlannerMode.RECOVERY
+                active_scan_elapsed_s = 0.0
+                active_scan_step_count = 0
                 if previous_planner_mode != PlannerMode.RECOVERY:
                     self._recovery_entry_count += 1
                     recovery_elapsed_s = 0.0
@@ -3121,10 +3782,21 @@ class ILManager:
             plan_success = bool(
                 plan_is_fresh and planner_mode == PlannerMode.FRESH_PLAN)
 
+            # Feed the completed 30 Hz planning result into the next 5 Hz
+            # macro update.  ACTIVE_SCAN / GOAL_HOLD are intentional
+            # zero-translation modes and therefore are not local failures.
+            if guide_sel.valid:
+                local_feedback_feasible = plan_success
+                local_feedback_blocked = not plan_success
+            else:
+                local_feedback_feasible = True
+                local_feedback_blocked = False
+
             # Trend is a perception label: it follows current Guide
             # visibility, independently of whether the local optimizer found
             # a Control trajectory on this tick.
             recovery_timed_out = False
+            active_scan_timed_out = False
             trend_mode = (
                 TrendMode.GOAL_HOLD
                 if goal_hold_active else (
@@ -3132,7 +3804,8 @@ class ILManager:
                     if guide_sel.valid else TrendMode.RECOVERY))
             if planner_mode == PlannerMode.GOAL_HOLD:
                 control_mode = ControlMode.HOLD_POSITION
-            elif planner_mode == PlannerMode.RECOVERY:
+            elif planner_mode in (
+                    PlannerMode.ACTIVE_SCAN, PlannerMode.RECOVERY):
                 control_mode = ControlMode.ROTATE_IN_PLACE
                 # v12: compute recovery direction BEFORE row build
                 # so Trend label and yaw-rate use the same azimuth
@@ -3154,6 +3827,11 @@ class ILManager:
                 planner_mode == PlannerMode.RECOVERY and
                 (recovery_elapsed_s + dt_sample >= recovery_max_duration_s or
                  recovery_step_count + 1 >= recovery_max_steps))
+            active_scan_timeout_pending = (
+                planner_mode == PlannerMode.ACTIVE_SCAN and
+                (active_scan_elapsed_s + dt_sample >=
+                 active_scan_max_duration_s or
+                 active_scan_step_count + 1 >= active_scan_max_steps))
             tracking_cmd = None
             if (self._latest_plan_snapshot is not None and
                     planner_mode in (PlannerMode.FRESH_PLAN, PlannerMode.CACHED_PLAN)):
@@ -3170,12 +3848,25 @@ class ILManager:
                 final_yr = 0.0
                 traj_sample_t = -1.0
                 sel_actor = "goal_hold"
-            elif planner_mode == PlannerMode.RECOVERY:
+            elif planner_mode in (
+                    PlannerMode.ACTIVE_SCAN, PlannerMode.RECOVERY):
                 # Apply the angular deadband to the action as well as the
                 # left/right label hysteresis.  Without this, a small positive
                 # azimuth can retain a RIGHT label while commanding left yaw.
                 if abs(recovery_azimuth_rad) <= recovery_yaw_deadband:
                     recovery_yaw_rate = 0.0
+                elif planner_mode == PlannerMode.ACTIVE_SCAN:
+                    # ACTIVE_SCAN is a deliberate constant-rate perception
+                    # action.  Do not feed its short body-relative look target
+                    # through the recovery P controller: with the default
+                    # 15-degree target that would cap the command at only
+                    # 0.393 rad/s and leave active_scan_yaw_rate_rps unused.
+                    active_scan_yaw_rate = min(
+                        max_yaw_rate,
+                        recovery_max_yaw_rate,
+                        self._macro_expert_config.active_scan_yaw_rate_rps)
+                    recovery_yaw_rate = math.copysign(
+                        active_scan_yaw_rate, recovery_azimuth_rad)
                 else:
                     recovery_yaw_rate = max(
                         -recovery_max_yaw_rate,
@@ -3184,12 +3875,23 @@ class ILManager:
                 ref_vel_flu = np.zeros(3, dtype=np.float64)
                 fb_vel_flu = np.zeros(3, dtype=np.float64)
                 final_vel_flu = np.zeros(3, dtype=np.float64)
+                scan_or_recovery_timeout = (
+                    active_scan_timeout_pending
+                    if planner_mode == PlannerMode.ACTIVE_SCAN
+                    else recovery_timeout_pending)
                 final_yr = (
-                    0.0 if recovery_timeout_pending else recovery_yaw_rate)
+                    0.0 if scan_or_recovery_timeout else recovery_yaw_rate)
                 traj_sample_t = -1.0
-                sel_actor = (
-                    "recovery_timeout_stop"
-                    if recovery_timeout_pending else "recovery_controller")
+                if scan_or_recovery_timeout:
+                    sel_actor = (
+                        "active_scan_timeout_stop"
+                        if planner_mode == PlannerMode.ACTIVE_SCAN
+                        else "recovery_timeout_stop")
+                else:
+                    sel_actor = (
+                        "active_scan_controller"
+                        if planner_mode == PlannerMode.ACTIVE_SCAN
+                        else "recovery_controller")
             elif tracking_cmd is not None and tracking_cmd.get("valid"):
                 ref_vel_flu = tracking_cmd["reference_velocity_flu"].copy()
                 fb_vel_flu = tracking_cmd["feedback_velocity_flu"].copy()
@@ -3214,8 +3916,53 @@ class ILManager:
                     planner_mode=planner_mode.value,
                     trend_mode=trend_mode.value,
                     control_mode=control_mode.value,
+                    macro_update=int(macro_update_int),
+                    macro_label_valid=int(current_macro_guide.valid),
+                    macro_mode=str(current_macro_guide.macro_state),
+                    macro_committed_side=int(
+                        current_macro_guide.committed_side),
+                    macro_move_dir_x_flu=float(
+                        current_macro_guide.move_direction_flu[0]),
+                    macro_move_dir_y_flu=float(
+                        current_macro_guide.move_direction_flu[1]),
+                    macro_move_dir_z_flu=float(
+                        current_macro_guide.move_direction_flu[2]),
+                    macro_move_distance_m=float(
+                        current_macro_guide.move_distance_m),
+                    macro_move_distance_norm=float(
+                        current_macro_guide.move_distance_norm),
+                    macro_yaw_dir_x_flu=float(
+                        current_macro_guide.yaw_direction_flu_xy[0]),
+                    macro_yaw_dir_y_flu=float(
+                        current_macro_guide.yaw_direction_flu_xy[1]),
+                    macro_target_x_world=float(
+                        current_macro_guide.move_target_world[0]),
+                    macro_target_y_world=float(
+                        current_macro_guide.move_target_world[1]),
+                    macro_target_z_world=float(
+                        current_macro_guide.move_target_world[2]),
+                    macro_look_target_x_world=float(
+                        current_macro_guide.look_target_world[0]),
+                    macro_look_target_y_world=float(
+                        current_macro_guide.look_target_world[1]),
+                    macro_look_target_z_world=float(
+                        current_macro_guide.look_target_world[2]),
+                    macro_decision_reason=str(
+                        current_macro_guide.decision_reason),
+                    local_feasible=int(local_feedback_feasible),
+                    local_progress_rate=float(local_progress_rate),
+                    local_blocked_reason=(
+                        "planner_rejected" if local_feedback_blocked else ""),
+                    macro_map_revision=int(
+                        current_macro_guide.macro_map_revision),
+                    macro_known_free_count=int(
+                        current_macro_guide.macro_known_free_count),
+                    macro_occupied_count=int(
+                        current_macro_guide.macro_occupied_count),
+                    macro_unknown_count=int(
+                        current_macro_guide.macro_unknown_count),
                     guide_source=(
-                        "current_depth_goal_explorer"
+                        "causal_macro_expert"
                         if guide_sel.valid
                         else (
                             "recovery_explore_direction"
@@ -3271,6 +4018,53 @@ class ILManager:
                 recovery_elapsed_s,
                 self._guide_progress_index, global_path,
             )
+            if current_macro_guide is None:
+                raise RuntimeError("missing schema-v17 macro guide")
+            row["macro_update"] = int(macro_update_int)
+            row["macro_label_valid"] = int(current_macro_guide.valid)
+            row["macro_mode"] = str(current_macro_guide.macro_state)
+            row["macro_committed_side"] = int(
+                current_macro_guide.committed_side)
+            row["macro_move_dir_x_flu"] = round(float(
+                current_macro_guide.move_direction_flu[0]), 6)
+            row["macro_move_dir_y_flu"] = round(float(
+                current_macro_guide.move_direction_flu[1]), 6)
+            row["macro_move_dir_z_flu"] = round(float(
+                current_macro_guide.move_direction_flu[2]), 6)
+            row["macro_move_distance_m"] = round(float(
+                current_macro_guide.move_distance_m), 6)
+            row["macro_move_distance_norm"] = round(float(
+                current_macro_guide.move_distance_norm), 6)
+            row["macro_yaw_dir_x_flu"] = round(float(
+                current_macro_guide.yaw_direction_flu_xy[0]), 6)
+            row["macro_yaw_dir_y_flu"] = round(float(
+                current_macro_guide.yaw_direction_flu_xy[1]), 6)
+            for axis_index, axis_name in enumerate(("x", "y", "z")):
+                row["macro_target_{}_world".format(axis_name)] = round(
+                    float(current_macro_guide.move_target_world[axis_index]), 6)
+                row["macro_look_target_{}_world".format(axis_name)] = round(
+                    float(current_macro_guide.look_target_world[axis_index]), 6)
+            row["macro_decision_reason"] = str(
+                current_macro_guide.decision_reason)
+            row["local_feasible"] = int(local_feedback_feasible)
+            row["local_progress_rate"] = round(
+                float(local_progress_rate), 6)
+            row["local_blocked_reason"] = (
+                "planner_rejected" if local_feedback_blocked else "")
+            row["macro_map_revision"] = int(
+                current_macro_guide.macro_map_revision)
+            row["macro_known_free_count"] = int(
+                current_macro_guide.macro_known_free_count)
+            row["macro_occupied_count"] = int(
+                current_macro_guide.macro_occupied_count)
+            row["macro_unknown_count"] = int(
+                current_macro_guide.macro_unknown_count)
+            row["planner_used_observed_esdf"] = int(
+                self._use_observed_esdf)
+            row["planner_map_source"] = (
+                "observed_esdf" if self._use_observed_esdf
+                else "global_esdf")
+            row["planner_unknown_is_free"] = 0
             if result is not None and planner_attempted_int:
                 # The row builder normally reads the successful immutable
                 # snapshot. For a rejected request, use the current result
@@ -3423,10 +4217,28 @@ class ILManager:
                 "final_executed_actor": decision.selected_actor,
             })
 
+            # ── Debug: collect per-frame diagnostics ──────────────
+            if self.debug and self.debug_dir is not None:
+                cur_yaw_rate = float(
+                    dynamics_state.angular_velocity_body[2])
+                self._collect_debug_frame(
+                    sample_index, frame_id, trajectory_time_s,
+                    cur_pos, cur_vel, cur_yaw, cur_yaw_rate,
+                    goal_np, goal_pt, guide_sel, decision,
+                    result, planner_compute_ms, planner_status_str,
+                    plan_success, plan_is_fresh, plan_cache_valid_int,
+                    plan_age_s, plan_source_frame_id,
+                    terminal_scale_used, planner_retry_count,
+                    ref_vel_flu, fb_vel_flu, final_vel_flu, final_yr,
+                    sel_actor, recovery_elapsed_s,
+                    recovery_azimuth_rad, recovery_last_direction,
+                    global_path, self._guide_progress_index)
+
             # ── Step 5: Execute dt_sample to advance to x_(t+1) ──────
             # ── Step 5: Execute dt_sample (v11: recovery / trajectory / hover) ──
-            if planner_mode == PlannerMode.RECOVERY:
-                # Recovery: zero translation + yaw rotation toward recovery target
+            if planner_mode in (
+                    PlannerMode.ACTIVE_SCAN, PlannerMode.RECOVERY):
+                # Active perception/recovery: zero translation + yaw rotation.
                 # (trend_mode, control_mode, recovery_direction, yaw-rate already set
                 #  in RuntimeDecision before row construction)
 
@@ -3441,18 +4253,35 @@ class ILManager:
                         max_velocity, max_acceleration, max_yaw_rate,
                         decision.selected_actor)
 
-                recovery_elapsed_s += dt_sample
-                recovery_step_count += 1
-                row["recovery_elapsed_s"] = round(recovery_elapsed_s, 6)
-                self._recovery_frame_count += 1
+                if planner_mode == PlannerMode.ACTIVE_SCAN:
+                    active_scan_elapsed_s += dt_sample
+                    active_scan_step_count += 1
+                    row["recovery_elapsed_s"] = 0.0
+                    self._active_scan_frame_count += 1
+                else:
+                    recovery_elapsed_s += dt_sample
+                    recovery_step_count += 1
+                    row["recovery_elapsed_s"] = round(
+                        recovery_elapsed_s, 6)
+                    self._recovery_frame_count += 1
                 if decision.recovery_direction == "left":
                     self._recover_left_frame_count += 1
                 else:
                     self._recover_right_frame_count += 1
 
-                # v11 FIX: check recovery timeout (timers accumulate across ticks)
-                if (recovery_elapsed_s >= recovery_max_duration_s or
-                        recovery_step_count >= recovery_max_steps):
+                if (planner_mode == PlannerMode.ACTIVE_SCAN and
+                        (active_scan_elapsed_s >= active_scan_max_duration_s or
+                         active_scan_step_count >= active_scan_max_steps)):
+                    active_scan_timed_out = True
+                    self._active_scan_timeout_count += 1
+                    self._trajectory_exit_reason = "ACTIVE_SCAN_TIMEOUT"
+                    rospy.logerr(
+                        "[ONLINE-LOCKSTEP] Active scan timeout after "
+                        "%.2fs / %d steps.",
+                        active_scan_elapsed_s, active_scan_step_count)
+                elif (planner_mode == PlannerMode.RECOVERY and
+                      (recovery_elapsed_s >= recovery_max_duration_s or
+                       recovery_step_count >= recovery_max_steps)):
                     recovery_timed_out = True
                     self._recovery_timeout_count += 1
                     self._trajectory_exit_reason = "RECOVERY_TIMEOUT"
@@ -3590,12 +4419,22 @@ class ILManager:
                 frame_invalid_reasons.append("planner_abort")
             if planner_mode == PlannerMode.GOAL_HOLD:
                 self._goal_hold_frame_count += 1
-            if planner_mode == PlannerMode.RECOVERY:
-                # Recovery frames are valid IF we have a finite recovery target
+            if planner_mode in (
+                    PlannerMode.ACTIVE_SCAN, PlannerMode.RECOVERY):
+                # Rotation-only labels are valid with a finite sensing or
+                # recovery target and command.
                 if not np.all(np.isfinite(recovery_target_world)):
-                    frame_invalid_reasons.append("invalid_recovery_target")
+                    frame_invalid_reasons.append(
+                        "invalid_active_scan_target"
+                        if planner_mode == PlannerMode.ACTIVE_SCAN
+                        else "invalid_recovery_target")
                 if not np.isfinite(decision.selected_yaw_rate):
-                    frame_invalid_reasons.append("invalid_recovery_command")
+                    frame_invalid_reasons.append(
+                        "invalid_active_scan_command"
+                        if planner_mode == PlannerMode.ACTIVE_SCAN
+                        else "invalid_recovery_command")
+                if active_scan_timed_out:
+                    frame_invalid_reasons.append("active_scan_timeout")
                 if recovery_timed_out:
                     frame_invalid_reasons.append("recovery_timeout")
             elif planner_mode == PlannerMode.GOAL_HOLD:
@@ -3612,14 +4451,15 @@ class ILManager:
                     frame_invalid_reasons.append(
                         "nonzero_goal_hold_command")
             elif planner_mode not in (
-                    PlannerMode.FRESH_PLAN, PlannerMode.CACHED_PLAN):
+                    PlannerMode.FRESH_PLAN, PlannerMode.CACHED_PLAN,
+                    PlannerMode.ABORT):
                 # Unknown planner mode
                 frame_invalid_reasons.append("unknown_planner_mode")
             if not bool(row.get("expert_label_valid", 0)):
                 frame_invalid_reasons.append("invalid_expert_label")
             # Check that trend label can be generated
-            if not bool(row.get("trend_label_valid", 0)):
-                frame_invalid_reasons.append("invalid_trend_label")
+            if not bool(row.get("macro_label_valid", 0)):
+                frame_invalid_reasons.append("invalid_macro_label")
             if (not np.all(np.isfinite(executed_command_velocity_flu)) or
                     not np.isfinite(executed_command_yaw_rate)):
                 frame_invalid_reasons.append("invalid_executed_command")
@@ -3713,7 +4553,7 @@ class ILManager:
             previous_command_velocity_flu = np.asarray(
                 executed_command_velocity_flu, dtype=np.float64).copy()
             previous_command_yaw_rate = float(executed_command_yaw_rate)
-            if recovery_timed_out:
+            if recovery_timed_out or active_scan_timed_out:
                 break
 
             # ── Goal check ───────────────────────────────────────────
@@ -3962,28 +4802,17 @@ class ILManager:
 
     def _is_guide_cache_valid(self, snapshot, current_time_s,
                                progress_index, global_path, cur_pos):
-        """Check whether the cached Guide from the last successful plan
-        is still usable for Trend labels.
-
-        v11 FIX: validates current drone position deviation from the
-        global path, NOT distance between cached guide and a path point
-        (which is trivially near zero).  Also checks that the Guide
-        distance from the drone is within limits.
-        """
+        """Validate a cached causal macro guide without global information."""
+        del progress_index, global_path
         if snapshot is None:
             return False
         online_rt = self.g.get("online_runtime", {})
         gc_cfg = online_rt.get("guide_cache", {})
         max_age = float(gc_cfg.get("max_age_s", 0.50))
         max_dist = float(gc_cfg.get("maximum_distance_m", 7.0))
-        max_dev = float(gc_cfg.get("maximum_path_deviation_m", 1.5))
-        max_behind = int(gc_cfg.get("maximum_indices_behind_progress", 0))
 
         age = current_time_s - snapshot.plan_timestamp_s
         if age > max_age:
-            return False
-        # Guide path index must not be behind current progress
-        if snapshot.guide_path_index < progress_index - max_behind:
             return False
         # Guide world coords must be finite
         if not np.all(np.isfinite(snapshot.guide_world)):
@@ -3993,19 +4822,6 @@ class ILManager:
             np.linalg.norm(snapshot.guide_world - cur_pos))
         if guide_dist_from_drone > max_dist:
             return False
-        # v11 FIX: check current drone deviation from global path
-        if global_path and len(global_path) > 0:
-            # Search a local window near the progress index
-            search_start = max(0, progress_index - 5)
-            search_end = min(len(global_path), progress_index + 10)
-            min_path_dev = float("inf")
-            for i in range(search_start, search_end):
-                d = float(np.linalg.norm(
-                    np.array(global_path[i]) - cur_pos))
-                if d < min_path_dev:
-                    min_path_dev = d
-            if min_path_dev > max_dev:
-                return False
         return True
 
     def _is_trajectory_cache_valid(self, snapshot, current_time_s,
@@ -4316,7 +5132,6 @@ class ILManager:
         goal_tolerance = float(lp_cfg.get("goal_tolerance", 0.30))
         max_yaw_rate = float(lp_cfg.get("max_yaw_rate", 2.0))
         yaw_tracking_gain = float(lp_cfg.get("yaw_tracking_gain", 3.0))
-        yaw_speed_threshold = float(lp_cfg.get("yaw_speed_threshold", 0.10))
         velocity_tracking_gain = float(
             lp_cfg.get("velocity_tracking_gain", 2.0))
         speed_ramp_time = float(
@@ -4421,12 +5236,21 @@ class ILManager:
         result["final_velocity_flu"] = quantize_bounded_vector(
             desired_vel_flu, max_velocity, decimals=6)
 
-        # Closed-loop yaw rate
-        yaw_rate_cmd = yaw_rate_for_world_velocity(
-            cur_yaw, desired_vel_world, yaw_tracking_gain,
-            max_yaw_rate, yaw_speed_threshold)
+        # Track the yaw trajectory time-parameterized by the independent
+        # teacher planner from the macro yaw intent.  The tracker must not
+        # silently replace it with velocity-facing yaw, otherwise the saved
+        # label no longer corresponds to the complete guide.
+        reference_yaw = float(preview_tp.yaw)
+        reference_yaw_rate = float(preview_tp.yaw_rate)
+        yaw_error = math.atan2(
+            math.sin(reference_yaw - cur_yaw),
+            math.cos(reference_yaw - cur_yaw))
+        yaw_rate_cmd = max(
+            -max_yaw_rate,
+            min(max_yaw_rate,
+                reference_yaw_rate + yaw_tracking_gain * yaw_error))
         result["final_yaw_rate"] = float(yaw_rate_cmd)
-        result["reference_yaw_rate"] = float(yaw_rate_cmd)
+        result["reference_yaw_rate"] = reference_yaw_rate
         result["valid"] = True
 
         return result
@@ -4688,7 +5512,7 @@ class ILManager:
             guide_progress_index=-1,
             global_path=None,
     ):
-        """Serialize one schema-v16 row from an immutable RuntimeDecision."""
+        """Serialize one schema-v17 row from an immutable RuntimeDecision."""
         snapshot = decision.plan_snapshot
         row = {}
 
@@ -5246,28 +6070,62 @@ class ILManager:
                 "z": "up",
             },
             "world_coordinate_frame": "ROS_WORLD_FLU",
-            "guide_source": (
-                "current_depth_goal_explorer_or_goal_tolerance_hold"),
+            "guide_source": "causal_macro_expert_or_goal_tolerance_hold",
             "guide_visibility_source": (
-                "current_depth_camera_fov_and_relative_mission_goal"),
+                "finite_depth_history_observed_map_and_current_depth"),
+            "macro_waypoint_latest_fov_required": False,
+            "macro_waypoint_requirement": (
+                "goal_direct_or_goal_directed_frontier_viewpoint_with_"
+                "hard_safe_endpoint_and_bounded_astar_reachability_in_"
+                "causal_observed_esdf; full_bspline_and_dynamics_validation_"
+                "belongs_to_the_independent_30hz_planner; viewpoint_may_"
+                "come_from_any_unexpired_observation"),
             "guide_selection_rule": (
-                "direct_goal_ray_if_clear_else_minimum_obstacle_avoiding_"
-                "azimuth_with_right_tie_break"),
+                "finite_history_goal_directed_frontier_viewpoint_scoring_"
+                "with_goal_progress_information_gain_yaw_cost_and_"
+                "committed_side_hysteresis"),
             "guide_known_free_corridor_check_enabled": True,
+            "guide_motion_feasibility_check": (
+                "cpp_observed_esdf_bounded_astar_then_30hz_bspline"),
             "guide_certified_range_m": float(
-                self._guide_selector.explorer_usable_range_m),
+                self._macro_expert_config.effective_guide_range_m),
             "guide_swept_radius_m": float(
-                self._guide_selector.explorer_required_radius_m),
+                self._macro_expert_config.guide_swept_radius_m),
             "guide_esdf_validation_clearance_m": float(
-                self._guide_selector.explorer_esdf_validation_clearance_m),
+                self._macro_expert_config.guide_obstacle_clearance_m),
+            "guide_corridor_parameters_role": (
+                "active_peek_scoring_and_offline_macro_fallback_only"),
+            "macro_frontier_config": {
+                "candidate_limit": int(
+                    self._macro_expert_config.frontier_candidate_limit),
+                "angular_bin_deg": float(
+                    self._macro_expert_config.frontier_angular_bin_deg),
+                "standoff_m": float(
+                    self._macro_expert_config.frontier_standoff_m),
+                "maximum_backtrack_m": float(
+                    self._macro_expert_config.frontier_max_backtrack_m),
+                "goal_progress_weight": float(
+                    self._macro_expert_config.frontier_goal_progress_weight),
+                "information_weight": float(
+                    self._macro_expert_config.frontier_information_weight),
+                "yaw_cost_weight": float(
+                    self._macro_expert_config.frontier_yaw_cost_weight),
+                "side_commitment_bonus": float(
+                    self._macro_expert_config.frontier_side_commitment_bonus),
+            },
             "trajectory_terminal_rule": (
-                "NORMAL: selected visible Guide is the hard optimization "
+                "MOVE: held FLU macro instruction is converted to the current "
+                "local terminal and is the hard optimization "
                 "endpoint with automatically allocated feasible duration; "
-                "RECOVERY: no local trajectory, rotate in place; "
+                "ACTIVE_SCAN: no local trajectory, rotate in place; "
                 "GOAL_HOLD: owns braking after first goal-tolerance entry, "
                 "uses center Guide with value=0 and zero four-dimensional "
                 "Control, and releases only if stopped outside tolerance"),
-            "unknown_space_policy": "not_applicable_to_complete_global_esdf",
+            "local_plan_failure_policy": (
+                "atomically_replace_move_guide_and_control_with_active_scan"),
+            "macro_instruction_hold": (
+                "zero_order_hold_in_body_flu_between_5hz_updates"),
+            "unknown_space_policy": "unknown_is_infeasible",
             "global_map_fallback_enabled": False,
             "trend_config": {
                 "normal_horizontal_bins": TREND_NORMAL_HORIZONTAL_BIN_COUNT,
@@ -5288,7 +6146,7 @@ class ILManager:
                 "required_row_fields": [
                     "frame_valid",
                     "expert_label_valid",
-                    "trend_label_valid",
+                    "macro_label_valid",
                     "global_direction_valid",
                 ],
                 "required_value": 1,
@@ -5300,26 +6158,54 @@ class ILManager:
             "trend_soft_sigma_bins": float(
                 data_cfg["trend"]["soft_sigma_bins"]),
             "max_guide_range_m": float(
-                self._guide_selector.explorer_usable_range_m),
+                self._macro_expert_config.effective_guide_range_m),
             "maximum_global_guidance_distance_m": 0.0,
             "depth_all_valid_in_simulation": True,
             # ── Phase 2: observed map metadata ──
-            "local_planner_map_source": "global_esdf",
-            "local_expert_map": "global_esdf",
-            "observed_map_enabled": False,
-            "observed_esdf_enabled": False,
-            "local_trajectory_collision_check": "global_esdf",
-            "trend_supervision_source": "guide_waypoint",
+            "local_planner_map_source": "observed_esdf",
+            "teacher_trajectory_planner_role": (
+                "independent_complete_guide_to_collision_free_trajectory"),
+            "teacher_trajectory_planner_hz": float(
+                self.g.get("planning", {}).get("local_planner", {}).get(
+                    "planner_hz", 30.0)),
+            "teacher_trajectory_planner_inputs": [
+                "complete_macro_guide", "vehicle_state",
+                "finite_history_observed_esdf"],
+            "teacher_trajectory_planner_student_visible": False,
+            "local_expert_role": "trajectory_tracker_and_label_generator_only",
+            "local_expert_map": "none_directly; map_is_owned_by_teacher_planner",
+            "local_student_trajectory_input": False,
+            "local_student_inputs": [
+                "complete_macro_guide_flu", "current_depth",
+                "velocity_flu", "angular_velocity_flu", "gravity_flu"],
+            "local_student_outputs": ["velocity_flu", "yaw_rate"],
+            "observed_map_enabled": bool(self._use_observed_map),
+            "observed_esdf_enabled": bool(self._use_observed_esdf),
+            "observed_esdf_backend": "cpp_exact_squared_edt",
+            "macro_corridor_backend": "cpp_spherical_swept_volume",
+            "macro_guide_feasibility_backend": (
+                "goal_directed_frontier_with_observed_esdf_bounded_astar"),
+            "local_trajectory_collision_check": "observed_esdf",
+            "macro_supervision_source": "continuous_causal_macro_guide",
+            "macro_student_inputs": [
+                "goal_direction_flu", "clipped_goal_distance_norm",
+                "current_depth", "velocity_flu",
+                "angular_velocity_flu", "gravity_flu"],
+            "macro_student_outputs": [
+                "move_direction_flu", "move_distance_norm",
+                "yaw_direction_flu_xy"],
             "control_supervision_source": (
-                "future_velocity_and_yaw_rate_sampled_from_local_bspline; "
+                "pure_tracking_of_independent_observed_map_trajectory; "
+                "velocity_flu_and_yaw_rate_are_saved_as_labels; "
                 "zero_velocity_and_yaw_rate_in_goal_hold"),
             "global_map_usage": [
                 "task_feasibility",
                 "offline_audit",
-                "local_bspline_optimization",
-                "local_trajectory_collision_validation",
             ],
-            "global_map_used_for_local_collision_optimization": True,
+            "global_map_used_for_local_collision_optimization": False,
+            "global_path_used_by_macro_expert": False,
+            "global_path_used_by_teacher_trajectory_planner": False,
+            "privileged_global_side_cost_used_for_runtime_acceptance": False,
             "global_esdf_cache_key": self._current_esdf_cache_key,
             "global_esdf_cache_hit": self._current_esdf_cache_hit,
             "global_esdf_cache_stats": (
@@ -5503,6 +6389,8 @@ class ILManager:
                 self, "_cached_plan_frame_count", 0),
             "recovery_control_frame_count": getattr(
                 self, "_recovery_frame_count", 0),
+            "active_scan_control_frame_count": getattr(
+                self, "_active_scan_frame_count", 0),
             "planner_attempt_count": getattr(
                 self, "_planner_attempt_count", 0),
             "planner_success_count": getattr(
@@ -5523,6 +6411,8 @@ class ILManager:
                 self, "_recovery_success_count", 0),
             "recovery_timeout_count": getattr(
                 self, "_recovery_timeout_count", 0),
+            "active_scan_timeout_count": getattr(
+                self, "_active_scan_timeout_count", 0),
             "maximum_plan_age_s": getattr(
                 self, "_max_plan_age_s", 0.0),
             "maximum_guide_cache_age_s": getattr(
@@ -5814,9 +6704,8 @@ class ILManager:
                             "invalid_expert_label_at_row:{}".format(row_index))
                         break
                     formal_checks = (
-                        # v11: trend_label_valid must be 1 in ALL modes (including RECOVERY)
-                        (str(row.get("trend_label_valid", "0")) == "1",
-                         "invalid_trend_label"),
+                        (str(row.get("macro_label_valid", "0")) == "1",
+                         "invalid_macro_label"),
                         (str(row.get("global_direction_valid", "0")) == "1",
                          "invalid_global_direction"),
                         (row.get("guide_source", "") in (
@@ -5827,6 +6716,7 @@ class ILManager:
                          "current_guide_selector",
                          "current_depth_visible_guide",
                          "current_depth_goal_explorer",
+                          "causal_macro_expert",
                           "recovery_goal_direction",
                           "recovery_explore_direction",
                           "goal_tolerance_hold",
@@ -5841,12 +6731,12 @@ class ILManager:
                         # v11: planner_success may be 0 in RECOVERY mode
                         (str(row.get("planner_success", "")).lower() in ("1", "true")
                          or str(row.get("planner_mode", "")) in (
-                             "RECOVERY", "GOAL_HOLD"),
+                             "ACTIVE_SCAN", "RECOVERY", "GOAL_HOLD"),
                           "planner_unsuccessful"),
-                        (row.get("planner_map_source", "") == "global_esdf",
-                         "planner_map_not_global_esdf"),
-                        (str(row.get("planner_used_observed_esdf", "1")) == "0",
-                         "planner_used_observed_esdf"),
+                        (row.get("planner_map_source", "") == "observed_esdf",
+                         "planner_map_not_observed_esdf"),
+                        (str(row.get("planner_used_observed_esdf", "0")) == "1",
+                         "planner_did_not_use_observed_esdf"),
                         (str(row.get("planner_used_global_fallback", "1")) == "0",
                          "global_fallback"),
                     )
@@ -5904,10 +6794,10 @@ class ILManager:
             validation_passed = False
             failure_reasons.append("metadata_missing")
 
-        # 8. Schema v16 command and row-integrity checks
+        # 8. Schema-v17 command and row-integrity checks
         data_cfg = self.g["data"]
         schema_version = int(data_cfg["schema_version"])
-        if schema_version != 16:
+        if schema_version != 17:
             validation_passed = False
             failure_reasons.append(
                 "unsupported_current_schema_version:{}".format(
@@ -5916,7 +6806,7 @@ class ILManager:
             v16_issues = self._validate_schema_v16(
                 data_path, col_map, data_cfg)
             if v16_issues:
-                rospy.logwarn("[Validate] Schema v16 issues: %s",
+                rospy.logwarn("[Validate] Schema v17 issues: %s",
                               "; ".join(v16_issues[:10]))
                 failure_reasons.extend(v16_issues)
                 validation_passed = False
@@ -5927,12 +6817,18 @@ class ILManager:
         else:
             self._reject_trajectory(failure_reasons)
 
+        # ── Flush debug frames regardless of commit/reject ────────
+        if self.debug and self._debug_frames:
+            self._flush_debug_trajectory(
+                "traj_{:03d}".format(self.traj_idx + 1),
+                getattr(self, "scene_label", "unknown_scene"))
+
         self._inprogress_dir = None
         self._final_dir = None
         self._route_next()
 
     def _validate_schema_v16(self, data_path, col_map, data_cfg):
-        """Validate strict schema-v16 data invariants. Returns issue strings."""
+        """Validate schema-v17 rows plus retained command invariants."""
         issues = []
         trend_cfg_v = data_cfg["trend"]
         trend_normal_h_bins = int(
@@ -5944,6 +6840,13 @@ class ILManager:
         command_compare_atol = float(
             self.g.get("planning", {}).get("validation", {}).get(
                 "command_compare_atol", 1.0e-5))
+        macro_interval_frames = max(
+            1, int(round(
+                float(self._record_hz) /
+                self._macro_expert_config.update_hz)))
+        valid_macro_modes = {
+            state.value for state in MacroState
+        }
         required_fields = (
             "timestamp_ns", "receive_timestamp_ns",
             "episode_id", "frame_id", "episode_frame_index",
@@ -5959,6 +6862,13 @@ class ILManager:
             "gravity_direction_y_flu",
             "gravity_direction_z_flu",
             "state_vx_flu", "state_vy_flu", "state_vz_flu",
+            "macro_update", "macro_label_valid", "macro_mode",
+            "macro_committed_side",
+            "macro_move_dir_x_flu", "macro_move_dir_y_flu",
+            "macro_move_dir_z_flu", "macro_move_distance_m",
+            "macro_move_distance_norm", "macro_yaw_dir_x_flu",
+            "macro_yaw_dir_y_flu", "local_feasible",
+            "local_progress_rate",
             "previous_executed_command_valid",
             "previous_executed_command_frame_id", "previous_executed_actor",
             "previous_executed_command_vx_flu",
@@ -6022,7 +6932,7 @@ class ILManager:
 
                     for validity_field in (
                             "frame_valid", "expert_label_valid",
-                            "trend_label_valid", "global_direction_valid"):
+                            "macro_label_valid", "global_direction_valid"):
                         if str(row.get(validity_field, "0")) != "1":
                             issues.append(
                                 "CRITICAL: {} must be 1 at row {}: {}"
@@ -6048,6 +6958,8 @@ class ILManager:
                             float(row["state_vx_flu"]),
                             float(row["state_vy_flu"]),
                             float(row["state_vz_flu"]),
+                            float(row["state_angular_velocity_x_flu"]),
+                            float(row["state_angular_velocity_y_flu"]),
                             float(row["state_angular_velocity_z_flu"])])
                         if not np.all(np.isfinite(control_input_state)):
                             issues.append(
@@ -6136,7 +7048,9 @@ class ILManager:
                             "{}".format(row_idx))
 
                     # Check normalized distances in [0, 1]
-                    for fname in ("global_distance_norm", "guide_distance_norm"):
+                    for fname in (
+                            "global_distance_norm", "guide_distance_norm",
+                            "macro_move_distance_norm"):
                         val = row.get(fname)
                         if val is not None and val != "":
                             try:
@@ -6145,6 +7059,70 @@ class ILManager:
                                     issues.append("{}={} out of [0,1] at row {}".format(fname, v, row_idx))
                             except ValueError:
                                 pass
+
+                    try:
+                        macro_update = int(row["macro_update"])
+                        expected_macro_update = int(
+                            (row_idx - 1) % macro_interval_frames == 0)
+                        if macro_update != expected_macro_update:
+                            issues.append(
+                                "CRITICAL: invalid_macro_update_cadence at row "
+                                "{}: got {}, expected {}".format(
+                                    row_idx, macro_update,
+                                    expected_macro_update))
+                        macro_mode = str(row["macro_mode"])
+                        if macro_mode not in valid_macro_modes:
+                            issues.append(
+                                "CRITICAL: invalid_macro_mode at row {}: {}"
+                                .format(row_idx, macro_mode))
+                        move_direction = np.array([
+                            float(row["macro_move_dir_x_flu"]),
+                            float(row["macro_move_dir_y_flu"]),
+                            float(row["macro_move_dir_z_flu"])])
+                        yaw_direction = np.array([
+                            float(row["macro_yaw_dir_x_flu"]),
+                            float(row["macro_yaw_dir_y_flu"])])
+                        move_distance = float(
+                            row["macro_move_distance_m"])
+                        move_distance_norm = float(
+                            row["macro_move_distance_norm"])
+                        if (not np.all(np.isfinite(move_direction)) or
+                                abs(np.linalg.norm(move_direction) - 1.0) >
+                                2.0e-3):
+                            issues.append(
+                                "CRITICAL: invalid_macro_move_direction at "
+                                "row {}".format(row_idx))
+                        if (not np.all(np.isfinite(yaw_direction)) or
+                                abs(np.linalg.norm(yaw_direction) - 1.0) >
+                                2.0e-3):
+                            issues.append(
+                                "CRITICAL: invalid_macro_yaw_direction at "
+                                "row {}".format(row_idx))
+                        expected_distance_norm = np.clip(
+                            move_distance /
+                            self._macro_expert_config.effective_guide_range_m,
+                            0.0, 1.0)
+                        if (move_distance < -1.0e-6 or
+                                move_distance >
+                                self._macro_expert_config.effective_guide_range_m +
+                                1.0e-6 or
+                                abs(move_distance_norm -
+                                    expected_distance_norm) > 2.0e-3):
+                            issues.append(
+                                "CRITICAL: invalid_macro_move_distance at "
+                                "row {}".format(row_idx))
+                        if (macro_mode in {
+                                MacroState.ACTIVE_SCAN_LEFT.value,
+                                MacroState.ACTIVE_SCAN_RIGHT.value,
+                                MacroState.GOAL_HOLD.value,
+                                } and move_distance > 1.0e-6):
+                            issues.append(
+                                "CRITICAL: translating_zero_motion_macro_mode "
+                                "at row {}".format(row_idx))
+                    except (KeyError, ValueError, TypeError):
+                        issues.append(
+                            "CRITICAL: unparseable_macro_label at row {}"
+                            .format(row_idx))
 
                     try:
                         expert = np.array([
@@ -6247,13 +7225,13 @@ class ILManager:
                         except (ValueError, TypeError):
                             issues.append("CRITICAL: unparseable learner command at row {}".format(row_idx))
 
-                    if row.get("planner_map_source", "") != "global_esdf":
+                    if row.get("planner_map_source", "") != "observed_esdf":
                         issues.append(
-                            "CRITICAL: planner map is not global ESDF at row {}".format(
+                            "CRITICAL: planner map is not observed ESDF at row {}".format(
                                 row_idx))
-                    if str(row.get("planner_used_observed_esdf", "1")) != "0":
+                    if str(row.get("planner_used_observed_esdf", "0")) != "1":
                         issues.append(
-                            "CRITICAL: planner used observed ESDF at row {}".format(
+                            "CRITICAL: planner did not use observed ESDF at row {}".format(
                                 row_idx))
                     if str(row.get("planner_used_global_fallback", "1")) != "0":
                         issues.append(
@@ -6557,7 +7535,7 @@ class ILManager:
 
         except Exception as exc:
             issues.append(
-                "CRITICAL: schema_v16_validation_exception: {}".format(exc))
+                "CRITICAL: schema_v17_validation_exception: {}".format(exc))
 
         return issues
 

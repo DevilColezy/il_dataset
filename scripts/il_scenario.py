@@ -112,6 +112,61 @@ def _infer_density_tier(density_min, density_max, sg_cfg):
     return "dense"
 
 
+def _load_distance_bands(sg_cfg):
+    """Parse distance_bands config into an ordered dict.
+
+    Returns:
+        OrderedDict mapping band_name → {flight_min_m, flight_max_m,
+        region_x_half, region_y_pad, region_z_pad}.
+    """
+    raw = sg_cfg.get("distance_bands", {})
+    if not raw:
+        # Fallback: a single default band
+        return OrderedDict([
+            ("medium", {"flight_min_m": 1.0, "flight_max_m": 1000.0,
+                        "region_x_half": 6.0, "region_y_pad": 2.0,
+                        "region_z_pad": 1.5}),
+        ])
+    bands = OrderedDict()
+    for band_name in raw:
+        b = raw[band_name]
+        bands[str(band_name)] = {
+            "flight_min_m": float(b.get("flight_min_m", 1.0)),
+            "flight_max_m": float(b.get("flight_max_m", 1000.0)),
+            "region_x_half": float(b.get("region_x_half", 6.0)),
+            "region_y_pad": float(b.get("region_y_pad", 2.0)),
+            "region_z_pad": float(b.get("region_z_pad", 1.5)),
+        }
+    return bands
+
+
+def _compute_adaptive_region(band_cfg, start, goal):
+    """Size an obstacle region tightly around the start→goal corridor.
+
+    The x-range is centred on the corridor midpoint, the y-range is the
+    flight distance padded at each end, and z is centred on the goal height.
+    """
+    start = np.asarray(start, dtype=np.float64)
+    goal = np.asarray(goal, dtype=np.float64)
+    mid_x = 0.5 * (start[0] + goal[0])
+    mid_z = 0.5 * (start[2] + goal[2])
+    x_half = float(band_cfg["region_x_half"])
+    y_pad = float(band_cfg["region_y_pad"])
+    z_pad = float(band_cfg["region_z_pad"])
+
+    y_min = min(start[1], goal[1]) - y_pad
+    y_max = max(start[1], goal[1]) + y_pad
+
+    return ObstacleRegion(
+        x_min=mid_x - x_half,
+        x_max=mid_x + x_half,
+        y_min=float(y_min),
+        y_max=float(y_max),
+        z_min=float(mid_z - z_pad),
+        z_max=float(mid_z + z_pad),
+    )
+
+
 def _validate_2p5d_cylinder_height(scene_generation_cfg):
     """Return the full-height cylinder value required by the 2.5D contract."""
     region = scene_generation_cfg.get("obstacle_region", {})
@@ -339,6 +394,7 @@ class SceneGenerationProfile:
     safety_margin_m: float
 
     density_tier: str
+    distance_band: str
     coverage_balancing: dict
 
     @property
@@ -371,12 +427,37 @@ class SceneGenerationProfile:
                 "profile '{}' must not override density_tier; it is derived "
                 "from density_min/density_max".format(name))
 
+        # ── distance_band (new) ────────────────────────────────────
+        distance_band = str(profile_dict.get("distance_band", "medium"))
+        allowed_bands = _load_distance_bands(scene_generation_cfg)
+        if distance_band not in allowed_bands:
+            raise ValueError(
+                "profile '{}' distance_band '{}' not in configured "
+                "distance_bands: {}".format(
+                    name, distance_band, sorted(allowed_bands.keys())))
+
         common_cylinder = scene_generation_cfg.get(
             "common_cylinder", {})
         _validate_2p5d_cylinder_height(scene_generation_cfg)
         vehicle = scene_generation_cfg.get("vehicle", {})
         common_task = scene_generation_cfg.get(
             "common_task_generation", {})
+
+        density_tier = _infer_density_tier(
+            total_density_min, total_density_max,
+            scene_generation_cfg)
+
+        # ── Per-density gap overrides ──────────────────────────────
+        gap_by_density = scene_generation_cfg.get(
+            "gap_constraints_by_density", {})
+        tier_gap = gap_by_density.get(
+            density_tier, gap_by_density.get("medium", {}))
+        surface_gap = float(tier_gap.get(
+            "minimum_surface_gap_m",
+            common_cylinder.get("minimum_surface_gap_m", 1.20)))
+        post_inflation_gap = float(tier_gap.get(
+            "minimum_post_inflation_gap_m",
+            common_cylinder.get("minimum_post_inflation_gap_m", 0.40)))
 
         return SceneGenerationProfile(
             name=name,
@@ -394,18 +475,13 @@ class SceneGenerationProfile:
             region_boundary_margin_m=float(
                 common_cylinder.get(
                     "region_boundary_margin_m", 0.30)),
-            minimum_surface_gap_m=float(
-                common_cylinder.get(
-                    "minimum_surface_gap_m", 0.0)),
-            minimum_post_inflation_gap_m=float(
-                common_cylinder.get(
-                    "minimum_post_inflation_gap_m", 0.15)),
+            minimum_surface_gap_m=surface_gap,
+            minimum_post_inflation_gap_m=post_inflation_gap,
             vehicle_radius_m=float(vehicle.get("radius_m", 0.30)),
             safety_margin_m=float(
                 vehicle.get("safety_margin_m", 0.10)),
-            density_tier=_infer_density_tier(
-                total_density_min, total_density_max,
-                scene_generation_cfg),
+            density_tier=density_tier,
+            distance_band=distance_band,
             coverage_balancing=dict(
                 common_task.get("coverage_balancing", {})),
         )
@@ -1233,6 +1309,11 @@ class StartGoalTaskGenerator:
         self.max_detour = float(cfg.get("maximum_detour_ratio", 1.80))
         self.fixed_tasks = list(cfg.get("fixed_tasks", []))
 
+        # -- Adaptive region (new) --
+        self.use_adaptive_region = bool(cfg.get("use_adaptive_region", True))
+        sg_cfg = config.get("global", {}).get("scene_generation", {})
+        self._distance_bands = _load_distance_bands(sg_cfg)
+
         start_sampling_regions = cfg.get("start_sampling_regions", [
             {"x_min": -12.0, "x_max": -8.0,
              "y_min": -8.0, "y_max": 8.0},
@@ -1253,9 +1334,88 @@ class StartGoalTaskGenerator:
         ]
 
         self._coverage_density_tier = "default"
+        self._active_distance_band = ""
+        self._active_band_cfg = None
         self._configure_coverage(
             cfg.get("coverage_balancing", {}),
             density_tier=self._coverage_density_tier)
+
+    def configure_from_profile(self, profile):
+        """Apply per-profile overrides from a SceneGenerationProfile.
+
+        When the profile provides a distance_band, the task generator
+        constrains start-goal distances to that band's range and sizes the
+        obstacle region adaptively around each candidate pair.
+        """
+        self._coverage_density_tier = str(
+            getattr(profile, "density_tier", "default") or "default").lower()
+        self._configure_coverage(
+            getattr(profile, "coverage_balancing", self._cfg.get(
+                "coverage_balancing", {})),
+            density_tier=self._coverage_density_tier)
+
+        distance_band = str(getattr(profile, "distance_band", ""))
+        rospy.loginfo(
+            "[TaskGen] configure_from_profile: density_tier=%s "
+            "distance_band='%s' available_bands=%s",
+            self._coverage_density_tier, distance_band,
+            list(self._distance_bands.keys()) if self._distance_bands else [])
+        if distance_band and distance_band in self._distance_bands:
+            band = self._distance_bands[distance_band]
+            self.min_dist = float(band["flight_min_m"])
+            self.max_dist = float(band["flight_max_m"])
+            self._active_distance_band = distance_band
+            self._active_band_cfg = band
+            # Auto-size start/goal regions to the distance band so
+            # that sampling does not reject 100 % of candidates.
+            self._setup_band_regions(band)
+        else:
+            self._active_distance_band = ""
+            self._active_band_cfg = None
+
+    def _setup_band_regions(self, band):
+        """Replace start/goal regions with band-compatible ones."""
+        flight_mid = 0.5 * (
+            float(band["flight_min_m"]) + float(band["flight_max_m"]))
+        if not self.start_regions or not self.goal_regions:
+            return
+        base_start = self.start_regions[0]
+        base_goal = self.goal_regions[0]
+        y_centre = 0.5 * (base_start.y_min + base_goal.y_max)
+        y_half = flight_mid * 0.5
+
+        start_y_min = y_centre - y_half - 1.0
+        start_y_max = y_centre - y_half + 1.0
+        goal_y_min = y_centre + y_half - 1.0
+        goal_y_max = y_centre + y_half + 1.0
+
+        self.start_regions = [
+            ObstacleRegion(
+                x_min=base_start.x_min, x_max=base_start.x_max,
+                y_min=start_y_min, y_max=start_y_max,
+                z_min=base_start.z_min, z_max=base_start.z_max,
+            )
+        ]
+        self.goal_regions = [
+            ObstacleRegion(
+                x_min=base_goal.x_min, x_max=base_goal.x_max,
+                y_min=goal_y_min, y_max=goal_y_max,
+                z_min=base_goal.z_min, z_max=base_goal.z_max,
+            )
+        ]
+        rospy.loginfo(
+            "[TaskGen] Distance band '%s': flight=%.1f-%.1fm, "
+            "start_y=[%.1f,%.1f] goal_y=[%.1f,%.1f]",
+            self._active_distance_band,
+            float(band["flight_min_m"]), float(band["flight_max_m"]),
+            start_y_min, start_y_max, goal_y_min, goal_y_max)
+
+    def get_adaptive_region(self, start, goal):
+        """Return an ObstacleRegion sized to the active distance band."""
+        if not self.use_adaptive_region or self._active_band_cfg is None:
+            return None
+        return _compute_adaptive_region(
+            self._active_band_cfg, start, goal)
 
     @staticmethod
     def _normalise_weights(raw, allowed, field_name):
@@ -1613,15 +1773,6 @@ class StartGoalTaskGenerator:
         result.coverage_region_pair_index = int(region_pair_index)
         result.nearest_direct_blocker_distance_m = float(
             classification["nearest_distance_m"] or 0.0)
-
-    def configure_from_profile(self, profile):
-        """Select density-tier coverage weights for the active profile."""
-        if profile is None:
-            return
-        self._configure_coverage(
-            profile.coverage_balancing,
-            density_tier=profile.density_tier)
-
 
     def generate_tasks(self, obstacles, esdf, esdf_origin, esdf_res,
                        astar_planner_fn, seed=0):
