@@ -23,6 +23,7 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch
+from matplotlib.collections import LineCollection
 from matplotlib.widgets import Button
 
 FREE_COLOR = (0.95, 0.95, 0.95)
@@ -32,10 +33,16 @@ DRONE_COLOR = (0.0, 0.6, 0.0)
 GOAL_COLOR = (1.0, 0.0, 0.0)
 GUIDE_COLOR = (0.0, 0.3, 1.0)
 PATH_COLOR = (0.8, 0.0, 0.8)
+PLAN_FAIL_COLOR = (1.0, 0.2, 0.2)
+DANGER_COLOR = (1.0, 0.05, 0.05)
 SCAN_COLOR = (1.0, 0.5, 0.0)
 BYPASS_COLOR = (0.0, 0.7, 0.7)
 SEEK_COLOR = (0.0, 0.6, 0.0)
 HOLD_COLOR = (0.0, 1.0, 0.0)
+
+# A spline sample whose clearance dips below this (ESDF value; the vehicle
+# radius is already subtracted) is drawn in red as a danger segment.
+CLEARANCE_WARN_M = 0.15
 
 MACRO_COLORS = {
     "GOAL_SEEK": SEEK_COLOR,
@@ -87,6 +94,8 @@ class TrajectoryReplay:
         self.traj_dir = os.path.abspath(traj_dir)
         self.frames = _read_csv(os.path.join(traj_dir, "data.csv"))
         self.plans = _read_csv(os.path.join(traj_dir, "local_plans.csv"))
+        self.plan_points = _read_csv(
+            os.path.join(traj_dir, "local_plan_points.csv"))
         self.obstacles = _load_obstacles(traj_dir)
 
         if not self.frames:
@@ -96,17 +105,35 @@ class TrajectoryReplay:
         self.current = 0
         self.playing = False
         self.play_speed = 10  # frames per second
+        self.show_all_plans = False
         self.plan_by_source = {}
         for plan in self.plans:
             sf = int(_expect_float(plan, "source_frame_id", -1))
             if sf >= 0:
                 self.plan_by_source.setdefault(sf, []).append(plan)
+        # Dense B-spline samples, grouped by plan_id and ordered by t.
+        self.plan_curves = {}
+        for pt in self.plan_points:
+            pid = int(_expect_float(pt, "plan_id", -1))
+            if pid >= 0:
+                self.plan_curves.setdefault(pid, []).append(pt)
+        for pid in self.plan_curves:
+            self.plan_curves[pid].sort(key=lambda p: _expect_float(p, "t"))
 
         # Compute path bounds
         xs = [_expect_float(r, "x") for r in self.frames]
         ys = [_expect_float(r, "y") for r in self.frames]
         valid_xs = [x for x in xs if np.isfinite(x)]
         valid_ys = [y for y in ys if np.isfinite(y)]
+        # Include every planned-curve sample so trajectories near the edge
+        # of the view are not clipped.
+        for pt in self.plan_points:
+            px = _expect_float(pt, "x")
+            py = _expect_float(pt, "y")
+            if np.isfinite(px):
+                valid_xs.append(px)
+            if np.isfinite(py):
+                valid_ys.append(py)
         gx = _expect_float(self.frames[0], "goal_x", valid_xs[0])
         gy = _expect_float(self.frames[0], "goal_y", valid_ys[0])
         if np.isfinite(gx):
@@ -164,6 +191,9 @@ class TrajectoryReplay:
             self.play_speed = min(120, self.play_speed * 2)
         elif event.key == "s":
             self._print_summary()
+        elif event.key == "a":
+            self.show_all_plans = not self.show_all_plans
+            self._draw()
 
     def _start_play(self):
         self._play_tick()
@@ -203,6 +233,53 @@ class TrajectoryReplay:
                 except Exception:
                     pass
             print("  {}: {}".format(k, v))
+
+    def _plot_plan_curve(self, plan, alpha=1.0, bright=False):
+        """Draw one plan's dense B-spline trajectory.
+
+        The curve is drawn with a single LineCollection (segment colours)
+        so samples whose ESDF clearance dips below CLEARANCE_WARN_M turn
+        red.  Successful plans are purple, rejected plans red.  On the
+        bright (current-frame) curve, short ticks show the planned world
+        yaw along the spline.  Returns True when a curve was drawn.
+        """
+        pid = int(_expect_float(plan, "plan_id", -1))
+        curve = self.plan_curves.get(pid, [])
+        if len(curve) < 2:
+            return False
+        xs = np.array([_expect_float(p, "x") for p in curve], dtype=np.float64)
+        ys = np.array([_expect_float(p, "y") for p in curve], dtype=np.float64)
+        cl = np.array([_expect_float(p, "clearance") for p in curve],
+                      dtype=np.float64)
+        yaws = np.array([_expect_float(p, "yaw") for p in curve],
+                        dtype=np.float64)
+        success = str(plan.get("success", "0")) == "True"
+        base = PATH_COLOR if success else PLAN_FAIL_COLOR
+        segments = np.stack([
+            np.column_stack([xs[:-1], ys[:-1]]),
+            np.column_stack([xs[1:], ys[1:]])], axis=1)
+        colors = np.tile(base, (len(segments), 1))
+        danger = (cl[:-1] < CLEARANCE_WARN_M) | (cl[1:] < CLEARANCE_WARN_M)
+        colors[danger] = DANGER_COLOR
+        self.ax_main.add_collection(LineCollection(
+            segments, colors=colors,
+            linewidths=2.4 if bright else 1.0,
+            alpha=alpha, capstyle="round"))
+        # Planned-yaw heading ticks along the current plan only.
+        if bright and len(xs) > 0:
+            step = max(1, len(xs) // 20)
+            for i in range(0, len(xs), step):
+                if not (np.isfinite(xs[i]) and np.isfinite(ys[i]) and
+                        np.isfinite(yaws[i])):
+                    continue
+                dx, dy = _yaw_direction(yaws[i])
+                self.ax_main.plot([xs[i], xs[i] + dx * 0.25],
+                                  [ys[i], ys[i] + dy * 0.25],
+                                  color=base, lw=1.0, alpha=0.7)
+        if bright:
+            self.ax_main.plot(xs, ys, ".", color=base, ms=2.5,
+                              alpha=min(1.0, alpha * 1.2))
+        return True
 
     def _draw(self):
         self.ax_main.clear()
@@ -282,24 +359,34 @@ class TrajectoryReplay:
                                        fc=color, ec=color, alpha=0.5,
                                        length_includes_head=True)
 
-        # Planned trajectory
+        # Planned trajectory curves (dense B-spline from
+        # local_plan_points.csv).  The current frame's plan(s) are drawn
+        # bright; 'a' overlays every plan in the episode faintly.
         sf = int(row.get("frame_id",
                          row.get("episode_frame_index", self.current)))
         plans_here = self.plan_by_source.get(sf, [])
         if not plans_here:
             plans_here = self.plan_by_source.get(self.current, [])
-        if plans_here:
-            plan = plans_here[-1]
-            gx_p = _expect_float(plan, "guide_x")
-            gy_p = _expect_float(plan, "guide_y")
-            lgx = _expect_float(plan, "local_goal_x")
-            lgy = _expect_float(plan, "local_goal_y")
-            if (np.isfinite(gx_p) and np.isfinite(gy_p) and
-                    np.isfinite(lgx) and np.isfinite(lgy)):
-                success = plan.get("success", "0")
-                plan_color = PATH_COLOR if success == "True" else "red"
-                self.ax_main.plot([gx_p, lgx], [gy_p, lgy],
-                                  "--", color=plan_color, lw=1, alpha=0.6)
+        if self.show_all_plans:
+            for other in self.plans:
+                self._plot_plan_curve(other, alpha=0.12, bright=False)
+        drawn_curve = False
+        for plan in plans_here:
+            if self._plot_plan_curve(plan, alpha=0.9, bright=True):
+                drawn_curve = True
+        if not drawn_curve:
+            # Fallback: no dense sidecar — draw the guide→local_goal line.
+            for plan in plans_here:
+                gx_p = _expect_float(plan, "guide_x")
+                gy_p = _expect_float(plan, "guide_y")
+                lgx = _expect_float(plan, "local_goal_x")
+                lgy = _expect_float(plan, "local_goal_y")
+                if (np.isfinite(gx_p) and np.isfinite(gy_p) and
+                        np.isfinite(lgx) and np.isfinite(lgy)):
+                    success = plan.get("success", "0")
+                    plan_color = PATH_COLOR if success == "True" else "red"
+                    self.ax_main.plot([gx_p, lgx], [gy_p, lgy],
+                                      "--", color=plan_color, lw=1, alpha=0.6)
 
         self.ax_main.set_xlim(self.bounds[0], self.bounds[1])
         self.ax_main.set_ylim(self.bounds[2], self.bounds[3])
@@ -335,6 +422,21 @@ class TrajectoryReplay:
             "Success: {}".format(planner_success),
             "Clearance: {:.4f} m".format(
                 clearance if np.isfinite(clearance) else 0),
+            "Plan ids: {}".format(
+                ",".join(str(int(_expect_float(p, "plan_id", -1)))
+                          for p in plans_here) or "-"),
+            "Plan ok: {}".format(
+                ",".join("1" if str(p.get("success", "0")) == "True"
+                           else "0" for p in plans_here) or "-"),
+            "Traj pts: {}".format(
+                ",".join(str(len(self.plan_curves.get(
+                    int(_expect_float(p, "plan_id", -1)), [])))
+                          for p in plans_here) or "-"),
+            "",
+            "--- Curve legend ---",
+            "purple=plan ok  red=rejected",
+            "dark red=clearance < {:.2f} m".format(CLEARANCE_WARN_M),
+            "tick=planned yaw  (a=all plans)",
             "",
             "--- Diagnostics ---",
             "Collision: {}".format(coll),
@@ -345,6 +447,7 @@ class TrajectoryReplay:
             "Controls:",
             "\u2190\u2192 step 1  \u2191\u2193 step 10",
             "Space=play  q/w=speed  s=summary",
+            "a=all plan curves  Home/End=first/last",
         ]
         if self.playing:
             info_lines.append("\n[AUTO-PLAY {} fps]".format(self.play_speed))

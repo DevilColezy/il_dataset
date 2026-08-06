@@ -166,6 +166,14 @@ class MacroExpertConfig:
     # Guard against infinite explore: after this many consecutive explore
     # steps without recovering a known-free advance, fall back to PROBE.
     max_explore_steps: int = 10
+    # ── V15.7 observed-corridor gating ──
+    # GOAL_SEEK is only allowed when the corridor toward the goal is
+    # actually OBSERVED known-free (ratio >= this over the guide range);
+    # an unobserved "straight" line must be routed via BYPASS instead of
+    # blind-flying.  The small explore step only advances when at least
+    # this fraction of the short corridor ahead is observed known-free.
+    goal_corridor_clear_ratio: float = 0.60
+    explore_ahead_min_ratio: float = 0.30
     # ── PROBE (replaces ACTIVE_SCAN 360° sweep) ──
     # When A* finds no path, briefly pan left then right to gather
     # information, then re-evaluate.  No full-circle rotation.
@@ -405,25 +413,27 @@ class MacroExpert:
         straight = self._guide_path_straight(
             path, min(goal_dist, self.cfg.effective_guide_range_m),
             self.cfg.guide_straight_ratio)
+        # V15.7: GOAL_SEEK requires the goal corridor to be OBSERVED
+        # known-free.  A line that is straight only because UNKNOWN is
+        # treated as free must not trigger blind GOAL_SEEK flight.
+        goal_corridor_clear = self._goal_corridor_observed_clear(
+            goal_dir, observed_map, position_world, quaternion,
+            goal_dist=goal_dist)
 
         if state == MacroState.GOAL_SEEK:
             if target is None:
                 if path is not None:
-                    # V15.2: a route exists but its known-free advance is
-                    # exhausted — make a small explore step along the line
-                    # (camera leads) instead of stopping to probe.
-                    self._explore_count += 1
-                    if self._explore_count >= self.cfg.max_explore_steps:
-                        self._explore_count = 0
-                        self._blocked_counter += 1
-                        self._clear_counter = 0
-                        if self._blocked_counter >= self.cfg.enter_blocked_frames:
-                            state = MacroState.PROBE
-                            self._begin_scan_session()
-                            self._tick_time = 0.0
-                    else:
-                        self._blocked_counter = 0
-                        self._clear_counter = 0
+                    # V15.7: a route exists but its known-free advance is
+                    # exhausted — the corridor ahead is unobserved or
+                    # blocked.  Do NOT blind-advance into the unknown:
+                    # route via BYPASS so the guide line's known points
+                    # are followed (BYPASS pans when even those are gone).
+                    self._explore_count = 0
+                    self._blocked_counter += 1
+                    self._clear_counter = 0
+                    if self._blocked_counter >= self.cfg.enter_blocked_frames:
+                        state = MacroState.BYPASS
+                        self._tick_time = 0.0
                 else:
                     # No route at all — accumulate blockage, then probe.
                     self._explore_count = 0
@@ -435,12 +445,14 @@ class MacroExpert:
                         self._tick_time = 0.0
             else:
                 self._explore_count = 0
-                if straight:
-                    # Guide line is straight → keep seeking the goal.
+                if straight and goal_corridor_clear:
+                    # Guide line is straight AND the corridor is observed
+                    # clear → keep seeking the goal.
                     self._blocked_counter = 0
                     self._clear_counter = self.cfg.exit_clear_frames
                 else:
-                    # Line routes around an obstacle → enter BYPASS.
+                    # V15.7: straight-but-unobserved or bent line → route
+                    # around via the guide line's known points (BYPASS).
                     self._blocked_counter += 1
                     self._clear_counter = 0
                     if self._blocked_counter >= self.cfg.enter_blocked_frames:
@@ -451,13 +463,33 @@ class MacroExpert:
             # The guide line (recomputed above) routes around an obstacle.
             # Follow it — _build_guide consumes the farthest reachable
             # point every tick, so the target rolls forward as the map
-            # updates.  Straight line → back to GOAL_SEEK; no advance →
-            # explore along the line; only a truly route-less state probes.
+            # updates.  Straight + observed-clear line → back to GOAL_SEEK;
+            # no advance → explore only when the corridor ahead is actually
+            # observed; only a truly route-less state probes.
             if target is None:
                 if path is not None:
-                    # V15.2 explore advance along the existing route.
-                    self._explore_count += 1
-                    if self._explore_count >= self.cfg.max_explore_steps:
+                    explore_dir_flu = self._guide_explore_direction_flu(
+                        path, position_world, quaternion, goal_dir)
+                    if self._known_free_ahead(
+                            explore_dir_flu, observed_map, position_world,
+                            quaternion):
+                        # V15.2 explore advance along the existing route
+                        # (a short observed-corridor step, camera leads).
+                        self._explore_count += 1
+                        if self._explore_count >= self.cfg.max_explore_steps:
+                            self._explore_count = 0
+                            self._blocked_counter += 1
+                            self._clear_counter = 0
+                            if self._blocked_counter >= self.cfg.enter_blocked_frames:
+                                state = MacroState.PROBE
+                                self._begin_scan_session()
+                                self._tick_time = 0.0
+                        else:
+                            self._blocked_counter = 0
+                            self._clear_counter = 0
+                    else:
+                        # V15.7: nothing observed ahead — pan to observe
+                        # instead of blind-flying into the unknown.
                         self._explore_count = 0
                         self._blocked_counter += 1
                         self._clear_counter = 0
@@ -465,9 +497,6 @@ class MacroExpert:
                             state = MacroState.PROBE
                             self._begin_scan_session()
                             self._tick_time = 0.0
-                    else:
-                        self._blocked_counter = 0
-                        self._clear_counter = 0
                 else:
                     self._explore_count = 0
                     self._blocked_counter += 1
@@ -478,13 +507,14 @@ class MacroExpert:
                         self._tick_time = 0.0
             else:
                 self._explore_count = 0
-                if straight:
+                if straight and goal_corridor_clear:
                     self._clear_counter += 1
                     if self._clear_counter >= self.cfg.exit_clear_frames:
                         state = MacroState.GOAL_SEEK
                         self._tick_time = 0.0
                 else:
-                    # Still routing — keep following the guide line.
+                    # Still routing (or corridor not yet observed) — keep
+                    # following the guide line.
                     self._blocked_counter = 0
                     self._clear_counter = 0
 
@@ -522,7 +552,7 @@ class MacroExpert:
                         position_world, quaternion,
                         source_state=previous_state,
                         scan_budget_exhausted=True)
-                elif straight:
+                elif straight and goal_corridor_clear:
                     state = MacroState.GOAL_SEEK
                 else:
                     state = MacroState.BYPASS
@@ -536,7 +566,10 @@ class MacroExpert:
             position_world, quaternion, source_state=previous_state)
 
     def _reset(self):
-        self._state = MacroState.GOAL_SEEK
+        # V15.7: start in BYPASS, not GOAL_SEEK.  At episode start the
+        # goal corridor is usually unobserved; GOAL_SEEK is only entered
+        # once the corridor is confirmed known-free (see update()).
+        self._state = MacroState.BYPASS
         self._committed_side = CommittedSide.NONE
         self._blocked_counter = 0
         self._clear_counter = 0
@@ -700,9 +733,69 @@ class MacroExpert:
             self.cfg.effective_guide_range_m,
             self.cfg.blocked_corridor_radius_m, quaternion)
         if ratio is not None:
-            return ratio >= 0.60
-        # No map data yet (first frame) — assume open.
-        return True
+            return ratio >= self.cfg.goal_corridor_clear_ratio
+        # V15.7: no map data yet — never assume the corridor is open.
+        # An unobserved goal corridor must be routed via BYPASS/probe.
+        return False
+
+    def _goal_corridor_observed_clear(
+        self, goal_dir_flu, observed_map, position_world, quaternion,
+        goal_dist=None,
+    ):
+        """True only when the goal corridor is OBSERVED known-free.
+
+        V15.7: GOAL_SEEK gate.  Unlike _goal_direction_feasible, never
+        assumes an unobserved corridor is open.  The corridor is sampled
+        out to min(effective_guide_range, goal_dist) so a goal that is
+        right in front only requires a short observed corridor.
+        """
+        if observed_map is None:
+            return False
+        distance = float(goal_dist) if (
+            goal_dist is not None and goal_dist >= 0.0
+        ) else self.cfg.effective_guide_range_m
+        distance = min(distance, self.cfg.effective_guide_range_m)
+        if distance <= 0.0:
+            return True
+        ratio = self._corridor_ratio(
+            observed_map, position_world, goal_dir_flu, distance,
+            self.cfg.blocked_corridor_radius_m, quaternion)
+        if ratio is None:
+            return False
+        return ratio >= self.cfg.goal_corridor_clear_ratio
+
+    def _known_free_ahead(
+        self, direction_flu, observed_map, position_world, quaternion,
+    ):
+        """True when a short corridor ahead is observed known-free.
+
+        V15.7: gates the small explore step so the drone only advances
+        into space the camera has partially cleared.  At episode start
+        (nothing observed toward the goal) this returns False, so the
+        drone pans instead of blind-flying.
+        """
+        if observed_map is None:
+            return False
+        ratio = self._corridor_ratio(
+            observed_map, position_world, direction_flu,
+            self.cfg.guide_explore_step_m,
+            self.cfg.guide_swept_radius_m, quaternion)
+        if ratio is None:
+            return False
+        return ratio >= self.cfg.explore_ahead_min_ratio
+
+    def _guide_explore_direction_flu(
+        self, path, position_world, quaternion, fallback_dir_flu,
+    ):
+        """First guide-line segment direction (for explore gating)."""
+        if path is not None and len(path) >= 2:
+            seg = np.asarray(path[1], dtype=np.float64) - np.asarray(
+                path[0], dtype=np.float64)
+            seg_len = float(np.linalg.norm(seg))
+            if seg_len > 1.0e-6:
+                return self._unit3(self._world_to_flu(
+                    seg / seg_len, quaternion))
+        return self._unit3(fallback_dir_flu)
 
     @staticmethod
     def _depth_sector_score(depth_m, side):
@@ -1188,6 +1281,30 @@ class MacroExpert:
             float(np.clip(self.cfg.guide_range_fraction, 0.1, 1.0)))
         if goal_dist is not None and goal_dist >= 0.0:
             guide_range = min(guide_range, float(goal_dist))
+
+        # V15.7 goal snap: when the goal is directly in front (within the
+        # guide range) and its whole corridor is observed known-free,
+        # target the goal EXACTLY.  Previously the target hovered at the
+        # last path waypoint ~0.1 m short of the goal, so the debug view
+        # showed the selected point floating around the terminal and
+        # guide_is_final (1 mm tolerance) stayed False.
+        if (goal_dist is not None and goal_dist >= 0.0 and
+                goal_dist <= guide_range + 1.0e-3):
+            goal_pt = position + self._unit3(self._flu_to_world(
+                goal_dir_flu, quaternion)) * goal_dist
+            goal_known = (
+                observed_map.is_known_free(goal_pt)
+                if hasattr(observed_map, "is_known_free") else True)
+            if goal_known:
+                reach_to_goal = self._fit_known_free_guide_distance(
+                    observed_map, position, goal_dir_flu, quaternion,
+                    goal_dist, allow_clipping=True)
+                if reach_to_goal + 1.0e-6 >= goal_dist:
+                    result = (goal_pt, 1.0)
+                    cache = getattr(self, "_guide_cache", None)
+                    if cache is not None:
+                        cache["target"] = result
+                    return result
 
         # Walk the path outward, measuring cumulative distance, and check
         # reachability at each waypoint.  Pick the farthest reachable.
@@ -1748,14 +1865,18 @@ class MacroExpert:
                             np.asarray(explore, dtype=np.float64)
                             - position_world)
                         explore_dist = float(np.linalg.norm(explore_delta))
-                        if explore_dist > 0.2:
+                        explore_dir_flu = self._unit3(self._world_to_flu(
+                            explore_delta / max(explore_dist, 1.0e-6),
+                            quaternion))
+                        # V15.7: only advance when the short corridor ahead
+                        # is observed known-free; otherwise hold and yaw
+                        # toward the goal so the camera reveals it.
+                        if (explore_dist > 0.2 and self._known_free_ahead(
+                                explore_dir_flu, observed_map,
+                                position_world, quaternion)):
                             move_dist = explore_dist
-                            move_dir = self._unit3(self._world_to_flu(
-                                explore_delta / explore_dist, quaternion))
+                            move_dir = explore_dir_flu
                             reason = "goal_seek_explore"
-                            # Allow entering the unknown edge; the 30 Hz
-                            # planner still validates the B-spline against
-                            # the ESDF (occupied → its own recovery).
                         else:
                             move_dist = 0.0
                             move_dir = goal_dir_flu.copy()
@@ -1783,11 +1904,11 @@ class MacroExpert:
                 move_dist = float(np.linalg.norm(target_delta_world))
                 move_dir = self._unit3(self._world_to_flu(
                     target_delta_world / move_dist, quaternion))
-                yaw_goal = self._unit2(goal_dir_flu[:2])
-                yaw_move = self._unit2(move_dir[:2])
-                yaw_dir = self._unit2(
-                    self.cfg.bypass_yaw_goal_weight * yaw_goal +
-                    (1.0 - self.cfg.bypass_yaw_goal_weight) * yaw_move)
+                # V15.7: the planned yaw is the direction to the selected
+                # candidate point (also saved as the macro_yaw_dir label).
+                # The nose points where the drone is flying — no more goal
+                # blend that leaves the candidate off to the side.
+                yaw_dir = self._unit2(move_dir[:2])
                 reason = "guide_bypass"
             else:
                 # No known-free advance.  If a route still exists, explore
@@ -1803,16 +1924,18 @@ class MacroExpert:
                         np.asarray(explore, dtype=np.float64)
                         - position_world)
                     explore_dist = float(np.linalg.norm(explore_delta))
-                    if explore_dist > 0.2:
+                    explore_dir_flu = self._unit3(self._world_to_flu(
+                        explore_delta / max(explore_dist, 1.0e-6),
+                        quaternion))
+                    # V15.7: only advance the small explore step when the
+                    # short corridor ahead is actually observed; otherwise
+                    # hold and let the camera reveal it (PROBE pans).
+                    if (explore_dist > 0.2 and self._known_free_ahead(
+                            explore_dir_flu, observed_map, position_world,
+                            quaternion)):
                         move_dist = explore_dist
-                        move_dir = self._unit3(self._world_to_flu(
-                            explore_delta / explore_dist, quaternion))
-                        yaw_goal = self._unit2(goal_dir_flu[:2])
-                        yaw_move = self._unit2(move_dir[:2])
-                        yaw_dir = self._unit2(
-                            self.cfg.bypass_yaw_goal_weight * yaw_goal +
-                            (1.0 - self.cfg.bypass_yaw_goal_weight)
-                            * yaw_move)
+                        move_dir = explore_dir_flu
+                        yaw_dir = self._unit2(move_dir[:2])
                         reason = "guide_bypass_explore"
                     else:
                         move_dist = 0.0

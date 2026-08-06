@@ -1074,7 +1074,18 @@ global:
     # ── V15 guide-line navigation ──
     # 2-D A* on the observed map (unknown = free + small penalty).
     guide_unknown_cost: 1.05
+    # A* path is "straight" (→ GOAL_SEEK) when path_length / straight ≤ this.
     guide_straight_ratio: 1.20
+    # V15.7: GOAL_SEEK requires the goal corridor to be OBSERVED known-free
+    # (ratio over the guide range >= this).  A line that is straight only
+    # because unknown is treated as free no longer triggers blind flight.
+    goal_corridor_clear_ratio: 0.60
+    # V15.7: the small explore step only advances when at least this
+    # fraction of the short corridor ahead is observed known-free.
+    explore_ahead_min_ratio: 0.30
+    # V15.7: bypass yaw points at the selected candidate point (also the
+    # macro_yaw_dir expert label).  Weight retained for compatibility but
+    # no longer blended into the yaw direction.
     bypass_yaw_goal_weight: 0.60
     # V15.2 explore advance: when a route exists but known-free advance is
     # exhausted, move this far along the guide line (camera leads) instead
@@ -1152,6 +1163,15 @@ global:
       maximum_recovery_control_steps: 90
 
       tie_break_direction: "right"
+
+      # V15.6 corridor-widening scan: after `scan_failure_threshold`
+      # consecutive planner rejections, the drone pans sideways (left/right
+      # alternately) for `scan_duration_s` to observe the lateral corridor,
+      # so the guide line can route around the blocker instead of hovering
+      # and retrying the identical target until the abort limit.
+      scan_failure_threshold: 2
+      scan_duration_s: 1.0
+      scan_radius_m: 1.5
 
   # ── Sync & commit thresholds ─────────────────────────────────────────
   sync:

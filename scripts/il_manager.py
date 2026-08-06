@@ -34,7 +34,7 @@ import rospkg
 #    - Active scan min angle 15°→90°
 #    - stop_at_terminal field in LocalPlanningRequest
 # ═══════════════════════════════════════════════════════════════════
-_FIX_VERSION = "IL_FIX_V15_5_20260806"
+_FIX_VERSION = "IL_FIX_V15_7_20260806"
 print("=" * 70)
 print("  IL_FIX_VERSION: {}".format(_FIX_VERSION))
 print("  V15.2: explore advance along route, PROBE only when route-less")
@@ -648,6 +648,10 @@ class ILManager:
                 "guide_explore_step_m", 0.8)),
             max_explore_steps=int(macro_cfg.get(
                 "max_explore_steps", 10)),
+            goal_corridor_clear_ratio=float(macro_cfg.get(
+                "goal_corridor_clear_ratio", 0.60)),
+            explore_ahead_min_ratio=float(macro_cfg.get(
+                "explore_ahead_min_ratio", 0.30)),
             probe_side_duration_s=float(macro_cfg.get(
                 "probe_side_duration_s", 1.2)),
             probe_max_duration_s=float(macro_cfg.get(
@@ -3017,6 +3021,19 @@ class ILManager:
         recovery_max_steps = int(rec_cfg.get(
             "maximum_recovery_control_steps", 90))
         recovery_tie_break = str(rec_cfg.get("tie_break_direction", "right"))
+        # ── V15.6 corridor-widening scan on repeated planner failure ──
+        # When the planner rejects the same target several times in a row,
+        # the drone pans sideways (left/right alternately) to observe the
+        # lateral space.  The new observations widen the known-free corridor,
+        # so the guide line can route around the blocker and the optimizer
+        # has room to fit a valid spline — instead of hovering and retrying
+        # the identical target until the 30-failure abort.
+        recovery_scan_failure_threshold = int(rec_cfg.get(
+            "scan_failure_threshold", 2))
+        recovery_scan_duration_s = float(rec_cfg.get(
+            "scan_duration_s", 1.0))
+        recovery_scan_radius_m = float(rec_cfg.get(
+            "scan_radius_m", 1.5))
         active_scan_cfg = online_rt.get("active_scan", {})
         active_scan_max_duration_s = float(active_scan_cfg.get(
             "maximum_duration_s", 8.0))
@@ -3036,6 +3053,10 @@ class ILManager:
         recovery_target_world = np.zeros(3, dtype=np.float64)
         recovery_target_path_index = -1
         recovery_azimuth_rad = 0.0  # v11 FIX: computed from atan2, used for yaw-rate
+        # V15.6 corridor-widening scan state: +1=pan left, -1=pan right, 0=off
+        failure_scan_side = 0
+        failure_scan_elapsed = 0.0
+        failure_scan_toggles = 0
         active_scan_elapsed_s = 0.0
         active_scan_step_count = 0
 
@@ -3733,6 +3754,13 @@ class ILManager:
                         )
                         self._latest_plan_snapshot = snapshot
                         planner_mode = PlannerMode.FRESH_PLAN
+                        # V15.6: a fresh valid plan ends any corridor scan and
+                        # resets the failure counter so only TRULY consecutive
+                        # planner rejections accumulate toward the abort limit
+                        # (scattered single rejections no longer add up).
+                        failure_scan_side = 0
+                        failure_scan_elapsed = 0.0
+                        consecutive_failures = 0
 
                     else:
                         self._failed_replans += 1
@@ -3759,6 +3787,24 @@ class ILManager:
                         self._consecutive_guide_failures += 1
                         # ── Track consecutive planner failure ───────────
                         consecutive_failures += 1
+                        # ── V15.6 corridor-widening scan ────────────────
+                        # After `recovery_scan_failure_threshold` consecutive
+                        # rejections, start panning sideways (alternate left /
+                        # right each time) so the camera observes the lateral
+                        # corridor and the guide line can route around the
+                        # blocker.  The scan runs inside RECOVERY below.
+                        if (failure_scan_side == 0 and
+                                consecutive_failures >=
+                                recovery_scan_failure_threshold):
+                            failure_scan_side = (
+                                1 if failure_scan_toggles % 2 == 0 else -1)
+                            failure_scan_toggles += 1
+                            failure_scan_elapsed = 0.0
+                            rospy.logwarn(
+                                "[LOCAL-PLAN] Entering corridor-widening "
+                                "scan (side=%s) after %d planner failures.",
+                                "left" if failure_scan_side > 0 else "right",
+                                consecutive_failures)
                         rospy.logwarn(
                             "[LOCAL-PLAN] Planner failure #%d (limit %d): "
                             "macro mode=%s stays immutable; safety stop.",
@@ -3873,9 +3919,34 @@ class ILManager:
                 control_mode = ControlMode.ROTATE_IN_PLACE
                 # v12: compute recovery direction BEFORE row build
                 # so Trend label and yaw-rate use the same azimuth
+                scan_target_world = None
+                if (planner_mode == PlannerMode.RECOVERY and
+                        failure_scan_side != 0):
+                    # V15.6 corridor-widening scan: look SIDEWAYS (perpendicular
+                    # to the goal direction) instead of toward the goal, so the
+                    # camera observes the lateral space the guide line needs.
+                    failure_scan_elapsed += dt_sample
+                    if failure_scan_elapsed >= recovery_scan_duration_s:
+                        failure_scan_side = 0
+                        failure_scan_elapsed = 0.0
+                    else:
+                        goal_delta = goal_np - cur_pos
+                        goal_len = float(np.linalg.norm(goal_delta))
+                        if goal_len > 1.0e-6:
+                            perp = np.array(
+                                [-goal_delta[1], goal_delta[0], 0.0],
+                                dtype=np.float64) / goal_len
+                            scan_target_world = (
+                                cur_pos +
+                                perp * float(failure_scan_side) *
+                                recovery_scan_radius_m)
+                        else:
+                            scan_target_world = goal_np.copy()
                 recovery_direction, recovery_azimuth_rad = \
                     self._compute_recovery_direction(
-                        recovery_target_world, cur_pos,
+                        (scan_target_world if scan_target_world is not None
+                         else recovery_target_world),
+                        cur_pos,
                         dynamics_state.quaternion_world_body,
                         recovery_yaw_deadband,
                         recovery_last_direction, recovery_tie_break)
@@ -4034,10 +4105,16 @@ class ILManager:
                             else "recovery_goal_direction")),
                     guide_target_world=(
                         guide_sel.guide_position_world.copy()
-                        if guide_sel.valid else recovery_target_world.copy()),
+                        if guide_sel.valid else (
+                            recovery_target_world.copy()
+                            if guide_sel.recovery_target_valid
+                            else goal_np.copy())),
                     guide_target_path_index=(
                         guide_sel.guide_path_index
-                        if guide_sel.valid else recovery_target_path_index),
+                        if guide_sel.valid else (
+                            recovery_target_path_index
+                            if guide_sel.recovery_target_valid
+                            else len(global_path) - 1)),
                     recovery_direction=recovery_last_direction,
                     recovery_azimuth_rad=recovery_azimuth_rad,
                     plan_snapshot=self._latest_plan_snapshot,
@@ -5030,8 +5107,14 @@ class ILManager:
         else:
             # A shortened moving Guide represents limited observable/control
             # horizon, so reduce cruise speed without treating it as a stop.
+            # V15.5: the floor MUST match the C++ planner's terminal-speed
+            # distance_ratio floor (0.55 in spline_planner.cpp).  Previously
+            # only the planner was raised to 0.55 while this Python tracking
+            # cap stayed at 0.25, so short Guides (0.5-0.9 m) were still
+            # capped at ~0.45 m/s — the drone crawled regardless of the
+            # planner's terminal speed.
             distance_ratio = max(
-                0.25, min(
+                0.55, min(
                     1.0,
                     distance / max(0.5, float(lookahead_distance))))
             speed_reference = cruise_speed * distance_ratio
@@ -5306,9 +5389,16 @@ class ILManager:
         # label no longer corresponds to the complete guide.
         reference_yaw = float(preview_tp.yaw)
         reference_yaw_rate = float(preview_tp.yaw_rate)
+        # V15.7: close the yaw loop against the plan's TARGET yaw rather
+        # than the 0.08 s preview.  The C++ trajectory spreads the full
+        # yaw change over the whole plan duration (linear interpolation),
+        # so tracking only the preview yields ~(yaw_error / duration) rad/s
+        # — a sluggish turn.  Tracking the target turns the nose to the
+        # selected candidate at up to max_yaw_rate.
+        target_yaw = float(traj[-1].yaw)
         yaw_error = math.atan2(
-            math.sin(reference_yaw - cur_yaw),
-            math.cos(reference_yaw - cur_yaw))
+            math.sin(target_yaw - cur_yaw),
+            math.cos(target_yaw - cur_yaw))
         yaw_rate_cmd = max(
             -max_yaw_rate,
             min(max_yaw_rate,
@@ -5473,9 +5563,20 @@ class ILManager:
             desired_speed = float(np.linalg.norm(desired_vel_world))
             if desired_speed > max_velocity:
                 desired_vel_world *= max_velocity / max(desired_speed, 1e-9)
-            yaw_rate_cmd = yaw_rate_for_world_velocity(
-                yaw, desired_vel_world, yaw_tracking_gain,
-                max_yaw_rate, yaw_speed_threshold)
+            # V15.7: same target-yaw closed loop as the expert label in
+            # _compute_trajectory_tracking_command.  The nose turns to the
+            # plan target yaw at up to max_yaw_rate instead of waiting for
+            # horizontal velocity to exceed yaw_speed_threshold — the old
+            # velocity-facing law kept the yaw at zero while the drone was
+            # still slow, which made heading changes feel sluggish.
+            target_yaw_exec = float(traj[-1].yaw)
+            yaw_error_exec = math.atan2(
+                math.sin(target_yaw_exec - yaw),
+                math.cos(target_yaw_exec - yaw))
+            yaw_rate_cmd = max(
+                -max_yaw_rate,
+                min(max_yaw_rate,
+                    yaw_tracking_gain * yaw_error_exec))
             command_state = self._dynamics.get_state()
             desired_vel_flu = world_vector_to_body_flu_quat(
                 desired_vel_world,
@@ -7540,58 +7641,62 @@ class ILManager:
                         except (ValueError, TypeError):
                             pass
 
-                        # Valid trend: soft label sums should be ~1
-                        # v11: 13-class horizontal soft labels (trend_horizontal_soft_00..12)
-                        h_sum = 0.0
-                        for i in range(TREND_HORIZONTAL_CLASS_COUNT):
-                            key = "trend_horizontal_soft_{:02d}".format(i)
-                            try:
-                                h_sum += float(row.get(key, 0))
-                            except (ValueError, TypeError):
-                                pass
-                        if abs(h_sum - 1.0) > 0.02:
-                            issues.append("azimuth soft sum={:.4f} != 1 at row {}".format(h_sum, row_idx))
-
-                        v_sum = 0.0
-                        for i in range(trend_v_bins):
-                            key = "guide_elevation_soft_{}".format(i)
-                            try:
-                                v_sum += float(row.get(key, 0))
-                            except (ValueError, TypeError):
-                                pass
-                        if abs(v_sum - 1.0) > 0.02:
-                            issues.append(
-                                "elevation soft sum={:.4f} != 1 at row {}"
-                                .format(v_sum, row_idx))
-
-                    # Invalid trend: bin should be -1, soft labels all zero
-                    if tlv is not None and str(tlv) == "0":
+                        # V15.6: expert labels are CONTINUOUS — the bin/soft-label
+                        # representation is obsolete.  Validate the new macro
+                        # expert label (unit direction + normalized distance +
+                        # target yaw) and the local expert label (velocity + yaw
+                        # rate) instead of the old 13-class soft bins, whose
+                        # coverage ended at the FOV edge and falsely rejected
+                        # sharp-bypass rows (e.g. a 104-120° guide azimuth).
                         try:
-                            ab = int(row.get("guide_azimuth_bin", -1))
-                            eb = int(row.get("guide_elevation_bin", -1))
-                            if ab != -1:
-                                issues.append("invalid trend azimuth_bin={} != -1 at row {}".format(ab, row_idx))
-                            if eb != -1:
-                                issues.append("invalid trend elevation_bin={} != -1 at row {}".format(eb, row_idx))
-
-                            for i in range(TREND_HORIZONTAL_CLASS_COUNT):
-                                key = "trend_horizontal_soft_{:02d}".format(i)
-                                try:
-                                    v = float(row.get(key, 0))
-                                    if abs(v) > 1e-9:
-                                        issues.append("invalid trend horizontal_soft non-zero={} at row {}".format(v, row_idx))
-                                        break
-                                except ValueError:
-                                    pass
-                            for i in range(trend_v_bins):
-                                key = "guide_elevation_soft_{}".format(i)
-                                try:
-                                    v = float(row.get(key, 0))
-                                    if abs(v) > 1e-9:
-                                        issues.append("invalid trend elevation_soft non-zero={} at row {}".format(v, row_idx))
-                                        break
-                                except ValueError:
-                                    pass
+                            mdx = float(row.get("macro_move_dir_x_flu", 0))
+                            mdy = float(row.get("macro_move_dir_y_flu", 0))
+                            mdz = float(row.get("macro_move_dir_z_flu", 0))
+                            mnorm = math.sqrt(
+                                mdx * mdx + mdy * mdy + mdz * mdz)
+                            move_dist = float(
+                                row.get("macro_move_distance_m", 0))
+                            # Zero direction allowed only for a hold.
+                            if move_dist > 0.05 and abs(mnorm - 1.0) > 0.05:
+                                issues.append(
+                                    "macro_move_dir norm={:.4f} != 1 at "
+                                    "row {}".format(mnorm, row_idx))
+                            dist_norm = float(
+                                row.get("macro_move_distance_norm", -1))
+                            if dist_norm < 0.0 or dist_norm > 1.0:
+                                issues.append(
+                                    "macro_move_distance_norm={} out of "
+                                    "[0,1] at row {}".format(
+                                        dist_norm, row_idx))
+                            # Target yaw (macro_yaw_dir_* is a unit 2-D FLU
+                            # direction encoding the desired camera yaw).
+                            ydx = float(row.get("macro_yaw_dir_x_flu", 0))
+                            ydy = float(row.get("macro_yaw_dir_y_flu", 0))
+                            ynorm = math.sqrt(ydx * ydx + ydy * ydy)
+                            if move_dist > 0.05 and abs(ynorm - 1.0) > 0.05:
+                                issues.append(
+                                    "macro_yaw_dir norm={:.4f} != 1 at "
+                                    "row {}".format(ynorm, row_idx))
+                        except (ValueError, TypeError):
+                            pass
+                        # ── Local expert label: velocity + yaw rate ──
+                        try:
+                            evx = float(row.get("expert_vx_flu", 0))
+                            evy = float(row.get("expert_vy_flu", 0))
+                            evz = float(row.get("expert_vz_flu", 0))
+                            espeed = math.sqrt(
+                                evx * evx + evy * evy + evz * evz)
+                            if espeed > max_velocity + 0.05:
+                                issues.append(
+                                    "expert speed={:.3f} > max {} at "
+                                    "row {}".format(
+                                        espeed, max_velocity, row_idx))
+                            eyr = float(row.get("expert_yaw_rate", 0))
+                            if abs(eyr) > max_yaw_rate + 0.05:
+                                issues.append(
+                                    "expert yaw_rate={:.3f} > max {} at "
+                                    "row {}".format(
+                                        eyr, max_yaw_rate, row_idx))
                         except (ValueError, TypeError):
                             pass
 
