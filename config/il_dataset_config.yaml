@@ -1,24 +1,34 @@
 # ============================================================================
-#  Imitation Learning Dataset Collection — Configuration  v5
+#  Imitation Learning Dataset Collection — Official Configuration  (schema v17)
 # ============================================================================
-#  Obstacle regimes:
-#    small_only           – radius 0.15 – 1.0 m   (diameter 0.3 – 2.0 m)
-#    small_medium         – radius 0.15 – 2.5 m   (diameter 0.3 – 5.0 m)
-#    large_medium_small   – radius 0.15 – 4.0 m   (diameter 0.3 – 8.0 m)
+#  This is the SINGLE canonical config file.  It is referenced by:
+#    - il_dataset/launch/il_dataset_collect.launch
+#    - il_multiscale_dataset/launch/multiscale_dataset_collect.launch
 #
-#  Workflow  (state machine):
-#    BOOT → WAIT_UNITY → GEN_OBSTACLES → WAIT_SCENE → EXPORT_PC →
-#    WAIT_PC → BUILD_ESDF → GEN_PAIRS → PLAN_GLOBAL_PATHS →
-#    VALIDATE_GLOBAL_PATHS → RESET_DRONE → WAIT_STABLE →
-#    INIT_LOCAL_PLANNER → START_RECORDING → ONLINE_PLAN_AND_RECORD →
-#    STOP_RECORDING → VALIDATE_AND_COMMIT → NEXT_TRAJ / NEXT_CONFIG
+#  Sole collection flow:
+#    density-balanced cylinder scene → quota-balanced task generation →
+#    causal local Guide exploration → C++ receding-horizon Control →
+#    deterministic lockstep recording → whole-episode validation/commit.
 #
-#  Schema version: 5
+#  This is a 2.5D validation setup: the network interfaces remain 3D, while
+#  every obstacle spans the complete z range so avoidance labels are planar.
+#  Removed schemas and fallback planners are intentionally unsupported.
+#
+#  Yaw convention (unified across the package):
+#    yaw = atan2(world_y, world_x) - pi/2   (yaw=0 => nose/body +Y faces world +Y)
+#    nose world direction = (-sin yaw, cos yaw); body quaternion = rotZ(yaw).
+#
+#  Schema version: 17   (matches il_manager.py DATA_SCHEMA_V17_FIELDS and the
+#  "schema_version" recorded in every metadata.json; CSV header = v17 fields)
 #    - v1: il_pipeline.py     (global.flight, global.connect_timeout, scene.trajectories)
 #    - v2: il_manager.py      (global.fsm, global.control, global.start_goal)
 #    - v3: il_manager.py v3   (sync diagnostics, atomic commit, validated config)
 #    - v4: added vel_source, body_frame_convention metadata
 #    - v5: receding-horizon local planner, C++ pybind11 backend, global A* only
+#    - v16: strict schema — 2.5D quota-balanced scenes, causal Guide labels,
+#           deterministic lockstep recording, whole-episode validation.
+#    - v17: continuous expert supervision and continuous global navigation
+#           labels; causal observed map required; unknown space treated as unsafe.
 # ============================================================================
 
 # ── Global settings ──────────────────────────────────────────────────────────
@@ -963,7 +973,14 @@ global:
 
     esdf_max_distance_m: 5.0
 
-    rebuild_every_n_frames: 1
+    # V15.5: rebuild the observed ESDF every 3rd frame instead of every
+    # frame.  A full 120x120x50 EDT rebuild costs ~35 ms; at 30 Hz the
+    # budget is 33 ms, so rebuilding every frame blocks the single-threaded
+    # lockstep loop and makes the sim run ~3.4x slow-motion.  With a 3-frame
+    # cadence the planner uses an ESDF at most 2 frames (0.067 s ≈ 0.1 m)
+    # stale — safely re-validated on the very next rebuild — while the loop
+    # recovers ~23 ms per frame on average.
+    rebuild_every_n_frames: 3
 
     depth_integration_step: 2
 
@@ -1017,6 +1034,22 @@ global:
     # the independent 30 Hz planner then optimizes and validates the B-spline.
     guide_swept_radius_m: 0.30
     guide_obstacle_clearance_m: 0.20
+    # Guide line keeps this real-world distance from raw obstacle-surface
+    # voxels (A* penalty radius = ceil(m / map_resolution)).  The ESDF
+    # clearance is dist_to_surface - vehicle_radius(0.30); 0.55 m keeps the
+    # drone centre at ESDF >= 0.25 so the 30 Hz B-spline fits a valid
+    # trajectory instead of grazing the boundary (UNKNOWN_SPACE rejections
+    # → stutter).
+    guide_line_clearance_m: 0.55
+    guide_penalty_gain: 0.6
+    # Temporal consistency: adjacent guide lines must not jump to the
+    # opposite side of an obstacle.  The search anchors to the previous
+    # tick's line: candidate cells keep a lateral offset within
+    # [prev - hard, prev + hard] (hard = blocked), soft band adds
+    # guide_lateral_cost per metre beyond guide_lateral_soft_m.
+    guide_lateral_soft_m: 0.30
+    guide_lateral_hard_m: 0.70
+    guide_lateral_cost: 3.0
     guide_corridor_min_ratio: 1.0
     minimum_corridor_score: 0.45         # below this, actively scan instead of blindly choosing a side
     symmetric_score_tolerance: 0.03      # near-equal sides use the fixed preference
@@ -1031,22 +1064,46 @@ global:
     frontier_standoff_m: 0.45
     frontier_max_backtrack_m: 0.20
     frontier_goal_progress_weight: 1.0
-    frontier_information_weight: 0.25
+    frontier_information_weight: 0.06
     frontier_yaw_cost_weight: 0.10
     frontier_side_commitment_bonus: 0.15
     enter_blocked_frames: 3
     exit_clear_frames: 8
     minimum_progress_rate_m_s: 0.15
     minimum_commit_time_s: 0.8
+    # ── V15 guide-line navigation ──
+    # 2-D A* on the observed map (unknown = free + small penalty).
+    guide_unknown_cost: 1.05
+    guide_straight_ratio: 1.20
+    bypass_yaw_goal_weight: 0.60
+    # V15.2 explore advance: when a route exists but known-free advance is
+    # exhausted, move this far along the guide line (camera leads) instead
+    # of stopping to probe. Only a route-less state enters PROBE.
+    guide_explore_step_m: 0.8
+    max_explore_steps: 10
+    # ── PROBE (replaces 360° ACTIVE_SCAN) ──
+    probe_side_duration_s: 1.2
+    probe_max_duration_s: 3.0
+    probe_side_angle_deg: 90.0
     active_scan_yaw_rate_rps: 2.0
-    active_scan_min_angle_deg: 15.0
+    # ── 90° minimum scan before committing to BYPASS (was 15°).
+    # At 2.0 rad/s, 90° takes ~0.8 s — enough to observe the lateral
+    # corridor without unacceptable delay.
+    active_scan_min_angle_deg: 90.0
     # Full scan covers left 90° + crossing back through initial to right -90°
     # = ~270° at 0.8 rad/s ≈ 5.9 s + acceleration margins → 8.0 s.
     active_scan_max_duration_s: 5.0
-    active_peek_distance_m: 2.0
-    active_peek_safety_radius_m: 0.55
     vertical_avoidance_enabled: false
     vertical_active_perception_enabled: false
+
+    # ── Episode-level scan budget (Task 2) ──
+    # Limits on cumulative scanning to prevent infinite recovery loops.
+    max_completed_scans: 2           # completed full-circle scans per episode
+    max_cumulative_scan_time_s: 10.0 # maximum total scan seconds per episode
+    max_unsuccessful_scans: 2        # consecutive scans w/o new known-free or reachable candidates
+
+    # ── Unified goal tolerance (Task 9) ──
+    goal_tolerance_m: 0.30           # must match local_planner.goal_tolerance and Manager goal check
 
   # ── Local expert (v17: 30 Hz pure trajectory tracker / labeler) ────
   local_expert:
@@ -1078,8 +1135,8 @@ global:
     # Intentional macro active perception. This is distinct from unexpected
     # no-Guide recovery and therefore owns a longer two-side sensing budget.
     active_scan:
-      maximum_duration_s: 8.0
-      maximum_control_steps: 240
+      maximum_duration_s: 5.0       # matches macro_expert.active_scan_max_duration_s
+      maximum_control_steps: 150
 
     recovery:
       enabled: true

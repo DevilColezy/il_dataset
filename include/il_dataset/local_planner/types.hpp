@@ -77,6 +77,16 @@ struct LocalPlanningRequest {
     /// DEPRECATED: allow_global_map_fallback — NO LONGER SUPPORTED.
     /// The local planner MUST NOT fall back to the global path on failure.
     bool allow_global_map_fallback{false};
+
+    /// If true, the trajectory terminal is the final task goal.
+    /// The B-spline boundary must enforce zero terminal velocity and
+    /// zero terminal acceleration (full stop at goal).
+    bool stop_at_terminal{false};
+
+    /// Desired terminal velocity (world frame).  Ignored when
+    /// stop_at_terminal is true (forced to zero).  Default allows
+    /// non-zero cruise speed through intermediate waypoints.
+    Eigen::Vector3d terminal_velocity{Eigen::Vector3d::Zero()};
 };
 
 /// Complete result of a single local-planning invocation.

@@ -8,6 +8,8 @@ the global path, global ESDF, or ground-truth obstacle geometry.
 
 from __future__ import division, print_function
 
+import collections
+import heapq
 import math
 from dataclasses import dataclass, field
 from enum import Enum
@@ -17,13 +19,8 @@ import numpy as np
 
 class MacroState(Enum):
     GOAL_SEEK = "GOAL_SEEK"
-    BYPASS_LEFT = "BYPASS_LEFT"
-    BYPASS_RIGHT = "BYPASS_RIGHT"
-    ACTIVE_SCAN_LEFT = "ACTIVE_SCAN_LEFT"
-    ACTIVE_SCAN_RIGHT = "ACTIVE_SCAN_RIGHT"
-    ACTIVE_PEEK_LEFT = "ACTIVE_PEEK_LEFT"
-    ACTIVE_PEEK_RIGHT = "ACTIVE_PEEK_RIGHT"
-    GOAL_HOLD = "GOAL_HOLD"
+    BYPASS = "BYPASS"
+    PROBE = "PROBE"
 
 
 class CommittedSide(Enum):
@@ -31,6 +28,30 @@ class CommittedSide(Enum):
     # FLU is [forward, left, up], so positive y means left.
     LEFT = 1
     RIGHT = -1
+
+
+def _obstacle_distance_field(grid):
+    """Distance (in cells) from every cell to the nearest OCCUPIED cell,
+    via multi-source BFS.  Returns an int32 array (0 on occupied)."""
+    rows, cols = grid.shape
+    dist = np.full((rows, cols), 999999, dtype=np.int32)
+    queue = collections.deque()
+    occ = grid == 2
+    for i in range(rows):
+        for j in range(cols):
+            if occ[i, j]:
+                dist[i, j] = 0
+                queue.append((i, j))
+    while queue:
+        i, j = queue.popleft()
+        nd = dist[i, j] + 1
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                ni, nj = i + di, j + dj
+                if 0 <= ni < rows and 0 <= nj < cols and dist[ni, nj] > nd:
+                    dist[ni, nj] = nd
+                    queue.append((ni, nj))
+    return dist
 
 
 @dataclass
@@ -66,6 +87,11 @@ class MacroGuide:
     # Aggregate rejection reasons (compact key → count for CSV width).
     frontier_rejection_summary: str = ""
 
+    # ── Episode-level scan budget exhaustion (Task 2) ──
+    # True when episode scan budget is exhausted; the Manager should
+    # terminate the episode rather than continue scanning.
+    scan_budget_exhausted: bool = False
+
 
 @dataclass
 class MacroExpertConfig:
@@ -89,20 +115,82 @@ class MacroExpertConfig:
     frontier_standoff_m: float = 0.45
     frontier_max_backtrack_m: float = 0.20
     frontier_goal_progress_weight: float = 1.0
-    frontier_information_weight: float = 0.25
+    frontier_information_weight: float = 0.06
     frontier_yaw_cost_weight: float = 0.10
     frontier_side_commitment_bonus: float = 0.15
     enter_blocked_frames: int = 3
     exit_clear_frames: int = 8
     minimum_progress_rate_m_s: float = 0.15
     minimum_commit_time_s: float = 0.8
+    # ── V15 guide-line navigation ──
+    # 2-D A* on the observed map with "unknown = free + small penalty".
+    # The resulting guide line is the optimal path to the goal given
+    # current information; the drone flies its farthest reachable point
+    # (receding horizon) and the line is recomputed every tick.
+    guide_unknown_cost: float = 1.05
+    # A* path is "straight" (→ GOAL_SEEK) when path_length / straight ≤ this.
+    guide_straight_ratio: float = 1.20
+    # Yaw blend fraction toward the goal during BYPASS (camera leads).
+    bypass_yaw_goal_weight: float = 0.60
+    # ── V15.2 A* obstacle-distance penalty (guide-line clearance) ──
+    # The observed map stores RAW obstacle-surface voxels and the ESDF
+    # clearance is dist_to_surface - vehicle_radius.  A penalty radius of
+    # only ~vehicle_radius puts the guide line exactly at ESDF=0, so the
+    # 30 Hz B-spline optimizer grazes the boundary and the planner rejects
+    # (UNKNOWN_SPACE) → safety stop → stutter.  Keep the guide line at
+    # >= guide_line_clearance_m from surfaces (cells = ceil(m / res)), so
+    # the drone centre always has ESDF clearance >= this minus vehicle
+    # radius and the B-spline fits comfortably.
+    guide_line_clearance_m: float = 0.55
+    # Obstacle-distance penalty gain applied to guide-line search steps
+    # inside `penalty_radius` cells of an OCCUPIED voxel.
+    guide_penalty_gain: float = 0.6
+    # ── V15.3 temporal consistency (adjacent guide lines must not jump) ──
+    # The guide-line search is anchored to the PREVIOUS tick's guide line:
+    # each candidate cell's signed lateral offset from the goal ray must
+    # stay within [prev_offset - hard, prev_offset + hard] (hard = blocked),
+    # with a soft band that adds `guide_lateral_cost` per metre beyond
+    # `guide_lateral_soft_m`.  This prevents the line from flipping from
+    # one side of an obstacle to the other while rounding it (e.g. going
+    # around on the left, then suddenly routing to the right).
+    guide_lateral_soft_m: float = 0.30
+    guide_lateral_hard_m: float = 0.70
+    guide_lateral_cost: float = 3.0
+    # ── V15.2 explore advance ──
+    # When a guide line EXISTS but its known-free advance is exhausted
+    # (obstacle ahead, far side unobserved), the drone makes a small
+    # explore step along the line into the unknown edge, camera leading.
+    # Observation turns unknown→free and the known-free advance resumes.
+    # Only when A* has NO route at all does the drone enter PROBE (pan).
+    guide_explore_step_m: float = 0.8
+    # Guard against infinite explore: after this many consecutive explore
+    # steps without recovering a known-free advance, fall back to PROBE.
+    max_explore_steps: int = 10
+    # ── PROBE (replaces ACTIVE_SCAN 360° sweep) ──
+    # When A* finds no path, briefly pan left then right to gather
+    # information, then re-evaluate.  No full-circle rotation.
+    probe_side_duration_s: float = 1.2
+    probe_max_duration_s: float = 3.0
+    probe_side_angle_deg: float = 90.0
     active_scan_yaw_rate_rps: float = 2.0
-    active_scan_min_angle_deg: float = 15.0
-    active_scan_max_duration_s: float = 2.0
-    active_peek_distance_m: float = 2.0
-    active_peek_safety_radius_m: float = 0.55
+    # ── 90° minimum ensures the drone observes enough lateral space
+    # before committing to BYPASS.  A narrow scan (<45°) leaves the
+    # bypass corridor unobserved → UNKNOWN_SPACE / OPTIMIZATION_FAILED.
+    active_scan_min_angle_deg: float = 90.0
+    active_scan_max_duration_s: float = 5.0
     vertical_avoidance_enabled: bool = False
     vertical_active_perception_enabled: bool = False
+
+    # ── Episode-level scan budget ──
+    # Completed full-circle scans that yielded NO reachable frontier.
+    max_completed_scans: int = 2
+    # Cumulative scan time across the entire episode (s).
+    max_cumulative_scan_time_s: float = 10.0
+    # Consecutive scans with zero increase in known-free or reachable candidates.
+    max_unsuccessful_scans: int = 2
+
+    # ── Goal tolerance unified with Manager/planner ──
+    goal_tolerance_m: float = 0.30
 
     def validate(self, depth_max_m):
         if self.update_hz <= 0.0 or self.local_hz <= 0.0:
@@ -114,8 +202,6 @@ class MacroExpertConfig:
             raise ValueError("guide_range_fraction must be in (0, 1]")
         if not 0.0 < self.effective_guide_range_m <= depth_max_m:
             raise ValueError("effective guide range must be inside depth range")
-        if not 0.0 < self.active_peek_distance_m < self.effective_guide_range_m:
-            raise ValueError("active peek distance must be inside guide range")
         if self.map_resolution_m <= 0.0:
             raise ValueError("map_resolution_m must be positive")
         if self.map_history_seconds <= 0.0:
@@ -130,6 +216,15 @@ class MacroExpertConfig:
             raise ValueError("guide_obstacle_clearance_m must be non-negative")
         if not 0.0 < self.guide_corridor_min_ratio <= 1.0:
             raise ValueError("guide_corridor_min_ratio must be in (0, 1]")
+        if self.guide_line_clearance_m <= 0.0:
+            raise ValueError("guide_line_clearance_m must be positive")
+        if self.guide_penalty_gain < 0.0:
+            raise ValueError("guide_penalty_gain must be non-negative")
+        if not 0.0 < self.guide_lateral_soft_m < self.guide_lateral_hard_m:
+            raise ValueError(
+                "guide_lateral_soft_m must be in (0, guide_lateral_hard_m)")
+        if self.guide_lateral_cost < 0.0:
+            raise ValueError("guide_lateral_cost must be non-negative")
         if not 0.0 <= self.symmetric_score_tolerance <= 1.0:
             raise ValueError("symmetric_score_tolerance must be in [0, 1]")
         if str(self.preferred_symmetric_side).lower() not in ("left", "right"):
@@ -156,28 +251,28 @@ class MacroExpertConfig:
                 self.active_scan_min_angle_deg <= 0.0 or
                 self.active_scan_max_duration_s <= 0.0):
             raise ValueError("active scan parameters must be positive")
-        # Full scan: one continuous 360° rotation at the configured yaw
-        # rate captures the complete surroundings.  At 30 Hz the 90° FOV
-        # camera observes the full circle in ~7.9 s.
-        full_scan_deg = 360.0
-        full_scan_time = (
-            math.radians(full_scan_deg) / self.active_scan_yaw_rate_rps
-            + 0.5)  # yaw accel/decel margin (single direction, no switching)
-        if self.active_scan_max_duration_s + 1.0e-9 < full_scan_time:
+        # V15 PROBE: brief left/right pan replaces the 360° sweep.
+        if (self.probe_side_duration_s <= 0.0 or
+                self.probe_max_duration_s <= 0.0 or
+                self.probe_side_angle_deg <= 0.0):
+            raise ValueError("probe parameters must be positive")
+        if self.probe_max_duration_s + 1.0e-9 < 2.0 * self.probe_side_duration_s:
             raise ValueError(
-                "active_scan_max_duration_s ({:.2f} s) is too short for "
-                "a {:.0f}° full scan at {:.2f} rad/s "
-                "(needs ≥ {:.2f} s)".format(
-                    self.active_scan_max_duration_s,
-                    full_scan_deg,
-                    self.active_scan_yaw_rate_rps,
-                    full_scan_time))
-        if self.map_history_seconds + 1.0e-9 < self.active_scan_max_duration_s:
+                "probe_max_duration_s ({:.2f} s) must cover both sides "
+                "(2 × probe_side_duration_s = {:.2f} s)".format(
+                    self.probe_max_duration_s,
+                    2.0 * self.probe_side_duration_s))
+        if (self.guide_unknown_cost < 1.0 or
+                self.guide_straight_ratio <= 1.0):
+            raise ValueError(
+                "guide_unknown_cost must be ≥ 1.0 and "
+                "guide_straight_ratio must be > 1.0")
+        if self.map_history_seconds + 1.0e-9 < self.probe_max_duration_s:
             raise ValueError(
                 "map_history_seconds ({:.2f} s) must be ≥ "
-                "active_scan_max_duration_s ({:.2f} s)".format(
+                "probe_max_duration_s ({:.2f} s)".format(
                     self.map_history_seconds,
-                    self.active_scan_max_duration_s))
+                    self.probe_max_duration_s))
         if self.vertical_avoidance_enabled:
             raise ValueError("vertical obstacle avoidance must remain disabled")
         if self.vertical_active_perception_enabled:
@@ -191,6 +286,12 @@ class MacroExpert:
         self.cfg = config
         self._reset()
         self._guide_reachability_checker = None
+        # Episode-level scan budget (reset per episode, NOT per scan session)
+        self._episode_cumulative_scan_time_s = 0.0
+        self._episode_completed_scans = 0
+        self._episode_unsuccessful_scans = 0
+        self._episode_last_known_free_before_scan = -1
+        self._scan_exhausted_this_episode = False
 
     def set_guide_reachability_checker(self, checker):
         """Install the expert-only C++ observed-ESDF reachability query."""
@@ -198,6 +299,12 @@ class MacroExpert:
 
     def reset(self):
         self._reset()
+        # ── Episode-level scan budget resets per new episode ──
+        self._episode_cumulative_scan_time_s = 0.0
+        self._episode_completed_scans = 0
+        self._episode_unsuccessful_scans = 0
+        self._episode_last_known_free_before_scan = -1
+        self._scan_exhausted_this_episode = False
 
     def force_active_scan(
         self,
@@ -207,51 +314,25 @@ class MacroExpert:
         current_position_world,
         current_quaternion_xyzw,
     ):
-        """Atomically replace a rejected MOVE Guide with safe perception.
+        """Replace a rejected MOVE Guide with a brief left/right probe.
 
-        When a scan session is already in progress, the session clock is
-        *not* reset — the drone has already observed one side and resetting
-        the timer would allow plan→fail→scan cycles to accumulate unbounded
-        time in the same direction without the macro-level timeout ever
-        firing.
-
-        When the planner repeatedly fails near the goal (OPTIMIZATION_FAILED
-        or COLLISION), the committed side can lock the scan to one direction
-        forever.  Track consecutive restarts and alternate sides so both
-        flanks are tried.
+        V15: enter PROBE (pan left then right).  Termination after
+        probing is an upper-layer decision — the planner's rejection
+        merely asks for information; it does not change macro intent.
         """
-        committed = self._committed_side
-        if committed != CommittedSide.NONE:
-            self._consecutive_scan_restarts += 1
-            if self._consecutive_scan_restarts >= 3:
-                # Stuck on the committed side — try the opposite flank.
-                scan_side = (CommittedSide.RIGHT if committed == CommittedSide.LEFT
-                             else CommittedSide.LEFT)
-                self._consecutive_scan_restarts = 0
-            else:
-                scan_side = committed
-        else:
-            scan_side = self._preferred_side()
-            self._consecutive_scan_restarts = 0
-        scan_state = self._scan_state(scan_side)
-        self._state = scan_state
-        # Preserve the scan session when one is already active.  Only start
-        # a fresh session when entering ACTIVE_SCAN from a non-scan state.
+        self._state = MacroState.PROBE
         if self._scan_session_initial_yaw is None:
             self._begin_scan_session()
         else:
-            # Sync the per-phase accumulator to the (possibly new) direction.
-            self._scan_angle_accum = 0.0
-            self._scan_signed_angle = 0.0
             self._scan_last_yaw = self._current_observed_yaw
         return self._build_guide(
-            scan_state,
+            MacroState.PROBE,
             self._unit3(goal_direction_flu),
             float(goal_distance_m),
             observed_map,
             np.asarray(current_position_world, dtype=np.float64),
             np.asarray(current_quaternion_xyzw, dtype=np.float64),
-            source_state=scan_state)
+            source_state=MacroState.PROBE)
 
     def update(
         self,
@@ -268,6 +349,21 @@ class MacroExpert:
         local_feasible=True,
         dt_since_last_macro=0.2,
     ):
+        """V15 guide-line 3-state machine: GOAL_SEEK / BYPASS / PROBE.
+
+        A 2-D A* guide line (unknown=free+penalty) is recomputed every
+        tick.  GOAL_SEEK when the line is straight to the goal, BYPASS
+        when it routes around obstacles, PROBE when A* finds no path
+        (brief left/right pan, then re-evaluate; upper-layer decision on
+        termination, independent of the planner).
+        """
+        # ── V15.2 perf: cache the guide-line computation for THIS update ──
+        # _compute_guide_path / _select_guide_target are invoked several
+        # times per tick (update() + _build_guide + recursive fallbacks)
+        # with identical inputs; without caching that is up to 6 A* runs
+        # (~70 ms each) per macro tick, which stalled phase-2 to ~600 ms
+        # and made the drone fly in ~1.1 s jerky steps.
+        self._guide_cache = {}
         self._current_velocity_world = np.asarray(
             current_velocity_world, dtype=np.float64)
         dt = max(0.0, float(dt_since_last_macro))
@@ -280,197 +376,163 @@ class MacroExpert:
         self._last_frontier_candidate_count = 0
         scan_exhausted = self._scan_exhausted_this_tick
         self._scan_exhausted_this_tick = False
+        goal_dist = float(goal_distance_m)
 
-        if float(goal_distance_m) < 0.30:
-            if self._state in (MacroState.ACTIVE_SCAN_LEFT,
-                               MacroState.ACTIVE_SCAN_RIGHT):
+        # ── At goal: hold position, face goal ──
+        if goal_dist < self.cfg.goal_tolerance_m:
+            if self._state == MacroState.PROBE:
                 self._end_scan_session()
-            self._state = MacroState.GOAL_HOLD
-            return self._make_goal_hold_guide(position_world, quaternion)
-
-        blocked_now = self._is_blocked(
-            goal_dir, depth_m, observed_map, position_world, quaternion,
-            local_blocked, local_progress_rate, local_feasible)
-        if blocked_now:
-            self._blocked_counter += 1
-            self._clear_counter = 0
-        else:
-            self._blocked_counter = max(0, self._blocked_counter - 1)
-            self._clear_counter += 1
+            self._state = MacroState.GOAL_SEEK
+            # Zero-distance GOAL_SEEK = hold
+            return self._build_guide(
+                MacroState.GOAL_SEEK, goal_dir, goal_dist, observed_map,
+                position_world, quaternion, at_goal=True)
 
         previous_state = self._state
         state = previous_state
-        query_args = (
-            goal_dir, depth_m, observed_map, position_world, quaternion)
+
+        # ── V15: guide-line decision every tick ──
+        # 2-D A* on the observed map (unknown = free + penalty).  The
+        # DECISION driver is the farthest REACHABLE advance point on the
+        # line (_select_guide_target): no advance → PROBE; a straight
+        # line → GOAL_SEEK; a bent line → BYPASS.
+        target, _ = self._select_guide_target(
+            goal_dir, observed_map, position_world, quaternion,
+            goal_dist=goal_dist)
+        path = self._compute_guide_path(
+            goal_dir, observed_map, position_world, quaternion,
+            goal_dist=goal_dist)
+        straight = self._guide_path_straight(
+            path, min(goal_dist, self.cfg.effective_guide_range_m),
+            self.cfg.guide_straight_ratio)
 
         if state == MacroState.GOAL_SEEK:
-            if self._blocked_counter >= self.cfg.enter_blocked_frames:
-                state = self._choose_bypass_side(*query_args)
-                self._tick_time = 0.0
-                self._clear_counter = 0
-
-        elif state in (MacroState.BYPASS_LEFT, MacroState.BYPASS_RIGHT):
-            commit_ok = self._tick_time >= self.cfg.minimum_commit_time_s
-            if (commit_ok and self._blocked_counter == 0 and
-                    self._clear_counter >= self.cfg.exit_clear_frames):
-                state = MacroState.GOAL_SEEK
-                self._committed_side = CommittedSide.NONE
-                self._consecutive_scan_restarts = 0
-                self._tick_time = 0.0
-            elif commit_ok and not self._bypass_side_feasible(
-                    state, *query_args):
-                # Preserve the committed homotopy while acquiring a better
-                # view.  Immediately scanning the opposite side creates the
-                # left/right switching that later appears as expert wobble.
-                state = (MacroState.ACTIVE_SCAN_LEFT
-                         if state == MacroState.BYPASS_LEFT
-                         else MacroState.ACTIVE_SCAN_RIGHT)
-                self._begin_scan_session()
-
-        elif state in (MacroState.ACTIVE_SCAN_LEFT,
-                       MacroState.ACTIVE_SCAN_RIGHT):
-            # ── Scan-session state machine ────────────────────────────
-            # At 30 Hz depth the camera captures the full 90° FOV in one
-            # frame.  One continuous 360° rotation at 0.8 rad/s (~7.9 s)
-            # observes the complete surroundings and fits within the 8 s
-            # scan budget.  There is no reason to split this into two
-            # alternating ±90° phases; a single sweep is both faster and
-            # keeps the rolling map coherent.
-            #
-            # The session tracks cumulative unwrapped yaw from the initial
-            # heading.  Once the camera has swept 360° the session is
-            # exhausted; until then frontier candidates are extracted
-            # continuously (after a short min_angle settle period).
-            # ────────────────────────────────────────────────────────────
-            if self._scan_session_initial_yaw is None:
-                self._begin_scan_session()
-            if self._scan_last_yaw is None:
-                self._scan_last_yaw = yaw
-            yaw_delta = self._wrap_angle(yaw - self._scan_last_yaw)
-            self._scan_last_yaw = yaw
-            self._scan_signed_angle += yaw_delta
-            # Cumulative rotation (unwrapped, ≥ 0 when turning in the
-            # scan direction).
-            scan_sign = (1.0 if state == MacroState.ACTIVE_SCAN_LEFT
-                         else -1.0)
-            self._scan_angle_accum = max(
-                0.0, scan_sign * self._scan_signed_angle)
-            self._scan_time += dt
-            scanned_enough = self._scan_angle_accum >= math.radians(
-                self.cfg.active_scan_min_angle_deg)
-            full_circle_rad = 2.0 * math.pi
-            full_scan_timeout = (
-                self._scan_time >= self.cfg.active_scan_max_duration_s)
-
-            # Determine which side to search — the side the camera is
-            # currently rotating toward.
-            scan_side = (CommittedSide.LEFT
-                         if state == MacroState.ACTIVE_SCAN_LEFT
-                         else CommittedSide.RIGHT)
-
-            candidate = (
-                self._find_horizontal_corridor(
-                    *query_args, required_side=scan_side)
-                if scanned_enough else None)
-            if candidate is not None:
-                # Found a reachable frontier — commit the bypass.
-                state = candidate
-                self._set_committed_side(state)
-                self._end_scan_session()
-                self._tick_time = 0.0
-                self._blocked_counter = 0
-                self._clear_counter = 0
-            elif (self._scan_angle_accum >= full_circle_rad or
-                  full_scan_timeout):
-                # Full 360° swept (or timeout).  The camera has seen
-                # everything around the drone.  If no bypass was found,
-                # try a peek on the committed side as a last resort.
-                # If that also fails, fall back to GOAL_SEEK — staying in
-                # ACTIVE_SCAN would just restart another 360° and loop
-                # forever until the online_runtime timeout.
-                side_val = (self._committed_side.value
-                            if self._committed_side != CommittedSide.NONE
-                            else scan_side.value)
-                if self._peek_side_feasible(
-                        side_val, goal_dir, depth_m, observed_map,
-                        position_world, quaternion):
-                    state = (MacroState.ACTIVE_PEEK_LEFT
-                             if side_val > 0
-                             else MacroState.ACTIVE_PEEK_RIGHT)
+            if target is None:
+                if path is not None:
+                    # V15.2: a route exists but its known-free advance is
+                    # exhausted — make a small explore step along the line
+                    # (camera leads) instead of stopping to probe.
+                    self._explore_count += 1
+                    if self._explore_count >= self.cfg.max_explore_steps:
+                        self._explore_count = 0
+                        self._blocked_counter += 1
+                        self._clear_counter = 0
+                        if self._blocked_counter >= self.cfg.enter_blocked_frames:
+                            state = MacroState.PROBE
+                            self._begin_scan_session()
+                            self._tick_time = 0.0
+                    else:
+                        self._blocked_counter = 0
+                        self._clear_counter = 0
                 else:
-                    # Give up scanning — try GOAL_SEEK with whatever
-                    # observations we have.  The bounded A* may still
-                    # find a partial forward path.
-                    state = MacroState.GOAL_SEEK
-                    self._committed_side = CommittedSide.NONE
-                    self._consecutive_scan_restarts = 0
-                    self._scan_exhausted_this_tick = True
-                    # Reset hysteresis: don't let _is_blocked immediately
-                    # re-trigger scanning on the next tick.  Give GOAL_SEEK
-                    # a few ticks to try moving before blocking again.
+                    # No route at all — accumulate blockage, then probe.
+                    self._explore_count = 0
+                    self._blocked_counter += 1
+                    self._clear_counter = 0
+                    if self._blocked_counter >= self.cfg.enter_blocked_frames:
+                        state = MacroState.PROBE
+                        self._begin_scan_session()
+                        self._tick_time = 0.0
+            else:
+                self._explore_count = 0
+                if straight:
+                    # Guide line is straight → keep seeking the goal.
                     self._blocked_counter = 0
                     self._clear_counter = self.cfg.exit_clear_frames
-                self._end_scan_session()
-                self._tick_time = 0.0
-            elif (scanned_enough and
-                  self._extracted_frontier_count > 0 and
-                  self._scan_peek_count < 2):
-                # Frontiers exist but bounded A* rejected them — peek to
-                # bridge the known-space gap (only if we haven't already
-                # completed a full circle).
-                if self._peek_side_feasible(
-                        scan_side.value, goal_dir, depth_m,
-                        observed_map, position_world, quaternion):
-                    state = (MacroState.ACTIVE_PEEK_LEFT
-                             if scan_side == CommittedSide.LEFT
-                             else MacroState.ACTIVE_PEEK_RIGHT)
-                    self._scan_peek_count += 1
-                    self._tick_time = 0.0
+                else:
+                    # Line routes around an obstacle → enter BYPASS.
+                    self._blocked_counter += 1
+                    self._clear_counter = 0
+                    if self._blocked_counter >= self.cfg.enter_blocked_frames:
+                        state = MacroState.BYPASS
+                        self._tick_time = 0.0
 
-        elif state in (MacroState.ACTIVE_PEEK_LEFT,
-                       MacroState.ACTIVE_PEEK_RIGHT):
-            peek_side = (CommittedSide.LEFT
-                         if state == MacroState.ACTIVE_PEEK_LEFT
-                         else CommittedSide.RIGHT)
-            candidate = self._find_horizontal_corridor(
-                *query_args, required_side=peek_side)
-            if candidate is not None:
-                # Peek succeeded — the new observations bridged the gap.
-                state = candidate
-                self._set_committed_side(state)
-                self._end_scan_session()
-                self._tick_time = 0.0
-                self._clear_counter = 0
-            elif self._clear_counter >= self.cfg.exit_clear_frames:
-                state = MacroState.GOAL_SEEK
-                self._committed_side = CommittedSide.NONE
-                self._consecutive_scan_restarts = 0
-                self._end_scan_session()
-                self._tick_time = 0.0
-            else:
-                side = (CommittedSide.LEFT.value
-                        if state == MacroState.ACTIVE_PEEK_LEFT
-                        else CommittedSide.RIGHT.value)
-                if not self._peek_side_feasible(
-                        side, goal_dir, depth_m, observed_map,
-                        position_world, quaternion):
-                    # Peek corridor closed — resume scanning from where we
-                    # left off.  Do NOT start a fresh session: the drone has
-                    # already observed one side; restarting would discard
-                    # that progress and risk oscillating left/right peeks.
-                    state = (MacroState.ACTIVE_SCAN_LEFT
-                             if side > 0 else MacroState.ACTIVE_SCAN_RIGHT)
-                    if self._scan_session_initial_yaw is None:
-                        self._begin_scan_session()
+        elif state == MacroState.BYPASS:
+            # The guide line (recomputed above) routes around an obstacle.
+            # Follow it — _build_guide consumes the farthest reachable
+            # point every tick, so the target rolls forward as the map
+            # updates.  Straight line → back to GOAL_SEEK; no advance →
+            # explore along the line; only a truly route-less state probes.
+            if target is None:
+                if path is not None:
+                    # V15.2 explore advance along the existing route.
+                    self._explore_count += 1
+                    if self._explore_count >= self.cfg.max_explore_steps:
+                        self._explore_count = 0
+                        self._blocked_counter += 1
+                        self._clear_counter = 0
+                        if self._blocked_counter >= self.cfg.enter_blocked_frames:
+                            state = MacroState.PROBE
+                            self._begin_scan_session()
+                            self._tick_time = 0.0
                     else:
-                        # Resume: only reset the per-phase accumulator.
-                        self._scan_angle_accum = 0.0
-                        self._scan_signed_angle = 0.0
-                        self._scan_last_yaw = yaw
+                        self._blocked_counter = 0
+                        self._clear_counter = 0
+                else:
+                    self._explore_count = 0
+                    self._blocked_counter += 1
+                    self._clear_counter = 0
+                    if self._blocked_counter >= self.cfg.enter_blocked_frames:
+                        state = MacroState.PROBE
+                        self._begin_scan_session()
+                        self._tick_time = 0.0
+            else:
+                self._explore_count = 0
+                if straight:
+                    self._clear_counter += 1
+                    if self._clear_counter >= self.cfg.exit_clear_frames:
+                        state = MacroState.GOAL_SEEK
+                        self._tick_time = 0.0
+                else:
+                    # Still routing — keep following the guide line.
+                    self._blocked_counter = 0
+                    self._clear_counter = 0
+
+        elif state == MacroState.PROBE:
+
+            # ── Brief left/right pan to gather information ──
+            # No 360° sweep.  Pan left/right (yaw from _build_guide),
+            # then re-evaluate.  Early exit as soon as a guide line
+            # appears.  Termination is an upper-layer decision based on
+            # the map, independent of the planner.
+            if self._scan_session_initial_yaw is None:
+                self._begin_scan_session()
+            self._scan_time += dt
+            done = self._scan_time >= self.cfg.probe_max_duration_s
+            if target is not None and self._scan_time >= 0.5:
+                done = True  # path recovered during the pan
+            if done:
+                self._end_scan_session()
+                if target is None:
+                    # Still no reachable advance after probing — terminate.
+                    self._episode_cumulative_scan_time_s += self._scan_time
+                    self._episode_completed_scans += 1
+                    self._scan_exhausted_this_episode = True
+                    budget_exceeded = (
+                        self._episode_completed_scans > self.cfg.max_completed_scans
+                        or self._episode_cumulative_scan_time_s > self.cfg.max_cumulative_scan_time_s)
+                    self._scan_exhausted_this_tick = budget_exceeded
+                    state = MacroState.GOAL_SEEK
+                    self._blocked_counter = 0
+                    self._clear_counter = self.cfg.exit_clear_frames
+                    self._tick_time = 0.0
+                    self._state = state
+                    return self._build_guide(
+                        state, goal_dir, goal_dist, observed_map,
+                        position_world, quaternion,
+                        source_state=previous_state,
+                        scan_budget_exhausted=True)
+                elif straight:
+                    state = MacroState.GOAL_SEEK
+                else:
+                    state = MacroState.BYPASS
+                self._blocked_counter = 0
+                self._clear_counter = self.cfg.exit_clear_frames
+                self._tick_time = 0.0
 
         self._state = state
         return self._build_guide(
-            state, goal_dir, float(goal_distance_m), observed_map,
+            state, goal_dir, goal_dist, observed_map,
             position_world, quaternion, source_state=previous_state)
 
     def _reset(self):
@@ -484,11 +546,8 @@ class MacroExpert:
         self._scan_last_yaw = None
         self._current_observed_yaw = None
         self._scan_time = 0.0
-        # Scan-session state — survives side-switches within one scan episode.
+        # Scan-session state.
         self._scan_session_initial_yaw = None
-        self._scan_phase = 0  # 0 = left-first, 1 = crossing to right
-        self._scan_left_angle_reached = False
-        self._consecutive_scan_restarts = 0  # across-session counter
         self._scan_exhausted_this_tick = False  # prevent immediate re-scan
         self._frontier_rejection_reasons = {}  # candidate_index → reason
         self._extracted_frontier_count = 0
@@ -498,6 +557,19 @@ class MacroExpert:
         self._selected_frontier_score = -float("inf")
         self._selected_frontier_map_revision = -1
         self._last_frontier_candidate_count = 0
+        self._explore_count = 0  # V15.2 consecutive explore steps
+        # V15.3: previous tick's guide line, used as the lateral temporal
+        # reference so adjacent guide lines cannot flip sides of an obstacle.
+        self._prev_guide_line_world = None
+        self._guide_cache = {}
+        self._last_bypass_score = -1.0  # V14: enforce score improvement after scan
+        # ── V14.2 active bypass target ──
+        # What we are ACTUALLY flying toward, decoupled from the last
+        # search result (_selected_frontier_*).  update() decides whether
+        # to retarget; _build_guide consumes the active target.
+        self._active_bypass_target_world = None
+        self._active_bypass_score = -float("inf")
+        self._active_bypass_side = CommittedSide.NONE
         self._held_move_target_world = np.zeros(3, dtype=np.float64)
         self._held_look_target_world = np.zeros(3, dtype=np.float64)
         self._held_move_direction_flu = np.array(
@@ -513,22 +585,16 @@ class MacroExpert:
         self._held_valid = False
 
     def _begin_scan_session(self):
-        """Record the scan-session reference yaw (called once per episode).
+        """Record the scan-session reference yaw.
 
-        Always cleans up any stale session state first so that callers in
-        _build_guide and _choose_bypass_side can safely start a fresh session
-        without manually calling _end_scan_session.
+        Always cleans up any stale session state first.
         """
         self._end_scan_session()
         self._scan_session_initial_yaw = self._current_observed_yaw
         self._scan_angle_accum = 0.0
         self._scan_signed_angle = 0.0
-        self._scan_relative_angle = 0.0
         self._scan_last_yaw = self._current_observed_yaw
         self._scan_time = 0.0
-        self._scan_phase = 0
-        self._scan_left_angle_reached = False
-        self._scan_peek_count = 0  # peeks attempted in this session
         self._frontier_rejection_reasons = {}
         self._extracted_frontier_count = 0
         self._reachable_frontier_count = 0
@@ -542,8 +608,6 @@ class MacroExpert:
     def _end_scan_session(self):
         """Clean up scan-session state when leaving ACTIVE_SCAN."""
         self._scan_session_initial_yaw = None
-        self._scan_phase = 0
-        self._scan_left_angle_reached = False
         self._scan_angle_accum = 0.0
         self._scan_signed_angle = 0.0
         self._scan_last_yaw = None
@@ -556,25 +620,10 @@ class MacroExpert:
     def _wrap_angle(angle):
         return math.atan2(math.sin(angle), math.cos(angle))
 
-    def _set_committed_side(self, state):
-        self._committed_side = (
-            CommittedSide.LEFT if state == MacroState.BYPASS_LEFT
-            else CommittedSide.RIGHT)
-
     def _preferred_side(self):
         return (CommittedSide.LEFT
                 if str(self.cfg.preferred_symmetric_side).lower() == "left"
                 else CommittedSide.RIGHT)
-
-    @staticmethod
-    def _bypass_state(side):
-        return (MacroState.BYPASS_LEFT
-                if side == CommittedSide.LEFT else MacroState.BYPASS_RIGHT)
-
-    @staticmethod
-    def _scan_state(side):
-        return (MacroState.ACTIVE_SCAN_LEFT
-                if side == CommittedSide.LEFT else MacroState.ACTIVE_SCAN_RIGHT)
 
     def _goal_relative_lateral(self, goal_dir_flu, side):
         """Horizontal left/right relative to the goal ray, not body yaw."""
@@ -634,6 +683,27 @@ class MacroExpert:
             spacing_m=max(0.05, self.cfg.map_resolution_m),
             min_clearance_m=0.0))
 
+    def _goal_direction_feasible(
+        self, goal_dir_flu, observed_map, position_world,
+        quaternion,
+    ):
+        """Check if the goal-direction corridor is actually clear.
+
+        Prevents GOAL_SEEK from being abandoned due to transient
+        planner failures that drop progress_rate below threshold.
+        Only the observed-map corridor matters for the blockage
+        decision — planner failures are resolved by the planner's
+        own retry logic, not by switching macro state.
+        """
+        ratio = self._corridor_ratio(
+            observed_map, position_world, goal_dir_flu,
+            self.cfg.effective_guide_range_m,
+            self.cfg.blocked_corridor_radius_m, quaternion)
+        if ratio is not None:
+            return ratio >= 0.60
+        # No map data yet (first frame) — assume open.
+        return True
+
     @staticmethod
     def _depth_sector_score(depth_m, side):
         """Conservative current-frame fallback; invalid depth is blocked."""
@@ -661,22 +731,534 @@ class MacroExpert:
         position_world, quaternion, local_blocked,
         local_progress_rate, local_feasible,
     ):
-        if local_blocked or not local_feasible:
-            return True
-        if float(local_progress_rate) < self.cfg.minimum_progress_rate_m_s:
-            return True
+        # ── Layered architecture: Macro Expert is pure perception ──
+        # Planner failures, safety stops, and low progress rate are
+        # lower-layer issues that must NOT influence the macro-level
+        # blockage decision.  Only the observed map determines whether
+        # the goal corridor is physically obstructed.  If the planner
+        # cannot execute the macro's intent, the episode should
+        # terminate — not silently change the macro's decision.
+        del local_blocked, local_progress_rate, local_feasible
         ratio = self._corridor_ratio(
             observed_map, position_world, goal_dir_flu,
             self.cfg.effective_guide_range_m,
             self.cfg.blocked_corridor_radius_m, quaternion)
         if ratio is not None:
             return ratio < 0.60
+        # Depth-only fallback when map not yet populated (first frame).
         return self._depth_sector_score(depth_m, 0) < 0.55
+
+    # ────────────────────────────────────────────────────────────────────
+    # V15 guide-line navigation
+    # ────────────────────────────────────────────────────────────────────
+    # A guide line is the optimal path from the current position toward
+    # the goal under the "unknown = free + small penalty" assumption,
+    # computed by 2-D A* on the observed-map slice at flight height.
+    # The macro flies the farthest reachable point of the line (receding
+    # horizon); every tick the line is recomputed as the map updates.
+    @staticmethod
+    def _astar_2d(grid, start, target, unknown_cost,
+                  penalty_radius=6, penalty_gain=0.6):
+        """A* on a 2-D occupancy grid (UNKNOWN=0, FREE=1, OCCUPIED=2).
+
+        penalty_radius is in CELLS: cells within this distance of an
+        OCCUPIED cell accumulate extra step cost so the guide line keeps
+        away from obstacle surfaces (caller converts a real-world
+        clearance target to cells using the map resolution).
+
+        Returns a list of (x, y) grid cells from start to target
+        (inclusive), or None if no path exists.
+        """
+        rows, cols = grid.shape
+        sx, sy = start
+        tx, ty = target
+        if not (0 <= sx < rows and 0 <= sy < cols):
+            return None
+        if not (0 <= tx < rows and 0 <= ty < cols):
+            return None
+        if grid[tx, ty] == 2:
+            # Target occupied — backtrack toward start for nearest walkable.
+            found = None
+            steps = max(abs(tx - sx), abs(ty - sy))
+            for s in range(1, steps + 1):
+                cx = int(round(sx + (tx - sx) * (1.0 - s / (steps + 1))))
+                cy = int(round(sy + (ty - sy) * (1.0 - s / (steps + 1))))
+                cx = int(np.clip(cx, 0, rows - 1))
+                cy = int(np.clip(cy, 0, cols - 1))
+                if grid[cx, cy] != 2:
+                    found = (cx, cy)
+                    break
+            if found is None:
+                return None
+            target = found
+            tx, ty = target
+
+        open_heap = [(0.0, 0, (sx, sy))]
+        g_score = {(sx, sy): 0.0}
+        came_from = {}
+        neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1),
+                     (-1, -1), (-1, 1), (1, -1), (1, 1)]
+        # ── V15.2: obstacle-distance penalty ──
+        # Cells within `penalty_radius` cells of an OCCUPIED cell get extra
+        # cost, so the guide line keeps away from obstacles instead of
+        # hugging their inflated edge.  The B-spline optimizer keeps final
+        # clearance, but the MACRO line must not aim through a 0.1 m gap.
+        dist_field = _obstacle_distance_field(grid)
+        counter = 0
+        while open_heap:
+            _, _, current = heapq.heappop(open_heap)
+            if current == (tx, ty):
+                break
+            cx, cy = current
+            for dx, dy in neighbors:
+                nx, ny = cx + dx, cy + dy
+                if not (0 <= nx < rows and 0 <= ny < cols):
+                    continue
+                cell = grid[nx, ny]
+                if cell == 2:
+                    continue
+                step_cost = (unknown_cost if cell == 0 else 1.0)
+                if dx != 0 and dy != 0:
+                    step_cost *= math.sqrt(2.0)
+                # Push the line away from obstacles (soft constraint).
+                d_obs = dist_field[nx, ny]
+                if d_obs < penalty_radius:
+                    step_cost += penalty_gain * (
+                        penalty_radius - d_obs)
+                tentative = g_score[current] + step_cost
+                if tentative < g_score.get((nx, ny), float("inf")):
+                    g_score[(nx, ny)] = tentative
+                    came_from[(nx, ny)] = current
+                    h = math.hypot(nx - tx, ny - ty)
+                    counter += 1
+                    heapq.heappush(
+                        open_heap, (tentative + h, counter, (nx, ny)))
+
+        if (tx, ty) not in came_from and (tx, ty) != (sx, sy):
+            return None
+        path = [(tx, ty)]
+        cur = (tx, ty)
+        while cur != (sx, sy):
+            cur = came_from[cur]
+            path.append(cur)
+        path.reverse()
+        return path
+
+    def _compute_guide_path(
+        self, goal_dir_flu, observed_map, position_world, quaternion,
+        goal_dist=None,
+    ):
+        """Compute the 2-D guide line in world coordinates.
+
+        Returns an (N, 3) array of world points (start → target) or None.
+        The A* target is the point guide_range ahead along the goal ray,
+        clamped into the rolling map; if the goal is inside the map, the
+        goal itself is used.
+
+        V15.2: result is cached per update() tick (inputs are identical
+        for every call within one tick), eliminating redundant searches.
+
+        V15.3: the guide line is a goal-directed DEPTH-FIRST search toward
+        the terminal, implemented in C++ (`_il_local_planner.
+        compute_guide_line_2d`) with a Python DFS fallback for offline
+        tooling.  It is anchored to the previous tick's guide line so
+        adjacent updates cannot jump to the opposite side of an obstacle.
+
+        V15.5: `goal_dist` clamps the guide-line range to the remaining
+        goal distance so the line (and the executed target) never extends
+        PAST the goal — the debug view no longer shows the candidate
+        overshooting the terminal in the latter half of the flight.
+        goal_dist is constant within a tick, so the per-tick cache stays
+        valid.
+        """
+        cache = getattr(self, "_guide_cache", None)
+        if cache is not None and "path" in cache:
+            return cache["path"]
+        if not self._map_supports_frontiers(observed_map):
+            return None
+        try:
+            occupancy = observed_map.get_occupancy(copy=False)
+        except TypeError:
+            occupancy = observed_map.get_occupancy()
+        occupancy = np.asarray(occupancy, dtype=np.uint8)
+        if occupancy.ndim != 3 or min(occupancy.shape) < 3:
+            return None
+        origin = np.asarray(observed_map.get_origin(), dtype=np.float64)
+        res = float(observed_map.get_resolution())
+        if res <= 0.0:
+            return None
+        position = np.asarray(position_world, dtype=np.float64).reshape(3)
+        grid = np.floor((position - origin) / res).astype(np.int32)
+        iz = int(np.clip(grid[2], 0, occupancy.shape[2] - 1))
+        grid_2d = occupancy[:, :, iz]
+
+        goal_world = self._flu_to_world(goal_dir_flu, quaternion)
+        guide_range = (
+            self.cfg.effective_guide_range_m *
+            float(np.clip(self.cfg.guide_range_fraction, 0.1, 1.0)))
+        # V15.5: never extend the guide line past the goal.
+        if goal_dist is not None and goal_dist >= 0.0:
+            guide_range = min(guide_range, float(goal_dist))
+        target_world = position + self._unit3(goal_world) * guide_range
+
+        # V15.2: resolution-aware obstacle-distance penalty.  Convert the
+        # real-world guide-line clearance target to cells; at 0.10 m this
+        # is 6 cells (0.55 m from the raw surface = ESDF clearance 0.25).
+        penalty_radius = max(
+            2, int(math.ceil(self.cfg.guide_line_clearance_m / res)))
+        path = self._guide_line_search(
+            grid_2d, origin, res, position, target_world, penalty_radius)
+        if path is None:
+            cache = getattr(self, "_guide_cache", None)
+            if cache is not None:
+                cache["path"] = None
+            return None
+        cache = getattr(self, "_guide_cache", None)
+        if cache is not None:
+            cache["path"] = path
+        return path
+
+    def _guide_line_search(
+        self, grid_2d, origin, res, position, target_world, penalty_radius,
+    ):
+        """Goal-directed DFS guide line (C++ preferred, Python fallback).
+
+        Returns an (N, 3) world path (start → target) or None.  The search
+        dives toward the terminal (remaining Chebyshev distance first),
+        keeps ESDF clearance via the obstacle-distance penalty, and stays
+        within a lateral band around the previous tick's guide line.
+        """
+        prev_line = getattr(self, "_prev_guide_line_world", None)
+        if prev_line is not None and len(prev_line) >= 2:
+            prev_line_xy = np.asarray(
+                prev_line, dtype=np.float64)[:, :2].copy()
+        else:
+            prev_line_xy = np.zeros((0, 2), dtype=np.float64)
+        try:
+            import _il_local_planner as _cpp
+            if hasattr(_cpp, "compute_guide_line_2d"):
+                out = _cpp.compute_guide_line_2d(
+                    np.ascontiguousarray(grid_2d, dtype=np.uint8),
+                    np.ascontiguousarray(origin[:2], dtype=np.float64),
+                    float(res),
+                    np.ascontiguousarray(
+                        position[:2], dtype=np.float64),
+                    np.ascontiguousarray(
+                        target_world[:2], dtype=np.float64),
+                    float(self.cfg.guide_unknown_cost),
+                    int(penalty_radius),
+                    float(self.cfg.guide_penalty_gain),
+                    np.ascontiguousarray(prev_line_xy, dtype=np.float64),
+                    float(self.cfg.guide_lateral_soft_m),
+                    float(self.cfg.guide_lateral_hard_m),
+                    float(self.cfg.guide_lateral_cost))
+                arr = np.asarray(out, dtype=np.float64)
+                if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] < 1:
+                    return None
+                path = np.zeros((arr.shape[0], 3), dtype=np.float64)
+                path[:, :2] = arr
+                path[:, 2] = position[2]
+                return path
+        except Exception:
+            pass
+        # Python fallback (offline tooling / no C++ module).
+        return self._guide_line_search_python(
+            grid_2d, origin, res, position, target_world, penalty_radius)
+
+    def _guide_line_search_python(
+        self, grid_2d, origin, res, position, target_world, penalty_radius,
+    ):
+        """Python mirror of the C++ goal-directed guide-line search.
+
+        Weighted A* (h_weight > 1) that dives depth-first toward the
+        terminal while ACCUMULATING the obstacle-distance and lateral
+        temporal penalties along the path (a raw DFS cannot accumulate
+        penalty and therefore hugs obstacle boundaries).  Same lateral
+        temporal band around the previous guide line.
+        """
+        rows, cols = grid_2d.shape
+        sx = int(np.clip(
+            int(np.floor((position[0] - origin[0]) / res)), 0, rows - 1))
+        sy = int(np.clip(
+            int(np.floor((position[1] - origin[1]) / res)), 0, cols - 1))
+        tx = int(np.clip(
+            int(np.floor((target_world[0] - origin[0]) / res)), 0, rows - 1))
+        ty = int(np.clip(
+            int(np.floor((target_world[1] - origin[1]) / res)), 0, cols - 1))
+        if grid_2d[sx, sy] == 2:
+            return None
+        if grid_2d[tx, ty] == 2:
+            found = False
+            steps = max(abs(tx - sx), abs(ty - sy))
+            for s in range(1, steps + 1):
+                f = 1.0 - s / (steps + 1)
+                cx = int(round(sx + (tx - sx) * f))
+                cy = int(round(sy + (ty - sy) * f))
+                cx = int(np.clip(cx, 0, rows - 1))
+                cy = int(np.clip(cy, 0, cols - 1))
+                if grid_2d[cx, cy] != 2:
+                    tx, ty = cx, cy
+                    found = True
+                    break
+            if not found:
+                return None
+
+        dist = _obstacle_distance_field(grid_2d)
+        gd = target_world[:2] - position[:2]
+        glen = float(np.linalg.norm(gd))
+        if glen < 1.0e-9:
+            return np.array(
+                [[position[0], position[1], position[2]]],
+                dtype=np.float64)
+        gx, gy = gd[0] / glen, gd[1] / glen
+
+        prev = getattr(self, "_prev_guide_line_world", None)
+        ref = []
+        if prev is not None and len(prev) >= 2:
+            for p in prev:
+                fx = p[0] - position[0]
+                fy = p[1] - position[1]
+                ref.append((gx * fx + gy * fy, gx * fy - gy * fx))
+            ref.sort()
+
+        def ref_lat(f):
+            if not ref:
+                return 0.0
+            if len(ref) == 1:
+                return ref[0][1]
+            if f <= ref[0][0]:
+                return ref[0][1]
+            if f >= ref[-1][0]:
+                return ref[-1][1]
+            lo, hi = 0, len(ref) - 1
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                if ref[mid][0] <= f:
+                    lo = mid
+                else:
+                    hi = mid
+            f0, f1 = ref[lo][0], ref[hi][0]
+            t = (f - f0) / (f1 - f0) if f1 > f0 else 0.0
+            return ref[lo][1] + t * (ref[hi][1] - ref[lo][1])
+
+        soft = self.cfg.guide_lateral_soft_m
+        hard = self.cfg.guide_lateral_hard_m
+        lcost = self.cfg.guide_lateral_cost
+        unknown_cost = self.cfg.guide_unknown_cost
+        pgain = self.cfg.guide_penalty_gain
+        sqrt2 = math.sqrt(2.0)
+        h_weight = 1.6  # >1 -> greedy depth-first dive toward the goal
+        neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1),
+                     (-1, -1), (-1, 1), (1, -1), (1, 1)]
+        parent = {}
+        inf = float("inf")
+        g_score = {(sx, sy): 0.0}
+        # heap entries (f, -g, i, j): on f ties prefer the DEEPER node
+        import heapq as _heapq
+        open_heap = [(h_weight * max(abs(sx - tx), abs(sy - ty)),
+                      0.0, sx, sy)]
+        found_t = False
+        best = (sx, sy)
+        best_h = max(abs(sx - tx), abs(sy - ty))
+        max_exp = rows * cols * 8
+        expansions = 0
+        while open_heap:
+            _, neg_g, ci, cj = _heapq.heappop(open_heap)
+            if -neg_g > g_score.get((ci, cj), inf) + 1.0e-9:
+                continue
+            expansions += 1
+            if expansions >= max_exp:
+                break
+            if ci == tx and cj == ty:
+                found_t = True
+                best = (ci, cj)
+                break
+            h = max(abs(ci - tx), abs(cj - ty))
+            if h < best_h:
+                best_h = h
+                best = (ci, cj)
+            cur_g = -neg_g
+            for dx, dy in neighbors:
+                ni, nj = ci + dx, cj + dy
+                if not (0 <= ni < rows and 0 <= nj < cols):
+                    continue
+                if grid_2d[ni, nj] == 2:
+                    continue
+                wx = origin[0] + (ni + 0.5) * res
+                wy = origin[1] + (nj + 0.5) * res
+                fx = wx - position[0]
+                fy = wy - position[1]
+                f = gx * fx + gy * fy
+                lat = gx * fy - gy * fx
+                dev = abs(lat - ref_lat(f))
+                if dev > hard:
+                    continue
+                d_obs = int(dist[ni, nj])
+                step = (unknown_cost if grid_2d[ni, nj] == 0 else 1.0)
+                if dx != 0 and dy != 0:
+                    step *= sqrt2
+                if d_obs < penalty_radius:
+                    step += pgain * (penalty_radius - d_obs)
+                if dev > soft:
+                    step += lcost * (dev - soft)
+                ng = cur_g + step
+                if ng >= g_score.get((ni, nj), inf) - 1.0e-9:
+                    continue
+                g_score[(ni, nj)] = ng
+                parent[(ni, nj)] = (ci, cj)
+                hh = max(abs(ni - tx), abs(nj - ty))
+                _heapq.heappush(
+                    open_heap, (ng + h_weight * hh, -ng, ni, nj))
+
+        end = best
+        cells = [end]
+        while cells[-1] != (sx, sy):
+            if cells[-1] not in parent:
+                break
+            cells.append(parent[cells[-1]])
+        cells.reverse()
+        path = np.zeros((len(cells), 3), dtype=np.float64)
+        for k, (gi, gj) in enumerate(cells):
+            path[k, 0] = origin[0] + (gi + 0.5) * res
+            path[k, 1] = origin[1] + (gj + 0.5) * res
+            path[k, 2] = position[2]
+        return path
+
+    @staticmethod
+    def _guide_path_straight(path, straight_dist, ratio):
+        """True when the guide line is essentially straight to the goal."""
+        if path is None or len(path) < 2:
+            return True
+        total = 0.0
+        for i in range(1, len(path)):
+            total += float(np.linalg.norm(path[i] - path[i - 1]))
+        direct = float(np.linalg.norm(path[-1] - path[0]))
+        if direct <= 1.0e-6:
+            return total <= ratio * straight_dist
+        return total <= ratio * direct
+
+    @staticmethod
+    def _advance_along_path(path, position, distance_m):
+        """Return the world point `distance_m` along the guide line from the
+        drone position (walking the path segments).  Returns the path end if
+        the line is shorter, or None when no path."""
+        if path is None or len(path) < 2:
+            return None
+        remaining = max(0.0, float(distance_m))
+        for i in range(1, len(path)):
+            seg = path[i] - path[i - 1]
+            seg_len = float(np.linalg.norm(seg))
+            if seg_len <= 1.0e-9:
+                continue
+            if remaining <= seg_len:
+                return path[i - 1] + seg * (remaining / seg_len)
+            remaining -= seg_len
+        return path[-1].copy()
+
+    def _select_guide_target(
+        self, goal_dir_flu, observed_map, position_world, quaternion,
+        goal_dist=None,
+    ):
+        """Choose the farthest reachable point along the guide line.
+
+        Returns (target_world, score) with score = reachable/guide_range,
+        or (None, -inf) when no reachable advance exists.
+
+        V15.2: result is cached per update() tick (inputs are identical
+        for every call within one tick), eliminating redundant reachable
+        scans that dominated the phase-2 budget.
+
+        V15.5: `goal_dist` (constant within a tick) clamps the walk so the
+        executed target never extends past the goal.
+        """
+        cache = getattr(self, "_guide_cache", None)
+        if cache is not None and "target" in cache:
+            return cache["target"]
+        path = self._compute_guide_path(
+            goal_dir_flu, observed_map, position_world, quaternion,
+            goal_dist=goal_dist)
+        if path is None or len(path) < 2:
+            result = (None, -float("inf"))
+            if cache is not None:
+                cache["target"] = result
+            return result
+        position = np.asarray(position_world, dtype=np.float64).reshape(3)
+        guide_range = (
+            self.cfg.effective_guide_range_m *
+            float(np.clip(self.cfg.guide_range_fraction, 0.1, 1.0)))
+        if goal_dist is not None and goal_dist >= 0.0:
+            guide_range = min(guide_range, float(goal_dist))
+
+        # Walk the path outward, measuring cumulative distance, and check
+        # reachability at each waypoint.  Pick the farthest reachable.
+        #
+        # V15.1 SAFETY CONTRACT: the guide line may pass through UNKNOWN
+        # space (it is a planning direction), but an EXECUTED advance point
+        # must lie in OBSERVED known-free space.  The drone only flies to
+        # places the camera has already cleared; the line then extends as
+        # new observations turn unknown into free.  This is what makes
+        # exploration serve navigation instead of blind-flying.
+        best_target = None
+        best_score = -float("inf")
+        cumulative = 0.0
+        for i in range(1, len(path)):
+            cumulative += float(np.linalg.norm(path[i] - path[i - 1]))
+            if cumulative > guide_range:
+                break
+            # Hard constraint: only observed free waypoints are flyable.
+            if (hasattr(observed_map, "is_known_free") and
+                    not observed_map.is_known_free(path[i])):
+                # Stop at the first unobserved waypoint — anything beyond
+                # is still unknown and must not be targeted.
+                break
+            delta = path[i] - position
+            dist = float(np.linalg.norm(delta))
+            if dist < 1.0e-6:
+                continue
+            direction_flu = self._world_to_flu(
+                delta / dist, quaternion)
+            reachable = self._fit_known_free_guide_distance(
+                observed_map, position, direction_flu, quaternion, dist,
+                allow_clipping=True)
+            if reachable + 1.0e-6 < self.cfg.minimum_guide_distance_m:
+                continue
+            # Re-anchor the target to the actual reachable distance.
+            target = position + (delta / dist) * reachable
+            score = cumulative / guide_range
+            if score > best_score:
+                best_score = score
+                best_target = target
+        if best_target is None:
+            result = (None, -float("inf"))
+            cache = getattr(self, "_guide_cache", None)
+            if cache is not None:
+                cache["target"] = result
+            return result
+        result = (best_target, float(best_score))
+        cache = getattr(self, "_guide_cache", None)
+        if cache is not None:
+            cache["target"] = result
+        return result
 
     def _choose_bypass_side(
         self, goal_dir_flu, depth_m, observed_map,
         position_world, quaternion,
     ):
+        # ── Goal-first: if the goal corridor is clear, stay in GOAL_SEEK ──
+        # Frontiers are exploration targets for obstructed paths.  When the
+        # observed map shows a clear corridor toward the goal, the goal IS
+        # the target — not a frontier somewhere near it.  This prevents the
+        # drone from orbiting the goal through successive frontier targets
+        # when it could just fly straight there.
+        if self._goal_direction_feasible(
+                goal_dir_flu, observed_map, position_world, quaternion):
+            self._state = MacroState.GOAL_SEEK
+            self._committed_side = CommittedSide.NONE
+            self._consecutive_scan_restarts = 0
+            self._blocked_counter = 0
+            self._clear_counter = self.cfg.exit_clear_frames
+            return MacroState.GOAL_SEEK
+
         if self._map_supports_frontiers(observed_map):
             selected = self._select_reachable_frontier(
                 goal_dir_flu, observed_map, position_world, quaternion)
@@ -747,22 +1329,6 @@ class MacroExpert:
             return depth_score
         return 0.8 * float(np.mean(map_scores)) + 0.2 * depth_score
 
-    def _bypass_side_feasible(
-        self, state, goal_dir_flu, depth_m, observed_map,
-        position_world, quaternion,
-    ):
-        side_enum = (CommittedSide.LEFT
-                     if state == MacroState.BYPASS_LEFT
-                     else CommittedSide.RIGHT)
-        if self._map_supports_frontiers(observed_map):
-            return self._select_reachable_frontier(
-                goal_dir_flu, observed_map, position_world, quaternion,
-                required_side=side_enum) is not None
-        side = side_enum.value
-        return self._score_horizontal_corridor(
-            goal_dir_flu, depth_m, observed_map, side,
-            position_world, quaternion) >= self.cfg.minimum_corridor_score
-
     def _find_horizontal_corridor(
         self, goal_dir_flu, depth_m, observed_map,
         position_world, quaternion, required_side=None,
@@ -804,6 +1370,40 @@ class MacroExpert:
             selected = (CommittedSide.LEFT
                         if left > right else CommittedSide.RIGHT)
         return self._bypass_state(selected)
+
+    def _find_best_bypass_point(
+        self, goal_dir_flu, observed_map, position_world, quaternion,
+    ):
+        """Try both left and right sides.  Return (best_CommittedSide, score)
+        for the reachable frontier that maximises goal progress, or
+        (None, -inf) if neither side has a reachable point.
+
+        V14: replaces _choose_bypass_side's multi-step fallback with a
+        simple max-over-sides comparison.  No scanning, no side commitment
+        bias — just pick the single best exploration point toward the goal.
+        """
+        best_side = None
+        best_score = -float("inf")
+        best_target = None
+        for side in (CommittedSide.LEFT, CommittedSide.RIGHT):
+            selected = self._select_reachable_frontier(
+                goal_dir_flu, observed_map, position_world, quaternion,
+                required_side=side)
+            if selected is not None:
+                score = float(self._selected_frontier_score)
+                if score > best_score + 1.0e-9:
+                    best_score = score
+                    best_side = selected
+                    best_target = np.asarray(
+                        self._selected_frontier_target_world,
+                        dtype=np.float64).copy()
+        if best_side is not None:
+            # Restore the cache so it points at the BEST candidate, not
+            # whatever the last side in the loop happened to find.
+            self._selected_frontier_target_world = best_target
+            self._selected_frontier_side = best_side
+            self._selected_frontier_score = best_score
+        return best_side, best_score
 
     @staticmethod
     def _map_supports_frontiers(observed_map):
@@ -934,21 +1534,10 @@ class MacroExpert:
             1.0e-6)
         bin_width = math.radians(self.cfg.frontier_angular_bin_deg)
         angular_bins = np.floor((azimuth + math.pi) / bin_width).astype(int)
-        unique_bins, bin_counts = np.unique(
-            angular_bins, return_counts=True)
-        maximum_bin_count = max(int(np.max(bin_counts)), 1)
-        bin_gain_by_id = {
-            int(bin_id): float(count) / maximum_bin_count
-            for bin_id, count in zip(unique_bins, bin_counts)
-        }
-        cluster_gain = np.array(
-            [bin_gain_by_id[int(bin_id)] for bin_id in angular_bins],
-            dtype=np.float64)
         scores = (
             self.cfg.frontier_goal_progress_weight *
             goal_progress / guide_range +
-            self.cfg.frontier_information_weight *
-            (0.5 * info_gain + 0.5 * cluster_gain) -
+            self.cfg.frontier_information_weight * info_gain -
             self.cfg.frontier_yaw_cost_weight *
             np.abs(azimuth) / math.pi)
         sides = np.where(cross > math.sin(math.radians(2.0)), 1,
@@ -998,6 +1587,7 @@ class MacroExpert:
             -item["score"], item["azimuth_abs"],
             -item["distance_m"],
             -item["side"].value))
+
         candidates = candidates[:self.cfg.frontier_candidate_limit]
         self._last_frontier_candidate_count = len(candidates)
         return candidates
@@ -1101,186 +1691,188 @@ class MacroExpert:
             candidate -= step
         return 0.0
 
-    def _peek_side_feasible(
-        self, side, goal_dir_flu, depth_m, observed_map,
-        position_world, quaternion,
-    ):
-        del depth_m
-        lateral = self._goal_relative_lateral(goal_dir_flu, side)
-        ratio = self._corridor_ratio(
-            observed_map, position_world, lateral,
-            self.cfg.active_peek_distance_m,
-            self.cfg.active_peek_safety_radius_m, quaternion)
-        # Peek is active translation. It requires map-confirmed swept-volume
-        # clearance because the camera is not necessarily aligned with motion.
-        return ratio is not None and ratio >= 0.95
-
-    def _make_goal_hold_guide(self, position_world, quaternion):
-        forward_world = self._flu_to_world(
-            np.array([1.0, 0.0, 0.0]), quaternion)
-        guide = MacroGuide(
-            valid=True,
-            move_direction_flu=np.array([1.0, 0.0, 0.0]),
-            move_distance_m=0.0,
-            move_distance_norm=0.0,
-            yaw_direction_flu_xy=np.array([1.0, 0.0]),
-            move_target_world=position_world.copy(),
-            look_target_world=position_world + forward_world,
-            macro_state=MacroState.GOAL_HOLD.value,
-            committed_side=CommittedSide.NONE.value,
-            decision_reason="goal_hold")
-        self._hold_guide(guide)
-        return guide
-
     def _build_guide(
         self, state, goal_dir_flu, goal_distance_m, observed_map,
         position_world, quaternion, source_state=None,
+        scan_budget_exhausted=False, at_goal=False,
     ):
+        """V15: GOAL_SEEK / BYPASS / PROBE only, driven by the guide line."""
         del source_state
         guide_range = (
             self.cfg.effective_guide_range_m *
             float(np.clip(self.cfg.guide_range_fraction, 0.1, 1.0)))
         needs_reachability_check = False
+        goal_dist = float(goal_distance_m)
+
         if state == MacroState.GOAL_SEEK:
-            move_dir = goal_dir_flu.copy()
-            move_dist = min(goal_distance_m, guide_range)
-            yaw_dir = self._unit2(move_dir[:2])
-            reason = "goal_seek"
-            needs_reachability_check = True
-        elif state in (MacroState.BYPASS_LEFT, MacroState.BYPASS_RIGHT):
-            side = (CommittedSide.LEFT
-                    if state == MacroState.BYPASS_LEFT
-                    else CommittedSide.RIGHT)
-            if not self._map_supports_frontiers(observed_map):
-                # Offline/static compatibility only. Formal collection never
-                # synthesizes bypass rays; it uses the frontier target below.
-                lateral = self._goal_relative_lateral(
-                    goal_dir_flu, side.value)
-                move_dir = self._unit3(
-                    self.cfg.bypass_goal_weight * goal_dir_flu +
-                    (1.0 - self.cfg.bypass_goal_weight) * lateral)
-                move_dist = min(goal_distance_m * 0.60, guide_range)
+            if at_goal:
+                move_dir = goal_dir_flu.copy()
+                move_dist = 0.0
+                reason = "goal_hold_at_target"
                 yaw_dir = self._unit2(move_dir[:2])
-                reason = ("offline_bypass_left"
-                          if side == CommittedSide.LEFT
-                          else "offline_bypass_right")
-                needs_reachability_check = True
+            elif scan_budget_exhausted:
+                move_dir = goal_dir_flu.copy()
+                move_dist = 0.0
+                reason = "scan_exhausted|goal_seek_zero_move"
+                yaw_dir = self._unit2(move_dir[:2])
             else:
-                if (self._selected_frontier_target_world is None or
-                        self._selected_frontier_side != side):
-                    selected = self._select_reachable_frontier(
-                        goal_dir_flu, observed_map, position_world, quaternion,
-                        required_side=side)
-                    if selected is None:
-                        scan_state = self._scan_state(side)
-                        self._state = scan_state
-                        self._committed_side = side
-                        self._begin_scan_session()
-                        return self._build_guide(
-                            scan_state, goal_dir_flu, goal_distance_m,
-                            observed_map, position_world, quaternion)
+                # ── V15.1: follow the guide line, never blind-fly ──
+                # GOAL_SEEK targets the farthest OBSERVED known-free
+                # advance along the guide line toward the goal.  If the
+                # line still passes through unknown space (not yet seen),
+                # the drone flies the last known point and the camera
+                # leads toward the goal to reveal the rest.
+                target, _ = self._select_guide_target(
+                    goal_dir_flu, observed_map, position_world, quaternion,
+                    goal_dist=goal_distance_m)
+                if target is not None:
+                    target_delta_world = (
+                        np.asarray(target, dtype=np.float64) - position_world)
+                    move_dist = float(np.linalg.norm(target_delta_world))
+                    move_dir = self._unit3(self._world_to_flu(
+                        target_delta_world / max(move_dist, 1.0e-6),
+                        quaternion))
+                    reason = "goal_seek_guide"
+                else:
+                    # No known-free advance.  If a guide line still exists
+                    # (obstacle ahead, far side unobserved), make a small
+                    # EXPLORE step along it with the camera leading —
+                    # observation turns unknown→free and advance resumes.
+                    path = self._compute_guide_path(
+                        goal_dir_flu, observed_map, position_world,
+                        quaternion, goal_dist=goal_distance_m)
+                    explore = self._advance_along_path(
+                        path, position_world, self.cfg.guide_explore_step_m)
+                    if explore is not None:
+                        explore_delta = (
+                            np.asarray(explore, dtype=np.float64)
+                            - position_world)
+                        explore_dist = float(np.linalg.norm(explore_delta))
+                        if explore_dist > 0.2:
+                            move_dist = explore_dist
+                            move_dir = self._unit3(self._world_to_flu(
+                                explore_delta / explore_dist, quaternion))
+                            reason = "goal_seek_explore"
+                            # Allow entering the unknown edge; the 30 Hz
+                            # planner still validates the B-spline against
+                            # the ESDF (occupied → its own recovery).
+                        else:
+                            move_dist = 0.0
+                            move_dir = goal_dir_flu.copy()
+                            reason = "goal_seek_explore_hold"
+                    else:
+                        # No route at all — safe clipped prefix of the goal
+                        # ray only; reachability clips to observed space.
+                        move_dir = goal_dir_flu.copy()
+                        move_dist = min(goal_dist, guide_range)
+                        reason = "goal_seek_ray_clipped"
+                        needs_reachability_check = True
+                yaw_dir = self._unit2(move_dir[:2])
+
+        elif state == MacroState.BYPASS:
+            # ── V15: follow the guide line ──
+            # Fly the farthest reachable point of the 2-D A* line.  The
+            # line is recomputed every tick, so the target rolls forward
+            # as the map updates.  Camera leads toward the goal.
+            target, _ = self._select_guide_target(
+                goal_dir_flu, observed_map, position_world, quaternion,
+                goal_dist=goal_distance_m)
+            if target is not None:
                 target_delta_world = (
-                    np.asarray(self._selected_frontier_target_world,
-                               dtype=np.float64) - position_world)
+                    np.asarray(target, dtype=np.float64) - position_world)
                 move_dist = float(np.linalg.norm(target_delta_world))
-                if move_dist <= 1.0e-6:
-                    scan_state = self._scan_state(side)
-                    self._state = scan_state
-                    self._begin_scan_session()
-                    return self._build_guide(
-                        scan_state, goal_dir_flu, goal_distance_m,
-                        observed_map, position_world, quaternion)
                 move_dir = self._unit3(self._world_to_flu(
                     target_delta_world / move_dist, quaternion))
-                yaw_dir = self._unit2(move_dir[:2])
-                reason = ("frontier_bypass_left"
-                          if side == CommittedSide.LEFT
-                          else "frontier_bypass_right")
-        elif state in (MacroState.ACTIVE_SCAN_LEFT,
-                       MacroState.ACTIVE_SCAN_RIGHT):
+                yaw_goal = self._unit2(goal_dir_flu[:2])
+                yaw_move = self._unit2(move_dir[:2])
+                yaw_dir = self._unit2(
+                    self.cfg.bypass_yaw_goal_weight * yaw_goal +
+                    (1.0 - self.cfg.bypass_yaw_goal_weight) * yaw_move)
+                reason = "guide_bypass"
+            else:
+                # No known-free advance.  If a route still exists, explore
+                # forward along the line (camera leads); only when A* has
+                # no route at all do we enter PROBE.
+                path = self._compute_guide_path(
+                    goal_dir_flu, observed_map, position_world, quaternion,
+                    goal_dist=goal_distance_m)
+                explore = self._advance_along_path(
+                    path, position_world, self.cfg.guide_explore_step_m)
+                if explore is not None:
+                    explore_delta = (
+                        np.asarray(explore, dtype=np.float64)
+                        - position_world)
+                    explore_dist = float(np.linalg.norm(explore_delta))
+                    if explore_dist > 0.2:
+                        move_dist = explore_dist
+                        move_dir = self._unit3(self._world_to_flu(
+                            explore_delta / explore_dist, quaternion))
+                        yaw_goal = self._unit2(goal_dir_flu[:2])
+                        yaw_move = self._unit2(move_dir[:2])
+                        yaw_dir = self._unit2(
+                            self.cfg.bypass_yaw_goal_weight * yaw_goal +
+                            (1.0 - self.cfg.bypass_yaw_goal_weight)
+                            * yaw_move)
+                        reason = "guide_bypass_explore"
+                    else:
+                        move_dist = 0.0
+                        move_dir = self._unit3(self._world_to_flu(
+                            self._flu_to_world(goal_dir_flu, quaternion),
+                            quaternion))
+                        yaw_dir = self._unit2(goal_dir_flu[:2])
+                        reason = "guide_bypass_explore_hold"
+                else:
+                    # No route at all → probe (brief left/right pan).
+                    self._state = MacroState.PROBE
+                    self._begin_scan_session()
+                    return self._build_guide(
+                        MacroState.PROBE, goal_dir_flu, goal_dist,
+                        observed_map, position_world, quaternion)
+
+        elif state == MacroState.PROBE:
+            # ── Brief left/right pan, no translation ──
             move_dir = np.array([1.0, 0.0, 0.0])
             move_dist = 0.0
-            scan_sign = (CommittedSide.LEFT.value
-                         if state == MacroState.ACTIVE_SCAN_LEFT
-                         else CommittedSide.RIGHT.value)
-            # The FLU instruction is held until the next 5 Hz macro tick.
-            # Command one bounded relative-yaw increment per tick; using the
-            # accumulated scan angle as another relative command would make
-            # the vehicle increasingly overshoot and oscillate.
-            scan_angle = scan_sign * min(
-                math.radians(self.cfg.active_scan_min_angle_deg),
-                math.radians(30.0))
-            yaw_dir = np.array(
-                [math.cos(scan_angle), math.sin(scan_angle)])
-            reason = "active_scan_left" if scan_sign > 0 else "active_scan_right"
-        elif state in (MacroState.ACTIVE_PEEK_LEFT,
-                       MacroState.ACTIVE_PEEK_RIGHT):
-            side = (CommittedSide.LEFT.value
-                    if state == MacroState.ACTIVE_PEEK_LEFT
-                    else CommittedSide.RIGHT.value)
-            lateral = self._goal_relative_lateral(goal_dir_flu, side)
-            move_dir = self._unit3(0.25 * goal_dir_flu + 0.75 * lateral)
-            move_dist = min(self.cfg.active_peek_distance_m, 0.5 * guide_range)
-            # During an active translation the camera must substantially
-            # face the swept direction.  A small goal component still makes
-            # the newly revealed region useful for the subsequent decision.
-            yaw_dir = self._unit2(
-                (0.20 * goal_dir_flu + 0.80 * move_dir)[:2])
-            reason = "active_peek_left" if side > 0 else "active_peek_right"
-            needs_reachability_check = True
-        else:
-            return self._make_goal_hold_guide(position_world, quaternion)
+            phase = int(self._scan_time / self.cfg.probe_side_duration_s) % 2
+            sign = 1.0 if phase == 0 else -1.0
+            pan = sign * math.radians(self.cfg.probe_side_angle_deg)
+            yaw_dir = np.array([math.cos(pan), math.sin(pan)])
+            reason = "probe_left" if phase == 0 else "probe_right"
 
+        else:
+            # Unknown state — hold position safely.
+            move_dir = np.array([1.0, 0.0, 0.0])
+            move_dist = 0.0
+            yaw_dir = np.array([1.0, 0.0])
+            reason = "unknown_state_hold"
+
+        # ── Reachability check: clip move distance to known-free space ──
         if move_dist > 0.0 and needs_reachability_check:
             fitted_distance = self._fit_known_free_guide_distance(
-                observed_map, position_world, move_dir, quaternion, move_dist)
+                observed_map, position_world, move_dir, quaternion,
+                move_dist)
             if fitted_distance <= 0.0:
-                # A blocked goal ray does not define a bypass direction.
-                # First try actual goal-directed frontier viewpoints from the
-                # accumulated causal map. Each candidate is screened by C++
-                # bounded A* before becoming a Guide.
-                if (state == MacroState.GOAL_SEEK and
-                        self._map_supports_frontiers(observed_map)):
-                    selected = self._select_reachable_frontier(
+                # Goal ray blocked.  Follow the guide line instead; if no
+                # reachable advance exists, probe (brief left/right pan).
+                if state == MacroState.GOAL_SEEK:
+                    target, _ = self._select_guide_target(
                         goal_dir_flu, observed_map, position_world,
-                        quaternion)
-                    if selected is not None:
-                        self._committed_side = selected
-                        bypass_state = self._bypass_state(selected)
-                        self._state = bypass_state
+                        quaternion, goal_dist=goal_distance_m)
+                    if target is not None:
+                        self._state = MacroState.BYPASS
                         self._tick_time = 0.0
                         return self._build_guide(
-                            bypass_state, goal_dir_flu, goal_distance_m,
+                            MacroState.BYPASS, goal_dir_flu, goal_dist,
                             observed_map, position_world, quaternion)
-
-                # Keep observing the attempted/committed side. A single
-                # rejected candidate must not reverse the scan at 15 degrees;
-                # the ACTIVE_SCAN state itself changes side only after the
-                # configured sector duration/angle has been exhausted.
                 if self._scan_exhausted_this_tick:
-                    # Just came from a full 360° scan exhaustion → don't
-                    # re-enter scan.  Accept zero distance; the next tick
-                    # will re-evaluate with fresh observations.
                     self._scan_exhausted_this_tick = False
                     move_dist = 0.0
                     reason += "_scan_exhausted_hold"
-                    # Skip the scan re-entry below; fall through to guide
-                    # construction.
                 else:
-                    if state == MacroState.ACTIVE_PEEK_LEFT:
-                        scan_side = CommittedSide.RIGHT
-                    elif state == MacroState.ACTIVE_PEEK_RIGHT:
-                        scan_side = CommittedSide.LEFT
-                    elif self._committed_side != CommittedSide.NONE:
-                        scan_side = self._committed_side
-                    else:
-                        scan_side = self._preferred_side()
-                    scan_state = self._scan_state(scan_side)
-                    self._state = scan_state
-                    self._committed_side = scan_side
+                    self._state = MacroState.PROBE
                     self._begin_scan_session()
                     return self._build_guide(
-                        scan_state, goal_dir_flu, goal_distance_m,
+                        MacroState.PROBE, goal_dir_flu, goal_dist,
                         observed_map, position_world, quaternion)
             if fitted_distance + 1.0e-6 < move_dist:
                 reason += "_map_clipped"
@@ -1300,11 +1892,10 @@ class MacroExpert:
             unknown = max(0, total - int(observed_map.known_voxel_count()))
             revision = int(observed_map.get_revision())
 
-        # Summarise rejection reasons: deduplicate into "key:N" pairs.
         rejection_summary_parts = []
         reason_counts = {}
-        for reason in self._frontier_rejection_reasons.values():
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        for r in self._frontier_rejection_reasons.values():
+            reason_counts[r] = reason_counts.get(r, 0) + 1
         for key, count in sorted(reason_counts.items()):
             rejection_summary_parts.append("{}:{}".format(key, count))
         rejection_summary = ";".join(rejection_summary_parts)
@@ -1331,7 +1922,19 @@ class MacroExpert:
                 self._extracted_frontier_count),
             reachable_frontier_candidate_count=(
                 self._reachable_frontier_count),
-            frontier_rejection_summary=rejection_summary)
+            frontier_rejection_summary=rejection_summary,
+            scan_budget_exhausted=scan_budget_exhausted)
+        # V15.3: remember the guide line as the lateral temporal reference
+        # for the NEXT tick's search.  Only real forward intent
+        # (GOAL_SEEK/BYPASS with movement) becomes a reference — probes and
+        # holds clear it so a pan cannot skew the next guide line.
+        if (state in (MacroState.GOAL_SEEK, MacroState.BYPASS) and
+                move_dist > 0.05):
+            cache = getattr(self, "_guide_cache", None)
+            self._prev_guide_line_world = (
+                cache.get("path") if cache is not None else None)
+        else:
+            self._prev_guide_line_world = None
         self._hold_guide(guide)
         return guide
 

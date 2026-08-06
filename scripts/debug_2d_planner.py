@@ -186,7 +186,9 @@ class SimDepthCamera:
         depths = np.full(self.n_rays, self.max_range, dtype=np.float64)
         endpoints = np.zeros((self.n_rays, 3), dtype=np.float64)
         for i, a in enumerate(self.angles):
-            ray_angle = yaw + a
+            # Package convention B: yaw=0 => nose (body +Y) faces world +Y, so
+            # the world heading of the nose is yaw + pi/2.
+            ray_angle = yaw + a + math.pi / 2.0
             dx = math.cos(ray_angle)
             dy = math.sin(ray_angle)
             hit_dist = self.max_range
@@ -638,25 +640,30 @@ class Debug2DRunner:
             # Move toward guide direction, limited to realistic speed
             mv = guide.move_direction_flu
             yaw_dir = guide.yaw_direction_flu_xy
-            # FLU: X=forward, Y=left
+            # FLU: X=forward, Y=left.  Convention B (yaw=0 => nose faces
+            # world +Y):  forward -> world (-sin yaw, cos yaw),
+            # left -> world (-cos yaw, -sin yaw).
+            cy = math.cos(self.yaw)
+            sy = math.sin(self.yaw)
             move_dir_world = np.array([
-                math.cos(self.yaw) * mv[0] - math.sin(self.yaw) * mv[1],
-                math.sin(self.yaw) * mv[0] + math.cos(self.yaw) * mv[1],
+                -sy * mv[0] - cy * mv[1],
+                 cy * mv[0] - sy * mv[1],
                 0.0
             ])
             # Limit per-tick movement to nominal speed * dt
             max_step = 1.8 * dt  # nominal_speed * dt
             actual_dist = min(move_dist, max_step)
             self.pos += move_dir_world * actual_dist
-            # Track yaw toward intended direction (smooth turn)
-            target_yaw = math.atan2(move_dir_world[1], move_dir_world[0])
+            # Track yaw toward intended direction (smooth turn).
+            # Convention B: target yaw = world heading - pi/2.
+            target_yaw = (math.atan2(move_dir_world[1], move_dir_world[0])
+                          - math.pi / 2.0)
             yaw_err = self._wrap(target_yaw - self.yaw)
             self.yaw += max(-0.8, min(0.8, yaw_err))  # limited yaw rate
             self.vel = move_dir_world * actual_dist / dt
-        elif macro_state in ("ACTIVE_SCAN_LEFT", "ACTIVE_SCAN_RIGHT"):
-            # Pure rotation
-            yaw_rate = 2.0 * (1.0 if macro_state == "ACTIVE_SCAN_LEFT" else -1.0)
-            self.yaw += yaw_rate * dt
+        elif macro_state == "PROBE":
+            # Pure rotation — pan left then right (handled by macro guide
+            # yaw); here we simply rotate in place.
             self.vel = np.zeros(3)
         elif macro_state == "GOAL_HOLD":
             self.vel = np.zeros(3)
@@ -690,11 +697,13 @@ class Debug2DRunner:
         if dist < 1e-6:
             return np.array([1.0, 0.0, 0.0])
         world_dir = vec / dist
-        # World → FLU rotation
-        c = math.cos(-self.yaw)
-        s = math.sin(-self.yaw)
-        flu_x = c * world_dir[0] - s * world_dir[1]
-        flu_y = s * world_dir[0] + c * world_dir[1]
+        # World -> FLU (Convention B: yaw=0 => nose faces world +Y):
+        #   forward = -sin(yaw)*wx + cos(yaw)*wy
+        #   left    = -cos(yaw)*wx - sin(yaw)*wy
+        cy = math.cos(self.yaw)
+        sy = math.sin(self.yaw)
+        flu_x = -sy * world_dir[0] + cy * world_dir[1]
+        flu_y = -cy * world_dir[0] - sy * world_dir[1]
         flu = np.array([flu_x, flu_y, world_dir[2]], dtype=np.float64)
         norm = float(np.linalg.norm(flu))
         return flu / max(norm, 1e-9)

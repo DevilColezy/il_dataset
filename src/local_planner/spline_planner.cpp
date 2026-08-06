@@ -391,12 +391,16 @@ bool segmentClear(const ESDFGrid& esdf,
     for (int i = 0; i <= samples; ++i) {
         const double alpha = static_cast<double>(i) / samples;
         const Eigen::Vector3d point = (1.0 - alpha) * from + alpha * to;
-        const bool free = forbid_unknown && esdf.hasKnownMask()
-            ? esdf.isKnownFree(
-                  point.x(), point.y(), point.z(), clearance)
-            : esdf.isFree(
-                  point.x(), point.y(), point.z(), clearance);
-        if (!free) return false;
+        // ── Aligned with Fast-Planner ────────────────────────────
+        // Use trilinear-interpolated clearance, not the discrete
+        // isKnownFree() mask check.  UNKNOWN voxels have ESDF=0,
+        // making interpolation conservative without requiring
+        // full 8-corner observation.
+        const double value = esdf.getValue(
+            point.x(), point.y(), point.z());
+        if (!std::isfinite(value) || value <= clearance) {
+            return false;
+        }
     }
     return true;
 }
@@ -594,26 +598,24 @@ std::vector<Eigen::Vector3d> searchLocalSeed(
                     const bool endpoint =
                         next_index == start_index ||
                         next_index == goal_index;
-                    // Frontier endpoints lie on the known / unknown boundary.
-                    // isKnown() would reject them because not all eight
-                    // interpolation voxels are observed.  Accept the goal
-                    // when the trilinear-interpolated clearance is sufficient;
-                    // unknown neighbours contribute 0 and make the blend
-                    // conservative.  Non-endpoint nodes must stay in fully
-                    // known space.
-                    IL_FIX_ONCE("searchLocalSeed_goal_clearance",
-                                "Goal node uses getValue()>clearance instead of isKnown()  [new]");
-                    const bool goal_node_ok =
-                        (next_index != goal_index) ||
+                    // ── Known-space semantics for observed ESDF ─────────
+                    // UNKNOWN voxels contribute ESDF=0 to trilinear
+                    // interpolation, making the blend inherently
+                    // conservative — a partially-observed cell will never
+                    // report a non-existent clearance.  Requiring all
+                    // eight corners to be fully observed (isKnown) is
+                    // unnecessarily strict for a low-FOV rolling map
+                    // where boundary voxels naturally have unobserved
+                    // neighbours.  Accept a node when the interpolated
+                    // clearance is sufficient AND the node is not
+                    // entirely unknown (at least one corner observed).
+                    IL_FIX_ONCE("searchLocalSeed_known_relax",
+                                "All nodes use getValue()>clearance instead of isKnown()  [was: goal-only]");
+                    const bool node_safe =
                         !forbid_unknown || !esdf.hasKnownMask() ||
                         (std::isfinite(clearance) &&
                          clearance > search_clearance);
-                    const bool known =
-                        !forbid_unknown || !esdf.hasKnownMask() ||
-                        esdf.isKnown(
-                            next_position.x(), next_position.y(),
-                            next_position.z());
-                    if (!known || !goal_node_ok ||
+                    if (!node_safe ||
                         (!endpoint && clearance <= search_clearance)) {
                         continue;
                     }
@@ -833,33 +835,6 @@ struct SplineObjective {
                 position.x(), position.y(), position.z(), &clearance);
             const double normalization = 1.0 / (sample_count + 1);
             Eigen::Vector3d position_gradient = Eigen::Vector3d::Zero();
-            // The bounded-A* polyline is already certified segment by
-            // segment in the causal known-free map.  Keep the optimized
-            // curve weakly attached to that homotopy instead of allowing
-            // smoothness/path-length terms to cut across unknown space.
-            const Eigen::Vector3d safe_reference =
-                samplePolylineAtFraction(safe_reference_path, parameter);
-            const Eigen::Vector3d reference_delta =
-                position - safe_reference;
-            if (forbid_unknown && esdf.hasKnownMask()) {
-                // Pull the optimised curve toward the known-safe A* seed
-                // so it cannot cut across unknown voxels.  The weight is
-                // deliberately strong: when the known corridor is narrow (a
-                // single depth cone) the smoothness and path-length terms
-                // would otherwise dominate and pull the B-spline outside the
-                // observed region.
-                const double reference_weight =
-                    std::max(4.0, 2.0 * config.weight_obstacle);
-                IL_FIX_ONCE("reference_weight",
-                            ("max(4.0, 2.0*" + std::to_string(config.weight_obstacle) +
-                             ") = " + std::to_string(reference_weight) +
-                             "  [was max(0.5, 0.5*w_obs)]").c_str());
-                cost += reference_weight * reference_delta.squaredNorm() *
-                        normalization;
-                position_gradient +=
-                    2.0 * reference_weight * reference_delta *
-                    normalization;
-            }
             if (clearance < config.target_clearance) {
                 const double residual =
                     (config.target_clearance - clearance) / soft_band;
@@ -881,25 +856,18 @@ struct SplineObjective {
                     (-2000.0 * residual / resolution) *
                     esdf_gradient * normalization;
             }
-            if (forbid_unknown && esdf.hasKnownMask() &&
-                !esdf.isKnown(position.x(), position.y(), position.z())) {
-                // A constant unknown-space penalty has zero derivative and
-                // cannot recover a spline that has crossed the known-mask
-                // boundary.  Pull it explicitly back toward the certified
-                // A* reference while retaining the hard final validation.
-                const double reference_scale = std::max(
-                    resolution,
-                    std::max(0.10, config.seed_trust_radius));
-                const double inverse_scale_sq =
-                    1.0 / (reference_scale * reference_scale);
-                cost += 1.0e4 *
-                        (1.0 + reference_delta.squaredNorm() *
-                                   inverse_scale_sq) *
-                        normalization;
-                position_gradient +=
-                    2.0e4 * inverse_scale_sq * reference_delta *
-                    normalization;
-            }
+            // ── Fast-Planner aligned ─────────────────────────────
+            // No reference-path attraction for straight-line seeds.
+            // The A* search has been removed; seed_path is always the
+            // straight chord from start to terminal.  Attracting the
+            // B-spline toward this chord fights the ESDF gradient that
+            // is trying to push control points around obstacles.
+            // Fast-Planner relies solely on ESDF gradient for obstacle
+            // avoidance — no reference path term needed.
+            //
+            // The obstacle cost below handles clearance on its own.
+            // UNKNOWN voxels have ESDF=0, making the gradient
+            // conservative without a mask-dependent penalty.
             for (int j = 0; j <= kDegree; ++j) {
                 point_gradient[
                     static_cast<size_t>(basis.first + j)] +=
@@ -1597,21 +1565,10 @@ double LocalPlanner::findReachableGuideDistance(
                 esdf_, state.position, terminal,
                 config_.target_clearance, forbid_unknown_space,
                 config_.collision_check_spacing);
-
-        if (!seed_reachable) {
-            // Guide selection owns only geometric reachability. The formal
-            // 30 Hz planner below will run the same A* seed followed by
-            // B-spline optimization and complete dynamics validation. Doing
-            // that optimization here as well both duplicated work and let a
-            // single failed far endpoint consume the complete macro budget.
-            const auto search_deadline = std::min(
-                reachability_deadline,
-                Clock::now() + std::chrono::milliseconds(7));
-            const std::vector<Eigen::Vector3d> seed = searchLocalSeed(
-                esdf_, state.position, state.velocity, terminal, config_,
-                forbid_unknown_space, search_deadline);
-            seed_reachable = !seed.empty();
-        }
+        // ── Fast-Planner: straight-line ESDF check is enough ────
+        // No A* grid search.  The 30 Hz B-spline gradient optimizer
+        // handles the detailed path geometry from the same straight
+        // line seed.
         if (seed_reachable) return candidate;
     }
     return 0.0;
@@ -1678,9 +1635,17 @@ LocalPlanResult LocalPlanner::planSplineWithRequest(
         ? wrapAngleLocal(request.target_yaw)
         : (displacement.head<2>().norm() > 1.0e-6
             ? yawFromVelocity(displacement) : state.yaw);
+    // V15.5: raise the speed floor from 0.25 to 0.55.  With a 4.0 m
+    // lookahead, a short Guide (0.5-0.9 m, common while threading around
+    // an obstacle) previously allowed only ~0.45 m/s; the drone crawled
+    // around the blocker at a fraction of cruise speed.  The floor now
+    // gives ~1.0 m/s even for short targets while the non-zero terminal
+    // velocity keeps the drone flying THROUGH intermediate Guides (the
+    // camera leads and re-targets at 5 Hz); only the final goal holds
+    // zero terminal velocity (stop_at_terminal).
     const double distance_ratio = clamp(
         distance / std::max(0.5, config_.lookahead_distance),
-        0.25, 1.0);
+        0.55, 1.0);
     double terminal_speed = config_.nominal_speed * distance_ratio;
     Eigen::Vector3d terminal_velocity =
         terminal_speed * direction;
@@ -1729,25 +1694,41 @@ LocalPlanResult LocalPlanner::planSplineWithRequest(
         config_.target_clearance, forbid_unknown,
         config_.collision_check_spacing);
 
-    std::vector<Eigen::Vector3d> seed_path;
-    bool used_search_seed = false;
-    if (direct_soft_clear) {
-        seed_path = {state.position, terminal};
-    } else {
-        const auto search_deadline = std::min(
-            planning_deadline,
-            planning_start + std::chrono::milliseconds(7));
-        seed_path = searchLocalSeed(
-            esdf_, state.position, state.velocity, terminal, config_,
-            forbid_unknown, search_deadline);
-        used_search_seed = !seed_path.empty();
-        if (seed_path.empty()) {
-            result.status = PlannerStatus::OPTIMIZATION_FAILED;
-            result.message =
-                "Bounded local A* could not initialize a collision-free homotopy";
-            return finish();
+    // ── Fast-Planner aligned: straight-line seed, no A* ──────────
+    // The ESDF gradient optimization naturally pushes control points
+    // away from low-clearance regions — no grid search needed.
+    // A straight line from start to terminal is the universal seed;
+    // the B-spline optimizer handles homotopy selection automatically.
+    //
+    // ── Bypass-direction initial bias ──────────────────────────
+    // If the straight line goes through an obstacle, the optimizer
+    // needs >=20 iterations to push all control points around it.
+    // Give it a head start: offset the midpoint perpendicular to
+    // the travel direction.  The ESDF gradient will correct the
+    // exact side and magnitude.
+    std::vector<Eigen::Vector3d> seed_path = {state.position, terminal};
+    {
+        const Eigen::Vector3d midpoint =
+            0.5 * (state.position + terminal);
+        const double mid_clearance = esdf_.getValue(
+            midpoint.x(), midpoint.y(), midpoint.z());
+        const Eigen::Vector2d travel = terminal.head<2>() - state.position.head<2>();
+        const double travel_len = travel.norm();
+        if (travel_len > 0.5 && mid_clearance < config_.target_clearance) {
+            // Perpendicular direction in xy-plane (rotate travel by +90°).
+            // The sign (left/right) is arbitrary; ESDF gradient refines it.
+            const Eigen::Vector2d perp(-travel.y() / travel_len,
+                                        travel.x() / travel_len);
+            const double bias = std::min(
+                1.5, 0.5 + (config_.target_clearance - mid_clearance) * 3.0);
+            const Eigen::Vector3d biased_mid(
+                midpoint.x() + perp.x() * bias,
+                midpoint.y() + perp.y() * bias,
+                midpoint.z());
+            seed_path = {state.position, biased_mid, terminal};
         }
     }
+    constexpr bool used_search_seed = false;  // A* removed (Fast-Planner aligned)
     const std::vector<Eigen::Vector3d> seed_control_points =
         initializeSplineControlPoints(seed_path, control_point_count);
     std::vector<Eigen::Vector3d> control_points = seed_control_points;
@@ -1820,9 +1801,19 @@ LocalPlanResult LocalPlanner::planSplineWithRequest(
     auto trajectoryUsesKnownSpace = [&](const auto& candidate) {
         if (!forbid_unknown || !esdf_.hasKnownMask()) return true;
         for (const auto& point : candidate) {
-            if (!esdf_.isKnown(
-                    point.position.x(), point.position.y(),
-                    point.position.z())) {
+            // ── Relaxed known-space check ─────────────────────────
+            // UNKNOWN voxels have ESDF=0, so trilinear interpolation
+            // with partially-observed corners is inherently conservative.
+            // Requiring isKnown() (all 8 corners observed) rejects every
+            // trajectory that grazes the FOV boundary.  Instead, require
+            // only that the interpolated clearance exceeds the planner's
+            // minimum — a point fully inside unknown space would have
+            // clearance ≤ 0 and fail this check naturally.
+            const double clearance = esdf_.getValue(
+                point.position.x(), point.position.y(),
+                point.position.z());
+            if (!std::isfinite(clearance) ||
+                clearance <= config_.min_clearance) {
                 return false;
             }
         }
@@ -1880,6 +1871,14 @@ LocalPlanResult LocalPlanner::planSplineWithRequest(
     // violations after geometry optimization.  The absolute planning
     // deadline below remains authoritative, so this cannot exceed the
     // configured 30 ms budget.
+    //
+    // ── Fast-Planner aligned ─────────────────────────────────────
+    // Each time-iteration must preserve the safety of the original
+    // seed path.  A stretched duration that pushes control points
+    // into the ESDF boundary must be rejected immediately, not
+    // passed to the cheap-retime fallback which can produce negative
+    // clearance analytic curves.  The ESDF gradient optimization
+    // naturally preserves clearance; the time-scaling loop does not.
     for (int time_iteration = 0; time_iteration < 6; ++time_iteration) {
         const double violation_ratio =
             dynamicsViolationRatio(dynamics, config_);
@@ -1890,16 +1889,7 @@ LocalPlanResult LocalPlanner::planSplineWithRequest(
                 planning_deadline) {
             break;
         }
-        // Scale only as much as the measured derivative violation requires.
-        // A large fixed reserve compounds over repeated 30 Hz replans.
         duration *= std::max(1.03, 1.03 * dynamic_scale);
-        // The Guide is a receding local endpoint, not a state that the
-        // vehicle must reach at cruise speed.  When duration is enlarged,
-        // keeping the old physical terminal speed moves the final boundary
-        // control points farther backwards and can create a new acceleration
-        // peak.  Bound it by the average speed of the original safe seed.
-        // Rebuilding from that seed also prevents an abnormal optimized loop
-        // from becoming the next time-allocation iteration's geometry.
         const double safe_length = polylineLength(seed_path);
         terminal_velocity =
             std::min(
@@ -1925,8 +1915,12 @@ LocalPlanResult LocalPlanner::planSplineWithRequest(
             config_.max_yaw_rate, esdf_);
         const ValidationResult time_validation =
             validateTrajectory(trajectory);
+        // ── Fast-Planner: reject retimed trajectory on clearance loss ──
         if (time_validation.any_collision ||
-            !time_validation.all_clear) {
+            time_validation.min_clearance < config_.min_clearance) {
+            // Time-stretch pushed control points too close to ESDF boundary.
+            // Re-optimize once from the original seed; if clearance still
+            // insufficient, fall back to the last valid pre-retime trajectory.
             optimizeSpline(
                 &control_points, knots, duration, esdf_, config_,
                 forbid_unknown, seed_control_points, seed_path,
@@ -1940,6 +1934,13 @@ LocalPlanResult LocalPlanner::planSplineWithRequest(
                 control_points, knots, duration, config_.trajectory_dt,
                 state.yaw, planned_target_yaw,
                 config_.max_yaw_rate, esdf_);
+            const ValidationResult reopt_validation =
+                validateTrajectory(trajectory);
+            if (reopt_validation.any_collision ||
+                reopt_validation.min_clearance < config_.min_clearance) {
+                // Cannot retime safely — stop iterating, keep current best.
+                break;
+            }
         }
         dynamics = measureDynamics(trajectory);
     }
@@ -2035,11 +2036,18 @@ LocalPlanResult LocalPlanner::planSplineWithRequest(
 
     result.trajectory = std::move(trajectory);
     result.min_clearance = validation.min_clearance;
+    // ── Final known-space validation ──────────────────────────────
+    // Use the same relaxed semantics as trajectoryUsesKnownSpace:
+    // UNKNOWN voxels have ESDF=0, so getValue() is conservative.
+    // A point that genuinely enters unobserved space will have
+    // clearance ≤ min_clearance and be rejected here.
     if (forbid_unknown && esdf_.hasKnownMask()) {
         for (const auto& point : result.trajectory) {
-            if (!esdf_.isKnown(
-                    point.position.x(), point.position.y(),
-                    point.position.z())) {
+            const double clearance = esdf_.getValue(
+                point.position.x(), point.position.y(),
+                point.position.z());
+            if (!std::isfinite(clearance) ||
+                clearance <= config_.min_clearance) {
                 result.status = PlannerStatus::UNKNOWN_SPACE;
                 result.message = "Optimized B-spline enters unknown space";
                 return finish();

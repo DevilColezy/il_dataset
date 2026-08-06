@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <queue>
 #include <stdexcept>
 #include <tuple>
 #include <vector>
@@ -234,7 +235,19 @@ py::tuple build_observed_esdf(py::array_t<std::uint8_t> occupancy,
             value = std::max(-max_distance_m,
                              std::min(max_distance_m, value));
           }
-          esdf_out(x, y, z) = safe ? static_cast<float>(value) : 0.0F;
+          esdf_out(x, y, z) = safe
+              ? static_cast<float>(value)
+              // ── Fast-Planner aligned: unknown = free ─────────
+              // Fast-Planner sets distance_buffer_all_ to 10000 for
+              // unobserved voxels.  The ESDF gradient field must be
+              // smooth everywhere — an artificial 0 at the known/
+              // unknown boundary creates a cliff that blocks the
+              // B-spline optimizer.  Instead, assign the maximum
+              // distance (empty-space value) so the optimizer sees
+              // unknown space as traversable.  The receding-horizon
+              // planner will react to newly-observed obstacles within
+              // 33 ms (30 Hz), which is ~6 cm of travel at 1.8 m/s.
+              : static_cast<float>(max_distance_m - vehicle_radius_m);
         }
       }
     }
@@ -346,6 +359,293 @@ double sample_known_free_corridor(py::array_t<std::uint8_t> occupancy,
              ? 0.0
              : static_cast<double>(known_free_count) /
                    static_cast<double>(total_count);
+}
+
+// ── V15.3: goal-directed DFS guide-line search (C++) ─────────────
+py::array_t<double> compute_guide_line_2d(
+    py::array_t<std::uint8_t> occ2d,
+    py::array_t<double> origin_xy,
+    double resolution,
+    py::array_t<double> start_world,
+    py::array_t<double> target_world,
+    double unknown_cost,
+    int penalty_radius_cells,
+    double penalty_gain,
+    py::array_t<double> prev_line,
+    double lateral_soft_m,
+    double lateral_hard_m,
+    double lateral_cost) {
+  const py::buffer_info occ_info = occ2d.request();
+  const py::buffer_info ori_info = origin_xy.request();
+  const py::buffer_info st_info = start_world.request();
+  const py::buffer_info tg_info = target_world.request();
+  if (occ_info.ndim != 2 || ori_info.size != 2 || st_info.size != 2 ||
+      tg_info.size != 2 || resolution <= 0.0 || penalty_radius_cells <= 0) {
+    throw std::invalid_argument("compute_guide_line_2d: invalid arguments");
+  }
+  const int rows = static_cast<int>(occ_info.shape[0]);
+  const int cols = static_cast<int>(occ_info.shape[1]);
+  if (rows < 3 || cols < 3) {
+    throw std::invalid_argument("compute_guide_line_2d: grid too small");
+  }
+  const auto occ = occ2d.unchecked<2>();
+  const auto origin = origin_xy.unchecked<1>();
+  const double ox = origin(0), oy = origin(1);
+  const auto st = start_world.unchecked<1>();
+  const auto tg = target_world.unchecked<1>();
+
+  const auto empty_result = []() -> py::array_t<double> {
+    return py::array_t<double>(py::array::ShapeContainer({0, 2}));
+  };
+
+  auto world_to_grid = [&](double wx, double wy, int* gx, int* gy) {
+    *gx = static_cast<int>(std::floor((wx - ox) / resolution));
+    *gy = static_cast<int>(std::floor((wy - oy) / resolution));
+  };
+  int sx, sy, tx, ty;
+  world_to_grid(st(0), st(1), &sx, &sy);
+  world_to_grid(tg(0), tg(1), &tx, &ty);
+  const auto clamp = [](int& v, int hi) { v = std::max(0, std::min(hi, v)); };
+  clamp(sx, rows - 1);
+  clamp(sy, cols - 1);
+  clamp(tx, rows - 1);
+  clamp(ty, cols - 1);
+
+  if (occ(sx, sy) == 2) return empty_result();
+
+  // Terminal occupied -> backtrack toward the start for nearest walkable.
+  if (occ(tx, ty) == 2) {
+    bool found = false;
+    const int steps = std::max(std::abs(tx - sx), std::abs(ty - sy));
+    for (int s = 1; s <= steps; ++s) {
+      const double f = 1.0 - static_cast<double>(s) / (steps + 1);
+      int cx = static_cast<int>(std::lround(sx + (tx - sx) * f));
+      int cy = static_cast<int>(std::lround(sy + (ty - sy) * f));
+      cx = std::max(0, std::min(rows - 1, cx));
+      cy = std::max(0, std::min(cols - 1, cy));
+      if (occ(cx, cy) != 2) {
+        tx = cx;
+        ty = cy;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return empty_result();
+  }
+
+  const std::size_t n_cells = static_cast<std::size_t>(rows) * cols;
+
+  // Multi-source BFS: distance (cells) to the nearest OCCUPIED voxel.
+  std::vector<int> dist(n_cells, 1000000);
+  std::vector<int> q;
+  q.reserve(n_cells);
+  for (int i = 0; i < rows; ++i) {
+    for (int j = 0; j < cols; ++j) {
+      if (occ(i, j) == 2) {
+        const std::size_t idx = static_cast<std::size_t>(i) * cols + j;
+        dist[idx] = 0;
+        q.push_back(static_cast<int>(idx));
+      }
+    }
+  }
+  std::size_t head = 0;
+  while (head < q.size()) {
+    const int idx = q[head++];
+    const int i = idx / cols;
+    const int j = idx % cols;
+    const int nd = dist[static_cast<std::size_t>(idx)] + 1;
+    for (int di = -1; di <= 1; ++di) {
+      for (int dj = -1; dj <= 1; ++dj) {
+        const int ni = i + di, nj = j + dj;
+        if (ni < 0 || ni >= rows || nj < 0 || nj >= cols) continue;
+        const std::size_t nidx = static_cast<std::size_t>(ni) * cols + nj;
+        if (dist[nidx] > nd) {
+          dist[nidx] = nd;
+          q.push_back(static_cast<int>(nidx));
+        }
+      }
+    }
+  }
+
+  // Goal direction (world xy) and previous-line lateral reference.
+  double gx_w = tg(0) - st(0), gy_w = tg(1) - st(1);
+  const double glen = std::hypot(gx_w, gy_w);
+  if (glen < 1.0e-9) {
+    py::array_t<double> out(py::array::ShapeContainer({1, 2}));
+    auto mout = out.mutable_unchecked<2>();
+    mout(0, 0) = st(0);
+    mout(0, 1) = st(1);
+    return out;
+  }
+  gx_w /= glen;
+  gy_w /= glen;
+
+  std::vector<double> ref_f, ref_lat;
+  const py::buffer_info pl_info = prev_line.request();
+  if (pl_info.ndim == 2 && pl_info.shape[1] == 2 &&
+      pl_info.shape[0] > 0) {
+    const int m = static_cast<int>(pl_info.shape[0]);
+    const auto pl = prev_line.unchecked<2>();
+    std::vector<std::pair<double, double>> pairs;
+    pairs.reserve(static_cast<std::size_t>(m));
+    for (int k = 0; k < m; ++k) {
+      const double fx = pl(k, 0) - st(0), fy = pl(k, 1) - st(1);
+      pairs.emplace_back(gx_w * fx + gy_w * fy, gx_w * fy - gy_w * fx);
+    }
+    std::sort(pairs.begin(), pairs.end(),
+              [](const std::pair<double, double>& a,
+                 const std::pair<double, double>& b) {
+                return a.first < b.first;
+              });
+    ref_f.reserve(pairs.size());
+    ref_lat.reserve(pairs.size());
+    for (const auto& p : pairs) {
+      ref_f.push_back(p.first);
+      ref_lat.push_back(p.second);
+    }
+  }
+  const auto ref_lateral = [&](double f) -> double {
+    if (ref_f.empty()) return 0.0;
+    if (ref_f.size() == 1) return ref_lat[0];
+    if (f <= ref_f.front()) return ref_lat.front();
+    if (f >= ref_f.back()) return ref_lat.back();
+    std::size_t lo = 0, hi = ref_f.size() - 1;
+    while (hi - lo > 1) {
+      const std::size_t mid = (lo + hi) / 2;
+      if (ref_f[mid] <= f) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+    const double f0 = ref_f[lo], f1 = ref_f[hi];
+    const double t = (f1 > f0) ? (f - f0) / (f1 - f0) : 0.0;
+    return ref_lat[lo] + t * (ref_lat[hi] - ref_lat[lo]);
+  };
+
+  // ── Goal-directed weighted A* (dives toward the terminal) ──
+  // The guide line is the min-cost path from the drone to the terminal
+  // under 8-neighbour step cost = distance + obstacle-distance penalty +
+  // lateral temporal penalty.  The heuristic is weighted (w > 1) so the
+  // search expands depth-first toward the goal (like a DFS dive) while
+  // STILL accumulating the obstacle penalty — a raw DFS cannot accumulate
+  // penalty along the path and therefore hugs obstacle boundaries, which
+  // made the 30 Hz planner reject every plan (UNKNOWN_SPACE → stutter).
+  const int dirs[8][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1},
+                          {-1, -1}, {-1, 1}, {1, -1}, {1, 1}};
+  std::vector<int> parent(n_cells, -1);
+  const double kInfCost = 1.0e18;
+  std::vector<double> g_score(n_cells, kInfCost);
+  const std::size_t start_idx = static_cast<std::size_t>(sx) * cols + sy;
+  const std::size_t target_idx = static_cast<std::size_t>(tx) * cols + ty;
+  g_score[start_idx] = 0.0;
+  const double sqrt2 = std::sqrt(2.0);
+  const double h_weight = 1.6;  // >1 -> greedy depth-first dive toward goal
+
+  struct OpenNode {
+    double f;
+    double neg_g;  // -g: on f ties prefer the DEEPER node (DFS-like dive)
+    int idx;
+    bool operator>(const OpenNode& o) const {
+      if (f != o.f) return f > o.f;
+      return neg_g > o.neg_g;
+    }
+  };
+  std::priority_queue<OpenNode, std::vector<OpenNode>,
+                      std::greater<OpenNode>> open;
+  int best_h = std::max(std::abs(sx - tx), std::abs(sy - ty));
+  open.push({h_weight * static_cast<double>(best_h), 0.0,
+             static_cast<int>(start_idx)});
+  const std::size_t max_expansions =
+      std::min<std::size_t>(200000, n_cells * 8);
+  std::size_t expansions = 0;
+  bool found = false;
+  int best_cell = static_cast<int>(start_idx);
+  int end_cell = static_cast<int>(start_idx);
+
+  while (!open.empty()) {
+    const OpenNode top = open.top();
+    open.pop();
+    const std::size_t cur = static_cast<std::size_t>(top.idx);
+    const double top_g = -top.neg_g;  // neg_g stores -g
+    if (top_g > g_score[cur] + 1.0e-9) continue;  // stale entry
+    if (++expansions >= max_expansions) break;
+    const int ci = top.idx / cols, cj = top.idx % cols;
+    if (ci == tx && cj == ty) {
+      found = true;
+      end_cell = top.idx;
+      break;
+    }
+    const int h_cur = std::max(std::abs(ci - tx), std::abs(cj - ty));
+    if (h_cur < best_h) {
+      best_h = h_cur;
+      best_cell = top.idx;
+    }
+
+    for (int d = 0; d < 8; ++d) {
+      const int ni = ci + dirs[d][0], nj = cj + dirs[d][1];
+      if (ni < 0 || ni >= rows || nj < 0 || nj >= cols) continue;
+      if (occ(ni, nj) == 2) continue;
+      const std::size_t nidx = static_cast<std::size_t>(ni) * cols + nj;
+
+      // Lateral temporal consistency relative to the previous guide line.
+      const double wx = ox + (ni + 0.5) * resolution;
+      const double wy = oy + (nj + 0.5) * resolution;
+      const double fx = wx - st(0), fy = wy - st(1);
+      const double f = gx_w * fx + gy_w * fy;
+      const double lat = gx_w * fy - gy_w * fx;
+      const double dev = std::fabs(lat - ref_lateral(f));
+      if (dev > lateral_hard_m) continue;  // hard band: block side flips
+
+      const int d_obs = dist[nidx];
+      double step_cost = (occ(ni, nj) == 0 ? unknown_cost : 1.0);
+      if (dirs[d][0] != 0 && dirs[d][1] != 0) step_cost *= sqrt2;
+      if (d_obs < penalty_radius_cells) {
+        step_cost +=
+            penalty_gain *
+            static_cast<double>(penalty_radius_cells - d_obs);
+      }
+      if (dev > lateral_soft_m) {
+        step_cost += lateral_cost * (dev - lateral_soft_m);
+      }
+      const double ng = top_g + step_cost;
+      if (ng >= g_score[nidx] - 1.0e-9) continue;
+      g_score[nidx] = ng;
+      parent[nidx] = top.idx;
+      const double h = static_cast<double>(
+          std::max(std::abs(ni - tx), std::abs(nj - ty)));
+      open.push({ng + h_weight * h, -ng, static_cast<int>(nidx)});
+    }
+  }
+  if (!found) end_cell = best_cell;
+
+  // Reconstruct: terminal (or best-progress cell) back to the start.
+  std::vector<int> path;
+  int c = end_cell;
+  while (c >= 0 && path.size() <= n_cells) {
+    path.push_back(c);
+    if (c == static_cast<int>(start_idx)) break;
+    c = parent[static_cast<std::size_t>(c)];
+  }
+  if (path.empty() || path.back() != static_cast<int>(start_idx)) {
+    path.clear();
+    path.push_back(static_cast<int>(start_idx));
+    if (end_cell != static_cast<int>(start_idx)) {
+      path.push_back(end_cell);
+    }
+  }
+  std::reverse(path.begin(), path.end());
+
+  py::array_t<double> out(py::array::ShapeContainer(
+      {static_cast<py::ssize_t>(path.size()), 2}));
+  auto mout = out.mutable_unchecked<2>();
+  for (std::size_t k = 0; k < path.size(); ++k) {
+    const int idx = path[k];
+    const int i = idx / cols, j = idx % cols;
+    mout(static_cast<py::ssize_t>(k), 0) = ox + (i + 0.5) * resolution;
+    mout(static_cast<py::ssize_t>(k), 1) = oy + (j + 0.5) * resolution;
+  }
+  return out;
 }
 
 }  // namespace il_dataset

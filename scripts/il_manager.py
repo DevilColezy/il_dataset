@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Schema-v16 imitation-learning dataset collection manager.
+"""Schema-v17 imitation-learning dataset collection manager.
 
 The sole production flow generates a quota-balanced 2.5D cylinder scene and
 task set, derives causal local Guide labels from the current observation,
@@ -18,6 +18,32 @@ from dataclasses import replace
 
 import rospy
 import rospkg
+
+# ═══════════════════════════════════════════════════════════════════
+#  IL_FIX_V3_20240805  —  Modification manifest
+#  ─────────────────────────────────────────────────────────────
+#  Python side:
+#    - Macro labels immutable across planner failure (Task 1)
+#    - Episode-level scan budget (Task 2)
+#    - Consecutive planner failure tracking (Task 3)
+#    - Unified goal tolerance from config (Task 9)
+#  C++ side (requires rebuild):
+#    - ESDF isKnown() → getValue() everywhere (searchLocalSeed,
+#      segmentClear, trajectoryUsesKnownSpace, final validation)
+#    - Removed isKnown() soft penalty from B-spline optimization
+#    - Active scan min angle 15°→90°
+#    - stop_at_terminal field in LocalPlanningRequest
+# ═══════════════════════════════════════════════════════════════════
+_FIX_VERSION = "IL_FIX_V15_5_20260806"
+print("=" * 70)
+print("  IL_FIX_VERSION: {}".format(_FIX_VERSION))
+print("  V15.2: explore advance along route, PROBE only when route-less")
+print("=" * 70)
+# Also log via ROS when available
+try:
+    rospy.loginfo("[IL_FIX] Version: %s", _FIX_VERSION)
+except Exception:
+    pass
 
 # Ensure this script's directory is on sys.path
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -255,7 +281,7 @@ class State(Enum):
 class ILManager:
     """State-machine orchestrator for IL dataset collection."""
 
-    # ── Schema v16 ordered field list ────────────────────────────────
+    # ── Schema v17 ordered field list ────────────────────────────────
     # A committed trajectory contains only fully supervised frames.
     # Row-level validity fields remain as audit invariants; per-head loss
     # masks are intentionally absent because partial supervision is not a
@@ -602,20 +628,50 @@ class ILManager:
                 "minimum_progress_rate_m_s", 0.15)),
             minimum_commit_time_s=float(macro_cfg.get(
                 "minimum_commit_time_s", 0.8)),
+            guide_unknown_cost=float(macro_cfg.get(
+                "guide_unknown_cost", 1.05)),
+            guide_straight_ratio=float(macro_cfg.get(
+                "guide_straight_ratio", 1.20)),
+            bypass_yaw_goal_weight=float(macro_cfg.get(
+                "bypass_yaw_goal_weight", 0.60)),
+            guide_line_clearance_m=float(macro_cfg.get(
+                "guide_line_clearance_m", 0.55)),
+            guide_penalty_gain=float(macro_cfg.get(
+                "guide_penalty_gain", 0.6)),
+            guide_lateral_soft_m=float(macro_cfg.get(
+                "guide_lateral_soft_m", 0.30)),
+            guide_lateral_hard_m=float(macro_cfg.get(
+                "guide_lateral_hard_m", 0.70)),
+            guide_lateral_cost=float(macro_cfg.get(
+                "guide_lateral_cost", 3.0)),
+            guide_explore_step_m=float(macro_cfg.get(
+                "guide_explore_step_m", 0.8)),
+            max_explore_steps=int(macro_cfg.get(
+                "max_explore_steps", 10)),
+            probe_side_duration_s=float(macro_cfg.get(
+                "probe_side_duration_s", 1.2)),
+            probe_max_duration_s=float(macro_cfg.get(
+                "probe_max_duration_s", 3.0)),
+            probe_side_angle_deg=float(macro_cfg.get(
+                "probe_side_angle_deg", 90.0)),
             active_scan_yaw_rate_rps=float(macro_cfg.get(
                 "active_scan_yaw_rate_rps", 2.0)),
             active_scan_min_angle_deg=float(macro_cfg.get(
                 "active_scan_min_angle_deg", 15.0)),
             active_scan_max_duration_s=float(macro_cfg.get(
                 "active_scan_max_duration_s", 2.0)),
-            active_peek_distance_m=float(macro_cfg.get(
-                "active_peek_distance_m", 2.0)),
-            active_peek_safety_radius_m=float(macro_cfg.get(
-                "active_peek_safety_radius_m", 0.55)),
             vertical_avoidance_enabled=bool(macro_cfg.get(
                 "vertical_avoidance_enabled", False)),
             vertical_active_perception_enabled=bool(macro_cfg.get(
                 "vertical_active_perception_enabled", False)),
+            max_completed_scans=int(macro_cfg.get(
+                "max_completed_scans", 3)),
+            max_cumulative_scan_time_s=float(macro_cfg.get(
+                "max_cumulative_scan_time_s", 20.0)),
+            max_unsuccessful_scans=int(macro_cfg.get(
+                "max_unsuccessful_scans", 2)),
+            goal_tolerance_m=float(macro_cfg.get(
+                "goal_tolerance_m", 0.30)),
         )
         self._macro_expert_config.validate(float(self._depth_cfg["max_m"]))
         if abs(float(obs_cfg.get("resolution", 0.10)) -
@@ -3299,10 +3355,26 @@ class ILManager:
                 move_direction = current_macro_guide.move_direction_flu
                 move_distance = current_macro_guide.move_distance_m
                 macro_state = current_macro_guide.macro_state
+                # ── Task 2: Episode-level scan budget exhaustion ────
+                # The macro expert tracks cumulative scan time, completed
+                # scans, and unsuccessful scans across the whole episode.
+                # When the budget is exhausted, terminate the episode
+                # instead of looping forever.
+                if current_macro_guide.scan_budget_exhausted:
+                    self._trajectory_exit_reason = "scan_budget_exhausted"
+                    rospy.logerr(
+                        "[LOCKSTEP] Episode scan budget exhausted: "
+                        "cumulative_scan=%.2fs completed_scans=%d "
+                        "unsuccessful=%d. Terminating episode.",
+                        self._macro_expert._episode_cumulative_scan_time_s,
+                        self._macro_expert._episode_completed_scans,
+                        self._macro_expert._episode_unsuccessful_scans)
+                    break
                 is_scan = macro_state in (
-                    MacroState.ACTIVE_SCAN_LEFT.value,
-                    MacroState.ACTIVE_SCAN_RIGHT.value)
-                is_hold = macro_state == MacroState.GOAL_HOLD.value
+                    MacroState.PROBE.value,)
+                # V14: GOAL_HOLD removed — any guide with near-zero
+                # movement distance is a hold command.
+                is_hold = move_distance <= 0.05 and not is_scan
                 guide_sel.valid = bool(
                     current_macro_guide.valid and
                     move_distance > 0.05 and not is_scan and not is_hold)
@@ -3543,16 +3615,28 @@ class ILManager:
                             req.has_target_yaw = bool(
                                 np.linalg.norm(macro_look_world[:2]) >
                                 1.0e-6)
-                            req.target_yaw = (
-                                math.atan2(
-                                    float(macro_look_world[1]),
-                                    float(macro_look_world[0]))
-                                if req.has_target_yaw else float(cur_yaw))
+                            if req.has_target_yaw:
+                                # Package convention B: yaw=0 => nose (body +Y)
+                                # faces world +Y, so the yaw whose nose points
+                                # along the look direction d is
+                                # atan2(d_y, d_x) - pi/2 (NOT atan2(d_y, d_x)).
+                                # The C++ planner consumes this yaw verbatim.
+                                req.target_yaw = (
+                                    math.atan2(
+                                        float(macro_look_world[1]),
+                                        float(macro_look_world[0]))
+                                    - math.pi / 2.0)
+                            else:
+                                req.target_yaw = float(cur_yaw)
                             # reference_path_segment is NOT populated —
                             # the local planner uses straight-line initialization
                             req.forbid_unknown_space = bool(
                                 lp_cfg.get("forbid_unknown_space", True))
                             req.allow_global_map_fallback = False
+                            # ── Task 7: Zero terminal velocity at final goal ──
+                            req.stop_at_terminal = bool(guide_sel.guide_is_final)
+                            if req.stop_at_terminal:
+                                req.terminal_velocity = (0.0, 0.0, 0.0)
                             result = self._cpp_planner.plan_local_with_request(req)
 
                             t_plan_end = time.monotonic()
@@ -3653,53 +3737,33 @@ class ILManager:
                     else:
                         self._failed_replans += 1
                         self._planner_failure_count += 1
-                        # The held 5 Hz Guide may become infeasible as the
-                        # finite-history observed map changes between macro
-                        # ticks. Replace MOVE and Control together on this
-                        # frame, preserving a valid causal supervision pair
-                        # instead of aborting the complete episode.
-                        current_macro_guide = \
-                            self._macro_expert.force_active_scan(
-                                current_goal_direction_flu,
-                                current_goal_distance,
-                                self._observed_map,
-                                cur_pos,
-                                dynamics_state.quaternion_world_body)
-                        macro_state = current_macro_guide.macro_state
-                        is_scan = True
+                        # ── Task 1: Macro intent is IMMUTABLE on this frame.
+                        # The macro expert's original state, reason, direction,
+                        # and target must NOT be overwritten by planner failure.
+                        # Planner failure only records status and triggers a
+                        # safety command for this frame; it does NOT fabricate
+                        # a new macro label.
+                        # ────────────────────────────────────────────────
+                        # Keep the original macro guide from the expert's
+                        # update() call.  The CSV row will record the macro's
+                        # authentic decision, not a planner-failure artifact.
+                        # Only the LOCAL plan status/planner mode and safety
+                        # command execution change.
+                        planner_mode = PlannerMode.RECOVERY
+                        # Preserve original macro_state for guide_sel
+                        is_scan = (macro_state in (
+                            MacroState.PROBE.value,))
                         guide_sel.valid = False
-                        guide_sel.visible = False
-                        guide_sel.depth_visible = False
-                        guide_sel.guide_position_world = \
-                            current_macro_guide.move_target_world.copy()
-                        guide_sel.terminal_position_world = \
-                            current_macro_guide.move_target_world.copy()
-                        guide_sel.guide_direction_flu = \
-                            current_macro_guide.move_direction_flu.copy()
-                        guide_sel.guide_distance_m = 0.0
-                        guide_sel.guide_distance_norm = 0.0
-                        guide_sel.terminal_distance_m = 0.0
-                        guide_sel.azimuth_rad = 0.0
-                        guide_sel.elevation_rad = 0.0
-                        guide_sel.guide_is_final = False
-                        guide_sel.guide_path_index = -1
-                        guide_sel.terminal_path_index = -1
-                        guide_sel.selection_mode = \
-                            "macro_" + macro_state.lower()
-                        guide_sel.candidate_count = 0
-                        guide_sel.corridor_known_free_ratio = -1.0
-                        guide_sel.avoidance_side = int(
-                            current_macro_guide.committed_side)
-                        guide_sel.recovery_target_valid = True
-                        guide_sel.recovery_target_world = \
-                            current_macro_guide.look_target_world.copy()
-                        recovery_target_world = \
-                            guide_sel.recovery_target_world.copy()
-                        recovery_target_path_index = \
-                            self._guide_progress_index
                         guide_sel.rejection_reason = \
-                            "local_plan_rejected_active_scan"
+                            "local_plan_rejected_macro_intact"
                         self._consecutive_guide_failures += 1
+                        # ── Track consecutive planner failure ───────────
+                        consecutive_failures += 1
+                        rospy.logwarn(
+                            "[LOCAL-PLAN] Planner failure #%d (limit %d): "
+                            "macro mode=%s stays immutable; safety stop.",
+                            consecutive_failures, effective_failure_limit,
+                            macro_state)
                 else:
                     # No translational Guide: intentional active perception
                     # or generic recovery rotates in place without a planner
@@ -3989,8 +4053,8 @@ class ILManager:
                     selected_actor=sel_actor,
                 )
 
-            # ── Step 4: Build training row (v13) ────────────────────
-            row = self._build_training_row_v16(
+            # ── Step 4: Build training row (v17) ────────────────────
+            row = self._build_training_row_v17(
                 cur_pos, cur_vel, cur_yaw,
                 decision,
                 plan_success, planner_compute_ms,
@@ -5483,7 +5547,7 @@ class ILManager:
                 np.asarray(velocity_flu, dtype=np.float64).copy(),
                 float(yaw_rate))
 
-    def _build_training_row_v16(
+    def _build_training_row_v17(
             self, cur_pos, cur_vel, cur_yaw,
             decision: RuntimeDecision,
             plan_success, planner_compute_ms,
@@ -6041,7 +6105,7 @@ class ILManager:
             "valid": plan.get("valid", False),
             "validation_report": plan.get("validation_report", {}),
             "esdf_stats": self.current_esdf_stats if hasattr(self, "current_esdf_stats") else {},
-            # ── Schema v16 metadata ──
+            # ── Schema v17 metadata ──
             "schema_version": schema_version,
             "terminal_label_semantics": "goal_hold_v1",
             "collection_mode": collection_mode,
@@ -6803,12 +6867,12 @@ class ILManager:
                 "unsupported_current_schema_version:{}".format(
                     schema_version))
         elif os.path.isfile(data_path) and col_map:
-            v16_issues = self._validate_schema_v16(
+            v17_issues = self._validate_schema_v17(
                 data_path, col_map, data_cfg)
-            if v16_issues:
+            if v17_issues:
                 rospy.logwarn("[Validate] Schema v17 issues: %s",
-                              "; ".join(v16_issues[:10]))
-                failure_reasons.extend(v16_issues)
+                              "; ".join(v17_issues[:10]))
+                failure_reasons.extend(v17_issues)
                 validation_passed = False
 
         # ── Commit or reject ──────────────────────────────────────
@@ -6827,7 +6891,7 @@ class ILManager:
         self._final_dir = None
         self._route_next()
 
-    def _validate_schema_v16(self, data_path, col_map, data_cfg):
+    def _validate_schema_v17(self, data_path, col_map, data_cfg):
         """Validate schema-v17 rows plus retained command invariants."""
         issues = []
         trend_cfg_v = data_cfg["trend"]
@@ -7112,9 +7176,7 @@ class ILManager:
                                 "CRITICAL: invalid_macro_move_distance at "
                                 "row {}".format(row_idx))
                         if (macro_mode in {
-                                MacroState.ACTIVE_SCAN_LEFT.value,
-                                MacroState.ACTIVE_SCAN_RIGHT.value,
-                                MacroState.GOAL_HOLD.value,
+                                MacroState.PROBE.value,
                                 } and move_distance > 1.0e-6):
                             issues.append(
                                 "CRITICAL: translating_zero_motion_macro_mode "

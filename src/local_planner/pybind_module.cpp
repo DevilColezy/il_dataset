@@ -109,6 +109,20 @@ class FlightmareDynamicsBridge {
 using namespace il_dataset;
 
 PYBIND11_MODULE(_il_local_planner, m) {
+    // ═══════════════════════════════════════════════════════════
+    //  IL_FIX_V3_20240805  —  C++ modification manifest
+    //  ──────────────────────────────────────────────────────
+    //  - ESDF isKnown() → getValue() in searchLocalSeed nodes
+    //  - segmentClear: isKnownFree() → getValue()
+    //  - trajectoryUsesKnownSpace: isKnown() → getValue()
+    //  - Final B-spline validation: isKnown() → getValue()
+    //  - Removed isKnown() soft penalty from optimization
+    //  - stop_at_terminal + terminal_velocity in request
+    // ═══════════════════════════════════════════════════════════
+    py::print("==============================================");
+    py::print("  IL_FIX_VERSION: IL_FIX_V11_20240805 (C++)");
+    py::print("  Unknown=free ESDF + boundary=free");
+    py::print("==============================================");
   py::class_<FlightmareDynamicsBridge>(m, "FlightmareDynamics")
     .def(py::init<>())
     .def("reset", &FlightmareDynamicsBridge::reset,
@@ -133,6 +147,14 @@ PYBIND11_MODULE(_il_local_planner, m) {
           py::arg("end_world"), py::arg("radius_m"),
           py::arg("spacing_m"), py::arg("min_clearance_m") = 0.0,
           "Score a complete spherical swept volume against known FREE voxels.");
+    m.def("compute_guide_line_2d", &compute_guide_line_2d,
+          py::arg("occ2d"), py::arg("origin_xy"), py::arg("resolution"),
+          py::arg("start_world"), py::arg("target_world"),
+          py::arg("unknown_cost"), py::arg("penalty_radius_cells"),
+          py::arg("penalty_gain"), py::arg("prev_line"),
+          py::arg("lateral_soft_m"), py::arg("lateral_hard_m"),
+          py::arg("lateral_cost"),
+          "V15.3 goal-directed DFS macro guide line (2-D world xy).");
 
     // ── Enums ────────────────────────────────────────────────────
     py::enum_<PlannerStatus>(m, "PlannerStatus",
@@ -182,7 +204,11 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("forbid_unknown_space",
                        &LocalPlanningRequest::forbid_unknown_space)
         .def_readwrite("allow_global_map_fallback",
-                       &LocalPlanningRequest::allow_global_map_fallback);
+                       &LocalPlanningRequest::allow_global_map_fallback)
+        .def_readwrite("stop_at_terminal",
+                       &LocalPlanningRequest::stop_at_terminal)
+        .def_readwrite("terminal_velocity",
+                       &LocalPlanningRequest::terminal_velocity);
 
     py::class_<TrajectoryPoint>(m, "TrajectoryPoint",
         "Single point on a dense time-sampled trajectory.")

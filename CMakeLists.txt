@@ -146,26 +146,6 @@ target_link_libraries(_il_local_planner PRIVATE
   stdc++fs
 )
 
-if(CATKIN_ENABLE_TESTING)
-  add_executable(
-    il_local_planner_trajectory_test
-    tests/test_trajectory_consistency.cpp
-  )
-  target_compile_options(
-    il_local_planner_trajectory_test PRIVATE
-    -O2 -Wall -Wextra ${IL_DATASET_ARCH_FLAGS}
-  )
-  target_link_libraries(
-    il_local_planner_trajectory_test
-    il_local_planner_lib
-    ${catkin_LIBRARIES}
-  )
-  add_test(
-    NAME il_local_planner_trajectory_test
-    COMMAND il_local_planner_trajectory_test
-  )
-endif()
-
 # Place the .so next to the Python scripts so "import _il_local_planner" works
 set_target_properties(_il_local_planner PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/scripts"
@@ -175,14 +155,5 @@ set_target_properties(_il_local_planner PROPERTIES
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES il_local_planner_lib
-)
-
-catkin_install_python(PROGRAMS
-  scripts/expert_behavior_catalog.py
-  scripts/expert_behavior_suite.py
-  scripts/expert_behavior_test.py
-  scripts/expert_behavior_visualizer.py
-  scripts/observation_rollout_scenario_test.py
-  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

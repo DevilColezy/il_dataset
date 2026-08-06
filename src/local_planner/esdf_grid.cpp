@@ -83,7 +83,19 @@ double ESDFGrid::getValue(double x, double y, double z) const {
     if (gx_f < -0.5 || gx_f > gx_ - 0.5 ||
         gy_f < -0.5 || gy_f > gy_ - 0.5 ||
         gz_f < -0.5 || gz_f > gz_ - 0.5) {
-        return -1e6;  // outside map = collision
+        // ── Fast-Planner aligned ─────────────────────────────
+        // Return max positive distance for out-of-map queries.
+        // The rolling observed map is smaller than the planner's
+        // search range; treating the boundary as a collision
+        // (-1e6) creates artificial ESDF cliffs that block the
+        // B-spline optimizer.  Unknown=free within the map, and
+        // boundary=free beyond it — consistent with receding-
+        // horizon safety (obstacles appear at 5m, drone moves
+        // 0.06m per frame at 1.8m/s).
+        const double bound_max_dist =
+            static_cast<double>(std::max({gx_, gy_, gz_})) *
+            resolution_;
+        return bound_max_dist;
     }
 
     // Trilinear interpolation

@@ -96,7 +96,7 @@ class IssueStore(list):
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate a committed strict Schema-v16 IL dataset")
+        description="Evaluate a committed strict Schema-v17 IL dataset")
     parser.add_argument("--dataset-root", required=True,
                         help="Root containing committed trajectories")
     parser.add_argument("--config-file", default="",
@@ -778,7 +778,7 @@ def _write_markdown(result, path):
     guide = result["guide_labels"]
     behavior = result["control_behavior"]
     lines = [
-        "# Schema-v16 imitation-learning dataset evaluation",
+        "# Schema-v17 imitation-learning dataset evaluation",
         "",
         "## Verdict",
         "",
@@ -890,7 +890,7 @@ def _print_terminal_report(result):
     behavior = result["control_behavior"]
 
     print("=" * 78)
-    print("Schema-v16 模仿学习数据集评价")
+    print("Schema-v17 模仿学习数据集评价")
     print("=" * 78)
     print("数据集路径: {}".format(result["dataset_root"]))
     print("结构完整性: {}".format(verdict["structural_integrity"]))
