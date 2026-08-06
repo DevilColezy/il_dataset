@@ -1,54 +1,42 @@
 # ============================================================================
-#  Imitation Learning Dataset Collection — Official Configuration  (schema v17)
+#  Imitation Learning Dataset Collection — Two-Level Navigation Expert (schema v18)
 # ============================================================================
-#  This is the SINGLE canonical config file.  It is referenced by:
-#    - il_dataset/launch/il_dataset_collect.launch
-#    - il_multiscale_dataset/launch/multiscale_dataset_collect.launch
 #
-#  Sole collection flow:
-#    density-balanced cylinder scene → quota-balanced task generation →
-#    causal local Guide exploration → C++ receding-horizon Control →
-#    deterministic lockstep recording → whole-episode validation/commit.
+#  Architecture:
+#    task_oracle        privileged global map + cost-to-go (built once/task)
+#    observed_map       causal rolling occupancy + ESDF + known mask (C++)
+#    macro_expert       5 Hz strategic state machine
+#    macro_candidates   5 Hz candidate generation (C++)
+#    local_recoverability 5 Hz query: can the local layer recover direct intent?
+#    local_path_search  observed-map A* (C++, 30 Hz)
+#    trajectory_optimization  B-spline trajectory optimization (C++, 30 Hz)
+#    yaw_planning       FOV-constrained yaw trajectory (C++)
+#    trajectory_controller  30 Hz command extraction + limits
+#    execution_safety   fresh/cached/rotate/brake/emergency selection
+#    dataset_logging    recorded fields and files
 #
-#  This is a 2.5D validation setup: the network interfaces remain 3D, while
-#  every obstacle spans the complete z range so avoidance labels are planar.
-#  Removed schemas and fallback planners are intentionally unsupported.
+#  Yaw convention (unified): yaw = atan2(world_y, world_x) - pi/2
+#  (yaw=0 => body +Y faces world +Y; nose world dir = (-sin yaw, cos yaw)).
 #
-#  Yaw convention (unified across the package):
-#    yaw = atan2(world_y, world_x) - pi/2   (yaw=0 => nose/body +Y faces world +Y)
-#    nose world direction = (-sin yaw, cos yaw); body quaternion = rotZ(yaw).
-#
-#  Schema version: 17   (matches il_manager.py DATA_SCHEMA_V17_FIELDS and the
-#  "schema_version" recorded in every metadata.json; CSV header = v17 fields)
-#    - v1: il_pipeline.py     (global.flight, global.connect_timeout, scene.trajectories)
-#    - v2: il_manager.py      (global.fsm, global.control, global.start_goal)
-#    - v3: il_manager.py v3   (sync diagnostics, atomic commit, validated config)
-#    - v4: added vel_source, body_frame_convention metadata
-#    - v5: receding-horizon local planner, C++ pybind11 backend, global A* only
-#    - v16: strict schema — 2.5D quota-balanced scenes, causal Guide labels,
-#           deterministic lockstep recording, whole-episode validation.
-#    - v17: continuous expert supervision and continuous global navigation
-#           labels; causal observed map required; unknown space treated as unsafe.
+#  Every parameter below is read and used by the runtime code.
 # ============================================================================
 
-# ── Global settings ──────────────────────────────────────────────────────────
 global:
   scene_id: 1
   pub_port: "10253"
   sub_port: "10254"
   output_dir: ""
 
-  # ── FSM timeouts (seconds) ───────────────────────────────────────────
+  # ── FSM timeouts (seconds) ─────────────────────────────────────────
   fsm:
-    connect_timeout:       60.0
-    scene_settle_timeout:  10.0
-    pc_export_timeout:    600.0
-    esdf_build_timeout:    60.0
-    drone_stable_timeout:  10.0
-    trajectory_timeout:   120.0           # max seconds per trajectory flight
-    keep_alive_period:      3.0
+    connect_timeout:         60.0
+    scene_settle_timeout:    10.0
+    pc_export_timeout:      600.0
+    drone_stable_timeout:    10.0
+    trajectory_timeout:     120.0
+    keep_alive_period:        3.0
 
-  # ── Depth camera ─────────────────────────────────────────────────────
+  # ── Depth camera ───────────────────────────────────────────────────
   depth:
     width:  640
     height: 480
@@ -57,1138 +45,233 @@ global:
     near:    0.01
     far:  1000.0
 
-  # ── Point-cloud & ESDF ───────────────────────────────────────────────
+  # ── Point cloud export (privileged global map input) ───────────────
   pointcloud:
-    range:      [27.0, 44.0, 8.0]
-    origin:     [1.5, 16.0, 3.5]
-    # A 0.40 m-wide vehicle spans four samples at 0.10 m.  Keep point-cloud
-    # and ESDF resolution equal so voxelisation cannot create surface holes.
-    resolution: 0.10
-  esdf:
-    resolution:    0.10
-    drone_radius:  0.30              # matches vehicle.radius_m (0.30), was 0.20
+    range:        [27.0, 44.0, 8.0]
+    origin:       [1.5, 16.0, 3.5]
+    resolution:   0.10
+    export_file:  "obstacle_cloud.ply"
 
-  # ── Control & recording (async: high-freq control, lower-freq save) ──
+  # ── Vehicle geometry ───────────────────────────────────────────────
+  vehicle:
+    radius_m:        0.30
+    safety_margin_m: 0.20
+
+  # ── Recording rate ─────────────────────────────────────────────────
   control:
-    # Keep command and capture clocks aligned.  At 640x480 the Unity depth
-    # pipeline did not consume 50 Hz reliably, which caused queued poses to be
-    # discarded and produced mixed 20/40/60/80 ms frame intervals.
-    control_hz: 50.0
-    # Windows Unity + WSL transport target.  640x480 RFloat depth is about
-    # 1.2 MiB/frame, so 30 Hz remains practical while looking smooth.
+    # Unity depth at 640x480 cannot reliably be consumed at 50 Hz; 30 Hz is
+    # the record (and control sample) rate.
     record_hz:  30.0
 
-  # ── Obstacle generation shared defaults ──────────────────────────────
-  obstacle:
-    area_x:  [-9.0, 11.0]
-    area_y:  [0.0, 30.0]
-    height:   8.0
-    # SmartObstacleSampler produces an obstacle surface gap of:
-    # min_gap + 2*drone_radius + safety_margin = 0.80 m.  A 0.40 m vehicle
-    # therefore has 0.40 m total spare width in every generated pairwise gap.
-    min_gap:        0.80
-    drone_radius:   0.30
-    safety_margin:  0.20
-    border_margin:  0.20               # avoids creating an oversized perimeter corridor
-    candidate_attempts: 60
-    shrink_on_fail:  true
-    shrink_factor:    0.85
-    size_interval:    0.5
-    scale_weights: [0.72, 0.23, 0.05]   # small / medium / large; large is rare
-    avoid_x:      0.0
-    avoid_y:      0.0
-    avoid_radius: 0.0
-    ground_z:     0.0
-
-  # ── Phase 3: Scene & Task Generation  (v10 density-driven) ─────
-  scene_generation:
-    enabled: true
-
-    source: "density_driven"
-    obstacle_type: "cylinder"
-
-    seed: 12345
-
-    # ── Distance bands (adaptive obstacle regions) ────────────────
-    distance_bands:
-      micro:
-        flight_min_m:  1.0
-        flight_max_m:  5.0
-        region_x_half: 2.0
-        region_y_pad:  1.0
-        region_z_pad:  1.0
-      short:
-        flight_min_m:  5.0
-        flight_max_m: 10.0
-        region_x_half: 3.0
-        region_y_pad:  1.5
-        region_z_pad:  1.5
-      medium:
-        flight_min_m: 10.0
-        flight_max_m: 18.0
-        region_x_half: 4.0
-        region_y_pad:  2.0
-        region_z_pad:  1.5
-      long:
-        flight_min_m: 18.0
-        flight_max_m: 25.0
-        region_x_half: 5.5
-        region_y_pad:  2.5
-        region_z_pad:  2.0
-      extreme:
-        flight_min_m: 25.0
-        flight_max_m: 32.0
-        region_x_half: 7.0
-        region_y_pad:  3.0
-        region_z_pad:  2.0
-
-    # ── Per-density gap constraints ───────────────────────────────
-    gap_constraints_by_density:
-      sparse:
-        minimum_surface_gap_m: 1.50
-        minimum_post_inflation_gap_m: 0.50
-      medium:
-        minimum_surface_gap_m: 1.00
-        minimum_post_inflation_gap_m: 0.35
-      dense:
-        minimum_surface_gap_m: 0.60
-        minimum_post_inflation_gap_m: 0.20
-
-    # ── Per-density planner clearance ─────────────────────────────
-    planner_clearance_by_density:
-      sparse:
-        target_clearance: 0.25
-        min_clearance: 0.05
-      medium:
-        target_clearance: 0.20
-        min_clearance: 0.03
-      dense:
-        target_clearance: 0.15
-        min_clearance: 0.02
-
-    # ── Execution control ──────────────────────────────────────────
-    execution:
-      profile_order: "sequential"
-      stop_after_all_profiles: true
-
-      max_generation_attempts_per_scene: 1000
-      max_task_sampling_attempts_per_scene: 500
-
-    # ── Obstacle region ────────────────────────────────────────────
-    obstacle_region:
-      x_min: -7.0
-      x_max: 10.0
-      y_min: 0.0
-      y_max: 30.0
-      z_min: 0.0
-      z_max: 8.0
-
-    outside_region_policy: "free"
-
-    # ── Vehicle & inflation ────────────────────────────────────────
-    vehicle:
-      radius_m: 0.30
-      safety_margin_m: 0.10
-    # inflation_radius = 0.30 + 0.10 = 0.40 m
-    # minimum surface gap  = 0.40 + 2×0.40 = 1.20 m
-
-    # ── Core constraints (the only ones that matter) ──────────────
-    post_inflation_gap_m: 0.40         # minimum gap after inflation
-    region_boundary_margin_m: 0.30     # obstacle centre inset from region edge
-    allow_overlap: false               # raw cylinders must not overlap
-
-    # ── Post-generation validation ─────────────────────────────────
-    forbid_enclosed_free_components: true
-    forbid_inflated_component_merging: true
-
-    # ── Legacy compatibility (kept for il_config.py, validator) ────
-    topology_validation:
-      grid_resolution_m: 0.10
-      validation_halo_m: 3.0
-      vehicle_radius_m: 0.30
-      safety_margin_m: 0.10
-
-    common_cylinder:
-      height_min_m: 8.0
-      height_max_m: 8.0
-      require_full_vertical_blocking: true
-      region_boundary_margin_m: 0.30
-      minimum_surface_gap_m: 1.20
-      minimum_post_inflation_gap_m: 0.40
-      allow_overlap: false
-
-    # ── Common task generation ─────────────────────────────────────
-    common_task_generation:
-      tasks_per_scene: 48
-      initial_yaw_randomization_deg: 90.0
-
-      start_sampling_regions:
-        - {x_min: -6.5, x_max: 9.5, y_min: -1.5, y_max: -0.5}
-        - {x_min:  -8.5, x_max: -7.5, y_min: 1, y_max: 29}
-        - {x_min:  9.5, x_max:  11.5, y_min: -1, y_max: 0}
-
-      goal_sampling_regions:
-        - {x_min: -6.5, x_max: 9.5, y_min: 31.0, y_max: 32.0}
-        - {x_min:  10.5, x_max:  11.5, y_min: 1.0, y_max: 29.0}
-        - {x_min:  -8.5, x_max: -7.5, y_min: 30, y_max: 31}
-
-      start_height_min_m: 1.8
-      start_height_max_m: 2.2
-      goal_height_min_m: 1.8
-      goal_height_max_m: 2.2
-
-      # ── Disabled constraints (v10: let the scene define difficulty) ──
-      maximum_start_goal_height_difference_m: 100.0   # effectively unlimited
-      minimum_start_goal_distance_m: 0.0
-      maximum_start_goal_distance_m: 1000.0
-
-      # All tasks must be blocked to maximise Guide-label diversity.
-      require_direct_path_blocked: true
-      minimum_direct_blocker_count: 1
-      maximum_direct_blocker_count: 3
-      direct_path_corridor_radius_m: 0.40
-
-      require_astar_reachable: true
-      minimum_detour_ratio: 1.25
-      maximum_detour_ratio: 3.50
-
-      # Adaptive obstacle region: size the XY region to the distance band
-      use_adaptive_region: true
-
-    # ── Legacy block for backward compat ──────────────────────────
-    cylinder:
-      count_min: 6
-      count_max: 10
-      radius_min_m: 0.30
-      radius_max_m: 2.0
-      height_min_m: 8.0
-      height_max_m: 8.0
-      require_full_vertical_blocking: true
-      region_boundary_margin_m: 0.30
-      minimum_surface_gap_m: 0.80
-      minimum_inflated_gap_m: 0.40
-      allow_overlap: false
-      allow_inflated_component_merging: false
-
-    task_generation:
-      enabled: true
-      max_task_sampling_attempts: 2000
-      tasks_per_scene: 24
-      start_height_min_m: 1.8
-      start_height_max_m: 2.2
-      goal_height_min_m: 1.8
-      goal_height_max_m: 2.2
-      maximum_start_goal_height_difference_m: 100.0
-      start_clearance_m: 0.0
-      goal_clearance_m: 0.0
-      minimum_start_goal_distance_m: 0.0
-      maximum_start_goal_distance_m: 1000.0
-      # Keep both straight-flight and avoidance samples.
-      require_direct_path_blocked: false
-      direct_path_corridor_radius_m: 0.35
-      minimum_direct_blocker_count: 1
-      maximum_direct_blocker_count: 3
-      require_astar_reachable: true
-      minimum_detour_ratio: 1.0
-      maximum_detour_ratio: 1000.0
-      start_sampling_region:
-        x_min: -8.0
-        x_max: 10.0
-        y_min: -2.0
-        y_max: -1.0
-      goal_sampling_region:
-        x_min: -8.0
-        x_max: 10.0
-        y_min: 30.0
-        y_max: 32.0
-
-    side_cost:
-      enabled: false
-      minimum_cost_difference_ratio: 0.15
-      portal_lateral_clearance_m: 0.60
-      portal_longitudinal_offset_m: 0.50
-      require_both_sides_feasible: false
-      reject_nearly_equal_sides: true
-
-    observability_audit:
-      # This audit compares observed and global side-cost choices; it is not
-      # meaningful when side_cost is disabled.
-      enabled: false
-      require_runtime_side_consistency: true
-      minimum_observed_cost_difference_ratio: 0.05
-      maximum_invalid_frames_before_reject: 5
-      reject_episode_on_inconsistent_side_choice: true
-
-    # ═══════════════════════════════════════════════════════════════
-    #  Scene generation profiles  (v10: density-driven, 12 profiles)
-    #
-    #  Scale tiers:
-    #    S01–S03  0.10 – 0.50 m   small obstacles, low–moderate density
-    #    S04–S06  0.10 – 1.50 m   medium obstacles, moderate density
-    #    S07–S09  0.10 – 2.50 m   large obstacles, moderate–high density
-    #    S10–S12  0.10 – 3.50 m   mixed scale, high density
-    #
-    #  Density rationale:
-    #    Smaller obstacles pack efficiently → lower density still produces
-    #    many obstacles.  Larger obstacles need more area budget to fit.
-    #    Density increases with scale tier and within each tier
-    #    (sparse → medium → dense).
-    # ═══════════════════════════════════════════════════════════════
-    profiles:
-      # ──────────────────────────────────────────────────────────────
-      #  MICRO  (1-5 m)  -- pure reactive avoidance
-      # ──────────────────────────────────────────────────────────────
-      - name: "M01_micro_medium"
-        enabled: true
-        scene_count: 2
-        seed_offset: 1010
-        distance_band: micro
-        density_min: 0.04
-        density_max: 0.07
-        size_groups:
-          large:
-            capacity_fraction: 0.30
-            radius_min_m: 0.40
-            radius_max_m: 0.60
-            consecutive_fail_threshold: 40
-          medium:
-            capacity_fraction: 0.35
-            radius_min_m: 0.25
-            radius_max_m: 0.40
-            consecutive_fail_threshold: 80
-          small:
-            capacity_fraction: 0.35
-            radius_min_m: 0.10
-            radius_max_m: 0.25
-            consecutive_fail_threshold: 150
-
-      - name: "M02_micro_dense"
-        enabled: true
-        scene_count: 3
-        seed_offset: 1020
-        distance_band: micro
-        density_min: 0.10
-        density_max: 0.15
-        size_groups:
-          large:
-            capacity_fraction: 0.25
-            radius_min_m: 0.40
-            radius_max_m: 0.60
-            consecutive_fail_threshold: 50
-          medium:
-            capacity_fraction: 0.35
-            radius_min_m: 0.25
-            radius_max_m: 0.40
-            consecutive_fail_threshold: 100
-          small:
-            capacity_fraction: 0.40
-            radius_min_m: 0.10
-            radius_max_m: 0.25
-            consecutive_fail_threshold: 180
-
-      # ──────────────────────────────────────────────────────────────
-      #  SHORT  (5-10 m)
-      # ──────────────────────────────────────────────────────────────
-      - name: "S01_short_sparse"
-        enabled: true
-        scene_count: 1
-        seed_offset: 2010
-        distance_band: short
-        density_min: 0.015
-        density_max: 0.030
-        size_groups:
-          large:
-            capacity_fraction: 0.30
-            radius_min_m: 0.50
-            radius_max_m: 0.80
-            consecutive_fail_threshold: 30
-          medium:
-            capacity_fraction: 0.35
-            radius_min_m: 0.30
-            radius_max_m: 0.50
-            consecutive_fail_threshold: 60
-          small:
-            capacity_fraction: 0.35
-            radius_min_m: 0.15
-            radius_max_m: 0.30
-            consecutive_fail_threshold: 100
-
-      - name: "S02_short_medium"
-        enabled: true
-        scene_count: 2
-        seed_offset: 2020
-        distance_band: short
-        density_min: 0.04
-        density_max: 0.07
-        size_groups:
-          large:
-            capacity_fraction: 0.30
-            radius_min_m: 0.50
-            radius_max_m: 0.80
-            consecutive_fail_threshold: 40
-          medium:
-            capacity_fraction: 0.35
-            radius_min_m: 0.30
-            radius_max_m: 0.50
-            consecutive_fail_threshold: 80
-          small:
-            capacity_fraction: 0.35
-            radius_min_m: 0.15
-            radius_max_m: 0.30
-            consecutive_fail_threshold: 120
-
-      - name: "S03_short_dense"
-        enabled: true
-        scene_count: 4
-        seed_offset: 2030
-        distance_band: short
-        density_min: 0.10
-        density_max: 0.15
-        size_groups:
-          large:
-            capacity_fraction: 0.25
-            radius_min_m: 0.50
-            radius_max_m: 0.80
-            consecutive_fail_threshold: 50
-          medium:
-            capacity_fraction: 0.35
-            radius_min_m: 0.30
-            radius_max_m: 0.50
-            consecutive_fail_threshold: 100
-          small:
-            capacity_fraction: 0.40
-            radius_min_m: 0.15
-            radius_max_m: 0.30
-            consecutive_fail_threshold: 150
-
-      # ──────────────────────────────────────────────────────────────
-      #  MEDIUM  (10-18 m)  * core training band
-      # ──────────────────────────────────────────────────────────────
-      - name: "M01_medium_sparse"
-        enabled: true
-        scene_count: 3
-        seed_offset: 3010
-        distance_band: medium
-        density_min: 0.015
-        density_max: 0.030
-        size_groups:
-          large:
-            capacity_fraction: 0.30
-            radius_min_m: 0.60
-            radius_max_m: 1.00
-            consecutive_fail_threshold: 30
-          medium:
-            capacity_fraction: 0.35
-            radius_min_m: 0.35
-            radius_max_m: 0.60
-            consecutive_fail_threshold: 60
-          small:
-            capacity_fraction: 0.35
-            radius_min_m: 0.15
-            radius_max_m: 0.35
-            consecutive_fail_threshold: 100
-
-      - name: "M02_medium_medium"
-        enabled: true
-        scene_count: 6
-        seed_offset: 3020
-        distance_band: medium
-        density_min: 0.04
-        density_max: 0.07
-        size_groups:
-          large:
-            capacity_fraction: 0.30
-            radius_min_m: 0.60
-            radius_max_m: 1.00
-            consecutive_fail_threshold: 40
-          medium:
-            capacity_fraction: 0.35
-            radius_min_m: 0.35
-            radius_max_m: 0.60
-            consecutive_fail_threshold: 80
-          small:
-            capacity_fraction: 0.35
-            radius_min_m: 0.15
-            radius_max_m: 0.35
-            consecutive_fail_threshold: 120
-
-      - name: "M03_medium_dense"
-        enabled: true
-        scene_count: 8
-        seed_offset: 3030
-        distance_band: medium
-        density_min: 0.10
-        density_max: 0.15
-        size_groups:
-          large:
-            capacity_fraction: 0.25
-            radius_min_m: 0.60
-            radius_max_m: 1.00
-            consecutive_fail_threshold: 50
-          medium:
-            capacity_fraction: 0.35
-            radius_min_m: 0.35
-            radius_max_m: 0.60
-            consecutive_fail_threshold: 100
-          small:
-            capacity_fraction: 0.40
-            radius_min_m: 0.15
-            radius_max_m: 0.35
-            consecutive_fail_threshold: 150
-
-      # ──────────────────────────────────────────────────────────────
-      #  LONG  (18-25 m)
-      # ──────────────────────────────────────────────────────────────
-      - name: "L01_long_sparse"
-        enabled: true
-        scene_count: 3
-        seed_offset: 4010
-        distance_band: long
-        density_min: 0.015
-        density_max: 0.030
-        size_groups:
-          large:
-            capacity_fraction: 0.30
-            radius_min_m: 0.80
-            radius_max_m: 1.50
-            consecutive_fail_threshold: 30
-          medium:
-            capacity_fraction: 0.35
-            radius_min_m: 0.45
-            radius_max_m: 0.80
-            consecutive_fail_threshold: 60
-          small:
-            capacity_fraction: 0.35
-            radius_min_m: 0.20
-            radius_max_m: 0.45
-            consecutive_fail_threshold: 100
-
-      - name: "L02_long_medium"
-        enabled: true
-        scene_count: 4
-        seed_offset: 4020
-        distance_band: long
-        density_min: 0.04
-        density_max: 0.07
-        size_groups:
-          large:
-            capacity_fraction: 0.30
-            radius_min_m: 0.80
-            radius_max_m: 1.50
-            consecutive_fail_threshold: 40
-          medium:
-            capacity_fraction: 0.35
-            radius_min_m: 0.45
-            radius_max_m: 0.80
-            consecutive_fail_threshold: 80
-          small:
-            capacity_fraction: 0.35
-            radius_min_m: 0.20
-            radius_max_m: 0.45
-            consecutive_fail_threshold: 120
-
-      - name: "L03_long_dense"
-        enabled: true
-        scene_count: 5
-        seed_offset: 4030
-        distance_band: long
-        density_min: 0.10
-        density_max: 0.15
-        size_groups:
-          large:
-            capacity_fraction: 0.25
-            radius_min_m: 0.80
-            radius_max_m: 1.50
-            consecutive_fail_threshold: 50
-          medium:
-            capacity_fraction: 0.35
-            radius_min_m: 0.45
-            radius_max_m: 0.80
-            consecutive_fail_threshold: 100
-          small:
-            capacity_fraction: 0.40
-            radius_min_m: 0.20
-            radius_max_m: 0.45
-            consecutive_fail_threshold: 150
-
-      # ──────────────────────────────────────────────────────────────
-      #  EXTREME  (25-32 m)
-      # ──────────────────────────────────────────────────────────────
-      - name: "E01_extreme_sparse"
-        enabled: true
-        scene_count: 2
-        seed_offset: 5010
-        distance_band: extreme
-        density_min: 0.015
-        density_max: 0.030
-        size_groups:
-          large:
-            capacity_fraction: 0.30
-            radius_min_m: 1.00
-            radius_max_m: 2.00
-            consecutive_fail_threshold: 30
-          medium:
-            capacity_fraction: 0.35
-            radius_min_m: 0.55
-            radius_max_m: 1.00
-            consecutive_fail_threshold: 60
-          small:
-            capacity_fraction: 0.35
-            radius_min_m: 0.25
-            radius_max_m: 0.55
-            consecutive_fail_threshold: 100
-
-      - name: "E02_extreme_medium"
-        enabled: true
-        scene_count: 2
-        seed_offset: 5020
-        distance_band: extreme
-        density_min: 0.04
-        density_max: 0.07
-        size_groups:
-          large:
-            capacity_fraction: 0.30
-            radius_min_m: 1.00
-            radius_max_m: 2.00
-            consecutive_fail_threshold: 40
-          medium:
-            capacity_fraction: 0.35
-            radius_min_m: 0.55
-            radius_max_m: 1.00
-            consecutive_fail_threshold: 80
-          small:
-            capacity_fraction: 0.35
-            radius_min_m: 0.25
-            radius_max_m: 0.55
-            consecutive_fail_threshold: 120
-
-      - name: "E03_extreme_dense"
-        enabled: true
-        scene_count: 3
-        seed_offset: 5030
-        distance_band: extreme
-        density_min: 0.10
-        density_max: 0.15
-        size_groups:
-          large:
-            capacity_fraction: 0.25
-            radius_min_m: 1.00
-            radius_max_m: 2.00
-            consecutive_fail_threshold: 50
-          medium:
-            capacity_fraction: 0.35
-            radius_min_m: 0.55
-            radius_max_m: 1.00
-            consecutive_fail_threshold: 100
-          small:
-            capacity_fraction: 0.40
-            radius_min_m: 0.25
-            radius_max_m: 0.55
-            consecutive_fail_threshold: 150
-
-  # ── Phase 4: ESDF Cache ────────────────────────────────────────────
-  esdf_cache:
-    enabled: true
-
-    cache_root: "cache/esdf"
-
-    global:
-      compression: true
-
-      validate_hash: true
-      validate_metadata: true
-      lock_timeout_s: 120.0
-
-      builder_version: 1
-
-    observed:
-      enabled: true
-
-      rebuild_only_on_map_change: true
-      upload_only_on_revision_change: true
-      maximum_cached_revisions: 2
-
-  # ── Phase 4: DAgger ────────────────────────────────────────────────
-  dagger:
-    enabled: false
-
-    round_id: 0
-    rollout_mode: "expert"
-
-    seed: 12345
-
-    policy:
-      backend: "disabled"
-      model_path: ""
-      device: "cpu"
-
-      python_module: ""
-      python_class: ""
-
-      onnx_input_names: {}
-      onnx_output_names: {}
-
-      recurrent: true
-      inference_timeout_ms: 30.0
-
-    mixture:
-      mode: "stochastic_switch"
-
-      beta_schedule: "linear"
-      beta_start: 1.0
-      beta_end: 0.0
-      beta_decay_rounds: 5
-
-      sample_scope: "frame"
-
-    safety:
-      enabled: true
-
-      override_on_invalid_policy_output: true
-      override_on_policy_timeout: true
-      override_on_observed_collision_risk: true
-
-      minimum_observed_clearance_m: 0.35
-      minimum_ttc_s: 0.60
-      prediction_horizon_s: 1.00
-
-      fallback_command: "hover"
-
-    aggregation:
-      output_root: "dataset/dagger"
-
-  # ── Phase 4: Dynamics ──────────────────────────────────────────────
+  # ── Flightmare dynamics backend (retained execution layer) ─────────
   dynamics:
     backend: "flightmare"
-
     control_mode: "velocity_yaw_rate"
-
     simulation_hz: 200.0
-    control_hz: 50.0
-    render_hz: 30.0
-
+    control_hz:     50.0
+    render_hz:      20.0
     deterministic_time: true
-
-    allow_legacy_kinematic_backend: true
-    legacy_backend_explicit_only: true
-
     velocity_controller:
       use_existing_flightmare_controller: true
-
       kp_velocity: [3.0, 3.0, 3.0]
       ki_velocity: [0.0, 0.0, 0.0]
       kd_velocity: [0.2, 0.2, 0.2]
-
       maximum_acceleration_mps2: [4.0, 4.0, 2.0]
       maximum_tilt_deg: 35.0
-      maximum_yaw_rate_rps: 2.0
+      maximum_yaw_rate_rps: 1.5
       maximum_yaw_acceleration_rps2: 4.0
       attitude_gain: 6.0
       maximum_body_rate_rps: 6.0
-
       integrator_limit: [1.0, 1.0, 0.5]
-
     reset:
       settle_time_s: 0.30
       initial_velocity_noise_std_mps: [0.0, 0.0, 0.0]
       initial_angular_velocity_noise_std_rps: [0.0, 0.0, 0.0]
 
-  # ── Start / goal random generation ───────────────────────────────────
-  start_goal:
-    num_pairs_per_config: 3            # fewer pairs for quick test
-    candidate_pair_multiplier: 2       # replace failed A* candidates when possible
-    start_zone:
-      x: [-8.0, 8.0]
-      y: [-2.0, -1.0]
-      z_min: 2.0
-      z_max: 4.0
-    goal_zone:
-      x: [-8.0, 8.0]
-      y: [31.0, 32.0]
-      z_min: 2.0
-      z_max: 4.0
-    min_start_goal_distance: 15.0
-    max_attempts: 200
-    min_esdf_clearance_at_endpoints: 0.20
-    # v11: random yaw offset applied to initial drone heading.
-    # 0 = always face along the first global-path segment.
-    # e.g. 30 = uniformly random offset in [-30°, +30°].
-    initial_yaw_randomization_deg: 90.0
+  # ── Privileged global map (section VII) ────────────────────────────
+  task_oracle:
+    # Task manifests: each JSON file provides start/goal/initial_yaw and an
+    # optional obstacle list sent to Unity.  Files are consumed in order.
+    task_manifest_dir: "tasks"
+    map_resolution_m:      0.10
+    map_margin_m:          2.0
+    inflation_m:           0.30
+    max_esdf_distance_m:   8.0
+    min_z_m:              -5.0
+    max_z_m:               8.0
+    free_clearance_m:      0.10
+    cost_to_go_cap_m:     30.0
+    # Candidate scoring weights (lower score = better).
+    weight_observed_cost:  1.0
+    weight_cost_to_go:     2.0
+    weight_connectivity:   6.0
+    weight_clearance:      1.0
+    weight_goal_progress:  1.0
+    weight_information:    0.5
+    weight_yaw_cost:       0.5
+    weight_side_switch:    1.0
+    weight_repeat:         0.5
+    side_switch_penalty:   1.0
+    repeat_penalty:        1.0
+    clearance_target_m:    0.6
+    yaw_cost_scale_rad:    1.0
 
-  # ── Trajectory planning & dynamics constraints ───────────────────────
-  planning:
-    # ═══════════════════════════════════════════════════════════════════
-    #  Goal-directed branch planner — ONE call per start→goal pair
-    # ═══════════════════════════════════════════════════════════════════
-    global_planner:
-      algorithm: "observation_rollout"
-      observation_rollout:
-        step_length_m: 0.10
-        angular_step_deg: 2.0
-        deviation_tie_tolerance_deg: 2.0
-        # FOV and range default to global.depth.
-        fov_margin_deg: 3.0
-        maximum_deviation_deg: 120.0
-        goal_tolerance_m: 0.10
-        maximum_rollout_steps: 10000
-        maximum_planning_time_s: 45.0
-      min_clearance: 0.30              # hard margin beyond vehicle-radius-subtracted ESDF
-      collision_check_spacing_m: 0.05
-      reference_resample_spacing_m: 0.10
-
-    # ═══════════════════════════════════════════════════════════════════
-    #  Teacher-only complete-guide trajectory planner (C++ pybind11 backend)
-    # ═══════════════════════════════════════════════════════════════════
-    local_planner:
-      backend: "cpp_pybind"
-      # auto uses NLopt/L-BFGS when libnlopt-cxx-dev is available at build
-      # time, otherwise the time-bounded native optimizer is used.
-      optimizer: "auto"
-
-      planner_hz: 30.0
-      horizon_time: 2.5                 # nominal optimizer horizon; sampled duration is auto-scaled
-      execute_prefix_time: 0.60          # legacy field; position prefixes are no longer replayed
-      velocity_command_lookahead_time: 0.08  # shorter preview reduces corner cutting
-      velocity_tracking_gain: 2.0        # [1/s] feedback toward the collision-checked local path
-      planner_acceleration_filter_time_constant_s: 0.15  # suppress one-frame dynamics spikes at the spline boundary
-      # Preserve collision-checked transverse acceleration across fresh 30 Hz
-      # replans while the shared Guide-speed reference closes longitudinal
-      # speed error. Position and velocity remain exact spline boundaries.
-      planner_acceleration_warm_start_blend: 0.80
-      planner_velocity_ramp_time_s: 1.00
-      # Velocity-controller acceleration feed-forward.  This realizes the
-      # spline acceleration without increasing geometric preview distance.
-      velocity_acceleration_feedforward_time_s: 0.30
-      yaw_tracking_gain: 3.0             # [1/s] track planner yaw generated from macro yaw intent
-      yaw_speed_threshold: 0.10          # legacy fallback only; planned yaw does not depend on speed
-      max_plan_age: 0.75                 # measured from request state, never completion time
-      planning_time_budget_ms: 30.0
-
-      lookahead_distance: 4.0
-      min_lookahead_distance: 2.0
-      max_lookahead_distance: 6.0
-      lookahead_velocity_gain: 0.6
-      curvature_lookahead_gain: 1.0
-      local_map_radius: 6.0              # fixed-radius ESDF query/optimization window
-      max_reference_points: 32           # fixed upper bound for local guide complexity
-
-      control_points: 16
-      control_point_spacing: 0.20        # 16 pts over 5 m = 0.33 m/pt; enough for obstacle detour
-      max_iterations: 10000
-      convergence_tolerance: 1.0e-4
-      initial_step_size: 0.1
-      minimum_step_size: 1.0e-4
-      max_cost_samples_per_segment: 64   # bounds every objective evaluation
-      # Per-control-point trust region around the collision-free A* seed.
-      # This prevents a block of control points drifting to a shared box edge.
-      seed_trust_radius: 0.35
-
-      # Hard rejection margin beyond the already radius-inflated ESDF.
-      # Keep this well below the global path's 0.30 m clearance reserve.
-      min_clearance: 0.02
-      target_clearance: 0.20             # local soft target < global 0.30 m reserve
-      collision_check_spacing: 0.05
-
-      weight_path_length: 0.05           # weak anti-loop term; not Guide tracking
-      weight_smooth: 1.0
-      weight_jerk: 0.2
-      # Guide is already the exact endpoint.  Do not penalize intermediate
-      # lateral avoidance or make Control track the straight Guide chord.
-      weight_guide: 0.0
-      weight_obstacle: 10.0
-      weight_goal: 2.0
-      weight_dynamics: 0.3
-
-      nominal_speed: 1.8
-      max_velocity: 2.5
-      max_acceleration: 8.0
-      max_jerk: 50.0
-      max_yaw_rate: 2.0
-
-      goal_tolerance: 0.30
-      goal_speed_tolerance: 0.20
-      goal_hold_ticks: 3
-
-      max_consecutive_failures: 6
-      failure_grace_time: 1.0            # effective limit also scales with planner_hz
-      reduce_lookahead_on_failure: true
-      emergency_hold_enabled: true
-
-      # ── Phase 2: observed ESDF usage ──
-      use_observed_esdf: true
-      forbid_unknown_space: true
-      allow_global_map_fallback: false
-      horizontal_avoidance_only: true
-
-    # ═══════════════════════════════════════════════════════════════════
-    #  Validation thresholds for committed data
-    # ═══════════════════════════════════════════════════════════════════
-    validation:
-      require_zero_collision: true
-      require_zero_clearance_violations: true
-      minimum_rows: 10
-      maximum_none_depth_ratio: 0.20
-      command_compare_atol: 1.0e-5
-
-    # ── DEPRECATED (kept for backward compat; NOT used by new pipeline) ──
-    # esdf_optimize, pos_smooth_window, resample_spacing, time_param,
-    # control_lookahead, control_yaw_smooth — these have been superseded
-    # by the local planner.  They remain in the file only so old config
-    # loaders do not crash; il_config.py will emit deprecation warnings.
-
-  # ── Data format ──────────────────────────────────────────────────────
-  data:
-    coordinate_frame: "CAMERA_FLU"
-    schema_version: 17
-    collection_mode: "deterministic_lockstep"
-    image_write_queue_size: 16
-    label_lookahead_time_s: 0.08
-    # ── Trend label configuration (v11: 11 normal FOV bins + 2 recovery classes = 13) ──
-    trend:
-      normal_horizontal_bins: 11
-      horizontal_class_count: 13
-      vertical_bins: 7
-      soft_sigma_bins: 0.75
-      recover_left_class: 0
-      normal_class_offset: 1
-      recover_right_class: 12
-
-  # ── Observed local occupancy map (Phase 2) ───────────────────────────
+  # ── Causal observed map (section X.1) ──────────────────────────────
   observed_map:
-    enabled: true
-
-    resolution: 0.10
-
-    size_x_m: 12.0
-    size_y_m: 12.0
-    size_z_m: 5.0
-
-    history_seconds: 8.0
-
-    occupied_endpoint_margin_m: 0.05
-
-    unknown_is_free: false
-
-    min_known_free_ratio: 0.95
-
-    esdf_max_distance_m: 5.0
-
-    # V15.5: rebuild the observed ESDF every 3rd frame instead of every
-    # frame.  A full 120x120x50 EDT rebuild costs ~35 ms; at 30 Hz the
-    # budget is 33 ms, so rebuilding every frame blocks the single-threaded
-    # lockstep loop and makes the sim run ~3.4x slow-motion.  With a 3-frame
-    # cadence the planner uses an ESDF at most 2 frames (0.067 s ≈ 0.1 m)
-    # stale — safely re-validated on the very next rebuild — while the loop
-    # recovers ~23 ms per frame on average.
-    rebuild_every_n_frames: 3
-
-    depth_integration_step: 2
-
-    # Mark a continuous known-free ray at the occupancy resolution.
+    resolution:                  0.10
+    size_x_m:                   12.0
+    size_y_m:                   12.0
+    size_z_m:                    5.0
+    history_seconds:             8.0
+    occupied_endpoint_margin_m:  0.05
+    esdf_max_distance_m:         5.0
+    rebuild_every_n_frames:      3
+    depth_integration_step:      2
     free_space_sample_spacing_m: 0.10
+    recenter_threshold_m:        3.0
 
-  # ── Guide selector (Phase 2) ─────────────────────────────────────────
-  guide_selector:
-    # Online Guide geometry comes only from the current depth frame and the
-    # relative mission goal. The precomputed global path is diagnostic only.
-    selection_mode: local_goal_explorer
-    max_range_m: 5.0
-
-    explorer_angle_step_deg: 3.0
-    explorer_refine_step_deg: 1.0
-    explorer_refine_half_width_deg: 3.0
-    explorer_max_angle_deg: 55.0
-    explorer_min_advance_m: 1.0
-    explorer_escape_min_advance_m: 0.40
-    explorer_max_clearance_drop_m: 0.02
-    explorer_recovery_turn_deg: 25.0
-    explorer_depth_step: 6
-    explorer_obstacle_margin_m: 0.05
-
-    horizontal_fov_margin_deg: 3.0
-    vertical_fov_margin_deg: 3.0
-
-    depth_visibility_tolerance_m: 0.20
-
-    corridor_radius_m: 0.35
-    corridor_sample_spacing_m: 0.10
-
-    min_clearance_m: 0.10
-
-    path_search_max_points: 200
-
-    use_depth_projection_visibility: true
-    use_known_free_corridor: false
-
-  # ── Online runtime scheduling & recovery (v11) ──────────────────────
-  # ── Macro expert (v17: 5 Hz horizontal active perception) ──────────
+  # ── 5 Hz macro expert (section IV) ─────────────────────────────────
   macro_expert:
-    update_hz: 5.0
-    effective_guide_range_m: 4.45          # <= depth.max_m (5.0) minus margins
-    map_resolution_m: 0.10
-    map_history_seconds: 8.0
-    guide_range_fraction: 0.85
-    blocked_corridor_radius_m: 0.55
-    # Active-peek corridor geometry and offline MacroExpert fallback. Formal
-    # MOVE-guide feasibility is checked by bounded A* in the observed ESDF;
-    # the independent 30 Hz planner then optimizes and validates the B-spline.
-    guide_swept_radius_m: 0.30
-    guide_obstacle_clearance_m: 0.20
-    # Guide line keeps this real-world distance from raw obstacle-surface
-    # voxels (A* penalty radius = ceil(m / map_resolution)).  The ESDF
-    # clearance is dist_to_surface - vehicle_radius(0.30); 0.55 m keeps the
-    # drone centre at ESDF >= 0.25 so the 30 Hz B-spline fits a valid
-    # trajectory instead of grazing the boundary (UNKNOWN_SPACE rejections
-    # → stutter).
-    guide_line_clearance_m: 0.55
-    guide_penalty_gain: 0.6
-    # Temporal consistency: adjacent guide lines must not jump to the
-    # opposite side of an obstacle.  The search anchors to the previous
-    # tick's line: candidate cells keep a lateral offset within
-    # [prev - hard, prev + hard] (hard = blocked), soft band adds
-    # guide_lateral_cost per metre beyond guide_lateral_soft_m.
-    guide_lateral_soft_m: 0.30
-    guide_lateral_hard_m: 0.70
-    guide_lateral_cost: 3.0
-    guide_corridor_min_ratio: 1.0
-    minimum_corridor_score: 0.45         # below this, actively scan instead of blindly choosing a side
-    symmetric_score_tolerance: 0.03      # near-equal sides use the fixed preference
-    preferred_symmetric_side: "left"
-    bypass_goal_weight: 0.45             # remaining 0.55 is committed lateral motion
-    minimum_guide_distance_m: 0.50       # endpoint must be a known-free rolling-map voxel
-    # Goal-directed local frontiers: known-free cells adjacent to unknown are
-    # clustered by bearing, pulled back into known space, then screened by
-    # bounded observed-map A*. The 30 Hz planner performs B-spline optimization.
-    frontier_candidate_limit: 8
-    frontier_angular_bin_deg: 10.0
-    frontier_standoff_m: 0.45
-    frontier_max_backtrack_m: 0.20
-    frontier_goal_progress_weight: 1.0
-    frontier_information_weight: 0.06
-    frontier_yaw_cost_weight: 0.10
-    frontier_side_commitment_bonus: 0.15
-    enter_blocked_frames: 3
-    exit_clear_frames: 8
-    minimum_progress_rate_m_s: 0.15
-    minimum_commit_time_s: 0.8
-    # ── V15 guide-line navigation ──
-    # 2-D A* on the observed map (unknown = free + small penalty).
-    guide_unknown_cost: 1.05
-    # A* path is "straight" (→ GOAL_SEEK) when path_length / straight ≤ this.
-    guide_straight_ratio: 1.20
-    # V15.7: GOAL_SEEK requires the goal corridor to be OBSERVED known-free
-    # (ratio over the guide range >= this).  A line that is straight only
-    # because unknown is treated as free no longer triggers blind flight.
-    goal_corridor_clear_ratio: 0.60
-    # V15.7: the small explore step only advances when at least this
-    # fraction of the short corridor ahead is observed known-free.
-    explore_ahead_min_ratio: 0.30
-    # V15.7: bypass yaw points at the selected candidate point (also the
-    # macro_yaw_dir expert label).  Weight retained for compatibility but
-    # no longer blended into the yaw direction.
-    bypass_yaw_goal_weight: 0.60
-    # V15.2 explore advance: when a route exists but known-free advance is
-    # exhausted, move this far along the guide line (camera leads) instead
-    # of stopping to probe. Only a route-less state enters PROBE.
-    guide_explore_step_m: 0.8
-    max_explore_steps: 10
-    # ── PROBE (replaces 360° ACTIVE_SCAN) ──
-    probe_side_duration_s: 1.2
-    probe_max_duration_s: 3.0
-    probe_side_angle_deg: 90.0
-    active_scan_yaw_rate_rps: 2.0
-    # ── 90° minimum scan before committing to BYPASS (was 15°).
-    # At 2.0 rad/s, 90° takes ~0.8 s — enough to observe the lateral
-    # corridor without unacceptable delay.
-    active_scan_min_angle_deg: 90.0
-    # Full scan covers left 90° + crossing back through initial to right -90°
-    # = ~270° at 0.8 rad/s ≈ 5.9 s + acceleration margins → 8.0 s.
-    active_scan_max_duration_s: 5.0
-    vertical_avoidance_enabled: false
-    vertical_active_perception_enabled: false
+    update_hz:               5.0
+    # Direct-guide lookahead (min(goal_distance, this)).
+    macro_lookahead_distance_m: 4.5
+    # Hysteresis: DIRECT -> SIDE/OBSERVE after N non-recoverable ticks.
+    direct_to_side_frames:      2
+    # SIDE -> DIRECT after N consecutive recoverable ticks with progress.
+    side_to_direct_frames:      3
+    # Minimum goal-progress rate (m/s) that keeps the current state valid.
+    min_goal_progress_m_s:      0.15
+    # Goal reached condition (distance + speed).
+    goal_tolerance_m:           0.30
+    goal_speed_tolerance_mps:   0.20
+    # OBSERVE abort limits.
+    max_observe_seconds:        8.0
+    max_no_progress_seconds:   12.0
+    observe_rotation_rate_rps:  1.5
+    # OBSERVE yaw sweep cap (half-FOV of the camera).
+    observe_fov_half_deg:      45.0
+    # Clearance required for the short OBSERVE move.
+    observe_clearance_m:        0.20
+    # Fixed left preference for genuinely tied sides (never unconditional).
+    left_preferred_on_tie:      true
+    # Confidence gate: below this the macro marks labels ambiguous.
+    confidence_gate:            0.5
 
-    # ── Episode-level scan budget (Task 2) ──
-    # Limits on cumulative scanning to prevent infinite recovery loops.
-    max_completed_scans: 2           # completed full-circle scans per episode
-    max_cumulative_scan_time_s: 10.0 # maximum total scan seconds per episode
-    max_unsuccessful_scans: 2        # consecutive scans w/o new known-free or reachable candidates
+  # ── Macro candidate generation (section VIII) ──────────────────────
+  macro_candidates:
+    lookahead_distance_m:       4.5
+    side_corridor_length_m:     4.0
+    side_corridor_radius_m:     0.55
+    edge_search_radius_m:       5.0
+    min_candidate_clearance_m:  0.25
+    candidate_spacing_m:        0.5
+    observe_step_m:             0.6
+    max_frontier_candidates:    8
+    frontier_standoff_m:        0.45
+    goal_frontier_cone_deg:     70.0
+    corridor_check_spacing_m:   0.10
 
-    # ── Unified goal tolerance (Task 9) ──
-    goal_tolerance_m: 0.30           # must match local_planner.goal_tolerance and Manager goal check
+  # ── Local recoverability query (section VI) ────────────────────────
+  # The search clearance is owned by local_path_search (single source).
+  local_recoverability:
+    rejoin_distance_m:       2.5
+    max_execution_time_s:    2.5
+    min_goal_progress_m:     0.30
+    min_terminal_alignment:  0.5
+    max_loop_ratio:          1.6
+    nominal_speed_mps:       1.8
+    side_corridor_length_m:  4.0
+    side_corridor_radius_m:  0.55
+    edge_search_radius_m:    5.0
 
-  # ── Local expert (v17: 30 Hz pure trajectory tracker / labeler) ────
-  local_expert:
-    update_hz: 30.0
-    nominal_speed: 1.8
-    max_velocity: 2.5
-    max_acceleration: 8.0
-    max_jerk: 50.0
-    max_yaw_rate: 2.0
+  # ── Observed-map A* (section X.2) ──────────────────────────────────
+  local_path_search:
+    search_clearance_m: 0.25
+    side_bias_gain:     2.0
+    max_expansions: 200000
+    max_time_ms:        20.0
+    region_margin_m:     2.0
+    forbid_unknown:     true
 
-  online_runtime:
-    control_rate_hz: 30.0
-    record_rate_hz: 30.0
-    # v13: planner runs at record rate (30 Hz). planner_rate_hz removed.
+  # ── B-spline trajectory optimization (section X.4) ─────────────────
+  # The A* search and yaw parameters live in local_path_search and
+  # yaw_planning respectively (single source per concern).
+  trajectory_optimization:
+    planning_time_budget_ms: 30.0
+    trajectory_dt:           0.04
+    horizon_time:            2.5
+    optimizer:              "auto"
+    control_points:          12
+    max_iterations:       10000
+    convergence_tolerance:    1.0e-4
+    initial_step_size:        0.1
+    minimum_step_size:        1.0e-4
+    seed_trust_radius:        0.35
+    horizontal_avoidance_only: true
+    min_clearance:            0.02
+    target_clearance:         0.20
+    collision_check_spacing:  0.05
+    weight_path_length:       0.05
+    weight_smooth:            1.0
+    weight_jerk:              0.2
+    weight_obstacle:          4.0
+    weight_dynamics:          1.0
+    nominal_speed:            1.8
+    max_velocity:             2.5
+    max_acceleration:         8.0
+    max_jerk:                50.0
+    lookahead_distance:       4.0
+    terminal_speed_ratio:     0.85
+    warm_start_max_age_s:     0.25
+    warm_start_max_terminal_deviation_m: 1.5
 
-    trajectory_cache:
-      max_plan_age_s: 0.20
-      minimum_remaining_time_s: 0.10
-      maximum_position_error_m: 0.50
-      maximum_velocity_error_mps: 1.00
-      revalidate_current_suffix_with_esdf: false  # v12: not yet implemented, must be false
+  # ── Yaw planning (section XI) ──────────────────────────────────────
+  yaw_planning:
+    max_yaw_rate:        2.0
+    max_yaw_accel:       8.0
+    fov_half_deg:       45.0
+    fov_margin_deg:      5.0
+    speed_threshold_mps: 0.20
 
-    guide_cache:
-      max_age_s: 0.50
-      maximum_distance_m: 7.0
-      maximum_path_deviation_m: 1.5
-      maximum_indices_behind_progress: 0
+  # ── 30 Hz trajectory controller (section XII) ──────────────────────
+  trajectory_controller:
+    velocity_lookahead_time_s:  0.08
+    position_gain:              2.0
+    acceleration_feedforward_time_s: 0.30
+    yaw_gain:                   2.0
+    max_velocity_mps:           2.5
+    max_acceleration_mps2:      3.5
+    command_change_rate_limit_mps2: 25.0
+    max_yaw_rate_rps:           2.0
+    max_yaw_accel_rps2:         8.0
+    emergency_brake_distance_m: 0.8
+    brake_deceleration_mps2:    3.0
 
-    # Intentional macro active perception. This is distinct from unexpected
-    # no-Guide recovery and therefore owns a longer two-side sensing budget.
-    active_scan:
-      maximum_duration_s: 5.0       # matches macro_expert.active_scan_max_duration_s
-      maximum_control_steps: 150
+  # ── Execution safety / degradation (section XIII) ──────────────────
+  execution_safety:
+    max_plan_age_s:          0.20
+    min_remaining_trajectory_s: 0.10
+    max_position_error_m:    0.50
+    max_velocity_error_mps:  1.00
+    emergency_deceleration_mps2: 5.0
+    consecutive_failure_limit: 3
 
-    recovery:
-      enabled: true
+  # ── Dataset logging (section XIV) ──────────────────────────────────
+  dataset_logging:
+    schema_version: 18
+    depth_in_memory: true
+    write_local_plan_points: true
+    collect_privileged_diagnostics: true
 
-      path_lookahead_distance_m: 2.0
-      path_projection_backtrack_points: 5
-
-      yaw_deadband_rad: 0.05
-      max_yaw_rate_rps: 2.0
-      yaw_gain: 1.50
-
-      maximum_recovery_duration_s: 3.0
-      maximum_recovery_control_steps: 90
-
-      tie_break_direction: "right"
-
-      # V15.6 corridor-widening scan: after `scan_failure_threshold`
-      # consecutive planner rejections, the drone pans sideways (left/right
-      # alternately) for `scan_duration_s` to observe the lateral corridor,
-      # so the guide line can route around the blocker instead of hovering
-      # and retrying the identical target until the abort limit.
-      scan_failure_threshold: 2
-      scan_duration_s: 1.0
-      scan_radius_m: 1.5
-
-  # ── Sync & commit thresholds ─────────────────────────────────────────
+  # ── Sync & commit thresholds ───────────────────────────────────────
   sync:
-    max_acceptable_sync_error_ms: 100.0   # reject trajectory if any frame exceeds this
-    max_acceptable_latency_ms:    250.0   # render RTT; frame_id exact matches remain synchronized
-    max_latency_violation_pct:      1.0   # reject sustained latency, not one isolated spike
-    catastrophic_latency_ms:     5000.0   # always reject a multi-second render backlog
-    max_inflight_frames:              4   # bounded pose/render pipeline, prevents unbounded Unity backlog
-    unity_response_timeout_s:       2.0   # abort/reject trajectory if pending frames receive no valid reply
-    max_unmatched_pct:              1.0   # tolerate a few startup/reset replies
-    max_none_depth_pct:             20.0  # max % of frames with missing depth
+    max_acceptable_latency_ms:     250.0
+    max_latency_violation_pct:       1.0
+    catastrophic_latency_ms:      5000.0
+    unity_response_timeout_s:        2.0
+    max_unmatched_pct:               1.0
+    max_none_depth_pct:             20.0
 
   commit:
-    strict_collision_policy: true          # reject trajectory on ANY collision
-    atomic_rename:           true          # use .inprogress → rename commit
-
-# ── Scene definitions (legacy — superseded by scene_generation.profiles) ────
-# The legacy scenes: list is disabled when source == "procedural_profiles".
-# To use legacy mode, set scene_generation.source to "procedural_yaml".
-scenes: []
+    strict_collision_policy: true
+    atomic_rename:           true

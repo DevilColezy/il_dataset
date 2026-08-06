@@ -3,10 +3,12 @@
   <name>il_dataset</name>
   <version>0.2.0</version>
   <description>
-    Imitation-Learning Dataset Collection — automated expert-demonstration
-    data acquisition with state-machine orchestration, ESDF-based C++ local
-    receding-horizon trajectory planning, and async depth-image recording
-    via AvoidBench Unity.
+    Imitation-Learning Dataset Collection — two-level navigation expert:
+    a 5 Hz macro expert (DIRECT_GUIDE / SIDE_GUIDE / OBSERVE / GOAL_REACHED /
+    FAILED) and a 30 Hz local expert (observed-map A* + B-spline trajectory
+    optimization).  C++ handles all map, search and optimization loops; Python
+    owns episode lifecycle, 5/30 Hz scheduling, recording and low-frequency
+    decisions.  Collects via AvoidBench Unity / Flightmare.
   </description>
 
   <maintainer email="user@example.com">flightmare_ws user</maintainer>

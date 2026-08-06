@@ -9,6 +9,8 @@
 namespace il_dataset {
 
 /// Vehicle state in ROS world coordinates (x-fwd, y-left, z-up).
+/// Yaw follows convention B: yaw=0 -> body +Y faces world +Y,
+/// yaw = atan2(world_y, world_x) - pi/2.
 struct VehicleState {
     Eigen::Vector3d position{Eigen::Vector3d::Zero()};
     Eigen::Vector3d velocity{Eigen::Vector3d::Zero()};
@@ -25,100 +27,202 @@ struct TrajectoryPoint {
     Eigen::Vector3d acceleration{Eigen::Vector3d::Zero()};
     double yaw = 0.0;
     double yaw_rate = 0.0;
-    /// ESDF clearance at this point (negative = collision, after drone_radius subtraction).
+    /// ESDF clearance at this point (negative = collision, after drone
+    /// radius subtraction). NaN when unknown / outside the map.
     double clearance = 0.0;
 };
 
-/// Status codes returned by the local planner.
+/// Status codes returned by the local trajectory planner.
 enum class PlannerStatus : int {
     SUCCESS = 0,
     INVALID_INPUT = 1,
-    NO_GLOBAL_PATH = 2,
-    LOCAL_GOAL_INVALID = 3,
+    NO_SAFE_MOTION = 2,
+    LOCAL_TERMINAL_INVALID = 3,
     OPTIMIZATION_FAILED = 4,
     COLLISION = 5,
     DYNAMICS_VIOLATION = 6,
-    OUTSIDE_MAP = 7,
-    EMERGENCY_HOLD = 8,
-    UNKNOWN_SPACE = 9  // Phase 2: trajectory enters unknown space
+    UNKNOWN_SPACE = 7,   // trajectory enters unknown space (not just low clearance)
+    SEARCH_FAILED = 8,   // A*/JPS found no usable local path
+    EMERGENCY_HOLD = 9,
 };
 
-/// Teacher-only local trajectory-planning request.
-struct LocalPlanningRequest {
+/// 5 Hz macro navigation state machine (section IV).
+enum class MacroMode : int {
+    DIRECT_GUIDE = 0,
+    SIDE_GUIDE = 1,
+    OBSERVE = 2,
+    GOAL_REACHED = 3,
+    FAILED = 4,
+};
+
+/// Committed horizontal bypass side. FLU: +y is left.
+enum class Side : int {
+    NONE = 0,
+    LEFT = 1,
+    RIGHT = -1,
+};
+
+/// Low-frequency query result from the 30 Hz local planner to the 5 Hz
+/// macro expert: whether the direct goal intent can be recovered by the
+/// local system within the finite horizon and current known space
+/// (section V / VI).
+enum class RecoverabilityStatus : int {
+    /// Local system really can resolve the direct intent (full known-free
+    /// path within horizon, terminal re-aligns with the guide direction).
+    DIRECT_REJOIN_SUCCESS = 0,
+    /// Some progress was found but the rejoin point is not reachable.
+    PARTIAL_PROGRESS_ONLY = 1,
+    /// Direct intent is blocked by a known occupied region.
+    BLOCKED_BY_KNOWN = 2,
+    /// Direct intent is blocked because the corridor is still unknown.
+    BLOCKED_BY_UNKNOWN = 3,
+    /// No safe motion exists from the current state.
+    NO_SAFE_MOTION = 4,
+};
+
+/// Result of the local recoverability query (section VI).
+struct RecoverabilityResult {
+    RecoverabilityStatus status = RecoverabilityStatus::NO_SAFE_MOTION;
+    bool feasible = false;
+    bool known_free = false;
+    double minimum_clearance = 0.0;
+    double estimated_duration = 0.0;
+    double goal_progress = 0.0;
+    double terminal_guide_alignment = 0.0;
+    double path_length = 0.0;
+    Eigen::Vector3d rejoin_point{Eigen::Vector3d::Zero()};
+    int blocking_component_id = -1;
+    bool left_edge_visible = false;
+    bool right_edge_visible = false;
+    bool left_corridor_known = false;
+    bool right_corridor_known = false;
+    std::string reason;
+};
+
+enum class CandidateType : int {
+    DIRECT = 0,
+    SIDE = 1,
+    OBSERVE = 2,
+    GOAL_FRONTIER = 3,
+    PREVIOUS_CONTINUATION = 4,
+};
+
+/// A single macro navigation candidate (section VIII).
+struct MacroCandidate {
+    CandidateType type = CandidateType::DIRECT;
+    Side side = Side::NONE;
+    Eigen::Vector3d position_world{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d position_flu{Eigen::Vector3d::Zero()};
+    bool known_reachable = false;
+    double observed_path_cost = 0.0;
+    double minimum_clearance = 0.0;
+    double goal_progress = 0.0;
+    bool left_edge_visible = false;
+    bool right_edge_visible = false;
+    double unknown_information_gain = 0.0;
+    // Privileged fields (filled only by the PrivilegedOracle).
+    bool connected_to_goal = false;
+    double global_cost_to_go = 0.0;
+    double global_clearance = 0.0;
+    double global_path_length = 0.0;
+    double privileged_score = 0.0;
+    std::string source;
+};
+
+/// Identified goal blocker in the observed map (section IV.2).
+struct GoalBlocker {
+    bool found = false;
+    int component_id = -1;
+    Eigen::Vector3d centroid{Eigen::Vector3d::Zero()};
+    double extent = 0.0;
+    /// True when the blocking component is known occupied (vs unknown).
+    bool blocked_by_known = false;
+    Eigen::Vector3d left_edge_world{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d right_edge_world{Eigen::Vector3d::Zero()};
+    bool left_edge_visible = false;
+    bool right_edge_visible = false;
+    bool left_corridor_known = false;
+    bool right_corridor_known = false;
+    Eigen::Vector3d left_corridor_point{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d right_corridor_point{Eigen::Vector3d::Zero()};
+};
+
+/// The 5 Hz macro action, frozen in the world frame for the following
+/// 200 ms (section IX).  Only the world-frame target and desired yaw are
+/// authoritative; position_flu is regenerated each 30 Hz frame.
+struct MacroAction {
+    MacroMode mode = MacroMode::DIRECT_GUIDE;
+    Side committed_side = Side::NONE;
+    Eigen::Vector3d guide_world{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d guide_flu{Eigen::Vector3d::Zero()};
+    double desired_yaw_world = 0.0;
+    bool has_desired_yaw = false;
+    double confidence = 1.0;
+    double guide_distance = 0.0;
+    bool is_new_tick = false;
+    std::string reason;
+};
+
+/// 30 Hz local execution lifecycle mode (section XIII).
+enum class ExecutionMode : int {
+    TRACK_FRESH = 0,
+    TRACK_CACHED = 1,
+    ROTATE_ONLY = 2,
+    BRAKE_HOLD = 3,
+    EMERGENCY_STOP = 4,
+};
+
+/// 30 Hz local planning request (section XVII).
+struct LocalPlanRequest {
     VehicleState state;
-
-    double previous_progress_s{0.0};
-
-    /// World endpoint reconstructed from the complete macro guide. It may
-    /// lie outside the latest FOV when known by the causal rolling map.
-    Eigen::Vector3d guide_waypoint{Eigen::Vector3d::Zero()};
-    int guide_waypoint_index{-1};
-
-    /// Hard optimization endpoint for the complete teacher trajectory.
-    Eigen::Vector3d trajectory_terminal{Eigen::Vector3d::Zero()};
-    int trajectory_terminal_index{-1};
-
-    /// World-frame yaw intent supplied by the complete macro guide.  The
-    /// teacher planner time-parameterizes this together with translation so
-    /// the local expert only tracks one coherent SE(2.5) trajectory.
-    bool has_target_yaw{false};
-    double target_yaw{0.0};
-
-    /// DEPRECATED: reference_path_segment is no longer used.
-    /// The local planner uses the terminal plus ESDF to initialize its local
-    /// B-spline (bounded local A* is used only when the direct seed is
-    /// obstructed).  This field is kept for backward compatibility but MUST
-    /// be empty.
-    std::vector<Eigen::Vector3d> reference_path_segment;
-
-    /// If true, use isKnownFree() instead of isFree() for collision checks.
-    bool forbid_unknown_space{true};
-
-    /// DEPRECATED: allow_global_map_fallback — NO LONGER SUPPORTED.
-    /// The local planner MUST NOT fall back to the global path on failure.
-    bool allow_global_map_fallback{false};
-
-    /// If true, the trajectory terminal is the final task goal.
-    /// The B-spline boundary must enforce zero terminal velocity and
-    /// zero terminal acceleration (full stop at goal).
-    bool stop_at_terminal{false};
-
-    /// Desired terminal velocity (world frame).  Ignored when
-    /// stop_at_terminal is true (forced to zero).  Default allows
-    /// non-zero cruise speed through intermediate waypoints.
-    Eigen::Vector3d terminal_velocity{Eigen::Vector3d::Zero()};
+    /// Fixed world-frame macro guide from the held 5 Hz action.
+    Eigen::Vector3d macro_guide_world{Eigen::Vector3d::Zero()};
+    bool has_macro_yaw = false;
+    double macro_yaw_world = 0.0;
+    /// The final task goal (used for stop-at-goal and terminal selection
+    /// only). Never used to synthesize hidden waypoints.
+    Eigen::Vector3d goal_world{Eigen::Vector3d::Zero()};
+    bool stop_at_goal = false;
+    /// Warm-start remainder of the previous executed trajectory.
+    std::vector<TrajectoryPoint> previous_trajectory;
+    double previous_trajectory_age_s = 0.0;
+    /// Committed macro side (SIDE_GUIDE): the search must respect it.
+    Side committed_side = Side::NONE;
+    /// forbid_unknown_space is always true for the local expert; kept to
+    /// make the semantics explicit at every call site.
+    bool forbid_unknown_space = true;
 };
 
-/// Complete result of a single local-planning invocation.
+/// Result of a single 30 Hz local-planning invocation.
 struct LocalPlanResult {
     bool success = false;
-    PlannerStatus status = PlannerStatus::SUCCESS;
+    PlannerStatus status = PlannerStatus::NO_SAFE_MOTION;
     std::string message;
-
-    /// Dense time-sampled trajectory (dt = trajectory_dt).
     std::vector<TrajectoryPoint> trajectory;
-
-    double planning_time_ms = 0.0;
-    double min_clearance = 0.0;    ///< minimum ESDF clearance along the planned trajectory
-    double progress_s = 0.0;       ///< legacy progress diagnostic
-    int progress_index = -1;       ///< legacy waypoint-index diagnostic
-    int local_goal_index = -1;     ///< legacy terminal-index diagnostic
-    Eigen::Vector3d local_goal{Eigen::Vector3d::Zero()};
-    uint64_t plan_id = 0;          ///< monotonically increasing plan identifier
-
-    // Phase 2: explicit guide/terminal separation
+    /// The macro guide waypoint (echoed, never the trajectory terminal).
     Eigen::Vector3d guide_waypoint{Eigen::Vector3d::Zero()};
-    int guide_waypoint_index{-1};
+    /// The actual trajectory terminal (local terminal, may be nearer than
+    /// the macro guide).
     Eigen::Vector3d trajectory_terminal{Eigen::Vector3d::Zero()};
-    int trajectory_terminal_index{-1};
-    bool used_global_fallback{false};
-    bool used_observed_esdf{false};
+    double min_clearance = 0.0;
+    double duration_s = 0.0;
+    double planning_time_ms = 0.0;
+    uint64_t plan_id = 0;
+    int search_status = 0;  // 0 = full path, 1 = partial, 2 = no path
+};
+
+/// Final 30 Hz controller command (section XII).
+struct ControllerCommand {
+    Eigen::Vector3d velocity_flu{Eigen::Vector3d::Zero()};
+    double yaw_rate = 0.0;
+    bool valid = false;
 };
 
 /// Validation result for a trajectory.
 struct ValidationResult {
     bool all_clear = false;
     bool any_collision = false;
+    bool any_unknown = false;
     double min_clearance = 0.0;
     int clearance_violation_count = 0;
     Eigen::Vector3d worst_position{Eigen::Vector3d::Zero()};

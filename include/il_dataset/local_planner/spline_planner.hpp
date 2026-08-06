@@ -1,0 +1,109 @@
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include <Eigen/Core>
+
+#include "il_dataset/local_planner/types.hpp"
+
+namespace il_dataset {
+
+class ObservedMap;
+
+/// Configuration for the 30 Hz local trajectory optimization
+/// (section X.4, "trajectory_optimization" config module).
+struct TrajectoryOptimizationConfig {
+    // Timing
+    double planning_time_budget_ms = 30.0;
+    double trajectory_dt = 0.04;
+    double horizon_time = 2.5;
+
+    // B-spline
+    std::string optimizer = "auto";  // auto | nlopt | native
+    int control_points = 12;
+    int max_iterations = 10000;
+    double convergence_tolerance = 1.0e-4;
+    double initial_step_size = 0.1;
+    double minimum_step_size = 1.0e-4;
+    double seed_trust_radius = 0.35;
+    bool horizontal_avoidance_only = true;
+
+    // Clearance
+    double min_clearance = 0.02;
+    double target_clearance = 0.20;
+    double collision_check_spacing = 0.05;
+
+    // Cost weights
+    double weight_path_length = 0.05;
+    double weight_smooth = 1.0;
+    double weight_jerk = 0.2;
+    double weight_obstacle = 4.0;
+    double weight_dynamics = 1.0;
+
+    // Dynamics
+    double nominal_speed = 1.8;
+    double max_velocity = 2.5;
+    double max_acceleration = 8.0;
+    double max_jerk = 50.0;
+    double lookahead_distance = 4.0;
+    /// Fraction of nominal speed for non-final terminals (cruise-through).
+    double terminal_speed_ratio = 0.85;
+
+    // Warm start / trajectory continuity
+    double warm_start_max_age_s = 0.25;
+    double warm_start_max_terminal_deviation_m = 1.5;
+
+    // Local A* seed (populated from the local_path_search config module).
+    double search_clearance_m = 0.25;
+    double search_max_time_ms = 18.0;
+    double search_region_margin_m = 2.0;
+    double search_side_bias_gain = 2.0;
+
+    // Yaw planning (populated from the yaw_planning config module).
+    double yaw_max_rate = 2.0;
+    double yaw_max_accel = 8.0;
+    double yaw_fov_half_deg = 45.0;
+    double yaw_fov_margin_deg = 5.0;
+    double yaw_speed_threshold_mps = 0.20;
+};
+
+/// The 30 Hz local trajectory planner (sections X, XII, XVII).
+///
+/// Planning flow:
+///   observed-map A* seed path
+///   -> previous-trajectory warm start (known-free revalidated)
+///   -> B-spline optimization
+///   -> dynamic retiming
+///   -> strict known-mask + clearance validation
+///   -> yaw planning (FOV-constrained)
+///
+/// The planner consumes ONLY the observed map, the current state, the held
+/// macro guide/yaw and the previous trajectory.  It never touches the
+/// privileged global map.
+class LocalPlanner {
+public:
+    explicit LocalPlanner(const TrajectoryOptimizationConfig& config);
+
+    /// Point the planner at the observed map (must outlive the planner).
+    void setMap(const ObservedMap* map);
+
+    /// Plan a 30 Hz local trajectory.
+    LocalPlanResult plan(const LocalPlanRequest& request) const;
+
+    /// Strict validation: every point must be known AND clearance above
+    /// `min_clearance`, plus finite state and dynamics feasibility.
+    ValidationResult validateTrajectory(
+        const std::vector<TrajectoryPoint>& trajectory) const;
+
+    uint64_t currentPlanId() const { return plan_id_counter_; }
+    const TrajectoryOptimizationConfig& config() const { return config_; }
+
+private:
+    TrajectoryOptimizationConfig config_;
+    const ObservedMap* map_ = nullptr;
+    mutable std::uint64_t plan_id_counter_ = 0;
+};
+
+}  // namespace il_dataset

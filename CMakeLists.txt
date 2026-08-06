@@ -89,9 +89,14 @@ include_directories(
 
 # ── C++ local planner static library ────────────────────────────
 set(LOCAL_PLANNER_SOURCES
+  src/local_planner/observed_map.cpp
   src/local_planner/esdf_grid.cpp
-  src/local_planner/local_planner.cpp
+  src/local_planner/local_path_search.cpp
+  src/local_planner/local_recoverability.cpp
+  src/local_planner/macro_candidate_search.cpp
+  src/local_planner/privileged_oracle.cpp
   src/local_planner/spline_planner.cpp
+  src/local_planner/yaw_planner.cpp
 )
 
 add_library(il_local_planner_lib STATIC ${LOCAL_PLANNER_SOURCES})
@@ -134,8 +139,6 @@ endif()
 # ── pybind11 Python module ──────────────────────────────────────
 pybind11_add_module(_il_local_planner
   src/local_planner/pybind_module.cpp
-  src/local_planner/depth_integrator.cpp
-  src/local_planner/observed_map_ops.cpp
 )
 target_compile_options(_il_local_planner PRIVATE
   -O3 -Wall -Wextra ${IL_DATASET_ARCH_FLAGS}

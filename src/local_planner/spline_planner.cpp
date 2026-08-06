@@ -1,4 +1,4 @@
-#include "il_dataset/local_planner/local_planner.hpp"
+#include "il_dataset/local_planner/spline_planner.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -6,47 +6,34 @@
 #include <cstdio>
 #include <deque>
 #include <limits>
-#include <mutex>
-#include <queue>
-#include <set>
 #include <sstream>
 #include <string>
-#include <utility>
 #include <vector>
 
 #ifdef IL_DATASET_HAS_NLOPT
 #include <nlopt.h>
 #endif
 
-namespace il_dataset {
+#include "il_dataset/local_planner/esdf_grid.hpp"
+#include "il_dataset/local_planner/local_path_search.hpp"
+#include "il_dataset/local_planner/observed_map.hpp"
+#include "il_dataset/local_planner/yaw_planner.hpp"
 
-// ── Diagnostic guards — log each fix once per process ────────────────
-// Grep for [IL_FIX] in the WSL terminal to confirm which C++ fixes are
-// compiled into the running binary.  Placed in il_dataset (not the
-// anonymous namespace) so member functions of LocalPlanner can call it.
-inline void logFixOnce(const char* tag, const char* detail) {
-    static std::mutex s_mutex;
-    static std::set<std::string> s_logged;
-    std::lock_guard<std::mutex> lock(s_mutex);
-    if (s_logged.insert(tag).second) {
-        std::fprintf(stderr, "[IL_FIX] %-40s %s\n", tag, detail);
-        std::fflush(stderr);
-    }
-}
-#define IL_FIX_ONCE(tag, detail) il_dataset::logFixOnce(tag, detail)
+namespace il_dataset {
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr int kDegree = 3;
 constexpr double kEpsilon = 1.0e-9;
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kDynamicsTolerance = 1.02;
 
 double clamp(double value, double lo, double hi) {
     return std::max(lo, std::min(hi, value));
 }
 
 double wrapAngleLocal(double angle) {
-    constexpr double kPi = 3.14159265358979323846;
     constexpr double kTwoPi = 2.0 * kPi;
     angle = std::fmod(angle, kTwoPi);
     if (angle > kPi) angle -= kTwoPi;
@@ -55,7 +42,6 @@ double wrapAngleLocal(double angle) {
 }
 
 double yawFromVelocity(const Eigen::Vector3d& velocity) {
-    constexpr double kPi = 3.14159265358979323846;
     return std::atan2(velocity.y(), velocity.x()) - 0.5 * kPi;
 }
 
@@ -137,15 +123,6 @@ Eigen::Vector3d evaluateSpline(
     int degree,
     double parameter) {
     if (control_points.empty()) return Eigen::Vector3d::Zero();
-    if (degree <= 0 || control_points.size() == 1) {
-        const int index = std::max(
-            0, std::min(
-                static_cast<int>(control_points.size()) - 1,
-                findSpan(
-                    knots, static_cast<int>(control_points.size()),
-                    0, parameter)));
-        return control_points[static_cast<size_t>(index)];
-    }
     const LocalBasis basis = evaluateBasis(
         knots, static_cast<int>(control_points.size()), degree, parameter);
     Eigen::Vector3d value = Eigen::Vector3d::Zero();
@@ -194,8 +171,7 @@ SplineDerivatives buildDerivatives(
     result.second_scales.reserve(result.second.capacity());
     for (int i = 0; i + 1 < static_cast<int>(result.first.size()); ++i) {
         const double denominator =
-            result.first_knots[
-                static_cast<size_t>(i + first_degree + 1)] -
+            result.first_knots[static_cast<size_t>(i + first_degree + 1)] -
             result.first_knots[static_cast<size_t>(i + 1)];
         const double scale =
             denominator > kEpsilon ? first_degree / denominator : 0.0;
@@ -214,8 +190,7 @@ SplineDerivatives buildDerivatives(
     result.third_scales.reserve(result.third.capacity());
     for (int i = 0; i + 1 < static_cast<int>(result.second.size()); ++i) {
         const double denominator =
-            result.second_knots[
-                static_cast<size_t>(i + second_degree + 1)] -
+            result.second_knots[static_cast<size_t>(i + second_degree + 1)] -
             result.second_knots[static_cast<size_t>(i + 1)];
         const double scale =
             denominator > kEpsilon ? second_degree / denominator : 0.0;
@@ -258,8 +233,7 @@ void imposeBoundaryState(
         duration * duration * start_acceleration;
     const Eigen::Vector3d desired_d1 =
         desired_d0 +
-        (e0_denominator / static_cast<double>(kDegree - 1)) *
-            desired_e0;
+        (e0_denominator / static_cast<double>(kDegree - 1)) * desired_e0;
     const double d1_denominator =
         knots[static_cast<size_t>(kDegree + 2)] - knots[2];
     points[2] = points[1] +
@@ -275,16 +249,11 @@ void imposeBoundaryState(
 
     const int previous_derivative_index = count - 3;
     const double previous_end_denominator =
-        knots[static_cast<size_t>(
-            previous_derivative_index + kDegree + 1)] -
+        knots[static_cast<size_t>(previous_derivative_index + kDegree + 1)] -
         knots[static_cast<size_t>(previous_derivative_index + 1)];
-    // Zero terminal acceleration: the final two first-derivative control
-    // points are equal.  This removes the endpoint acceleration spike while
-    // preserving a non-zero velocity at a moving Guide.
     points[static_cast<size_t>(count - 3)] =
         points[static_cast<size_t>(count - 2)] -
-        (previous_end_denominator / kDegree) *
-            duration * end_velocity;
+        (previous_end_denominator / kDegree) * duration * end_velocity;
 }
 
 double polylineLength(const std::vector<Eigen::Vector3d>& points) {
@@ -332,42 +301,11 @@ std::vector<Eigen::Vector3d> resamplePolyline(
     return result;
 }
 
-Eigen::Vector3d samplePolylineAtFraction(
-    const std::vector<Eigen::Vector3d>& path,
-    double fraction) {
-    if (path.empty()) return Eigen::Vector3d::Zero();
-    if (path.size() == 1) return path.front();
-    fraction = clamp(fraction, 0.0, 1.0);
-    double total = 0.0;
-    for (size_t i = 1; i < path.size(); ++i) {
-        total += (path[i] - path[i - 1]).norm();
-    }
-    if (total <= kEpsilon) return path.front();
-    const double target = fraction * total;
-    double accumulated = 0.0;
-    for (size_t next = 1; next < path.size(); ++next) {
-        const double length = (path[next] - path[next - 1]).norm();
-        if (accumulated + length >= target) {
-            const double alpha = length > kEpsilon
-                ? (target - accumulated) / length
-                : 0.0;
-            return (1.0 - alpha) * path[next - 1] +
-                   alpha * path[next];
-        }
-        accumulated += length;
-    }
-    return path.back();
-}
-
 std::vector<Eigen::Vector3d> initializeSplineControlPoints(
     const std::vector<Eigen::Vector3d>& path,
     int control_point_count) {
     std::vector<Eigen::Vector3d> points(
         static_cast<size_t>(control_point_count), path.front());
-    // P0/P1/P2 and P[n-3]/P[n-2]/P[n-1] are boundary-state control points.
-    // With S=N-3 spans, P2 already lies near path fraction 1/S.  P3 must
-    // therefore continue near 2/S.  Reusing 1/S duplicates P2, creates an
-    // artificial acceleration spike and makes time allocation over-stretch.
     const std::vector<Eigen::Vector3d> geometry =
         resamplePolyline(path, control_point_count - 2);
     for (int i = 3; i < control_point_count - 3; ++i) {
@@ -379,383 +317,14 @@ std::vector<Eigen::Vector3d> initializeSplineControlPoints(
     return points;
 }
 
-bool segmentClear(const ESDFGrid& esdf,
-                  const Eigen::Vector3d& from,
-                  const Eigen::Vector3d& to,
-                  double clearance,
-                  bool forbid_unknown,
-                  double spacing) {
-    const double distance = (to - from).norm();
-    const int samples = std::max(
-        1, static_cast<int>(std::ceil(distance / std::max(0.02, spacing))));
-    for (int i = 0; i <= samples; ++i) {
-        const double alpha = static_cast<double>(i) / samples;
-        const Eigen::Vector3d point = (1.0 - alpha) * from + alpha * to;
-        // ── Aligned with Fast-Planner ────────────────────────────
-        // Use trilinear-interpolated clearance, not the discrete
-        // isKnownFree() mask check.  UNKNOWN voxels have ESDF=0,
-        // making interpolation conservative without requiring
-        // full 8-corner observation.
-        const double value = esdf.getValue(
-            point.x(), point.y(), point.z());
-        if (!std::isfinite(value) || value <= clearance) {
-            return false;
-        }
-    }
-    return true;
-}
-
-struct SearchEntry {
-    double score = 0.0;
-    int index = -1;
-    bool operator<(const SearchEntry& other) const {
-        return score > other.score;
-    }
-};
-
-std::vector<Eigen::Vector3d> searchLocalSeed(
-    const ESDFGrid& esdf,
-    const Eigen::Vector3d& start,
-    const Eigen::Vector3d& start_velocity,
-    const Eigen::Vector3d& goal,
-    const LocalPlannerConfig& config,
-    bool forbid_unknown,
-    Clock::time_point deadline) {
-    // Match the ESDF resolution so the A* cannot skip across narrow unknown
-    // slivers that the B-spline collision checker (spacing ≤ 0.05 m) would
-    // detect.  With horizontal_avoidance_only the search is 2-D, so halving
-    // the grid spacing from 0.20 m to 0.10 m quadruples the node count —
-    // still well within the 120 000 expansion budget.
-    const double search_resolution =
-        std::max(esdf.resolution(), config.collision_check_spacing);
-    IL_FIX_ONCE("search_resolution",
-                ("max(res=" + std::to_string(esdf.resolution()) +
-                 ", col_spacing=" + std::to_string(config.collision_check_spacing) +
-                 ") = " + std::to_string(search_resolution) + " m  [was 0.20]").c_str());
-    const double expansion =
-        std::min(2.0, std::max(1.0, 0.4 * config.local_map_radius));
-    Eigen::Vector3d minimum = start.cwiseMin(goal);
-    Eigen::Vector3d maximum = start.cwiseMax(goal);
-    minimum.array() -= expansion;
-    maximum.array() += expansion;
-    if (config.horizontal_avoidance_only) {
-        // Collapse the search lattice to x-y. The position() mapping below
-        // restores the direct start-to-goal height profile at every node.
-        minimum.z() = start.z();
-        maximum.z() = start.z();
-    }
-    minimum.z() = std::max(
-        minimum.z(),
-        esdf.originZ() + 0.5 * esdf.resolution());
-    maximum.x() = std::min(
-        maximum.x(),
-        esdf.originX() + (esdf.gx() - 0.5) * esdf.resolution());
-    maximum.y() = std::min(
-        maximum.y(),
-        esdf.originY() + (esdf.gy() - 0.5) * esdf.resolution());
-    maximum.z() = std::min(
-        maximum.z(),
-        esdf.originZ() + (esdf.gz() - 0.5) * esdf.resolution());
-    minimum.x() = std::max(
-        minimum.x(), esdf.originX() + 0.5 * esdf.resolution());
-    minimum.y() = std::max(
-        minimum.y(), esdf.originY() + 0.5 * esdf.resolution());
-
-    const Eigen::Array3i dimensions =
-        ((maximum - minimum).array() / search_resolution)
-            .floor().cast<int>() + 1;
-    if (config.horizontal_avoidance_only) {
-        if (dimensions.x() <= 1 || dimensions.y() <= 1 ||
-            dimensions.z() != 1) return {};
-    } else if ((dimensions <= 1).any()) {
-        return {};
-    }
-    const int nx = dimensions.x();
-    const int ny = dimensions.y();
-    const int nz = dimensions.z();
-    const size_t total =
-        static_cast<size_t>(nx) * ny * nz;
-    if (total > 250000) return {};
-
-    auto encode = [ny, nz](int ix, int iy, int iz) {
-        return (ix * ny + iy) * nz + iz;
-    };
-    auto decode = [ny, nz](int index) {
-        Eigen::Vector3i value;
-        value.z() = index % nz;
-        index /= nz;
-        value.y() = index % ny;
-        value.x() = index / ny;
-        return value;
-    };
-    auto position = [&](const Eigen::Vector3i& index) {
-        Eigen::Vector3d point =
-            minimum + search_resolution * index.cast<double>();
-        if (config.horizontal_avoidance_only) {
-            const Eigen::Vector2d xy_travel =
-                goal.head<2>() - start.head<2>();
-            const double xy_length_sq = xy_travel.squaredNorm();
-            double progress = 0.0;
-            if (xy_length_sq > kEpsilon) {
-                progress = clamp(
-                    (point.head<2>() - start.head<2>()).dot(xy_travel) /
-                        xy_length_sq,
-                    0.0, 1.0);
-            }
-            point.z() = start.z() + progress * (goal.z() - start.z());
-        }
-        return point;
-    };
-    auto nearestIndex = [&](const Eigen::Vector3d& point) {
-        Eigen::Array3i index =
-            ((point - minimum).array() / search_resolution)
-                .round().cast<int>();
-        index = index.max(Eigen::Array3i::Zero());
-        index = index.min(dimensions - 1);
-        return Eigen::Vector3i(index.matrix());
-    };
-
-    const Eigen::Vector3i start_grid = nearestIndex(start);
-    const Eigen::Vector3i goal_grid = nearestIndex(goal);
-    const int start_index =
-        encode(start_grid.x(), start_grid.y(), start_grid.z());
-    const int goal_index =
-        encode(goal_grid.x(), goal_grid.y(), goal_grid.z());
-    const double search_clearance =
-        config.min_clearance +
-        std::min(0.15, 0.75 * std::max(
-            0.0, config.target_clearance - config.min_clearance));
-    const Eigen::Vector3d travel = goal - start;
-    const double travel_length_sq = travel.squaredNorm();
-    Eigen::Vector3d travel_direction = Eigen::Vector3d::UnitX();
-    if (travel_length_sq > kEpsilon) {
-        travel_direction = travel / std::sqrt(travel_length_sq);
-    }
-    Eigen::Vector3d preferred_lateral =
-        start_velocity -
-        start_velocity.dot(travel_direction) * travel_direction;
-    if (preferred_lateral.norm() > 0.05) {
-        preferred_lateral.normalize();
-    } else {
-        preferred_lateral.setZero();
-    }
-
-    std::vector<double> cost(
-        total, std::numeric_limits<double>::infinity());
-    std::vector<int> parent(total, -1);
-    std::vector<uint8_t> closed(total, 0);
-    std::priority_queue<SearchEntry> open;
-
-    // The search-grid start index is a discretised approximation.  Reject
-    // early when the true continuous start position would fail the formal
-    // planner's B-spline t=0 isKnown() check, so the macro expert cannot
-    // accept a path that the 30 Hz planner will immediately reject.
-    IL_FIX_ONCE("searchLocalSeed_start_isKnown",
-                "Continuous start position isKnown() check before A*  [new]");
-    if (forbid_unknown && esdf.hasKnownMask() &&
-        !esdf.isKnown(start.x(), start.y(), start.z())) {
-        return {};
-    }
-
-    cost[static_cast<size_t>(start_index)] = 0.0;
-    open.push({(goal - start).norm(), start_index});
-
-    bool found = false;
-    int expansions = 0;
-    while (!open.empty() && Clock::now() < deadline &&
-           expansions < 120000) {
-        const SearchEntry current = open.top();
-        open.pop();
-        if (closed[static_cast<size_t>(current.index)] != 0) continue;
-        closed[static_cast<size_t>(current.index)] = 1;
-        ++expansions;
-        if (current.index == goal_index) {
-            found = true;
-            break;
-        }
-        const Eigen::Vector3i grid = decode(current.index);
-        for (int dx = -1; dx <= 1; ++dx) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dz = -1; dz <= 1; ++dz) {
-                    if (config.horizontal_avoidance_only && dz != 0) continue;
-                    if (dx == 0 && dy == 0 && dz == 0) continue;
-                    const Eigen::Vector3i next =
-                        grid + Eigen::Vector3i(dx, dy, dz);
-                    if (next.x() < 0 || next.x() >= nx ||
-                        next.y() < 0 || next.y() >= ny ||
-                        next.z() < 0 || next.z() >= nz) {
-                        continue;
-                    }
-                    const int next_index =
-                        encode(next.x(), next.y(), next.z());
-                    if (closed[static_cast<size_t>(next_index)] != 0) {
-                        continue;
-                    }
-                    const Eigen::Vector3d next_position = position(next);
-                    double clearance = esdf.getValue(
-                        next_position.x(), next_position.y(),
-                        next_position.z());
-                    const bool endpoint =
-                        next_index == start_index ||
-                        next_index == goal_index;
-                    // ── Known-space semantics for observed ESDF ─────────
-                    // UNKNOWN voxels contribute ESDF=0 to trilinear
-                    // interpolation, making the blend inherently
-                    // conservative — a partially-observed cell will never
-                    // report a non-existent clearance.  Requiring all
-                    // eight corners to be fully observed (isKnown) is
-                    // unnecessarily strict for a low-FOV rolling map
-                    // where boundary voxels naturally have unobserved
-                    // neighbours.  Accept a node when the interpolated
-                    // clearance is sufficient AND the node is not
-                    // entirely unknown (at least one corner observed).
-                    IL_FIX_ONCE("searchLocalSeed_known_relax",
-                                "All nodes use getValue()>clearance instead of isKnown()  [was: goal-only]");
-                    const bool node_safe =
-                        !forbid_unknown || !esdf.hasKnownMask() ||
-                        (std::isfinite(clearance) &&
-                         clearance > search_clearance);
-                    if (!node_safe ||
-                        (!endpoint && clearance <= search_clearance)) {
-                        continue;
-                    }
-                    const double step =
-                        search_resolution *
-                        std::sqrt(
-                            static_cast<double>(
-                                dx * dx + dy * dy + dz * dz));
-                    const double normalized_deficit =
-                        std::max(
-                            0.0,
-                            config.target_clearance - clearance) /
-                        std::max(0.05, config.target_clearance);
-                    double side_switch_penalty = 0.0;
-                    if (preferred_lateral.squaredNorm() > 0.5 &&
-                        travel_length_sq > kEpsilon) {
-                        const double progress = clamp(
-                            (next_position - start).dot(travel) /
-                                travel_length_sq,
-                            0.0, 1.0);
-                        const Eigen::Vector3d chord_point =
-                            start + progress * travel;
-                        const double signed_lateral =
-                            (next_position - chord_point).dot(
-                                preferred_lateral);
-                        side_switch_penalty =
-                            4.0 * std::max(0.0, -signed_lateral) /
-                            std::max(search_resolution, expansion);
-                    }
-                    const double tentative =
-                        cost[static_cast<size_t>(current.index)] +
-                        step * (1.0 +
-                                1.5 * normalized_deficit *
-                                    normalized_deficit +
-                                side_switch_penalty);
-                    if (tentative >=
-                        cost[static_cast<size_t>(next_index)]) {
-                        continue;
-                    }
-                    cost[static_cast<size_t>(next_index)] = tentative;
-                    parent[static_cast<size_t>(next_index)] =
-                        current.index;
-                    const double heuristic =
-                        (goal - next_position).norm();
-                    open.push({tentative + heuristic, next_index});
-                }
-            }
-        }
-    }
-    if (!found) return {};
-
-    std::vector<Eigen::Vector3d> reverse_path;
-    bool reached_start = false;
-    for (int index = goal_index; index >= 0;
-         index = parent[static_cast<size_t>(index)]) {
-        reverse_path.push_back(position(decode(index)));
-        if (index == start_index) {
-            reached_start = true;
-            break;
-        }
-    }
-    if (reverse_path.empty() || !reached_start) return {};
-    std::reverse(reverse_path.begin(), reverse_path.end());
-    reverse_path.front() = start;
-    reverse_path.back() = goal;
-
-    std::vector<Eigen::Vector3d> shortcut_path;
-    shortcut_path.push_back(start);
-    size_t anchor = 0;
-    while (anchor + 1 < reverse_path.size()) {
-        size_t next = reverse_path.size() - 1;
-        while (next > anchor + 1 &&
-               !segmentClear(
-                   esdf, reverse_path[anchor], reverse_path[next],
-                   search_clearance, forbid_unknown,
-                   0.5 * search_resolution)) {
-            --next;
-        }
-        shortcut_path.push_back(reverse_path[next]);
-        anchor = next;
-    }
-    std::vector<Eigen::Vector3d> dense_path;
-    dense_path.push_back(start);
-    for (size_t segment_index = 1;
-         segment_index < shortcut_path.size(); ++segment_index) {
-        const Eigen::Vector3d from = shortcut_path[segment_index - 1];
-        const Eigen::Vector3d to = shortcut_path[segment_index];
-        const int steps = std::max(
-            1, static_cast<int>(std::ceil(
-                (to - from).norm() / search_resolution)));
-        for (int step = 1; step <= steps; ++step) {
-            dense_path.push_back(
-                from +
-                (static_cast<double>(step) / steps) * (to - from));
-        }
-    }
-    reverse_path.swap(dense_path);
-
-    // Remove voxel-grid stair steps without changing homotopy.  Every
-    // Laplacian update is accepted only when both adjacent segments retain
-    // the search clearance, so this cannot recreate the corner-cutting
-    // shortcut that the A* seed is meant to prevent.
-    for (int smoothing_iteration = 0;
-         smoothing_iteration < 20; ++smoothing_iteration) {
-        bool changed = false;
-        std::vector<Eigen::Vector3d> smoothed = reverse_path;
-        for (size_t i = 1; i + 1 < reverse_path.size(); ++i) {
-            const Eigen::Vector3d candidate =
-                0.25 * reverse_path[i - 1] +
-                0.50 * reverse_path[i] +
-                0.25 * reverse_path[i + 1];
-            if (segmentClear(
-                    esdf, reverse_path[i - 1], candidate,
-                    search_clearance, forbid_unknown,
-                    0.5 * search_resolution) &&
-                segmentClear(
-                    esdf, candidate, reverse_path[i + 1],
-                    search_clearance, forbid_unknown,
-                    0.5 * search_resolution)) {
-                smoothed[i] = candidate;
-                changed = changed ||
-                    (candidate - reverse_path[i]).norm() > 1.0e-4;
-            }
-        }
-        reverse_path.swap(smoothed);
-        if (!changed) break;
-    }
-    return reverse_path;
-}
-
 struct SplineObjective {
     const ESDFGrid& esdf;
-    const LocalPlannerConfig& config;
-    const std::vector<Eigen::Vector3d>& safe_reference_path;
+    const TrajectoryOptimizationConfig& config;
     std::vector<Eigen::Vector3d> points;
     std::vector<double> knots;
     int free_begin = 3;
     int free_end = 0;
     double duration = 1.0;
-    bool forbid_unknown = false;
 
     double evaluate(const double* values, double* gradient) {
         for (int i = free_begin; i < free_end; ++i) {
@@ -769,9 +338,7 @@ struct SplineObjective {
             points.size(), Eigen::Vector3d::Zero());
         double cost = 0.0;
 
-        // A weak first-difference term removes the affine null-space of the
-        // second/third-difference costs.  It discourages needless detours and
-        // loops without attracting the curve to the straight Guide chord.
+        // Weak first-difference term (removes the affine null-space).
         for (size_t i = 0; i + 1 < points.size(); ++i) {
             const Eigen::Vector3d edge = points[i + 1] - points[i];
             cost += config.weight_path_length * edge.squaredNorm();
@@ -780,8 +347,7 @@ struct SplineObjective {
             point_gradient[i] -= g;
             point_gradient[i + 1] += g;
         }
-
-        // Correct second- and third-order B-spline control-point differences.
+        // Smoothness (acceleration) cost.
         for (size_t i = 0; i + 2 < points.size(); ++i) {
             const Eigen::Vector3d acceleration =
                 points[i + 2] - 2.0 * points[i + 1] + points[i];
@@ -792,20 +358,20 @@ struct SplineObjective {
             point_gradient[i + 1] -= 2.0 * g;
             point_gradient[i + 2] += g;
         }
+        // Jerk cost.
         for (size_t i = 0; i + 3 < points.size(); ++i) {
             const Eigen::Vector3d jerk =
                 points[i + 3] - 3.0 * points[i + 2] +
                 3.0 * points[i + 1] - points[i];
             cost += config.weight_jerk * jerk.squaredNorm();
-            const Eigen::Vector3d g =
-                2.0 * config.weight_jerk * jerk;
+            const Eigen::Vector3d g = 2.0 * config.weight_jerk * jerk;
             point_gradient[i] -= g;
             point_gradient[i + 1] += 3.0 * g;
             point_gradient[i + 2] -= 3.0 * g;
             point_gradient[i + 3] += g;
         }
 
-        // ESDF collision objective evaluated on the exact curve being sampled.
+        // ESDF obstacle cost sampled on the curve.
         const double polygon_length = polylineLength(points);
         const int sample_count = std::max(
             4 * (static_cast<int>(points.size()) - kDegree),
@@ -828,14 +394,15 @@ struct SplineObjective {
             Eigen::Vector3d position = Eigen::Vector3d::Zero();
             for (int j = 0; j <= kDegree; ++j) {
                 position += basis.weights[static_cast<size_t>(j)] *
-                    points[static_cast<size_t>(basis.first + j)];
+                            points[static_cast<size_t>(basis.first + j)];
             }
             double clearance = 0.0;
             const Eigen::Vector3d esdf_gradient = esdf.getGradient(
                 position.x(), position.y(), position.z(), &clearance);
             const double normalization = 1.0 / (sample_count + 1);
             Eigen::Vector3d position_gradient = Eigen::Vector3d::Zero();
-            if (clearance < config.target_clearance) {
+            if (std::isfinite(clearance) &&
+                clearance < config.target_clearance) {
                 const double residual =
                     (config.target_clearance - clearance) / soft_band;
                 cost += config.weight_obstacle *
@@ -845,7 +412,8 @@ struct SplineObjective {
                     (-2.0 * residual / soft_band) *
                     esdf_gradient * normalization;
             }
-            if (clearance < optimization_floor) {
+            if (std::isfinite(clearance) &&
+                clearance < optimization_floor) {
                 const double residual =
                     (optimization_floor - clearance + resolution) /
                     resolution;
@@ -856,18 +424,6 @@ struct SplineObjective {
                     (-2000.0 * residual / resolution) *
                     esdf_gradient * normalization;
             }
-            // ── Fast-Planner aligned ─────────────────────────────
-            // No reference-path attraction for straight-line seeds.
-            // The A* search has been removed; seed_path is always the
-            // straight chord from start to terminal.  Attracting the
-            // B-spline toward this chord fights the ESDF gradient that
-            // is trying to push control points around obstacles.
-            // Fast-Planner relies solely on ESDF gradient for obstacle
-            // avoidance — no reference path term needed.
-            //
-            // The obstacle cost below handles clearance on its own.
-            // UNKNOWN voxels have ESDF=0, making the gradient
-            // conservative without a mask-dependent penalty.
             for (int j = 0; j <= kDegree; ++j) {
                 point_gradient[
                     static_cast<size_t>(basis.first + j)] +=
@@ -876,7 +432,7 @@ struct SplineObjective {
             }
         }
 
-        // B-spline derivative control points provide analytic dynamic costs.
+        // Analytic dynamics costs from derivative control points.
         const SplineDerivatives derivatives =
             buildDerivatives(points, knots);
         std::vector<Eigen::Vector3d> first_gradient(
@@ -898,24 +454,21 @@ struct SplineObjective {
                 100.0 * config.weight_dynamics;
             cost += dynamic_weight * residual * residual;
             *derivative_gradient +=
-                2.0 * dynamic_weight * residual *
-                physical /
+                2.0 * dynamic_weight * residual * physical /
                 (magnitude * time_scale * std::max(0.1, limit));
         };
         for (size_t i = 0; i < derivatives.first.size(); ++i) {
-            addLimitCost(
-                derivatives.first[i], config.max_velocity,
-                duration, &first_gradient[i]);
+            addLimitCost(derivatives.first[i], config.max_velocity,
+                         duration, &first_gradient[i]);
         }
         for (size_t i = 0; i < derivatives.second.size(); ++i) {
-            addLimitCost(
-                derivatives.second[i], config.max_acceleration,
-                duration * duration, &second_gradient[i]);
+            addLimitCost(derivatives.second[i], config.max_acceleration,
+                         duration * duration, &second_gradient[i]);
         }
         for (size_t i = 0; i < derivatives.third.size(); ++i) {
-            addLimitCost(
-                derivatives.third[i], config.max_jerk,
-                duration * duration * duration, &third_gradient[i]);
+            addLimitCost(derivatives.third[i], config.max_jerk,
+                         duration * duration * duration,
+                         &third_gradient[i]);
         }
         for (size_t i = 0; i < third_gradient.size(); ++i) {
             const Eigen::Vector3d contribution =
@@ -964,24 +517,19 @@ bool optimizeSpline(std::vector<Eigen::Vector3d>* points,
                     const std::vector<double>& knots,
                     double duration,
                     const ESDFGrid& esdf,
-                    const LocalPlannerConfig& config,
-                    bool forbid_unknown,
+                    const TrajectoryOptimizationConfig& config,
                     const std::vector<Eigen::Vector3d>& seed_anchors,
-                    const std::vector<Eigen::Vector3d>& safe_reference_path,
                     const Eigen::Vector3d& corridor_min,
                     const Eigen::Vector3d& corridor_max,
                     Clock::time_point deadline) {
     const int free_begin = 3;
     const int free_end = static_cast<int>(points->size()) - 3;
     const int variable_count = 3 * (free_end - free_begin);
-    if (variable_count <= 0 ||
-        seed_anchors.size() != points->size() ||
-        safe_reference_path.empty()) {
+    if (variable_count <= 0 || seed_anchors.size() != points->size()) {
         return false;
     }
     SplineObjective objective{
-        esdf, config, safe_reference_path, *points, knots,
-        free_begin, free_end, duration, forbid_unknown};
+        esdf, config, *points, knots, free_begin, free_end, duration};
     std::vector<double> values(static_cast<size_t>(variable_count), 0.0);
     std::vector<double> lower(static_cast<size_t>(variable_count), 0.0);
     std::vector<double> upper(static_cast<size_t>(variable_count), 0.0);
@@ -995,11 +543,9 @@ bool optimizeSpline(std::vector<Eigen::Vector3d>* points,
                 upper[static_cast<size_t>(index)] = anchor;
             } else {
                 lower[static_cast<size_t>(index)] = std::max(
-                    corridor_min[axis],
-                    anchor - config.seed_trust_radius);
+                    corridor_min[axis], anchor - config.seed_trust_radius);
                 upper[static_cast<size_t>(index)] = std::min(
-                    corridor_max[axis],
-                    anchor + config.seed_trust_radius);
+                    corridor_max[axis], anchor + config.seed_trust_radius);
             }
             if (lower[static_cast<size_t>(index)] >
                 upper[static_cast<size_t>(index)]) {
@@ -1018,8 +564,7 @@ bool optimizeSpline(std::vector<Eigen::Vector3d>* points,
         nlopt_opt optimizer = nlopt_create(
             NLOPT_LD_LBFGS, static_cast<unsigned>(variable_count));
         if (optimizer != nullptr) {
-            nlopt_set_min_objective(
-                optimizer, nloptObjective, &objective);
+            nlopt_set_min_objective(optimizer, nloptObjective, &objective);
             nlopt_set_lower_bounds(optimizer, lower.data());
             nlopt_set_upper_bounds(optimizer, upper.data());
             nlopt_set_ftol_rel(
@@ -1057,14 +602,11 @@ bool optimizeSpline(std::vector<Eigen::Vector3d>* points,
             for (double component : gradient) {
                 norm_sq += component * component;
             }
-            if (norm_sq <=
-                config.convergence_tolerance *
-                config.convergence_tolerance) {
+            if (norm_sq <= config.convergence_tolerance *
+                               config.convergence_tolerance) {
                 accepted = true;
                 break;
             }
-
-            // Standard limited-memory BFGS two-loop recursion.
             std::vector<double> quasi_gradient = gradient;
             std::vector<double> alpha(step_history.size(), 0.0);
             for (size_t reverse = step_history.size();
@@ -1072,8 +614,7 @@ bool optimizeSpline(std::vector<Eigen::Vector3d>* points,
                 const size_t history_index = reverse - 1;
                 double dot = 0.0;
                 for (int i = 0; i < variable_count; ++i) {
-                    dot += step_history[history_index][
-                               static_cast<size_t>(i)] *
+                    dot += step_history[history_index][static_cast<size_t>(i)] *
                            quasi_gradient[static_cast<size_t>(i)];
                 }
                 alpha[history_index] =
@@ -1081,8 +622,7 @@ bool optimizeSpline(std::vector<Eigen::Vector3d>* points,
                 for (int i = 0; i < variable_count; ++i) {
                     quasi_gradient[static_cast<size_t>(i)] -=
                         alpha[history_index] *
-                        gradient_history[history_index][
-                            static_cast<size_t>(i)];
+                        gradient_history[history_index][static_cast<size_t>(i)];
                 }
             }
             double initial_hessian_scale = 1.0;
@@ -1105,23 +645,20 @@ bool optimizeSpline(std::vector<Eigen::Vector3d>* points,
                 static_cast<size_t>(variable_count), 0.0);
             for (int i = 0; i < variable_count; ++i) {
                 direction[static_cast<size_t>(i)] =
-                    initial_hessian_scale *
-                    quasi_gradient[static_cast<size_t>(i)];
+                    initial_hessian_scale * quasi_gradient[static_cast<size_t>(i)];
             }
             for (size_t history_index = 0;
                  history_index < step_history.size(); ++history_index) {
                 double dot = 0.0;
                 for (int i = 0; i < variable_count; ++i) {
-                    dot += gradient_history[history_index][
-                               static_cast<size_t>(i)] *
+                    dot += gradient_history[history_index][static_cast<size_t>(i)] *
                            direction[static_cast<size_t>(i)];
                 }
                 const double beta =
                     inverse_curvature_history[history_index] * dot;
                 for (int i = 0; i < variable_count; ++i) {
                     direction[static_cast<size_t>(i)] +=
-                        step_history[history_index][
-                            static_cast<size_t>(i)] *
+                        step_history[history_index][static_cast<size_t>(i)] *
                         (alpha[history_index] - beta);
                 }
             }
@@ -1135,8 +672,7 @@ bool optimizeSpline(std::vector<Eigen::Vector3d>* points,
             if (!(directional_derivative < -1.0e-12)) {
                 directional_derivative = -norm_sq;
                 for (int i = 0; i < variable_count; ++i) {
-                    direction[static_cast<size_t>(i)] =
-                        -gradient[static_cast<size_t>(i)];
+                    direction[static_cast<size_t>(i)] = -gradient[static_cast<size_t>(i)];
                 }
             }
 
@@ -1150,9 +686,8 @@ bool optimizeSpline(std::vector<Eigen::Vector3d>* points,
                 maximum_direction > kEpsilon
                     ? std::min(
                           1.0,
-                          std::max(
-                              config.minimum_step_size,
-                              config.initial_step_size) /
+                          std::max(config.minimum_step_size,
+                                   config.initial_step_size) /
                               maximum_direction)
                     : 1.0;
             for (int line_search = 0;
@@ -1162,8 +697,7 @@ bool optimizeSpline(std::vector<Eigen::Vector3d>* points,
                 for (int i = 0; i < variable_count; ++i) {
                     candidate[static_cast<size_t>(i)] = clamp(
                         candidate[static_cast<size_t>(i)] +
-                            step_length *
-                                direction[static_cast<size_t>(i)],
+                            step_length * direction[static_cast<size_t>(i)],
                         lower[static_cast<size_t>(i)],
                         upper[static_cast<size_t>(i)]);
                 }
@@ -1193,9 +727,8 @@ bool optimizeSpline(std::vector<Eigen::Vector3d>* points,
                         gradient_change[static_cast<size_t>(i)] =
                             candidate_gradient[static_cast<size_t>(i)] -
                             gradient[static_cast<size_t>(i)];
-                        curvature +=
-                            actual_step[static_cast<size_t>(i)] *
-                            gradient_change[static_cast<size_t>(i)];
+                        curvature += actual_step[static_cast<size_t>(i)] *
+                                     gradient_change[static_cast<size_t>(i)];
                     }
                     if (curvature > 1.0e-10) {
                         if (step_history.size() == kHistorySize) {
@@ -1204,10 +737,8 @@ bool optimizeSpline(std::vector<Eigen::Vector3d>* points,
                             inverse_curvature_history.pop_front();
                         }
                         step_history.push_back(std::move(actual_step));
-                        gradient_history.push_back(
-                            std::move(gradient_change));
-                        inverse_curvature_history.push_back(
-                            1.0 / curvature);
+                        gradient_history.push_back(std::move(gradient_change));
+                        inverse_curvature_history.push_back(1.0 / curvature);
                     }
                     values.swap(candidate);
                     gradient.swap(candidate_gradient);
@@ -1218,8 +749,7 @@ bool optimizeSpline(std::vector<Eigen::Vector3d>* points,
                 }
                 step_length *= 0.5;
             }
-            if (!improved ||
-                step_length < config.minimum_step_size) {
+            if (!improved || step_length < config.minimum_step_size) {
                 break;
             }
         }
@@ -1235,174 +765,6 @@ bool optimizeSpline(std::vector<Eigen::Vector3d>* points,
     return true;
 }
 
-std::vector<TrajectoryPoint> sampleSpline(
-    const std::vector<Eigen::Vector3d>& points,
-    const std::vector<double>& knots,
-    double duration,
-    double dt,
-    double initial_yaw,
-    double target_yaw,
-    double maximum_yaw_rate,
-    const ESDFGrid& esdf) {
-    std::vector<TrajectoryPoint> trajectory;
-    if (points.size() < 4 || duration <= 0.0 || dt <= 0.0) {
-        return trajectory;
-    }
-    const SplineDerivatives derivatives =
-        buildDerivatives(points, knots);
-    const int sample_count =
-        std::max(2, static_cast<int>(std::ceil(duration / dt)) + 1);
-    trajectory.reserve(static_cast<size_t>(sample_count));
-    double previous_yaw = initial_yaw;
-    double previous_time = 0.0;
-    for (int i = 0; i < sample_count; ++i) {
-        const double time =
-            i + 1 == sample_count ? duration : std::min(duration, i * dt);
-        const double parameter = clamp(time / duration, 0.0, 1.0);
-        TrajectoryPoint point;
-        point.t = time;
-        point.position =
-            evaluateSpline(points, knots, kDegree, parameter);
-        point.velocity =
-            evaluateSpline(
-                derivatives.first, derivatives.first_knots,
-                kDegree - 1, parameter) / duration;
-        point.acceleration =
-            evaluateSpline(
-                derivatives.second, derivatives.second_knots,
-                kDegree - 2, parameter) /
-            (duration * duration);
-        const double interval =
-            i == 0 ? 0.0 : time - previous_time;
-        if (i == 0) {
-            point.yaw = initial_yaw;
-            point.yaw_rate = 0.0;
-        } else {
-            const double desired_yaw = wrapAngleLocal(
-                initial_yaw + parameter *
-                wrapAngleLocal(target_yaw - initial_yaw));
-            const double difference =
-                wrapAngleLocal(desired_yaw - previous_yaw);
-            const double applied = clamp(
-                difference,
-                -maximum_yaw_rate * interval,
-                maximum_yaw_rate * interval);
-            point.yaw = wrapAngleLocal(previous_yaw + applied);
-            point.yaw_rate =
-                interval > kEpsilon ? applied / interval : 0.0;
-        }
-        point.clearance = esdf.getValue(
-            point.position.x(), point.position.y(), point.position.z());
-        trajectory.push_back(point);
-        previous_yaw = point.yaw;
-        previous_time = time;
-    }
-    return trajectory;
-}
-
-std::vector<TrajectoryPoint> sampleQuinticBoundaryTrajectory(
-    const Eigen::Vector3d& start_position,
-    const Eigen::Vector3d& start_velocity,
-    const Eigen::Vector3d& start_acceleration,
-    const Eigen::Vector3d& end_position,
-    const Eigen::Vector3d& end_velocity,
-    const Eigen::Vector3d& end_acceleration,
-    double duration,
-    double dt,
-    double initial_yaw,
-    double target_yaw,
-    double maximum_yaw_rate,
-    const ESDFGrid& esdf) {
-    std::vector<TrajectoryPoint> trajectory;
-    if (duration <= 0.0 || dt <= 0.0) {
-        return trajectory;
-    }
-
-    const double duration2 = duration * duration;
-    const double duration3 = duration2 * duration;
-    const double duration4 = duration3 * duration;
-    const double duration5 = duration4 * duration;
-    const Eigen::Vector3d c0 = start_position;
-    const Eigen::Vector3d c1 = start_velocity;
-    const Eigen::Vector3d c2 = 0.5 * start_acceleration;
-    const Eigen::Vector3d displacement =
-        end_position - start_position;
-    const Eigen::Vector3d c3 =
-        (20.0 * displacement -
-         (8.0 * end_velocity + 12.0 * start_velocity) * duration -
-         (3.0 * start_acceleration - end_acceleration) * duration2) /
-        (2.0 * duration3);
-    const Eigen::Vector3d c4 =
-        (-30.0 * displacement +
-         (14.0 * end_velocity + 16.0 * start_velocity) * duration +
-         (3.0 * start_acceleration - 2.0 * end_acceleration) *
-             duration2) /
-        (2.0 * duration4);
-    const Eigen::Vector3d c5 =
-        (12.0 * displacement -
-         (6.0 * end_velocity + 6.0 * start_velocity) * duration -
-         (start_acceleration - end_acceleration) * duration2) /
-        (2.0 * duration5);
-
-    const int sample_count =
-        std::max(
-            2,
-            static_cast<int>(
-                std::ceil(duration / dt)) + 1);
-    trajectory.reserve(static_cast<size_t>(sample_count));
-    double previous_yaw = initial_yaw;
-    double previous_time = 0.0;
-    for (int i = 0; i < sample_count; ++i) {
-        const double time =
-            i + 1 == sample_count
-                ? duration
-                : std::min(duration, i * dt);
-        const double time2 = time * time;
-        const double time3 = time2 * time;
-        const double time4 = time3 * time;
-        const double time5 = time4 * time;
-        TrajectoryPoint point;
-        point.t = time;
-        point.position =
-            c0 + c1 * time + c2 * time2 + c3 * time3 +
-            c4 * time4 + c5 * time5;
-        point.velocity =
-            c1 + 2.0 * c2 * time + 3.0 * c3 * time2 +
-            4.0 * c4 * time3 + 5.0 * c5 * time4;
-        point.acceleration =
-            2.0 * c2 + 6.0 * c3 * time + 12.0 * c4 * time2 +
-            20.0 * c5 * time3;
-
-        const double interval =
-            i == 0 ? 0.0 : time - previous_time;
-        if (i == 0) {
-            point.yaw = initial_yaw;
-            point.yaw_rate = 0.0;
-        } else {
-            const double parameter = clamp(
-                time / duration, 0.0, 1.0);
-            const double desired_yaw = wrapAngleLocal(
-                initial_yaw + parameter *
-                wrapAngleLocal(target_yaw - initial_yaw));
-            const double difference =
-                wrapAngleLocal(desired_yaw - previous_yaw);
-            const double applied = clamp(
-                difference,
-                -maximum_yaw_rate * interval,
-                maximum_yaw_rate * interval);
-            point.yaw = wrapAngleLocal(previous_yaw + applied);
-            point.yaw_rate =
-                interval > kEpsilon ? applied / interval : 0.0;
-        }
-        point.clearance = esdf.getValue(
-            point.position.x(), point.position.y(), point.position.z());
-        trajectory.push_back(point);
-        previous_yaw = point.yaw;
-        previous_time = time;
-    }
-    return trajectory;
-}
-
 struct DynamicMetrics {
     double velocity = 0.0;
     double acceleration = 0.0;
@@ -1411,24 +773,18 @@ struct DynamicMetrics {
     bool finite = true;
 };
 
-constexpr double kDynamicsTolerance = 1.02;
-
 DynamicMetrics measureDynamics(
     const std::vector<TrajectoryPoint>& trajectory) {
     DynamicMetrics result;
     for (size_t i = 0; i < trajectory.size(); ++i) {
         const auto& point = trajectory[i];
         result.finite =
-            result.finite &&
-            point.position.allFinite() &&
-            point.velocity.allFinite() &&
-            point.acceleration.allFinite();
-        result.velocity =
-            std::max(result.velocity, point.velocity.norm());
+            result.finite && point.position.allFinite() &&
+            point.velocity.allFinite() && point.acceleration.allFinite();
+        result.velocity = std::max(result.velocity, point.velocity.norm());
         result.acceleration =
             std::max(result.acceleration, point.acceleration.norm());
-        result.yaw_rate =
-            std::max(result.yaw_rate, std::abs(point.yaw_rate));
+        result.yaw_rate = std::max(result.yaw_rate, std::abs(point.yaw_rate));
         if (i == 0) continue;
         const double dt = point.t - trajectory[i - 1].t;
         if (dt <= kEpsilon) {
@@ -1437,54 +793,42 @@ DynamicMetrics measureDynamics(
         }
         result.jerk = std::max(
             result.jerk,
-            (point.acceleration -
-             trajectory[i - 1].acceleration).norm() / dt);
+            (point.acceleration - trajectory[i - 1].acceleration).norm() / dt);
     }
     return result;
 }
 
-bool dynamicsFeasible(
-    const DynamicMetrics& dynamics,
-    const LocalPlannerConfig& config) {
+bool dynamicsFeasible(const DynamicMetrics& dynamics,
+                      const TrajectoryOptimizationConfig& config) {
     return dynamics.finite &&
-           dynamics.velocity <=
-               config.max_velocity * kDynamicsTolerance &&
+           dynamics.velocity <= config.max_velocity * kDynamicsTolerance &&
            dynamics.acceleration <=
                config.max_acceleration * kDynamicsTolerance &&
-           dynamics.jerk <=
-               config.max_jerk * kDynamicsTolerance &&
-           dynamics.yaw_rate <=
-               config.max_yaw_rate * kDynamicsTolerance;
+           dynamics.jerk <= config.max_jerk * kDynamicsTolerance &&
+           dynamics.yaw_rate <= config.yaw_max_rate * kDynamicsTolerance;
 }
 
-double dynamicsViolationRatio(
-    const DynamicMetrics& dynamics,
-    const LocalPlannerConfig& config) {
-    if (!dynamics.finite) {
-        return std::numeric_limits<double>::infinity();
-    }
+double dynamicsViolationRatio(const DynamicMetrics& dynamics,
+                              const TrajectoryOptimizationConfig& config) {
+    if (!dynamics.finite) return std::numeric_limits<double>::infinity();
     return std::max({
         dynamics.velocity / std::max(0.1, config.max_velocity),
         dynamics.acceleration / std::max(0.1, config.max_acceleration),
         dynamics.jerk / std::max(0.1, config.max_jerk),
-        dynamics.yaw_rate / std::max(0.1, config.max_yaw_rate)
+        dynamics.yaw_rate / std::max(0.1, config.yaw_max_rate)
     });
 }
 
-double requiredDurationScale(
-    const DynamicMetrics& dynamics,
-    const LocalPlannerConfig& config) {
-    if (!dynamics.finite) {
-        return std::numeric_limits<double>::infinity();
-    }
+double requiredDurationScale(const DynamicMetrics& dynamics,
+                             const TrajectoryOptimizationConfig& config) {
+    if (!dynamics.finite) return std::numeric_limits<double>::infinity();
     const double velocity_ratio =
         dynamics.velocity / std::max(0.1, config.max_velocity);
     const double acceleration_ratio =
         dynamics.acceleration / std::max(0.1, config.max_acceleration);
-    const double jerk_ratio =
-        dynamics.jerk / std::max(0.1, config.max_jerk);
+    const double jerk_ratio = dynamics.jerk / std::max(0.1, config.max_jerk);
     const double yaw_ratio =
-        dynamics.yaw_rate / std::max(0.1, config.max_yaw_rate);
+        dynamics.yaw_rate / std::max(0.1, config.yaw_max_rate);
     return std::max({
         1.0,
         velocity_ratio,
@@ -1496,616 +840,417 @@ double requiredDurationScale(
 
 }  // namespace
 
-double LocalPlanner::findReachableGuideDistance(
-    const VehicleState& state,
-    const Eigen::Vector3d& direction_world,
-    double desired_distance,
-    double minimum_distance,
-    double distance_step,
-    bool forbid_unknown_space) const {
-    if (!esdf_.initialized() || !state.position.allFinite() ||
-        !state.velocity.allFinite() || !direction_world.allFinite() ||
-        desired_distance <= 0.0 || minimum_distance <= 0.0 ||
-        distance_step <= 0.0) {
-        return 0.0;
-    }
-    const double direction_norm = direction_world.norm();
-    if (direction_norm <= kEpsilon) return 0.0;
-    const Eigen::Vector3d direction = direction_world / direction_norm;
-    const auto reachability_deadline =
-        Clock::now() + std::chrono::duration_cast<Clock::duration>(
-            std::chrono::duration<double, std::milli>(
-                std::max(
-                    8.0,
-                    std::min(
-                        35.0, config_.planning_time_budget_ms + 5.0))));
+LocalPlanner::LocalPlanner(const TrajectoryOptimizationConfig& config)
+    : config_(config) {}
 
-    // The macro bounded-A* reachability check must use the same known-space
-    // semantics as the formal 30 Hz planner's final trajectory validation.
-    // Reject immediately when the current position itself is not fully known;
-    // otherwise a path may appear reachable through a discretised start that
-    // the continuous B-spline t=0 check will reject as UNKNOWN_SPACE.
-    IL_FIX_ONCE("findReachable_start_isKnown",
-                "Continuous start position isKnown() check before loop  [new]");
-    if (forbid_unknown_space && esdf_.hasKnownMask() &&
-        !esdf_.isKnown(
-            state.position.x(), state.position.y(), state.position.z())) {
-        return 0.0;
-    }
+void LocalPlanner::setMap(const ObservedMap* map) { map_ = map; }
 
-    for (double candidate = desired_distance;
-         candidate + 1.0e-9 >= minimum_distance;
-         candidate -= distance_step) {
-        if (Clock::now() >= reachability_deadline) break;
-        const Eigen::Vector3d terminal =
-            state.position + candidate * direction;
-        const bool terminal_free = [&]() {
-            if (!(forbid_unknown_space && esdf_.hasKnownMask())) {
-                return esdf_.isFree(
-                    terminal.x(), terminal.y(), terminal.z(),
-                    config_.min_clearance);
+ValidationResult LocalPlanner::validateTrajectory(
+    const std::vector<TrajectoryPoint>& trajectory) const {
+    ValidationResult result;
+    if (trajectory.empty()) {
+        result.all_clear = false;
+        result.any_collision = true;
+        result.any_unknown = false;
+        return result;
+    }
+    if (map_ == nullptr || !map_->esdfBuilt()) {
+        result.all_clear = false;
+        result.any_collision = true;
+        result.any_unknown = true;
+        return result;
+    }
+    result.all_clear = true;
+    double min_clearance = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < trajectory.size(); ++i) {
+        const TrajectoryPoint& point = trajectory[i];
+        if (!point.position.allFinite() || !point.velocity.allFinite() ||
+            !point.acceleration.allFinite()) {
+            result.any_collision = true;
+            result.all_clear = false;
+            result.worst_position = point.position;
+            result.worst_time = point.t;
+            return result;
+        }
+        const bool known =
+            map_->isKnown(point.position.x(), point.position.y(),
+                          point.position.z());
+        const double clearance =
+            map_->esdfValue(point.position.x(), point.position.y(),
+                            point.position.z());
+        if (std::isfinite(clearance)) {
+            min_clearance = std::min(min_clearance, clearance);
+        }
+        if (!known || !std::isfinite(clearance) ||
+            clearance <= config_.min_clearance) {
+            result.any_collision = true;
+            result.all_clear = false;
+            result.clearance_violation_count++;
+            if (clearance < result.worst_clearance) {
+                result.worst_clearance = clearance;
+                result.worst_position = point.position;
+                result.worst_time = point.t;
             }
-            // Frontier candidates sit on the known / unknown boundary.
-            // Requiring all eight trilinear-interpolation voxels to be
-            // known (isKnownFree) would reject every useful viewpoint.
-            // Instead use the interpolated ESDF value directly: unknown
-            // voxels have value 0, so the trilinear blend is conservative
-            // — the known side must contribute enough clearance to keep the
-            // weighted average above the margin.
-            IL_FIX_ONCE("findReachable_terminal_getValue",
-                        "Terminal uses getValue()>clearance instead of isKnownFree()  [new]");
-            const double value = esdf_.getValue(
-                terminal.x(), terminal.y(), terminal.z());
-            return std::isfinite(value) &&
-                   value > config_.min_clearance;
-        }();
-        if (!terminal_free) continue;
-
-        bool seed_reachable = segmentClear(
-                esdf_, state.position, terminal,
-                config_.target_clearance, forbid_unknown_space,
-                config_.collision_check_spacing);
-        // ── Fast-Planner: straight-line ESDF check is enough ────
-        // No A* grid search.  The 30 Hz B-spline gradient optimizer
-        // handles the detailed path geometry from the same straight
-        // line seed.
-        if (seed_reachable) return candidate;
+            if (!known) result.any_unknown = true;
+        }
     }
-    return 0.0;
+    result.min_clearance =
+        std::isfinite(min_clearance) ? min_clearance : 0.0;
+    return result;
 }
 
-LocalPlanResult LocalPlanner::planSplineWithRequest(
-    const LocalPlanningRequest& request) const {
+LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
     const auto planning_start = Clock::now();
     const auto planning_deadline =
-        planning_start +
-        std::chrono::duration_cast<Clock::duration>(
-            std::chrono::duration<double, std::milli>(
-                std::max(1.0, config_.planning_time_budget_ms)));
+        planning_start + std::chrono::duration_cast<Clock::duration>(
+                             std::chrono::duration<double, std::milli>(
+                                 std::max(1.0, config_.planning_time_budget_ms)));
     LocalPlanResult result;
-    result.plan_id = plan_id_counter_.fetch_add(1);
-    result.guide_waypoint = request.guide_waypoint;
-    result.guide_waypoint_index = request.guide_waypoint_index;
-    result.trajectory_terminal = request.trajectory_terminal;
-    result.trajectory_terminal_index = request.trajectory_terminal_index;
-    result.local_goal = request.trajectory_terminal;
-    result.local_goal_index = request.trajectory_terminal_index;
-    result.used_global_fallback = false;
-    result.used_observed_esdf = esdf_.hasKnownMask();
+    result.plan_id = plan_id_counter_++;
+    result.guide_waypoint = request.macro_guide_world;
 
     auto finish = [&]() {
         result.planning_time_ms =
-            std::chrono::duration<double, std::milli>(
-                Clock::now() - planning_start).count();
+            std::chrono::duration<double, std::milli>(Clock::now() -
+                                                      planning_start)
+                .count();
         return result;
     };
-    // The schema-v17 local expert is guide-conditioned.  It needs only the
-    // causal observed ESDF and the request state/terminal; a precomputed
-    // global path must not gate or alter the action label.
-    if (!esdf_.initialized()) {
-        result.status = PlannerStatus::NO_GLOBAL_PATH;
-        result.message = "Planner not initialized (no observed ESDF)";
+
+    if (map_ == nullptr || !map_->esdfBuilt()) {
+        result.status = PlannerStatus::NO_SAFE_MOTION;
+        result.message = "observed_map_not_built";
         return finish();
     }
     const VehicleState& state = request.state;
-    if (!state.position.allFinite() ||
-        !state.velocity.allFinite() ||
+    if (!state.position.allFinite() || !state.velocity.allFinite() ||
         !state.acceleration.allFinite() ||
-        !request.trajectory_terminal.allFinite() ||
-        (request.has_target_yaw && !std::isfinite(request.target_yaw))) {
+        !request.macro_guide_world.allFinite()) {
         result.status = PlannerStatus::INVALID_INPUT;
-        result.message = "Planning request contains NaN/Inf";
+        result.message = "planning_request_contains_nan_or_inf";
         return finish();
     }
-    const auto progress =
-        computeProgress(state.position, request.previous_progress_s);
-    result.progress_s = progress.valid ? progress.progress_s : 0.0;
-    result.progress_index = progress.valid ? progress.segment_index : -1;
 
-    const Eigen::Vector3d terminal = request.trajectory_terminal;
+    // ── 1. Observed-map A* seed path ──────────────────────────────
+    LocalSearchConfig search_config;
+    search_config.search_clearance_m = config_.search_clearance_m;
+    search_config.committed_side = request.committed_side;
+    search_config.side_bias_gain = config_.search_side_bias_gain;
+    search_config.max_time_ms = config_.search_max_time_ms;
+    search_config.region_margin_m = config_.search_region_margin_m;
+    search_config.forbid_unknown = request.forbid_unknown_space;
+    LocalPathSearch search;
+    const LocalSearchResult search_result =
+        search.search(*map_, state, request.macro_guide_world, search_config);
+    if (!search_result.found_any) {
+        result.status = PlannerStatus::SEARCH_FAILED;
+        result.message = search_result.failure_reason.empty()
+                             ? "no_local_path"
+                             : search_result.failure_reason;
+        result.search_status = 2;
+        return finish();
+    }
+    result.search_status = search_result.success ? 0 : 1;
+    Eigen::Vector3d terminal = search_result.terminal;
+
+    // ── 2. Seed path (A* + warm start) ────────────────────────────
+    std::vector<Eigen::Vector3d> seed_path = search_result.path;
+    std::string seed_source = "astar";
+    if (!request.previous_trajectory.empty() &&
+        request.previous_trajectory_age_s <= config_.warm_start_max_age_s) {
+        // Extract the known-free suffix of the previous trajectory and use
+        // it as a warm start when it still ends near the new terminal.
+        std::vector<Eigen::Vector3d> suffix;
+        bool suffix_valid = true;
+        for (const TrajectoryPoint& point : request.previous_trajectory) {
+            if (point.t < request.previous_trajectory_age_s) continue;
+            if (!map_->isKnownFree(point.position.x(), point.position.y(),
+                                   point.position.z(),
+                                   config_.search_clearance_m)) {
+                suffix_valid = false;
+                break;
+            }
+            suffix.push_back(point.position);
+        }
+        if (suffix_valid && suffix.size() >= 2) {
+            const double deviation =
+                (suffix.back() - terminal).head<2>().norm();
+            if (deviation <= config_.warm_start_max_terminal_deviation_m) {
+                // Replace the start with the current state and prepend the
+                // A* start segment so the seed is continuous.
+                suffix.front() = state.position;
+                seed_path = std::move(suffix);
+                seed_source = "warm_start";
+            }
+        }
+    }
+
+    // ── 3. Truncate the local terminal to the planning horizon ────
+    // The local terminal must be executable within the fixed local
+    // horizon (section III / X.3): walk the seed path and keep only the
+    // farthest point within horizon_time * cruise speed.
+    {
+        const double horizon_budget =
+            std::max(1.0, config_.horizon_time * config_.nominal_speed);
+        double accumulated = 0.0;
+        Eigen::Vector3d trunc = state.position;
+        for (size_t i = 1; i < seed_path.size(); ++i) {
+            const double segment = (seed_path[i] - seed_path[i - 1]).norm();
+            if (accumulated + segment > horizon_budget) {
+                const double alpha =
+                    segment > kEpsilon
+                        ? (horizon_budget - accumulated) / segment
+                        : 1.0;
+                trunc = (1.0 - alpha) * seed_path[i - 1] +
+                        alpha * seed_path[i];
+                break;
+            }
+            accumulated += segment;
+            trunc = seed_path[i];
+        }
+        if ((trunc - seed_path.front()).norm() < 0.3) {
+            // The horizon cannot even fit a short move; keep the A*
+            // terminal (already the farthest known-safe point).
+            trunc = terminal;
+        }
+        terminal = trunc;
+        // Rebuild the seed path by arc length, ending at the truncated
+        // terminal.
+        std::vector<Eigen::Vector3d> trimmed;
+        trimmed.reserve(seed_path.size());
+        trimmed.push_back(state.position);
+        double arc = 0.0;
+        for (size_t i = 1; i < seed_path.size(); ++i) {
+            const double segment = (seed_path[i] - seed_path[i - 1]).norm();
+            if (arc + segment > horizon_budget + 1.0e-3) break;
+            arc += segment;
+            trimmed.push_back(seed_path[i]);
+        }
+        if (trimmed.size() < 2 ||
+            (trimmed.back() - terminal).norm() > 0.3) {
+            trimmed.push_back(terminal);
+        }
+        seed_path = std::move(trimmed);
+    }
+    result.trajectory_terminal = terminal;
+
+    // ── 4. B-spline geometry ──────────────────────────────────────
+    const int control_point_count =
+        std::max(8, config_.control_points);
+    const std::vector<double> knots =
+        makeClampedKnots(control_point_count, kDegree);
     const Eigen::Vector3d displacement = terminal - state.position;
     const double distance = displacement.norm();
     if (distance < 1.0e-3) {
-        result.status = PlannerStatus::LOCAL_GOAL_INVALID;
-        result.message = "Guide/terminal is indistinguishable from current position";
+        result.status = PlannerStatus::LOCAL_TERMINAL_INVALID;
+        result.message = "local_terminal_indistinguishable_from_position";
         return finish();
     }
     const Eigen::Vector3d direction = displacement / distance;
-    const double planned_target_yaw = request.has_target_yaw
-        ? wrapAngleLocal(request.target_yaw)
-        : (displacement.head<2>().norm() > 1.0e-6
-            ? yawFromVelocity(displacement) : state.yaw);
-    // V15.5: raise the speed floor from 0.25 to 0.55.  With a 4.0 m
-    // lookahead, a short Guide (0.5-0.9 m, common while threading around
-    // an obstacle) previously allowed only ~0.45 m/s; the drone crawled
-    // around the blocker at a fraction of cruise speed.  The floor now
-    // gives ~1.0 m/s even for short targets while the non-zero terminal
-    // velocity keeps the drone flying THROUGH intermediate Guides (the
-    // camera leads and re-targets at 5 Hz); only the final goal holds
-    // zero terminal velocity (stop_at_terminal).
-    const double distance_ratio = clamp(
-        distance / std::max(0.5, config_.lookahead_distance),
-        0.55, 1.0);
-    double terminal_speed = config_.nominal_speed * distance_ratio;
-    Eigen::Vector3d terminal_velocity =
-        terminal_speed * direction;
+
+    double terminal_speed = 0.0;
+    Eigen::Vector3d terminal_velocity = Eigen::Vector3d::Zero();
+    if (!request.stop_at_goal) {
+        const double distance_ratio = clamp(
+            distance / std::max(0.5, config_.lookahead_distance), 0.55, 1.0);
+        terminal_speed =
+            config_.nominal_speed * distance_ratio *
+            config_.terminal_speed_ratio;
+        terminal_velocity = terminal_speed * direction;
+    }
     Eigen::Vector3d start_acceleration = state.acceleration;
     if (start_acceleration.norm() > config_.max_acceleration) {
         start_acceleration *=
             config_.max_acceleration / start_acceleration.norm();
     }
-    // Duration follows Guide distance and cruise speed.  A non-zero local
-    // terminal velocity prevents braking at every moving Guide; the final
-    // global goal still has an exact zero-velocity boundary without making
-    // the whole segment crawl at half the cruise speed.
-    const double travel_speed = std::max(
-        0.5, config_.nominal_speed * distance_ratio);
+    const double travel_speed =
+        std::max(0.5, config_.nominal_speed *
+                          clamp(distance / std::max(0.5, config_.lookahead_distance),
+                                0.55, 1.0));
     double duration = std::max({
         1.0,
         distance / travel_speed,
-        std::sqrt(
-            12.0 * distance /
-            std::max(0.1, config_.max_acceleration))
+        std::sqrt(12.0 * distance / std::max(0.1, config_.max_acceleration))
     });
-    // Translation and macro yaw intent form one coherent teacher
-    // trajectory. Allocate enough time to reach the requested yaw instead
-    // of merely clipping yaw rate and ending with an incomplete instruction.
+    const bool has_macro_yaw = request.has_macro_yaw;
+    const double macro_yaw = request.macro_yaw_world;
+    const double planned_target_yaw =
+        has_macro_yaw ? wrapAngleLocal(macro_yaw)
+                      : (displacement.head<2>().norm() > 1.0e-6
+                             ? yawFromVelocity(displacement)
+                             : state.yaw);
     duration = std::max(
         duration,
-        1.05 * std::abs(wrapAngleLocal(
-            planned_target_yaw - state.yaw)) /
-            std::max(0.1, config_.max_yaw_rate));
+        1.05 * std::abs(wrapAngleLocal(planned_target_yaw - state.yaw)) /
+            std::max(0.1, config_.yaw_max_rate));
+    duration = std::max(duration,
+                        polylineLength(seed_path) /
+                            std::max(0.5, config_.nominal_speed));
 
-    // Keep the configured optimization dimension fixed.  Collision checking
-    // already samples the continuous curve at ESDF-scale spacing; increasing
-    // the number of control points to distance/control_point_spacing makes
-    // the knot interval very short and cubically amplifies harmless A* grid
-    // ripples into large jerk.
-    const int control_point_count = std::max(
-        8,
-        std::min(
-            std::max(8, config_.max_reference_points),
-            config_.control_points));
-    const std::vector<double> knots =
-        makeClampedKnots(control_point_count, kDegree);
-    const bool forbid_unknown = request.forbid_unknown_space;
-    const bool direct_soft_clear = segmentClear(
-        esdf_, state.position, terminal,
-        config_.target_clearance, forbid_unknown,
-        config_.collision_check_spacing);
-
-    // ── Fast-Planner aligned: straight-line seed, no A* ──────────
-    // The ESDF gradient optimization naturally pushes control points
-    // away from low-clearance regions — no grid search needed.
-    // A straight line from start to terminal is the universal seed;
-    // the B-spline optimizer handles homotopy selection automatically.
-    //
-    // ── Bypass-direction initial bias ──────────────────────────
-    // If the straight line goes through an obstacle, the optimizer
-    // needs >=20 iterations to push all control points around it.
-    // Give it a head start: offset the midpoint perpendicular to
-    // the travel direction.  The ESDF gradient will correct the
-    // exact side and magnitude.
-    std::vector<Eigen::Vector3d> seed_path = {state.position, terminal};
-    {
-        const Eigen::Vector3d midpoint =
-            0.5 * (state.position + terminal);
-        const double mid_clearance = esdf_.getValue(
-            midpoint.x(), midpoint.y(), midpoint.z());
-        const Eigen::Vector2d travel = terminal.head<2>() - state.position.head<2>();
-        const double travel_len = travel.norm();
-        if (travel_len > 0.5 && mid_clearance < config_.target_clearance) {
-            // Perpendicular direction in xy-plane (rotate travel by +90°).
-            // The sign (left/right) is arbitrary; ESDF gradient refines it.
-            const Eigen::Vector2d perp(-travel.y() / travel_len,
-                                        travel.x() / travel_len);
-            const double bias = std::min(
-                1.5, 0.5 + (config_.target_clearance - mid_clearance) * 3.0);
-            const Eigen::Vector3d biased_mid(
-                midpoint.x() + perp.x() * bias,
-                midpoint.y() + perp.y() * bias,
-                midpoint.z());
-            seed_path = {state.position, biased_mid, terminal};
-        }
-    }
-    constexpr bool used_search_seed = false;  // A* removed (Fast-Planner aligned)
     const std::vector<Eigen::Vector3d> seed_control_points =
         initializeSplineControlPoints(seed_path, control_point_count);
     std::vector<Eigen::Vector3d> control_points = seed_control_points;
-    duration = std::max(
-        duration,
-        polylineLength(seed_path) /
-            std::max(0.5, config_.nominal_speed));
-    imposeBoundaryState(
-        &control_points, knots, duration,
-        state.position, state.velocity, start_acceleration,
-        terminal, terminal_velocity);
-    // Keep the seed-derived horizon for the independent analytic fallback.
-    // Iterative B-spline boundary rebuilding can occasionally increase a
-    // residual derivative peak and compound duration on every iteration.
-    // Starting the fallback from that runaway duration makes an upward
-    // initial velocity overshoot the finite ESDF before returning to Guide.
-    const double boundary_fallback_duration = duration;
+    imposeBoundaryState(&control_points, knots, duration, state.position,
+                        state.velocity, start_acceleration, terminal,
+                        terminal_velocity);
 
     Eigen::Vector3d corridor_min = state.position.cwiseMin(terminal);
     Eigen::Vector3d corridor_max = state.position.cwiseMax(terminal);
-    for (const auto& point : seed_path) {
+    for (const Eigen::Vector3d& point : seed_path) {
         corridor_min = corridor_min.cwiseMin(point);
         corridor_max = corridor_max.cwiseMax(point);
     }
-    const double corridor_padding = config_.seed_trust_radius;
-    IL_FIX_ONCE("seed_trust_radius",
-                (std::to_string(config_.seed_trust_radius) +
-                 " m  [was 0.75]").c_str());
-    corridor_min.array() -= corridor_padding;
-    corridor_max.array() += corridor_padding;
+    corridor_min.array() -= config_.seed_trust_radius;
+    corridor_max.array() += config_.seed_trust_radius;
     corridor_min.x() = std::max(
-        corridor_min.x(),
-        esdf_.originX() + 0.5 * esdf_.resolution());
+        corridor_min.x(), map_->origin().x() + 0.5 * map_->resolution());
     corridor_min.y() = std::max(
-        corridor_min.y(),
-        esdf_.originY() + 0.5 * esdf_.resolution());
+        corridor_min.y(), map_->origin().y() + 0.5 * map_->resolution());
     corridor_min.z() = std::max(
-        corridor_min.z(),
-        esdf_.originZ() + 0.5 * esdf_.resolution());
+        corridor_min.z(), map_->origin().z() + 0.5 * map_->resolution());
     corridor_max.x() = std::min(
         corridor_max.x(),
-        esdf_.originX() + (esdf_.gx() - 0.5) * esdf_.resolution());
+        map_->origin().x() + (map_->gx() - 0.5) * map_->resolution());
     corridor_max.y() = std::min(
         corridor_max.y(),
-        esdf_.originY() + (esdf_.gy() - 0.5) * esdf_.resolution());
+        map_->origin().y() + (map_->gy() - 0.5) * map_->resolution());
     corridor_max.z() = std::min(
         corridor_max.z(),
-        esdf_.originZ() + (esdf_.gz() - 0.5) * esdf_.resolution());
+        map_->origin().z() + (map_->gz() - 0.5) * map_->resolution());
+
+    ESDFGrid esdf;
+    esdf.setMap(map_);
 
     bool optimized = optimizeSpline(
-        &control_points, knots, duration, esdf_, config_,
-        forbid_unknown, seed_control_points, seed_path,
-        corridor_min, corridor_max,
-        planning_deadline - std::chrono::milliseconds(2));
-    imposeBoundaryState(
-        &control_points, knots, duration,
-        state.position, state.velocity, start_acceleration,
-        terminal, terminal_velocity);
+        &control_points, knots, duration, esdf, config_,
+        seed_control_points, corridor_min, corridor_max,
+        planning_deadline - std::chrono::milliseconds(3));
+    imposeBoundaryState(&control_points, knots, duration, state.position,
+                        state.velocity, start_acceleration, terminal,
+                        terminal_velocity);
     if (!optimized) {
         result.status = PlannerStatus::OPTIMIZATION_FAILED;
-        result.message =
-            "Gradient B-spline optimization did not produce an incumbent";
+        result.message = "gradient_optimization_no_incumbent";
         return finish();
     }
 
-    std::vector<TrajectoryPoint> trajectory = sampleSpline(
-        control_points, knots, duration, config_.trajectory_dt,
-        state.yaw, planned_target_yaw, config_.max_yaw_rate, esdf_);
-    DynamicMetrics dynamics = measureDynamics(trajectory);
-    auto trajectoryUsesKnownSpace = [&](const auto& candidate) {
-        if (!forbid_unknown || !esdf_.hasKnownMask()) return true;
-        for (const auto& point : candidate) {
-            // ── Relaxed known-space check ─────────────────────────
-            // UNKNOWN voxels have ESDF=0, so trilinear interpolation
-            // with partially-observed corners is inherently conservative.
-            // Requiring isKnown() (all 8 corners observed) rejects every
-            // trajectory that grazes the FOV boundary.  Instead, require
-            // only that the interpolated clearance exceeds the planner's
-            // minimum — a point fully inside unknown space would have
-            // clearance ≤ 0 and fail this check naturally.
-            const double clearance = esdf_.getValue(
-                point.position.x(), point.position.y(),
-                point.position.z());
-            if (!std::isfinite(clearance) ||
-                clearance <= config_.min_clearance) {
-                return false;
-            }
+    auto sampleTrajectory = [&](const std::vector<Eigen::Vector3d>& points,
+                                double traj_duration) {
+        std::vector<TrajectoryPoint> trajectory;
+        const SplineDerivatives derivatives = buildDerivatives(points, knots);
+        const int sample_count = std::max(
+            2, static_cast<int>(std::ceil(traj_duration / config_.trajectory_dt)) +
+                   1);
+        trajectory.reserve(static_cast<size_t>(sample_count));
+        for (int i = 0; i < sample_count; ++i) {
+            const double time = i + 1 == sample_count
+                                    ? traj_duration
+                                    : std::min(traj_duration, i * config_.trajectory_dt);
+            const double parameter = clamp(time / traj_duration, 0.0, 1.0);
+            TrajectoryPoint point;
+            point.t = time;
+            point.position = evaluateSpline(points, knots, kDegree, parameter);
+            point.velocity =
+                evaluateSpline(derivatives.first, derivatives.first_knots,
+                               kDegree - 1, parameter) /
+                traj_duration;
+            point.acceleration =
+                evaluateSpline(derivatives.second, derivatives.second_knots,
+                               kDegree - 2, parameter) /
+                (traj_duration * traj_duration);
+            point.clearance = esdf.getValue(
+                point.position.x(), point.position.y(), point.position.z());
+            trajectory.push_back(point);
         }
-        return true;
+        return trajectory;
     };
-    bool used_known_space_repair = false;
 
-    // Boundary-state reconstruction can still move the initially optimized
-    // curve outside a thin observed corridor.  Before spending time on
-    // dynamics retiming, retry once inside a tighter tube around the same
-    // certified A* homotopy.  This never changes the Guide endpoint or uses
-    // privileged map information.
-    if (!trajectoryUsesKnownSpace(trajectory) &&
-        Clock::now() + std::chrono::milliseconds(2) < planning_deadline) {
-        LocalPlannerConfig repair_config = config_;
-        repair_config.seed_trust_radius = std::min(
-            config_.seed_trust_radius,
-            std::max(0.15, 2.0 * esdf_.resolution()));
-        std::vector<Eigen::Vector3d> repair_points = seed_control_points;
-        imposeBoundaryState(
-            &repair_points, knots, duration,
-            state.position, state.velocity, start_acceleration,
-            terminal, terminal_velocity);
-        const bool repaired = optimizeSpline(
-            &repair_points, knots, duration, esdf_, repair_config,
-            forbid_unknown, seed_control_points, seed_path,
-            corridor_min, corridor_max,
-            planning_deadline - std::chrono::milliseconds(1));
-        if (repaired) {
-            imposeBoundaryState(
-                &repair_points, knots, duration,
-                state.position, state.velocity, start_acceleration,
-                terminal, terminal_velocity);
-            std::vector<TrajectoryPoint> repair_trajectory = sampleSpline(
-                repair_points, knots, duration, config_.trajectory_dt,
-                state.yaw, planned_target_yaw,
-                config_.max_yaw_rate, esdf_);
-            const ValidationResult repair_validation =
-                validateTrajectory(repair_trajectory);
-            if (trajectoryUsesKnownSpace(repair_trajectory) &&
-                !repair_validation.any_collision &&
-                repair_validation.all_clear) {
-                control_points = std::move(repair_points);
-                trajectory = std::move(repair_trajectory);
-                dynamics = measureDynamics(trajectory);
-                used_known_space_repair = true;
-            }
-        }
-    }
+    std::vector<TrajectoryPoint> trajectory =
+        sampleTrajectory(control_points, duration);
+    DynamicMetrics dynamics = measureDynamics(trajectory);
 
-    // Iterative time reallocation follows the standard B-spline workflow.
-    // Boundary control points are rebuilt and the same objective is optimized
-    // again; geometry is never altered after the final sampling pass.
-    // Six inexpensive rescaling opportunities cover modest residual
-    // violations after geometry optimization.  The absolute planning
-    // deadline below remains authoritative, so this cannot exceed the
-    // configured 30 ms budget.
-    //
-    // ── Fast-Planner aligned ─────────────────────────────────────
-    // Each time-iteration must preserve the safety of the original
-    // seed path.  A stretched duration that pushes control points
-    // into the ESDF boundary must be rejected immediately, not
-    // passed to the cheap-retime fallback which can produce negative
-    // clearance analytic curves.  The ESDF gradient optimization
-    // naturally preserves clearance; the time-scaling loop does not.
+    // ── Iterative dynamic retiming ────────────────────────────────
     for (int time_iteration = 0; time_iteration < 6; ++time_iteration) {
         const double violation_ratio =
             dynamicsViolationRatio(dynamics, config_);
-        const double dynamic_scale =
-            requiredDurationScale(dynamics, config_);
+        const double dynamic_scale = requiredDurationScale(dynamics, config_);
         if (violation_ratio <= kDynamicsTolerance ||
-            Clock::now() + std::chrono::milliseconds(4) >=
-                planning_deadline) {
+            Clock::now() + std::chrono::milliseconds(4) >= planning_deadline) {
             break;
         }
         duration *= std::max(1.03, 1.03 * dynamic_scale);
-        const double safe_length = polylineLength(seed_path);
         terminal_velocity =
-            std::min(
-                terminal_speed,
-                safe_length / std::max(0.1, duration)) * direction;
+            std::min(terminal_speed,
+                     polylineLength(seed_path) / std::max(0.1, duration)) *
+            direction;
         control_points = seed_control_points;
-        imposeBoundaryState(
-            &control_points, knots, duration,
-            state.position, state.velocity, start_acceleration,
-            terminal, terminal_velocity);
-        optimizeSpline(
-            &control_points, knots, duration, esdf_, config_,
-            forbid_unknown, seed_control_points, seed_path,
-            corridor_min, corridor_max,
-            planning_deadline - std::chrono::milliseconds(1));
-        imposeBoundaryState(
-            &control_points, knots, duration,
-            state.position, state.velocity, start_acceleration,
-            terminal, terminal_velocity);
-        trajectory = sampleSpline(
-            control_points, knots, duration, config_.trajectory_dt,
-            state.yaw, planned_target_yaw,
-            config_.max_yaw_rate, esdf_);
+        imposeBoundaryState(&control_points, knots, duration, state.position,
+                            state.velocity, start_acceleration, terminal,
+                            terminal_velocity);
+        optimizeSpline(&control_points, knots, duration, esdf, config_,
+                       seed_control_points, corridor_min, corridor_max,
+                       planning_deadline - std::chrono::milliseconds(1));
+        imposeBoundaryState(&control_points, knots, duration, state.position,
+                            state.velocity, start_acceleration, terminal,
+                            terminal_velocity);
+        trajectory = sampleTrajectory(control_points, duration);
         const ValidationResult time_validation =
             validateTrajectory(trajectory);
-        // ── Fast-Planner: reject retimed trajectory on clearance loss ──
-        if (time_validation.any_collision ||
-            time_validation.min_clearance < config_.min_clearance) {
-            // Time-stretch pushed control points too close to ESDF boundary.
-            // Re-optimize once from the original seed; if clearance still
-            // insufficient, fall back to the last valid pre-retime trajectory.
-            optimizeSpline(
-                &control_points, knots, duration, esdf_, config_,
-                forbid_unknown, seed_control_points, seed_path,
-                corridor_min, corridor_max,
-                planning_deadline - std::chrono::milliseconds(1));
-            imposeBoundaryState(
-                &control_points, knots, duration,
-                state.position, state.velocity, start_acceleration,
-                terminal, terminal_velocity);
-            trajectory = sampleSpline(
-                control_points, knots, duration, config_.trajectory_dt,
-                state.yaw, planned_target_yaw,
-                config_.max_yaw_rate, esdf_);
-            const ValidationResult reopt_validation =
-                validateTrajectory(trajectory);
-            if (reopt_validation.any_collision ||
-                reopt_validation.min_clearance < config_.min_clearance) {
-                // Cannot retime safely — stop iterating, keep current best.
-                break;
-            }
+        if (time_validation.any_collision) {
+            optimizeSpline(&control_points, knots, duration, esdf, config_,
+                           seed_control_points, corridor_min, corridor_max,
+                           planning_deadline - std::chrono::milliseconds(1));
+            imposeBoundaryState(&control_points, knots, duration,
+                                state.position, state.velocity,
+                                start_acceleration, terminal,
+                                terminal_velocity);
+            trajectory = sampleTrajectory(control_points, duration);
+            if (validateTrajectory(trajectory).any_collision) break;
         }
         dynamics = measureDynamics(trajectory);
     }
 
-    ValidationResult validation = validateTrajectory(trajectory);
-    bool used_deadline_retime = false;
-    int cheap_retime_attempts = 0;
-    DynamicMetrics last_cheap_retime_dynamics;
-    ValidationResult last_cheap_retime_validation;
+    // ── Yaw planning (FOV-constrained) ────────────────────────────
+    YawPlannerConfig yaw_config;
+    yaw_config.max_yaw_rate = config_.yaw_max_rate;
+    yaw_config.max_yaw_accel = config_.yaw_max_accel;
+    yaw_config.fov_half_deg = config_.yaw_fov_half_deg;
+    yaw_config.fov_margin_deg = config_.yaw_fov_margin_deg;
+    yaw_config.speed_threshold_mps = config_.yaw_speed_threshold_mps;
+    YawPlanner yaw_planner(yaw_config);
+    yaw_planner.planYaw(&trajectory, state.yaw, planned_target_yaw,
+                        has_macro_yaw);
 
-    // A small residual derivative violation must not discard an otherwise
-    // valid Guide/Control training frame.  Do not time-warp the final spline:
-    // preserving both endpoint derivatives with a nonlinear clock creates
-    // extra u''(t) velocity terms and can increase acceleration/jerk in the
-    // middle of the trajectory (the recorded scale_transition failure did
-    // exactly that).  Instead, enlarge the duration and sample an analytic
-    // quintic trajectory from the exact measured start state to the Guide.
-    //
-    // This is optimizer-free and bounded.  The Guide endpoint remains exact,
-    // while terminal velocity is reduced consistently with the longer
-    // receding horizon.  Every candidate undergoes complete ESDF and dynamics
-    // validation, so an analytic curve that cuts an obstacle is rejected
-    // rather than becoming a Control label.
-    // This only gates whether a fully revalidated fallback is attempted; it
-    // does not relax the accepted Control-label limits.  A 1.5 ratio covers
-    // short-budget NLopt incumbents whose jerk is noisier than the production
-    // 30 ms result while remaining cheap to correct through time allocation.
-    constexpr double kMaximumCheapRetimeViolationRatio = 1.50;
-    constexpr int kMaximumCheapRetimeAttempts = 4;
-    const auto cheap_retime_deadline =
-        planning_deadline + std::chrono::milliseconds(2);
-    if (!validation.any_collision &&
-        validation.all_clear &&
-        !dynamicsFeasible(dynamics, config_) &&
-        dynamicsViolationRatio(dynamics, config_) <=
-            kMaximumCheapRetimeViolationRatio) {
-        double candidate_duration = boundary_fallback_duration;
-        DynamicMetrics candidate_dynamics = dynamics;
-        for (int attempt = 0;
-             attempt < kMaximumCheapRetimeAttempts;
-             ++attempt) {
-            if (Clock::now() >= cheap_retime_deadline) break;
-            cheap_retime_attempts = attempt + 1;
-            const double scale =
-                requiredDurationScale(candidate_dynamics, config_);
-            if (!std::isfinite(scale)) break;
-
-            // Five percent reserve keeps a trajectory that only barely
-            // crossed the tolerance from failing again on the next 30 Hz
-            // replan due to sampling or state-estimation noise.
-            const double next_duration =
-                candidate_duration *
-                std::max(1.05, 1.05 * scale);
-            if (next_duration / boundary_fallback_duration >= 1.95) break;
-            candidate_duration = next_duration;
-            const Eigen::Vector3d candidate_terminal_velocity =
-                std::min(
-                    terminal_speed,
-                    polylineLength(seed_path) /
-                        std::max(0.1, candidate_duration)) *
-                direction;
-            std::vector<TrajectoryPoint> candidate_trajectory =
-                sampleQuinticBoundaryTrajectory(
-                    state.position, state.velocity, start_acceleration,
-                    terminal, candidate_terminal_velocity,
-                    Eigen::Vector3d::Zero(), candidate_duration,
-                    config_.trajectory_dt, state.yaw, planned_target_yaw,
-                    config_.max_yaw_rate, esdf_);
-            if (candidate_trajectory.empty()) break;
-            const ValidationResult candidate_validation =
-                validateTrajectory(candidate_trajectory);
-            candidate_dynamics =
-                measureDynamics(candidate_trajectory);
-            last_cheap_retime_dynamics = candidate_dynamics;
-            last_cheap_retime_validation = candidate_validation;
-            if (!trajectoryUsesKnownSpace(candidate_trajectory) ||
-                candidate_validation.any_collision ||
-                !candidate_validation.all_clear) {
-                continue;
-            }
-            if (!dynamicsFeasible(candidate_dynamics, config_)) {
-                continue;
-            }
-
-            duration = candidate_duration;
-            trajectory = std::move(candidate_trajectory);
-            validation = candidate_validation;
-            dynamics = candidate_dynamics;
-            used_deadline_retime = true;
-            break;
-        }
-    }
-
-    result.trajectory = std::move(trajectory);
+    // ── Strict validation ─────────────────────────────────────────
+    const ValidationResult validation = validateTrajectory(trajectory);
     result.min_clearance = validation.min_clearance;
-    // ── Final known-space validation ──────────────────────────────
-    // Use the same relaxed semantics as trajectoryUsesKnownSpace:
-    // UNKNOWN voxels have ESDF=0, so getValue() is conservative.
-    // A point that genuinely enters unobserved space will have
-    // clearance ≤ min_clearance and be rejected here.
-    if (forbid_unknown && esdf_.hasKnownMask()) {
-        for (const auto& point : result.trajectory) {
-            const double clearance = esdf_.getValue(
-                point.position.x(), point.position.y(),
-                point.position.z());
-            if (!std::isfinite(clearance) ||
-                clearance <= config_.min_clearance) {
-                result.status = PlannerStatus::UNKNOWN_SPACE;
-                result.message = "Optimized B-spline enters unknown space";
-                return finish();
-            }
-        }
-    }
-    if (validation.any_collision || !validation.all_clear) {
-        result.status = PlannerStatus::COLLISION;
+    result.duration_s = duration;
+    if (validation.any_unknown || validation.any_collision) {
+        result.status = validation.any_unknown ? PlannerStatus::UNKNOWN_SPACE
+                                               : PlannerStatus::COLLISION;
         std::ostringstream message;
-        message << "Optimized B-spline violates clearance: min="
-                << validation.min_clearance
-                << ", start=" << result.trajectory.front().clearance
-                << ", worst_t=" << validation.worst_time
-                << ", samples=" << validation.clearance_violation_count;
+        message << (validation.any_unknown ? "trajectory_enters_unknown"
+                                           : "trajectory_collides")
+                << ": min_clearance=" << validation.min_clearance
+                << " violations=" << validation.clearance_violation_count;
         result.message = message.str();
         return finish();
     }
+    dynamics = measureDynamics(trajectory);
     if (!dynamicsFeasible(dynamics, config_)) {
         result.status = PlannerStatus::DYNAMICS_VIOLATION;
         std::ostringstream message;
-        message << "B-spline dynamics violation: v=" << dynamics.velocity
-                << ", a=" << dynamics.acceleration
-                << ", jerk=" << dynamics.jerk
-                << ", yaw_rate=" << dynamics.yaw_rate;
-        if (cheap_retime_attempts > 0) {
-            message << ", final_retime_attempts="
-                    << cheap_retime_attempts
-                    << ", final_retime_v="
-                    << last_cheap_retime_dynamics.velocity
-                    << ", final_retime_a="
-                    << last_cheap_retime_dynamics.acceleration
-                    << ", final_retime_jerk="
-                    << last_cheap_retime_dynamics.jerk
-                    << ", final_retime_yaw_rate="
-                    << last_cheap_retime_dynamics.yaw_rate
-                    << ", final_retime_clearance="
-                    << last_cheap_retime_validation.min_clearance;
-        }
+        message << "dynamics_violation: v=" << dynamics.velocity
+                << " a=" << dynamics.acceleration
+                << " jerk=" << dynamics.jerk
+                << " yaw_rate=" << dynamics.yaw_rate;
         result.message = message.str();
         return finish();
     }
     result.success = true;
     result.status = PlannerStatus::SUCCESS;
-    if (used_deadline_retime) {
-        result.message =
-            used_search_seed
-                ? "OK (local A* seed + gradient B-spline + final retime)"
-                : "OK (direct gradient B-spline + final retime)";
-    } else if (used_known_space_repair) {
-        result.message =
-            used_search_seed
-                ? "OK (local A* seed + known-space B-spline repair)"
-                : "OK (direct seed + known-space B-spline repair)";
-    } else {
-        result.message =
-            used_search_seed ? "OK (local A* seed + gradient B-spline)" :
-                               "OK (direct gradient B-spline)";
-    }
+    result.trajectory = std::move(trajectory);
+    result.message = seed_source == "warm_start" ? "ok_warm_start" : "ok_astar_seed";
     return finish();
 }
 
