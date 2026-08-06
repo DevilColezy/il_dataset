@@ -9,12 +9,14 @@
 ///   - LocalRecoverability (5 Hz recoverability query)
 ///   - MacroCandidateSearch + analyzeGoalBlocker
 ///   - PrivilegedOracle (global map + cost-to-go + candidate scoring)
+///   - PrivilegedInterventionOracle (macro-intervention necessity evaluator)
 ///   - LocalPlanner (A*-seeded B-spline, 30 Hz) + TrajectoryOptimizationConfig
 ///   - FlightmareDynamics (existing flightlib bridge)
 ///
 /// The A* search (LocalPathSearch) and the yaw planner (YawPlanner) are
-/// internal to the LocalPlanner / LocalRecoverability C++ implementations
-/// and are not exposed directly.
+/// internal to the LocalPlanner / LocalRecoverability C++ implementations;
+/// only their read-only result types (LocalPathResult / Status) are
+/// exposed.
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -36,6 +38,7 @@
 #include "il_dataset/local_planner/local_recoverability.hpp"
 #include "il_dataset/local_planner/macro_candidate_search.hpp"
 #include "il_dataset/local_planner/privileged_oracle.hpp"
+#include "il_dataset/local_planner/privileged_intervention_oracle.hpp"
 #include "il_dataset/local_planner/spline_planner.hpp"
 #include "il_dataset/local_planner/yaw_planner.hpp"
 
@@ -249,7 +252,10 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("position_world", &MacroCandidate::position_world)
         .def_readwrite("position_flu", &MacroCandidate::position_flu)
         .def_readwrite("known_reachable", &MacroCandidate::known_reachable)
+        .def_readwrite("full_goal_reached", &MacroCandidate::full_goal_reached)
+        .def_readwrite("found_partial", &MacroCandidate::found_partial)
         .def_readwrite("observed_path_cost", &MacroCandidate::observed_path_cost)
+        .def_readwrite("observed_path_length", &MacroCandidate::observed_path_length)
         .def_readwrite("minimum_clearance", &MacroCandidate::minimum_clearance)
         .def_readwrite("goal_progress", &MacroCandidate::goal_progress)
         .def_readwrite("left_edge_visible", &MacroCandidate::left_edge_visible)
@@ -286,7 +292,6 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("has_macro_yaw", &LocalPlanRequest::has_macro_yaw)
         .def_readwrite("macro_yaw_world", &LocalPlanRequest::macro_yaw_world)
         .def_readwrite("goal_world", &LocalPlanRequest::goal_world)
-        .def_readwrite("stop_at_goal", &LocalPlanRequest::stop_at_goal)
         .def_readwrite("previous_trajectory", &LocalPlanRequest::previous_trajectory)
         .def_readwrite("previous_trajectory_age_s",
                        &LocalPlanRequest::previous_trajectory_age_s)
@@ -324,6 +329,99 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("worst_position", &ValidationResult::worst_position)
         .def_readwrite("worst_time", &ValidationResult::worst_time)
         .def_readwrite("worst_clearance", &ValidationResult::worst_clearance);
+
+    // ── Brake-risk + privileged intervention result types ────────────
+    py::class_<BrakeRiskResult>(m, "BrakeRiskResult")
+        .def(py::init<>())
+        .def_readwrite("risk", &BrakeRiskResult::risk)
+        .def_readwrite("min_clearance", &BrakeRiskResult::min_clearance)
+        .def_readwrite("first_risk_time", &BrakeRiskResult::first_risk_time)
+        .def_readwrite("braking_distance", &BrakeRiskResult::braking_distance);
+
+    py::enum_<InterventionReason>(m, "InterventionReason")
+        .value("DIRECT_GLOBALLY_VALID", InterventionReason::DIRECT_GLOBALLY_VALID)
+        .value("DIRECT_LONG_WALL_BLOCKED", InterventionReason::DIRECT_LONG_WALL_BLOCKED)
+        .value("DIRECT_WRONG_HOMOTOPY", InterventionReason::DIRECT_WRONG_HOMOTOPY)
+        .value("DIRECT_GLOBAL_DISCONNECTED", InterventionReason::DIRECT_GLOBAL_DISCONNECTED)
+        .value("DIRECT_EXCESSIVE_DETOUR", InterventionReason::DIRECT_EXCESSIVE_DETOUR)
+        .value("DIRECT_LOOP_RISK", InterventionReason::DIRECT_LOOP_RISK)
+        .value("LEFT_ONLY_FEASIBLE", InterventionReason::LEFT_ONLY_FEASIBLE)
+        .value("RIGHT_ONLY_FEASIBLE", InterventionReason::RIGHT_ONLY_FEASIBLE)
+        .value("BOTH_SIDES_FEASIBLE", InterventionReason::BOTH_SIDES_FEASIBLE)
+        .value("NO_GLOBAL_ROUTE", InterventionReason::NO_GLOBAL_ROUTE)
+        .export_values();
+
+    py::class_<PrivilegedInterventionResult>(m, "PrivilegedInterventionResult")
+        .def(py::init<>())
+        .def_readwrite("direct_viable", &PrivilegedInterventionResult::direct_viable)
+        .def_readwrite("intervention_required",
+                       &PrivilegedInterventionResult::intervention_required)
+        .def_readwrite("left_globally_feasible",
+                       &PrivilegedInterventionResult::left_globally_feasible)
+        .def_readwrite("right_globally_feasible",
+                       &PrivilegedInterventionResult::right_globally_feasible)
+        .def_readwrite("direct_cost_to_go", &PrivilegedInterventionResult::direct_cost_to_go)
+        .def_readwrite("left_cost_to_go", &PrivilegedInterventionResult::left_cost_to_go)
+        .def_readwrite("right_cost_to_go", &PrivilegedInterventionResult::right_cost_to_go)
+        .def_readwrite("direct_detour_ratio", &PrivilegedInterventionResult::direct_detour_ratio)
+        .def_readwrite("direct_min_clearance",
+                       &PrivilegedInterventionResult::direct_min_clearance)
+        .def_readwrite("decision_margin", &PrivilegedInterventionResult::decision_margin)
+        .def_readwrite("reason", &PrivilegedInterventionResult::reason);
+
+    py::class_<PrivilegedInterventionConfig>(m, "PrivilegedInterventionConfig")
+        .def(py::init<>())
+        .def_readwrite("lateral_offset_m", &PrivilegedInterventionConfig::lateral_offset_m)
+        .def_readwrite("min_global_clearance_m",
+                       &PrivilegedInterventionConfig::min_global_clearance_m)
+        .def_readwrite("max_direct_detour_ratio",
+                       &PrivilegedInterventionConfig::max_direct_detour_ratio)
+        .def_readwrite("cost_margin_m", &PrivilegedInterventionConfig::cost_margin_m)
+        .def_readwrite("lookahead_sampling_m",
+                       &PrivilegedInterventionConfig::lookahead_sampling_m)
+        .def_readwrite("loop_revisit_radius_m",
+                       &PrivilegedInterventionConfig::loop_revisit_radius_m)
+        .def_readwrite("loop_history_size",
+                       &PrivilegedInterventionConfig::loop_history_size)
+        .def_readwrite("loop_min_revisits",
+                       &PrivilegedInterventionConfig::loop_min_revisits)
+        .def_readwrite("loop_min_speed_mps",
+                       &PrivilegedInterventionConfig::loop_min_speed_mps);
+
+    py::class_<PrivilegedInterventionOracle>(m, "PrivilegedInterventionOracle")
+        .def(py::init<const PrivilegedInterventionConfig&>())
+        .def("evaluate",
+             [](PrivilegedInterventionOracle& self,
+                const PrivilegedOracle& oracle,
+                const VehicleState& state,
+                const Eigen::Vector3d& direct_guide_world,
+                const Eigen::Vector3d& goal_world) {
+                 py::gil_scoped_release release;
+                 return self.evaluate(oracle, state, direct_guide_world,
+                                      goal_world);
+             })
+        .def("reset", &PrivilegedInterventionOracle::reset);
+
+    // ── Local path search result (exposed read-only) ─────────────────
+    py::enum_<LocalPathResult::Status>(m, "LocalPathStatus")
+        .value("FULL_GOAL_REACHED", LocalPathResult::Status::FULL_GOAL_REACHED)
+        .value("PARTIAL_TERMINAL_REACHED",
+               LocalPathResult::Status::PARTIAL_TERMINAL_REACHED)
+        .value("NO_PATH", LocalPathResult::Status::NO_PATH)
+        .export_values();
+
+    py::class_<LocalPathResult>(m, "LocalPathResult")
+        .def(py::init<>())
+        .def_readwrite("status", &LocalPathResult::status)
+        .def_readwrite("full_goal_reached", &LocalPathResult::full_goal_reached)
+        .def_readwrite("found_partial", &LocalPathResult::found_partial)
+        .def_readwrite("terminal", &LocalPathResult::terminal)
+        .def_readwrite("path", &LocalPathResult::path)
+        .def_readwrite("path_cost", &LocalPathResult::path_cost)
+        .def_readwrite("minimum_clearance", &LocalPathResult::minimum_clearance)
+        .def_readwrite("failure_reason", &LocalPathResult::failure_reason)
+        .def_readwrite("expanded_nodes", &LocalPathResult::expanded_nodes)
+        .def_readwrite("compute_ms", &LocalPathResult::compute_ms);
 
     // ── ObservedMap ─────────────────────────────────────────────────
     py::class_<ObservedMapConfig>(m, "ObservedMapConfig")
@@ -423,7 +521,20 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def("known_count", &ObservedMap::knownCount)
         .def("occupied_count", &ObservedMap::occupiedCount)
         .def("free_count", &ObservedMap::freeCount)
-        .def("unknown_count", &ObservedMap::unknownCount);
+        .def("unknown_count", &ObservedMap::unknownCount)
+        .def("swept_brake_risk",
+             [](const ObservedMap& self, const VehicleState& state,
+                double reaction_delay_s, double deceleration_mps2,
+                double body_radius_m, double safety_margin_m,
+                double sample_spacing_m) {
+                 py::gil_scoped_release release;
+                 return self.sweptBrakeRisk(
+                     state, reaction_delay_s, deceleration_mps2,
+                     body_radius_m, safety_margin_m, sample_spacing_m);
+             },
+             py::arg("state"), py::arg("reaction_delay_s"),
+             py::arg("deceleration_mps2"), py::arg("body_radius_m"),
+             py::arg("safety_margin_m"), py::arg("sample_spacing_m"));
 
     // ── ESDFGrid (debug) ────────────────────────────────────────────
     py::class_<ESDFGrid>(m, "ESDFGrid")
@@ -489,7 +600,15 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("goal_frontier_cone_deg",
                        &MacroCandidateConfig::goal_frontier_cone_deg)
         .def_readwrite("corridor_check_spacing_m",
-                       &MacroCandidateConfig::corridor_check_spacing_m);
+                       &MacroCandidateConfig::corridor_check_spacing_m)
+        .def_readwrite("search_clearance_m",
+                       &MacroCandidateConfig::search_clearance_m)
+        .def_readwrite("search_max_time_ms",
+                       &MacroCandidateConfig::search_max_time_ms)
+        .def_readwrite("search_region_margin_m",
+                       &MacroCandidateConfig::search_region_margin_m)
+        .def_readwrite("side_bias_gain",
+                       &MacroCandidateConfig::side_bias_gain);
 
     m.def("analyze_goal_blocker", &analyzeGoalBlocker,
           py::arg("map"), py::arg("state"), py::arg("goal_world"),
@@ -503,7 +622,9 @@ PYBIND11_MODULE(_il_local_planner, m) {
                 const VehicleState& state, const Eigen::Vector3d& goal_world,
                 const GoalBlocker& blocker,
                 const py::object& prev_candidate_world) {
-                 py::gil_scoped_release release;
+                 // Convert the optional previous candidate to plain C++
+                 // data BEFORE releasing the GIL (section X): touching
+                 // py::object while the GIL is released is a data race.
                  Eigen::Vector3d* prev_ptr = nullptr;
                  Eigen::Vector3d prev_val;
                  if (!prev_candidate_world.is_none()) {
@@ -511,6 +632,7 @@ PYBIND11_MODULE(_il_local_planner, m) {
                          prev_candidate_world.cast<Eigen::Vector3d>();
                      prev_ptr = &prev_val;
                  }
+                 py::gil_scoped_release release;
                  return self.generateCandidates(map, state, goal_world,
                                                 blocker, prev_ptr);
              },
@@ -702,6 +824,8 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &TrajectoryOptimizationConfig::lookahead_distance)
         .def_readwrite("terminal_speed_ratio",
                        &TrajectoryOptimizationConfig::terminal_speed_ratio)
+        .def_readwrite("goal_stop_tolerance_m",
+                       &TrajectoryOptimizationConfig::goal_stop_tolerance_m)
         .def_readwrite("warm_start_max_age_s",
                        &TrajectoryOptimizationConfig::warm_start_max_age_s)
         .def_readwrite("warm_start_max_terminal_deviation_m",
@@ -735,5 +859,22 @@ PYBIND11_MODULE(_il_local_planner, m) {
              "Plan a 30 Hz local trajectory. Releases the GIL.")
         .def("validate_trajectory", &LocalPlanner::validateTrajectory,
              py::arg("trajectory"))
+        .def("validate_trajectory_suffix",
+             [](const LocalPlanner& self,
+                const std::vector<TrajectoryPoint>& trajectory,
+                double plan_start_time, double current_time,
+                double controller_preview_time, const VehicleState& state,
+                double min_clearance, double max_position_error,
+                double max_velocity_error) {
+                 py::gil_scoped_release release;
+                 return self.validateTrajectorySuffix(
+                     trajectory, plan_start_time, current_time,
+                     controller_preview_time, state, min_clearance,
+                     max_position_error, max_velocity_error);
+             },
+             py::arg("trajectory"), py::arg("plan_start_time"),
+             py::arg("current_time"), py::arg("controller_preview_time"),
+             py::arg("state"), py::arg("min_clearance"),
+             py::arg("max_position_error"), py::arg("max_velocity_error"))
         .def("current_plan_id", &LocalPlanner::currentPlanId);
 }

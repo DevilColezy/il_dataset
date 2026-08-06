@@ -95,6 +95,7 @@ set(LOCAL_PLANNER_SOURCES
   src/local_planner/local_recoverability.cpp
   src/local_planner/macro_candidate_search.cpp
   src/local_planner/privileged_oracle.cpp
+  src/local_planner/privileged_intervention_oracle.cpp
   src/local_planner/spline_planner.cpp
   src/local_planner/yaw_planner.cpp
 )

@@ -3,6 +3,7 @@
 #include <Eigen/Core>
 #include <vector>
 
+#include "il_dataset/local_planner/local_path_search.hpp"
 #include "il_dataset/local_planner/types.hpp"
 
 namespace il_dataset {
@@ -33,6 +34,12 @@ struct MacroCandidateConfig {
     double goal_frontier_cone_deg = 70.0;
     /// Straight-line corridor check spacing.
     double corridor_check_spacing_m = 0.10;
+    // Observed-map path-search parameters used for REAL reachability of
+    // SIDE candidates (section XII).
+    double search_clearance_m = 0.25;
+    double search_max_time_ms = 20.0;
+    double search_region_margin_m = 2.0;
+    double side_bias_gain = 2.0;
 };
 
 /// Shared blocker analysis used by both the recoverability query and the
@@ -63,6 +70,9 @@ public:
         const Eigen::Vector3d* prev_candidate_world) const;
 
 private:
+    /// Observed-side scoring.  SIDE candidates get a REAL LocalPathSearch
+    /// reachability result; the other candidate types use the cheaper
+    /// straight-line corridor check.
     void scoreObserved(MacroCandidate* candidate,
                        const ObservedMap& map,
                        const VehicleState& state,

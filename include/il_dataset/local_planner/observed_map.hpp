@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "il_dataset/local_planner/types.hpp"
+
 namespace il_dataset {
 
 /// Occupancy grid values (must match the Python/C++ convention).
@@ -114,6 +116,18 @@ public:
 
     /// True when the drone position is within the grid bounds.
     bool inBounds(double x, double y, double z) const;
+
+    /// Swept-volume braking-risk check (section XVIII).  Predicts the
+    /// braking trajectory (reaction delay at constant velocity, then
+    /// deceleration to a stop) and samples it continuously.  Unknown space
+    /// counts as unsafe.  `body_radius_m` + `safety_margin_m` define the
+    /// swept clearance requirement.
+    BrakeRiskResult sweptBrakeRisk(const VehicleState& state,
+                                   double reaction_delay_s,
+                                   double deceleration_mps2,
+                                   double body_radius_m,
+                                   double safety_margin_m,
+                                   double sample_spacing_m) const;
 
 private:
     std::int64_t indexOf(int ix, int iy, int iz) const;

@@ -4,6 +4,8 @@
 #include <cmath>
 #include <limits>
 
+#include "il_dataset/local_planner/types.hpp"
+
 namespace il_dataset {
 
 namespace {
@@ -164,6 +166,81 @@ bool ObservedMap::inBounds(double x, double y, double z) const {
     const Eigen::Vector3d g = worldToGrid(Eigen::Vector3d(x, y, z));
     return g.x() >= 0.0 && g.x() < gx_ && g.y() >= 0.0 && g.y() < gy_ &&
            g.z() >= 0.0 && g.z() < gz_;
+}
+
+BrakeRiskResult ObservedMap::sweptBrakeRisk(
+    const VehicleState& state,
+    double reaction_delay_s,
+    double deceleration_mps2,
+    double body_radius_m,
+    double safety_margin_m,
+    double sample_spacing_m) const {
+    BrakeRiskResult result;
+    if (!esdf_built_ || !state.position.allFinite() ||
+        !state.velocity.allFinite()) {
+        result.risk = true;
+        result.min_clearance = 0.0;
+        return result;
+    }
+    const double required_clearance = body_radius_m + safety_margin_m;
+    const double speed = state.velocity.norm();
+    Eigen::Vector3d vel_dir(Eigen::Vector3d::Zero());
+    if (speed > kEpsilon) vel_dir = state.velocity / speed;
+
+    // Reaction phase: constant velocity.
+    const double reaction_distance = speed * std::max(0.0, reaction_delay_s);
+    // Braking phase: uniform deceleration from `speed` to rest.
+    const double braking_distance =
+        deceleration_mps2 > kEpsilon
+            ? speed * speed / (2.0 * deceleration_mps2)
+            : 0.0;
+    result.braking_distance = reaction_distance + braking_distance;
+    const double total_distance = result.braking_distance;
+
+    const int reaction_samples = std::max(
+        1, static_cast<int>(std::ceil(
+               reaction_distance / std::max(0.02, sample_spacing_m))));
+    const int brake_samples = std::max(
+        1, static_cast<int>(std::ceil(
+               braking_distance / std::max(0.02, sample_spacing_m))));
+
+    double min_clearance = std::numeric_limits<double>::infinity();
+    double first_risk_time = -1.0;
+
+    auto probe = [&](const Eigen::Vector3d& point, double t) {
+        const bool known =
+            isKnown(point.x(), point.y(), point.z());
+        const double clearance = esdfValue(point.x(), point.y(), point.z());
+        if (std::isfinite(clearance)) {
+            min_clearance = std::min(min_clearance, clearance);
+        }
+        if (!known || !std::isfinite(clearance) ||
+            clearance < required_clearance) {
+            if (first_risk_time < 0.0) first_risk_time = t;
+            result.risk = true;
+        }
+    };
+
+    // Reaction phase (constant velocity), times [0, reaction_delay_s].
+    for (int i = 0; i <= reaction_samples; ++i) {
+        const double s = reaction_distance * i / reaction_samples;
+        const double t = reaction_delay_s * i / reaction_samples;
+        probe(state.position + vel_dir * s, t);
+    }
+    // Braking phase (deceleration), times [reaction_delay_s, t_stop].
+    const double brake_duration =
+        deceleration_mps2 > kEpsilon ? speed / deceleration_mps2 : 0.0;
+    for (int i = 1; i <= brake_samples; ++i) {
+        const double s = reaction_distance +
+                         braking_distance * i / brake_samples;
+        const double f = static_cast<double>(i) / brake_samples;
+        const double t = reaction_delay_s + brake_duration * f;
+        probe(state.position + vel_dir * s, t);
+    }
+
+    result.min_clearance =
+        std::isfinite(min_clearance) ? min_clearance : 0.0;
+    return result;
 }
 
 Eigen::Vector3d ObservedMap::worldToGrid(const Eigen::Vector3d& world) const {

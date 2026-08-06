@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <queue>
 
@@ -25,18 +26,39 @@ struct OpenEntry {
     }
 };
 
+/// Continuous known-free segment check (all samples must be known AND
+/// clearance above `clearance`).
+bool segmentClear(const ObservedMap& map,
+                  const Eigen::Vector3d& from,
+                  const Eigen::Vector3d& to,
+                  double clearance,
+                  double spacing) {
+    const double distance = (to - from).norm();
+    const int samples = std::max(
+        1, static_cast<int>(std::ceil(distance / std::max(0.02, spacing))));
+    for (int i = 0; i <= samples; ++i) {
+        const double alpha = static_cast<double>(i) / samples;
+        const Eigen::Vector3d point = (1.0 - alpha) * from + alpha * to;
+        if (!map.isKnownFree(point.x(), point.y(), point.z(), clearance)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
-LocalSearchResult LocalPathSearch::search(const ObservedMap& map,
-                                          const VehicleState& state,
-                                          const Eigen::Vector3d& goal_world,
-                                          const LocalSearchConfig& config) const {
+LocalPathResult LocalPathSearch::search(const ObservedMap& map,
+                                        const VehicleState& state,
+                                        const Eigen::Vector3d& goal_world,
+                                        const LocalSearchConfig& config) const {
     using Clock = std::chrono::steady_clock;
     const auto start_time = Clock::now();
-    const auto deadline = start_time + std::chrono::duration_cast<Clock::duration>(
-                                           std::chrono::duration<double, std::milli>(
-                                               std::max(1.0, config.max_time_ms)));
-    LocalSearchResult result;
+    const auto deadline =
+        start_time + std::chrono::duration_cast<Clock::duration>(
+                         std::chrono::duration<double, std::milli>(
+                             std::max(1.0, config.max_time_ms)));
+    LocalPathResult result;
 
     if (!map.esdfBuilt() || !state.position.allFinite() ||
         !goal_world.allFinite()) {
@@ -85,12 +107,25 @@ LocalSearchResult LocalPathSearch::search(const ObservedMap& map,
                                                              std::floor(start_g.x()))));
     const int start_iy = std::max(min_iy, std::min(max_iy, static_cast<int>(
                                                              std::floor(start_g.y()))));
+    const int start_index = encode(start_ix - min_ix, start_iy - min_iy);
+
+    // ── Goal validity (section V) ────────────────────────────────────
+    // FULL success is only possible when the ORIGINAL goal is in-bounds,
+    // known and has enough clearance.
+    const bool goal_in_bounds =
+        goal_world.x() >= map.origin().x() && goal_world.y() >= map.origin().y() &&
+        goal_world.x() <= map.origin().x() + (map.gx() - 1.0) * res &&
+        goal_world.y() <= map.origin().y() + (map.gy() - 1.0) * res;
+    const bool goal_valid =
+        goal_in_bounds &&
+        map.isKnownFree(goal_world.x(), goal_world.y(), goal_world.z(),
+                        config.search_clearance_m);
     const int goal_ix = std::max(min_ix, std::min(max_ix, static_cast<int>(
                                                              std::floor(goal_g.x()))));
     const int goal_iy = std::max(min_iy, std::min(max_iy, static_cast<int>(
                                                              std::floor(goal_g.y()))));
-    const int start_index = encode(start_ix - min_ix, start_iy - min_iy);
     const int goal_index = encode(goal_ix - min_ix, goal_iy - min_iy);
+    const Eigen::Vector3d goal_cell_center = worldPoint(goal_ix, goal_iy);
 
     // The continuous start must be in known (observed) space.  It does not
     // need the full search clearance — the drone is already physically
@@ -139,7 +174,8 @@ LocalSearchResult LocalPathSearch::search(const ObservedMap& map,
         if (closed[ci] != 0) continue;
         closed[ci] = 1;
         ++expansions;
-        if (current.index == goal_index) {
+        // Only a VALID goal counts as full arrival.
+        if (goal_valid && current.index == goal_index) {
             goal_reached = true;
             break;
         }
@@ -163,8 +199,7 @@ LocalSearchResult LocalPathSearch::search(const ObservedMap& map,
             const size_t ni = static_cast<size_t>(next_index);
             if (closed[ni] != 0) continue;
             const Eigen::Vector3d next_world = worldPoint(nxi, nyi);
-            const double step =
-                (next_world - current_world).norm();
+            const double step = (next_world - current_world).norm();
             if (config.forbid_unknown &&
                 !map.isKnownFree(next_world.x(), next_world.y(),
                                  next_world.z(), config.search_clearance_m)) {
@@ -196,7 +231,6 @@ LocalSearchResult LocalPathSearch::search(const ObservedMap& map,
         }
     }
 
-    // Reconstruct the path.
     auto reconstruct = [&](int terminal_index) {
         std::vector<Eigen::Vector3d> reverse_path;
         for (int index = terminal_index; index >= 0;
@@ -213,22 +247,36 @@ LocalSearchResult LocalPathSearch::search(const ObservedMap& map,
     double min_clearance = inf;
     if (goal_reached) {
         std::vector<Eigen::Vector3d> path = reconstruct(goal_index);
-        if (path.empty() || (path.back() - worldPoint(goal_ix, goal_iy)).norm() >
-                                res * 2.0) {
+        if (path.empty() ||
+            (path.back() - goal_cell_center).norm() > res * 2.0) {
             result.failure_reason = "path_reconstruction_failed";
             return result;
         }
         path.front() = state.position;
-        path.back() = goal_world;
-        result.success = true;
-        result.found_any = true;
+        // Verify the continuous segment from the goal cell centre to the
+        // exact goal.  Only then is the terminal the exact goal.
+        path.back() = goal_cell_center;
+        if (segmentClear(map, goal_cell_center, goal_world,
+                         config.search_clearance_m,
+                         0.5 * config.search_clearance_m)) {
+            path.back() = goal_world;
+            result.status = LocalPathResult::Status::FULL_GOAL_REACHED;
+            result.terminal = goal_world;
+        } else {
+            result.status = LocalPathResult::Status::PARTIAL_TERMINAL_REACHED;
+            result.terminal = goal_cell_center;
+            result.failure_reason = "goal_cell_to_exact_goal_not_clear";
+        }
+        result.full_goal_reached =
+            result.status == LocalPathResult::Status::FULL_GOAL_REACHED;
+        result.found_partial = true;
         result.path = std::move(path);
-        result.terminal = goal_world;
     } else if (best_index != start_index) {
         std::vector<Eigen::Vector3d> path = reconstruct(best_index);
         if (!path.empty()) {
             path.front() = state.position;
-            result.found_any = true;
+            result.status = LocalPathResult::Status::PARTIAL_TERMINAL_REACHED;
+            result.found_partial = true;
             result.path = std::move(path);
             result.terminal = result.path.back();
             result.failure_reason = "partial_path_only";
@@ -245,13 +293,12 @@ LocalSearchResult LocalPathSearch::search(const ObservedMap& map,
         const double c = map.esdfValue(point.x(), point.y(), point.z());
         if (std::isfinite(c)) min_clearance = std::min(min_clearance, c);
     }
-    result.min_clearance =
+    result.minimum_clearance =
         std::isfinite(min_clearance) ? min_clearance : 0.0;
-    double length = 0.0;
+    result.path_cost = 0.0;
     for (size_t i = 1; i < result.path.size(); ++i) {
-        length += (result.path[i] - result.path[i - 1]).norm();
+        result.path_cost += (result.path[i] - result.path[i - 1]).norm();
     }
-    result.path_length = length;
     result.expanded_nodes = expansions;
     result.compute_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - start_time)

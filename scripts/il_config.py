@@ -14,7 +14,6 @@ Every parameter read here is consumed by the runtime code.
 
 from __future__ import print_function, division
 
-import math
 import os
 
 import yaml
@@ -31,7 +30,7 @@ REQUIRED_MODULES = [
     "task_oracle", "observed_map", "macro_expert", "macro_candidates",
     "local_recoverability", "local_path_search", "trajectory_optimization",
     "yaw_planning", "trajectory_controller", "execution_safety",
-    "dataset_logging", "sync", "commit",
+    "dataset_logging", "sync", "commit", "privileged_intervention",
 ]
 
 
@@ -185,6 +184,8 @@ def _validate_config(cfg):
         errors.append("target_clearance must be >= min_clearance")
     if to.get("optimizer", "auto") not in ("auto", "nlopt", "native"):
         errors.append("trajectory_optimization.optimizer must be auto|nlopt|native")
+    _positive(to.get("goal_stop_tolerance_m", 0.4),
+              "trajectory_optimization.goal_stop_tolerance_m", errors)
 
     # yaw planning
     _positive(yp.get("max_yaw_rate", 2.0), "yaw_planning.max_yaw_rate", errors)
@@ -203,16 +204,61 @@ def _validate_config(cfg):
               "trajectory_controller.max_acceleration_mps2", errors)
     _positive(tc.get("max_yaw_rate_rps", 2.0),
               "trajectory_controller.max_yaw_rate_rps", errors)
-    _positive(tc.get("command_change_rate_limit_mps2", 25.0),
-              "trajectory_controller.command_change_rate_limit_mps2", errors)
+    _positive(tc.get("max_yaw_accel_rps2", 8.0),
+              "trajectory_controller.max_yaw_accel_rps2", errors)
     _positive(tc.get("emergency_brake_distance_m", 0.8),
               "trajectory_controller.emergency_brake_distance_m", errors)
+    if tc.get("command_change_rate_limit_mps2") is not None:
+        errors.append(
+            "global.trajectory_controller.command_change_rate_limit_mps2 is "
+            "removed; use max_jerk_mps3 + max_acceleration_mps2 instead")
+    _positive(tc.get("max_jerk_mps3", 25.0),
+              "trajectory_controller.max_jerk_mps3", errors)
+
+    # execution safety
+    es = g.get("execution_safety", {})
+    _positive(es.get("max_plan_age_s", 0.5),
+              "execution_safety.max_plan_age_s", errors)
+    _positive(es.get("min_remaining_trajectory_s", 0.25),
+              "execution_safety.min_remaining_trajectory_s", errors)
+    _positive(es.get("max_position_error_m", 0.6),
+              "execution_safety.max_position_error_m", errors)
+    _positive(es.get("max_velocity_error_mps", 1.0),
+              "execution_safety.max_velocity_error_mps", errors)
+    _positive(es.get("emergency_deceleration_mps2", 3.0),
+              "execution_safety.emergency_deceleration_mps2", errors)
+    _positive(es.get("brake_reaction_delay_s", 0.10),
+              "execution_safety.brake_reaction_delay_s", errors)
+    _positive(es.get("max_brake_hold_seconds", 1.0),
+              "execution_safety.max_brake_hold_seconds", errors)
+    _positive(es.get("max_emergency_stop_seconds", 2.0),
+              "execution_safety.max_emergency_stop_seconds", errors)
 
     # dataset logging
-    _positive(ds.get("schema_version", 18),
+    _positive(ds.get("schema_version", 19),
               "dataset_logging.schema_version", errors)
-    if ds.get("schema_version", 18) != 18:
-        errors.append("dataset_logging.schema_version must be 18")
+    if ds.get("schema_version", 19) != 19:
+        errors.append("dataset_logging.schema_version must be 19")
+    _positive(ds.get("perception_range_m", 5.0),
+              "dataset_logging.perception_range_m", errors)
+    _positive(ds.get("flush_interval_rows", 64),
+              "dataset_logging.flush_interval_rows", errors)
+    _bounded(ds.get("depth_png_compress_level", 4),
+             "dataset_logging.depth_png_compress_level", 0, 9, errors)
+
+    # privileged intervention
+    pi = g.get("privileged_intervention", {})
+    _positive(pi.get("lateral_offset_m", 1.5),
+              "privileged_intervention.lateral_offset_m", errors)
+    _positive(pi.get("min_global_clearance_m", 0.20),
+              "privileged_intervention.min_global_clearance_m", errors)
+    if pi.get("max_direct_detour_ratio", 1.6) < 1.0:
+        errors.append(
+            "privileged_intervention.max_direct_detour_ratio must be >= 1.0")
+    _positive(pi.get("cost_margin_m", 2.0),
+              "privileged_intervention.cost_margin_m", errors)
+    _positive(pi.get("loop_min_revisits", 2),
+              "privileged_intervention.loop_min_revisits", errors)
 
     # task oracle
     to_ = g.get("task_oracle", {})
@@ -342,6 +388,28 @@ def build_macro_candidate_config(g, module):
     cfg.frontier_standoff_m = float(mc.get("frontier_standoff_m", 0.45))
     cfg.goal_frontier_cone_deg = float(mc.get("goal_frontier_cone_deg", 70.0))
     cfg.corridor_check_spacing_m = float(mc.get("corridor_check_spacing_m", 0.10))
+    # Observed-map path-search parameters for REAL SIDE-candidate
+    # reachability (section XII).  Taken from local_path_search.
+    lps = g.get("local_path_search", {})
+    cfg.search_clearance_m = float(lps.get("search_clearance_m", 0.25))
+    cfg.search_max_time_ms = float(lps.get("max_time_ms", 20.0))
+    cfg.search_region_margin_m = float(lps.get("region_margin_m", 2.0))
+    cfg.side_bias_gain = float(lps.get("side_bias_gain", 2.0))
+    return cfg
+
+
+def build_intervention_config(g, module):
+    pi = g.get("privileged_intervention", {})
+    cfg = module.PrivilegedInterventionConfig()
+    cfg.lateral_offset_m = float(pi.get("lateral_offset_m", 1.5))
+    cfg.min_global_clearance_m = float(pi.get("min_global_clearance_m", 0.20))
+    cfg.max_direct_detour_ratio = float(pi.get("max_direct_detour_ratio", 1.6))
+    cfg.cost_margin_m = float(pi.get("cost_margin_m", 2.0))
+    cfg.lookahead_sampling_m = float(pi.get("lookahead_sampling_m", 4.0))
+    cfg.loop_revisit_radius_m = float(pi.get("loop_revisit_radius_m", 0.8))
+    cfg.loop_history_size = int(pi.get("loop_history_size", 40))
+    cfg.loop_min_revisits = int(pi.get("loop_min_revisits", 2))
+    cfg.loop_min_speed_mps = float(pi.get("loop_min_speed_mps", 0.3))
     return cfg
 
 
@@ -392,6 +460,7 @@ def build_planner_config(g, module):
     cfg.max_jerk = float(to.get("max_jerk", 50.0))
     cfg.lookahead_distance = float(to.get("lookahead_distance", 4.0))
     cfg.terminal_speed_ratio = float(to.get("terminal_speed_ratio", 0.85))
+    cfg.goal_stop_tolerance_m = float(to.get("goal_stop_tolerance_m", 0.4))
     cfg.warm_start_max_age_s = float(to.get("warm_start_max_age_s", 0.25))
     cfg.warm_start_max_terminal_deviation_m = float(
         to.get("warm_start_max_terminal_deviation_m", 1.5))

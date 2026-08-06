@@ -113,8 +113,14 @@ struct MacroCandidate {
     Side side = Side::NONE;
     Eigen::Vector3d position_world{Eigen::Vector3d::Zero()};
     Eigen::Vector3d position_flu{Eigen::Vector3d::Zero()};
+    /// True only when a real observed-map path search reached the candidate
+    /// point (full goal reached).
     bool known_reachable = false;
+    bool full_goal_reached = false;
+    bool found_partial = false;
+    /// Observed-map A* path cost (length) from the current state.
     double observed_path_cost = 0.0;
+    double observed_path_length = 0.0;
     double minimum_clearance = 0.0;
     double goal_progress = 0.0;
     bool left_edge_visible = false;
@@ -179,10 +185,9 @@ struct LocalPlanRequest {
     Eigen::Vector3d macro_guide_world{Eigen::Vector3d::Zero()};
     bool has_macro_yaw = false;
     double macro_yaw_world = 0.0;
-    /// The final task goal (used for stop-at-goal and terminal selection
-    /// only). Never used to synthesize hidden waypoints.
+    /// The final task goal (used to decide stop-at-goal and terminal
+    /// selection only). Never used to synthesize hidden waypoints.
     Eigen::Vector3d goal_world{Eigen::Vector3d::Zero()};
-    bool stop_at_goal = false;
     /// Warm-start remainder of the previous executed trajectory.
     std::vector<TrajectoryPoint> previous_trajectory;
     double previous_trajectory_age_s = 0.0;
@@ -228,6 +233,49 @@ struct ValidationResult {
     Eigen::Vector3d worst_position{Eigen::Vector3d::Zero()};
     double worst_time = 0.0;
     double worst_clearance = 0.0;
+};
+
+/// Result of the swept-volume braking-risk check (section XVIII).
+struct BrakeRiskResult {
+    /// True when a collision risk exists along the predicted braking path.
+    bool risk = false;
+    double min_clearance = 0.0;
+    /// Time (s) of the first risk along the braking trajectory, or -1.
+    double first_risk_time = -1.0;
+    /// Predicted braking distance (m).
+    double braking_distance = 0.0;
+};
+
+/// Reason code of the privileged intervention evaluation (section III).
+/// Enumerated — never free-form strings.
+enum class InterventionReason : int {
+    DIRECT_GLOBALLY_VALID = 0,
+    DIRECT_LONG_WALL_BLOCKED = 1,
+    DIRECT_WRONG_HOMOTOPY = 2,
+    DIRECT_GLOBAL_DISCONNECTED = 3,
+    DIRECT_EXCESSIVE_DETOUR = 4,
+    DIRECT_LOOP_RISK = 5,
+    LEFT_ONLY_FEASIBLE = 6,
+    RIGHT_ONLY_FEASIBLE = 7,
+    BOTH_SIDES_FEASIBLE = 8,
+    NO_GLOBAL_ROUTE = 9,
+};
+
+/// Result of the privileged macro-intervention evaluation (section III).
+struct PrivilegedInterventionResult {
+    /// Direct intent can still efficiently connect to the goal.
+    bool direct_viable = true;
+    /// The macro layer should intervene (provide strategic guidance).
+    bool intervention_required = false;
+    bool left_globally_feasible = false;
+    bool right_globally_feasible = false;
+    double direct_cost_to_go = 0.0;
+    double left_cost_to_go = 0.0;
+    double right_cost_to_go = 0.0;
+    double direct_detour_ratio = 0.0;
+    double direct_min_clearance = 0.0;
+    double decision_margin = 0.0;
+    InterventionReason reason = InterventionReason::DIRECT_GLOBALLY_VALID;
 };
 
 }  // namespace il_dataset

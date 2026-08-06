@@ -1,5 +1,5 @@
 # ============================================================================
-#  Imitation Learning Dataset Collection — Two-Level Navigation Expert (schema v18)
+#  Imitation Learning Dataset Collection — Two-Level Navigation Expert (schema v19)
 # ============================================================================
 #
 #  Architecture:
@@ -11,6 +11,7 @@
 #    local_path_search  observed-map A* (C++, 30 Hz)
 #    trajectory_optimization  B-spline trajectory optimization (C++, 30 Hz)
 #    yaw_planning       FOV-constrained yaw trajectory (C++)
+#    privileged_intervention  low-frequency global viability evaluator (C++)
 #    trajectory_controller  30 Hz command extraction + limits
 #    execution_safety   fresh/cached/rotate/brake/emergency selection
 #    dataset_logging    recorded fields and files
@@ -193,6 +194,21 @@ global:
     region_margin_m:     2.0
     forbid_unknown:     true
 
+  # ── Privileged macro-intervention evaluation (section III) ─────────
+  # Decides, at low frequency, whether the direct goal intent remains
+  # globally viable.  It never emits hidden waypoints or a hidden side
+  # answer; it only gates intervention and ranks observable sides.
+  privileged_intervention:
+    lateral_offset_m:          1.5
+    min_global_clearance_m:    0.20
+    max_direct_detour_ratio:   1.6
+    cost_margin_m:             2.0
+    lookahead_sampling_m:      4.0
+    loop_revisit_radius_m:     0.8
+    loop_history_size:        40
+    loop_min_revisits:         2
+    loop_min_speed_mps:        0.3
+
   # ── B-spline trajectory optimization (section X.4) ─────────────────
   # The A* search and yaw parameters live in local_path_search and
   # yaw_planning respectively (single source per concern).
@@ -222,6 +238,7 @@ global:
     max_jerk:                50.0
     lookahead_distance:       4.0
     terminal_speed_ratio:     0.85
+    goal_stop_tolerance_m:    0.4
     warm_start_max_age_s:     0.25
     warm_start_max_terminal_deviation_m: 1.5
 
@@ -241,7 +258,7 @@ global:
     yaw_gain:                   2.0
     max_velocity_mps:           2.5
     max_acceleration_mps2:      3.5
-    command_change_rate_limit_mps2: 25.0
+    max_jerk_mps3:             25.0
     max_yaw_rate_rps:           2.0
     max_yaw_accel_rps2:         8.0
     emergency_brake_distance_m: 0.8
@@ -254,14 +271,19 @@ global:
     max_position_error_m:    0.50
     max_velocity_error_mps:  1.00
     emergency_deceleration_mps2: 5.0
-    consecutive_failure_limit: 3
+    brake_reaction_delay_s:  0.10
+    max_brake_hold_seconds:  1.0
+    max_emergency_stop_seconds: 2.0
 
   # ── Dataset logging (section XIV) ──────────────────────────────────
   dataset_logging:
-    schema_version: 18
+    schema_version: 19
     depth_in_memory: true
     write_local_plan_points: true
     collect_privileged_diagnostics: true
+    perception_range_m: 5.0
+    flush_interval_rows: 64
+    depth_png_compress_level: 4
 
   # ── Sync & commit thresholds ───────────────────────────────────────
   sync:

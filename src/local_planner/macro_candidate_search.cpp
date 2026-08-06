@@ -5,6 +5,7 @@
 #include <limits>
 #include <queue>
 
+#include "il_dataset/local_planner/local_path_search.hpp"
 #include "il_dataset/local_planner/observed_map.hpp"
 
 namespace il_dataset {
@@ -37,6 +38,19 @@ bool corridorIsKnownFree(const ObservedMap& map,
         }
     }
     return true;
+}
+
+/// Build the search config for a candidate's reachability query.
+LocalSearchConfig makeSearchConfig(const MacroCandidateConfig& config,
+                                   Side committed_side) {
+    LocalSearchConfig search_config;
+    search_config.search_clearance_m = config.search_clearance_m;
+    search_config.max_time_ms = config.search_max_time_ms;
+    search_config.region_margin_m = config.search_region_margin_m;
+    search_config.side_bias_gain = config.side_bias_gain;
+    search_config.committed_side = committed_side;
+    search_config.forbid_unknown = true;
+    return search_config;
 }
 
 Eigen::Vector3d worldToFlu(const Eigen::Vector3d& world_delta, double yaw) {
@@ -248,27 +262,53 @@ void MacroCandidateSearch::scoreObserved(MacroCandidate* candidate,
     const double dist = delta.norm();
     candidate->position_flu = worldToFlu(delta, state.yaw);
     candidate->observed_path_cost = dist;
-    candidate->known_reachable =
-        corridorIsKnownFree(map, state.position, candidate->position_world,
-                            config_.min_candidate_clearance_m,
-                            config_.corridor_check_spacing_m,
-                            config_.min_candidate_clearance_m);
-    // Minimum clearance along the candidate corridor.
-    double min_clearance = std::numeric_limits<double>::infinity();
-    if (dist > kEpsilon) {
-        const Eigen::Vector3d dir = delta / dist;
-        const int n = std::max(
-            1, static_cast<int>(std::ceil(
-                   dist / std::max(0.02, config_.corridor_check_spacing_m))));
-        for (int i = 0; i <= n; ++i) {
-            const Eigen::Vector3d point =
-                state.position + dir * (dist * i / n);
-            const double c = map.esdfValue(point.x(), point.y(), point.z());
-            if (std::isfinite(c)) min_clearance = std::min(min_clearance, c);
+
+    // REAL observed-map path search for SIDE candidates (section XII):
+    // known_reachable means the search FULLY reached the candidate point.
+    // Other candidate types use the cheap straight-line corridor check.
+    if (candidate->type == CandidateType::SIDE) {
+        LocalPathSearch search;
+        const LocalSearchConfig search_config =
+            makeSearchConfig(config_, candidate->side);
+        const LocalPathResult path_result =
+            search.search(map, state, candidate->position_world,
+                          search_config);
+        candidate->full_goal_reached =
+            path_result.status == LocalPathResult::Status::FULL_GOAL_REACHED;
+        candidate->found_partial =
+            path_result.status != LocalPathResult::Status::NO_PATH;
+        candidate->known_reachable = candidate->full_goal_reached;
+        candidate->observed_path_cost = path_result.path_cost;
+        candidate->observed_path_length = path_result.path_cost;
+        candidate->minimum_clearance = path_result.minimum_clearance;
+        if (candidate->found_partial) {
+            candidate->position_world = path_result.terminal;
         }
+    } else {
+        candidate->known_reachable =
+            corridorIsKnownFree(map, state.position, candidate->position_world,
+                                config_.min_candidate_clearance_m,
+                                config_.corridor_check_spacing_m,
+                                config_.min_candidate_clearance_m);
+        candidate->full_goal_reached = candidate->known_reachable;
+        candidate->found_partial = candidate->known_reachable;
+        // Minimum clearance along the candidate corridor.
+        double min_clearance = std::numeric_limits<double>::infinity();
+        if (dist > kEpsilon) {
+            const Eigen::Vector3d dir = delta / dist;
+            const int n = std::max(
+                1, static_cast<int>(std::ceil(
+                       dist / std::max(0.02, config_.corridor_check_spacing_m))));
+            for (int i = 0; i <= n; ++i) {
+                const Eigen::Vector3d point =
+                    state.position + dir * (dist * i / n);
+                const double c = map.esdfValue(point.x(), point.y(), point.z());
+                if (std::isfinite(c)) min_clearance = std::min(min_clearance, c);
+            }
+        }
+        candidate->minimum_clearance =
+            std::isfinite(min_clearance) ? min_clearance : 0.0;
     }
-    candidate->minimum_clearance =
-        std::isfinite(min_clearance) ? min_clearance : 0.0;
     // Goal progress: projection of the candidate offset onto the goal ray.
     const Eigen::Vector2d travel = goal_world.head<2>() - state.position.head<2>();
     const double travel_len = travel.norm();

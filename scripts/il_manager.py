@@ -50,6 +50,7 @@ from il_config import (
     build_macro_candidate_config,
     build_recoverability_config,
     build_planner_config,
+    build_intervention_config,
 )
 from il_dynamics import create_dynamics_backend
 from il_macro_expert import MacroExpert
@@ -113,13 +114,18 @@ class ILManager(object):
         self._candidate_search = module.MacroCandidateSearch(self._candidate_config)
         self._oracle = module.PrivilegedOracle()
         self._oracle_config = build_oracle_config(self.g, module)
+        self._intervention_config = build_intervention_config(self.g, module)
+        self._intervention_oracle = module.PrivilegedInterventionOracle(
+            self._intervention_config)
 
         # Macro expert
         macro_cfg = dict(self.g.get("macro_expert", {}))
         macro_cfg.update(self.g.get("macro_candidates", {}))
+        macro_cfg.update(self.g.get("privileged_intervention", {}))
         self._macro_expert = MacroExpert(
             macro_cfg, module, self._recoverability,
-            self._candidate_search, self._oracle, self._candidate_config)
+            self._candidate_search, self._oracle,
+            self._intervention_oracle, self._candidate_config)
 
         # Dynamics
         self._dynamics = create_dynamics_backend(cfg)
@@ -270,14 +276,19 @@ class ILManager(object):
         pc_dir = os.path.join(self.output_root, "pointclouds")
         if not os.path.isdir(pc_dir):
             os.makedirs(pc_dir)
+        # Unity appends ".ply" itself, so strip any existing extension from
+        # the configured file name (section XI) to avoid a double extension.
+        export_file = pc_cfg.get("export_file", "obstacle_cloud.ply")
+        base = export_file[:-4] if export_file.lower().endswith(".ply") \
+            else export_file
         req = {
             "range": pc_cfg.get("range", [27.0, 44.0, 8.0]),
             "origin": pc_cfg.get("origin", [1.5, 16.0, 3.5]),
             "resolution": pc_cfg.get("resolution", 0.10),
             "path": pc_dir,
-            "file_name": pc_cfg.get("export_file", "obstacle_cloud"),
+            "file_name": base,
         }
-        self._pc_path = os.path.join(pc_dir, req["file_name"] + ".ply")
+        self._pc_path = os.path.join(pc_dir, base + ".ply")
         if os.path.exists(self._pc_path):
             os.remove(self._pc_path)
         self._bridge.send_pc_request(req)
@@ -337,9 +348,13 @@ class ILManager(object):
         self._observed_map.reset(start)
         self._observed_map.force_rebuild_esdf()
         self._macro_expert.reset()
+        self._intervention_oracle.reset()
         self._trajectory_reached_goal = False
         self._exit_reason = ""
         self._consecutive_plan_failures = 0
+        self._local_unrecoverable_pending = False
+        self._brake_hold_time = 0.0
+        self._emergency_stop_time = 0.0
         self._total_plans = 0
         self._successful_plans = 0
         self._frame_latencies = []
@@ -347,15 +362,18 @@ class ILManager(object):
         self._unmatched_frames = 0
         self._exact_matches = 0
         self._last_velocity_world = None
+        self._last_acceleration_world = None
         self._last_yaw_rate = 0.0
         self._enter_state(State.START_RECORDING)
 
     def _st_start_recording(self):
         self._episode_id = "%s_%s_ep%03d" % (
             self._current_task_id, "traj", self._episode_index)
+        # Pass ONLY the dataset_logging sub-config (section XXII); the
+        # writer expects that hierarchy, not the full global config.
         self._writer = DatasetWriter(
-            self.cfg, self._episode_id, self._inprogress_root,
-            self._scene_id, self._current_task_id,
+            self.g.get("dataset_logging", {}), self._episode_id,
+            self._inprogress_root, self._scene_id, self._current_task_id,
             self._current_task["start"], self._current_task["goal"],
             self._current_task["initial_yaw"], self._depth_cfg)
         self._recording_start_mono = time.monotonic()
@@ -399,7 +417,6 @@ class ILManager(object):
             yaw = float(np.arctan2(
                 2.0 * (quat[3] * quat[2] + quat[0] * quat[1]),
                 1.0 - 2.0 * (quat[1] * quat[1] + quat[2] * quat[2])))
-            vel_flu = ds.velocity_flu
             state = {
                 "position": pos,
                 "velocity": vel_world,
@@ -434,7 +451,8 @@ class ILManager(object):
             if is_macro_tick:
                 dt_macro = macro_interval * dt
                 held_action = self._macro_expert.update(
-                    goal, state, self._observed_map, dt_s=dt_macro)
+                    goal, state, self._observed_map, dt_s=dt_macro,
+                    local_unrecoverable=self._local_unrecoverable_pending)
                 if held_action.mode == module.MacroMode.GOAL_REACHED:
                     self._trajectory_reached_goal = True
                     self._exit_reason = "goal_reached"
@@ -450,7 +468,6 @@ class ILManager(object):
                 held_action = self._macro_expert.make_direct_action(goal, state)
 
             # ── 5. Local planning (30 Hz, observed map only) ────────
-            goal_dist = float(np.linalg.norm(goal - pos))
             req = module.LocalPlanRequest()
             req.state.position = pos
             req.state.velocity = vel_world
@@ -461,11 +478,8 @@ class ILManager(object):
             req.has_macro_yaw = held_action.has_desired_yaw
             req.macro_yaw_world = held_action.desired_yaw_world
             req.goal_world = goal
-            # When the macro guide is the final goal, the trajectory must
-            # brake to zero at the terminal.
-            req.stop_at_goal = goal_dist <= \
-                self.g.get("macro_expert", {}).get(
-                    "macro_lookahead_distance_m", 4.5)
+            # Stop-at-goal is decided INSIDE the planner (section XVII):
+            # full search arrival + goal_stop_tolerance + known goal.
             req.committed_side = held_action.committed_side
             req.previous_trajectory = last_trajectory
             if last_plan_time is not None:
@@ -474,25 +488,43 @@ class ILManager(object):
             self._total_plans += 1
 
             # ── 6. Execution selection (section XIII) ───────────────
-            execution_mode, trajectory, fresh_plan, cached_used = \
-                self._select_execution(
+            execution_mode, trajectory, fresh_plan, cached_used, \
+                sample_offset = self._select_execution(
                     result, last_trajectory, last_plan_time, elapsed,
-                    held_action, pos, vel_world)
+                    held_action, state)
             if result.success:
                 self._successful_plans += 1
                 self._consecutive_plan_failures = 0
+                self._local_unrecoverable_pending = False
                 last_trajectory = result.trajectory
                 last_plan_time = elapsed
-            elif execution_mode != module.ExecutionMode.TRACK_CACHED:
+            elif execution_mode == module.ExecutionMode.TRACK_CACHED:
+                # Cached execution: the planner failed but the previous
+                # trajectory suffix is still safe (no episode abort).
+                pass
+            else:
                 self._consecutive_plan_failures += 1
-                if self._consecutive_plan_failures >= \
-                        self._safety_cfg.get("consecutive_failure_limit", 3):
-                    self._exit_reason = "consecutive_planner_failures"
+                self._local_unrecoverable_pending = \
+                    self._consecutive_plan_failures >= 2
+
+            # Brake / emergency hold timeouts (section XIII).
+            if execution_mode == module.ExecutionMode.BRAKE_HOLD:
+                self._brake_hold_time += dt
+            else:
+                self._brake_hold_time = 0.0
+            if execution_mode == module.ExecutionMode.EMERGENCY_STOP:
+                self._emergency_stop_time += dt
+                if self._emergency_stop_time > \
+                        self._safety_cfg.get("max_emergency_stop_seconds", 2.0):
+                    self._exit_reason = "emergency_stop_timeout"
                     break
+            else:
+                self._emergency_stop_time = 0.0
 
             # ── 7. Trajectory controller ────────────────────────────
             cmd = self._compute_command(
-                trajectory, state, ds, execution_mode, held_action, elapsed)
+                trajectory, state, ds, execution_mode, held_action,
+                sample_offset)
             if cmd is None:
                 self._exit_reason = "controller_invalid"
                 break
@@ -579,68 +611,92 @@ class ILManager(object):
 
     # ── Execution selection (section XIII) ───────────────────────────
     def _select_execution(self, result, last_trajectory, last_plan_time,
-                          elapsed, held_action, pos, vel_world):
+                          elapsed, held_action, state):
         safety = self._safety_cfg
         if result.success:
             return (module.ExecutionMode.TRACK_FRESH, result.trajectory,
-                    True, False)
+                    True, False, 0.0)
 
-        # Cached trajectory: previous trajectory suffix still safe.
+        # Cached trajectory: the C++ suffix validator re-checks the
+        # remaining segment against the CURRENT observed map (section
+        # VIII).  The controller samples it with an offset equal to the
+        # trajectory age (elapsed - plan_start_time).
         if last_trajectory and last_plan_time is not None:
             age = elapsed - last_plan_time
             if age <= safety.get("max_plan_age_s", 0.20):
                 remaining = last_trajectory[-1].t - age
                 if remaining >= safety.get("min_remaining_trajectory_s", 0.10):
-                    pos_err = float(np.linalg.norm(
-                        last_trajectory[0].position - pos))
-                    vel_err = float(np.linalg.norm(
-                        last_trajectory[0].velocity - vel_world))
-                    if pos_err <= safety.get("max_position_error_m", 0.50) and \
-                            vel_err <= safety.get("max_velocity_error_mps", 1.00):
+                    vs = module.VehicleState()
+                    vs.position = state["position"]
+                    vs.velocity = state["velocity"]
+                    vs.acceleration = state["acceleration"]
+                    vs.yaw = state["yaw"]
+                    vs.yaw_rate = state["yaw_rate"]
+                    valid = self._local_planner.validate_trajectory_suffix(
+                        last_trajectory, last_plan_time, elapsed,
+                        self._controller_cfg.get(
+                            "velocity_lookahead_time_s", 0.08),
+                        vs, self.g.get("trajectory_optimization", {}).get(
+                            "min_clearance", 0.02),
+                        safety.get("max_position_error_m", 0.50),
+                        safety.get("max_velocity_error_mps", 1.00))
+                    if valid.all_clear:
                         return (module.ExecutionMode.TRACK_CACHED,
-                                last_trajectory, False, True)
+                                last_trajectory, False, True, age)
 
-        # Macro OBSERVE -> rotate only.
+        # Macro OBSERVE -> rotate only (pure rotation, zero velocity).
         if held_action is not None and \
                 held_action.mode == module.MacroMode.OBSERVE:
-            return (module.ExecutionMode.ROTATE_ONLY, [], False, False)
+            return (module.ExecutionMode.ROTATE_ONLY, [], False, False, 0.0)
 
-        # Emergency brake when a collision is within the brake distance.
-        if self._collision_risk(pos, vel_world):
-            return (module.ExecutionMode.EMERGENCY_STOP, [], False, False)
+        # Emergency brake when the swept braking volume collides (C++).
+        if self._collision_risk(state):
+            return (module.ExecutionMode.EMERGENCY_STOP, [], False, False, 0.0)
 
-        return (module.ExecutionMode.BRAKE_HOLD, [], False, False)
+        # Brake-hold for too long (still planning-failed) escalates to an
+        # emergency stop (section XIII).
+        if self._brake_hold_time > \
+                safety.get("max_brake_hold_seconds", 1.0):
+            return (module.ExecutionMode.EMERGENCY_STOP, [], False, False, 0.0)
 
-    def _collision_risk(self, pos, vel_world):
-        """Check clearance ahead within the emergency brake distance.
-        Only KNOWN low-clearance space counts as a collision risk; unknown
-        space is not a confirmed collision risk (BRAKE_HOLD handles it)."""
-        dist = self._controller_cfg.get("emergency_brake_distance_m", 0.8)
-        speed = float(np.linalg.norm(vel_world))
-        if speed < 0.3:
-            return False
+        return (module.ExecutionMode.BRAKE_HOLD, [], False, False, 0.0)
+
+    def _collision_risk(self, state):
+        """Swept-volume braking check computed in C++ (section XVIII): the
+        predicted braking trajectory (reaction delay at constant velocity,
+        then deceleration to stop) is sampled continuously; UNKNOWN space
+        counts as unsafe."""
         if not self._observed_map.esdf_built():
             return False
-        lookahead = min(dist, max(0.3, speed * 0.5))
-        if lookahead <= 0.0:
+        speed = float(np.linalg.norm(state["velocity"]))
+        if speed < 0.3:
             return False
-        probe = pos + (vel_world / max(1e-6, speed)) * lookahead
-        if not self._observed_map.is_known(probe):
-            return False
-        value = self._observed_map.esdf_value(probe)
-        if not np.isfinite(value):
-            return False
-        return value <= 0.05
+        vs = module.VehicleState()
+        vs.position = state["position"]
+        vs.velocity = state["velocity"]
+        vs.acceleration = state["acceleration"]
+        vs.yaw = state["yaw"]
+        vs.yaw_rate = state["yaw_rate"]
+        brake_result = self._observed_map.swept_brake_risk(
+            vs,
+            self._safety_cfg.get("brake_reaction_delay_s", 0.10),
+            self._safety_cfg.get("emergency_deceleration_mps2", 5.0),
+            self.g.get("vehicle", {}).get("radius_m", 0.30),
+            self.g.get("vehicle", {}).get("safety_margin_m", 0.20),
+            0.05)
+        return bool(brake_result.risk)
 
     # ── Trajectory controller (section XII) ──────────────────────────
     def _compute_command(self, trajectory, state, ds, execution_mode,
-                         held_action, elapsed):
+                         held_action, sample_offset=0.0):
         tc = self._controller_cfg
         out = {"velocity_flu": np.zeros(3), "yaw_rate": 0.0}
         max_yaw_rate = tc.get("max_yaw_rate_rps", 2.0)
         max_vel = tc.get("max_velocity_mps", 2.5)
         max_accel = tc.get("max_acceleration_mps2", 3.5)
-        jerk_limit = tc.get("command_change_rate_limit_mps2", 25.0) * self._dt
+        max_jerk = tc.get("max_jerk_mps3", 25.0)
+        accel_limit = max_accel * self._dt
+        jerk_limit = max_jerk * self._dt
         max_yaw_accel = tc.get("max_yaw_accel_rps2", 8.0) * self._dt
         yaw_gain = tc.get("yaw_gain", 2.0)
         yaw = float(state["yaw"])
@@ -648,8 +704,12 @@ class ILManager(object):
 
         if execution_mode in (module.ExecutionMode.TRACK_FRESH,
                               module.ExecutionMode.TRACK_CACHED):
-            # Sample the trajectory at the velocity lookahead time.
-            lookahead = tc.get("velocity_lookahead_time_s", 0.08)
+            # Sample the trajectory at the velocity lookahead time.  For a
+            # cached trajectory the sample is shifted by the trajectory age
+            # (elapsed - plan_start_time) so the drone re-executes the
+            # REMAINING segment, not from t=0 (section VIII).
+            lookahead = tc.get("velocity_lookahead_time_s", 0.08) + \
+                max(0.0, sample_offset)
             idx = 0
             best = 1e9
             for i, point in enumerate(trajectory):
@@ -667,19 +727,33 @@ class ILManager(object):
             vel_world = vel_world + \
                 point.acceleration * tc.get("acceleration_feedforward_time_s", 0.30)
 
-            # Limits: max velocity, max acceleration (rate limit).
+            # Limits: max velocity, real acceleration AND jerk limits
+            # (section XIX).  The previous velocity gives the acceleration
+            # limit; the previous acceleration gives the jerk limit.
             speed = float(np.linalg.norm(vel_world))
             if speed > max_vel and speed > 1e-9:
                 vel_world = vel_world * (max_vel / speed)
-            cmd = vel_world
             prev = getattr(self, "_last_velocity_world", None)
+            prev_accel = getattr(self, "_last_acceleration_world", None)
             if prev is not None:
-                delta = cmd - prev
+                delta = vel_world - prev
                 delta_norm = float(np.linalg.norm(delta))
-                if delta_norm > jerk_limit and delta_norm > 1e-9:
-                    cmd = prev + delta * (jerk_limit / delta_norm)
-            self._last_velocity_world = cmd
-            vel_flu = world_vector_to_body_flu_quat(cmd, quat)
+                if delta_norm > accel_limit and delta_norm > 1e-9:
+                    vel_world = prev + delta * (accel_limit / delta_norm)
+            if prev is not None and prev_accel is not None:
+                new_accel = (vel_world - prev) / self._dt
+                accel_change = new_accel - prev_accel
+                change_norm = float(np.linalg.norm(accel_change))
+                if change_norm > jerk_limit and change_norm > 1e-9:
+                    desired_accel = prev_accel + \
+                        accel_change * (jerk_limit / change_norm)
+                    vel_world = prev + desired_accel * self._dt
+            self._last_velocity_world = vel_world
+            if prev is not None:
+                self._last_acceleration_world = (vel_world - prev) / self._dt
+            else:
+                self._last_acceleration_world = np.zeros(3)
+            vel_flu = world_vector_to_body_flu_quat(vel_world, quat)
             out["velocity_flu"] = vel_flu
 
             # Yaw: reference yaw + closed-loop gain.
@@ -693,8 +767,10 @@ class ILManager(object):
             self._last_yaw_rate = yr
             out["yaw_rate"] = yr
         elif execution_mode == module.ExecutionMode.ROTATE_ONLY:
-            # Pure rotation (or a very short known-safe advance) toward the
-            # macro desired yaw.
+            # Pure rotation toward the macro desired yaw.  Velocity is
+            # exactly zero (section IX); no short forward advance is
+            # emitted (the OBSERVE move is handled by the 5 Hz macro via a
+            # SIDE/GUIDE re-plan, never by a hidden 0.3 m/s push).
             yaw_target = state["yaw"]
             if held_action is not None and held_action.has_desired_yaw:
                 yaw_target = held_action.desired_yaw_world
@@ -704,17 +780,9 @@ class ILManager(object):
             yr = max(prev_yr - max_yaw_accel, min(prev_yr + max_yaw_accel, yr))
             self._last_yaw_rate = yr
             out["yaw_rate"] = yr
-            # Very short observe advance when the macro guide has a move.
-            if held_action is not None and \
-                    held_action.guide_distance > 0.15:
-                guide_flu = world_vector_to_body_flu_quat(
-                    held_action.guide_world - state["position"], quat)
-                forward = np.array([1.0, 0.0, 0.0])
-                if np.linalg.norm(guide_flu[:2]) > 1e-6:
-                    forward = guide_flu / np.linalg.norm(guide_flu)
-                out["velocity_flu"] = forward * 0.3
-            else:
-                out["velocity_flu"] = np.zeros(3)
+            out["velocity_flu"] = np.zeros(3)
+            self._last_velocity_world = np.zeros(3)
+            self._last_acceleration_world = np.zeros(3)
         elif execution_mode == module.ExecutionMode.BRAKE_HOLD:
             # Decelerate to hover.
             vel_flu = world_vector_to_body_flu_quat(state["velocity"], quat)
@@ -727,6 +795,7 @@ class ILManager(object):
             out["velocity_flu"] = vel_flu
             out["yaw_rate"] = 0.0
             self._last_velocity_world = np.zeros(3)
+            self._last_acceleration_world = np.zeros(3)
             self._last_yaw_rate = 0.0
         else:  # EMERGENCY_STOP
             # Emergency deceleration toward hover (stronger than brake).
@@ -741,6 +810,7 @@ class ILManager(object):
             out["velocity_flu"] = vel_flu
             out["yaw_rate"] = 0.0
             self._last_velocity_world = np.zeros(3)
+            self._last_acceleration_world = np.zeros(3)
             self._last_yaw_rate = 0.0
 
         # Final command clamp.
@@ -786,10 +856,11 @@ class ILManager(object):
                 local_terminal_flu = world_vector_to_body_flu_quat(tdelta, quat)
 
         # Privileged diagnostics (kept separate from student inputs).
-        collect_priv = self.g.get("dataset_logging", {}).get(
-            "collect_privileged_diagnostics", True)
+        ds_cfg = self.g.get("dataset_logging", {})
+        collect_priv = ds_cfg.get("collect_privileged_diagnostics", True)
         rec = self._macro_expert.last_recoverability
         blocker = self._macro_expert.last_blocker
+        intervention = self._macro_expert.last_intervention
         local_recoverable = rec.status if rec is not None else -1
         blocking_component = -1
         left_edge = right_edge = left_corridor = right_corridor = 0
@@ -801,13 +872,27 @@ class ILManager(object):
             right_corridor = int(blocker.right_corridor_known)
         privileged_side, margin = self._oracle.privileged_best_side(
             self._macro_expert.last_candidates)
+        # The intervention evaluator is the authoritative decision-margin
+        # source (section III).
+        if intervention is not None:
+            margin = float(intervention.decision_margin)
+        privileged_intervention_required = \
+            int(intervention.intervention_required) if \
+            intervention is not None else 0
+        privileged_direct_viable = \
+            int(intervention.direct_viable) if intervention is not None else 1
+        macro_decision_observable = \
+            int(self._macro_expert.macro_decision_observable)
+        macro_decision_confidence = \
+            float(self._macro_expert.macro_decision_confidence)
         global_ctg = self._oracle.cost_to_go(pos)
         global_clearance = self._oracle.clearance(pos)
         candidate_costs = json.dumps([
             {"type": int(c.type), "side": int(c.side),
              "score": round(c.privileged_score, 4),
              "ctg": round(c.global_cost_to_go, 3),
-             "conn": int(c.connected_to_goal)}
+             "conn": int(c.connected_to_goal),
+             "reach": int(c.known_reachable)}
             for c in self._macro_expert.last_candidates[:12]
         ])
         if not collect_priv:
@@ -819,10 +904,15 @@ class ILManager(object):
             global_ctg = -1.0
             global_clearance = -1.0
             candidate_costs = ""
+            privileged_intervention_required = 0
+            privileged_direct_viable = 1
+            macro_decision_observable = 1
+            macro_decision_confidence = 0.0
 
         desired_yaw = held_action.desired_yaw_world if \
             held_action.has_desired_yaw else state["yaw"]
         yaw = state["yaw"]
+        desired_yaw_delta = normalize_angle(desired_yaw - yaw)
 
         self._writer.write_depth(frame_id, depth_m, depth_valid_ratio)
         depth_file = self._writer.depth_file_for(frame_id)
@@ -857,7 +947,8 @@ class ILManager(object):
             "goal_direction_flu_y": goal_dir_flu[1],
             "goal_direction_flu_z": goal_dir_flu[2],
             "goal_distance_m": goal_dist,
-            "goal_distance_norm": min(1.0, goal_dist / 5.0),
+            "goal_distance_norm": min(1.0, goal_dist /
+                                      ds_cfg.get("perception_range_m", 5.0)),
             "velocity_flu_x": ds.velocity_flu[0],
             "velocity_flu_y": ds.velocity_flu[1],
             "velocity_flu_z": ds.velocity_flu[2],
@@ -867,6 +958,9 @@ class ILManager(object):
             "macro_committed_side": int(held_action.committed_side),
             "macro_confidence": held_action.confidence,
             "macro_decision_reason": held_action.reason,
+            "macro_decision_observable": macro_decision_observable,
+            "macro_decision_confidence": macro_decision_confidence,
+            "macro_decision_margin": margin,
             "macro_guide_world_x": held_action.guide_world[0] if
             held_action.guide_world is not None else 0.0,
             "macro_guide_world_y": held_action.guide_world[1] if
@@ -881,9 +975,9 @@ class ILManager(object):
             "macro_guide_direction_flu_z": guide_dir_flu[2],
             "macro_guide_distance_m": guide_dist,
             "desired_yaw_world": desired_yaw,
-            "desired_yaw_delta": normalize_angle(desired_yaw - yaw),
-            "desired_yaw_sin": math.sin(desired_yaw),
-            "desired_yaw_cos": math.cos(desired_yaw),
+            "desired_yaw_delta": desired_yaw_delta,
+            "desired_yaw_sin": math.sin(desired_yaw_delta),
+            "desired_yaw_cos": math.cos(desired_yaw_delta),
             # local labels
             "local_terminal_world_x": result.trajectory_terminal[0] if
             result.success else 0.0,
@@ -911,6 +1005,8 @@ class ILManager(object):
             "left_corridor_known": left_corridor,
             "right_corridor_known": right_corridor,
             "privileged_best_side": int(privileged_side),
+            "privileged_intervention_required": privileged_intervention_required,
+            "privileged_direct_viable": privileged_direct_viable,
             "macro_decision_margin": margin,
             "global_cost_to_go": global_ctg if np.isfinite(global_ctg) else -1.0,
             "global_clearance": global_clearance if

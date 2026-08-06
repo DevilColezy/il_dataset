@@ -18,10 +18,10 @@ import time
 
 import numpy as np
 
-# ── Schema (v18) ──────────────────────────────────────────────────────
+# ── Schema (v19) ──────────────────────────────────────────────────────
 # Order matters: this is the CSV header.  All fields are written on every
 # row; missing keys are filled with defaults by write_row().
-DATA_SCHEMA_V18_FIELDS = [
+DATA_SCHEMA_V19_FIELDS = [
     # time / matching
     "timestamp_ns", "receive_timestamp_ns", "episode_id", "frame_id",
     "episode_frame_index", "control_dt_s", "trajectory_time_s",
@@ -40,6 +40,8 @@ DATA_SCHEMA_V18_FIELDS = [
     # macro labels (5 Hz; held between ticks, macro_is_new_tick flags)
     "macro_is_new_tick", "macro_mode", "macro_committed_side",
     "macro_confidence", "macro_decision_reason",
+    "macro_decision_observable", "macro_decision_confidence",
+    "macro_decision_margin",
     "macro_guide_world_x", "macro_guide_world_y", "macro_guide_world_z",
     "macro_guide_flu_x", "macro_guide_flu_y", "macro_guide_flu_z",
     "macro_guide_direction_flu_x", "macro_guide_direction_flu_y",
@@ -57,7 +59,8 @@ DATA_SCHEMA_V18_FIELDS = [
     "local_recoverable", "blocking_component_id",
     "left_edge_visible", "right_edge_visible",
     "left_corridor_known", "right_corridor_known",
-    "privileged_best_side", "macro_decision_margin",
+    "privileged_best_side", "privileged_intervention_required",
+    "privileged_direct_viable",
     "global_cost_to_go", "global_clearance", "global_candidate_costs",
     # goal / plan bookkeeping
     "goal_world_x", "goal_world_y", "goal_world_z", "distance_to_final_goal",
@@ -66,7 +69,11 @@ DATA_SCHEMA_V18_FIELDS = [
     "scene_id", "task_id", "episode_valid",
 ]
 
-_DEFAULT_ROW = {field: "" for field in DATA_SCHEMA_V18_FIELDS}
+_DEFAULT_ROW = {field: "" for field in DATA_SCHEMA_V19_FIELDS}
+
+# Backwards-compatible alias (v18 name) so external tooling can still
+# import the schema under the old name.
+DATA_SCHEMA_V18_FIELDS = DATA_SCHEMA_V19_FIELDS
 
 
 class DatasetWriter(object):
@@ -82,8 +89,11 @@ class DatasetWriter(object):
         self.goal_world = np.asarray(goal_world, dtype=np.float64)
         self.initial_yaw = float(initial_yaw)
         self.depth_cfg = depth_cfg
-        self._depth_in_memory = bool(
-            cfg.get("dataset_logging", {}).get("depth_in_memory", True))
+        # The manager passes the dataset_logging SUB-config (section XXII).
+        self._depth_in_memory = bool(cfg.get("depth_in_memory", True))
+        self._flush_interval_rows = int(cfg.get("flush_interval_rows", 64))
+        self._depth_png_compress_level = int(
+            cfg.get("depth_png_compress_level", 4))
 
         self._inprogress_dir = os.path.join(output_root, "%s.inprogress" % episode_id)
         if not os.path.isdir(self._inprogress_dir):
@@ -101,14 +111,14 @@ class DatasetWriter(object):
 
         self._data_csv = open(self._data_file, "w", newline="")
         self._data_writer = csv.DictWriter(
-            self._data_csv, fieldnames=DATA_SCHEMA_V18_FIELDS)
+            self._data_csv, fieldnames=DATA_SCHEMA_V19_FIELDS)
         self._data_writer.writeheader()
 
         self._sync_csv = open(self._sync_file, "w", newline="")
         self._sync_writer = csv.writer(self._sync_csv)
         self._sync_writer.writerow([
             "frame_id", "latency_ms", "match_method", "is_dropped",
-            "exact_matches", "fallback_matches"])
+            "exact_matches", "unmatched_frames"])
 
         self._plans_csv = open(self._local_plans_file, "w", newline="")
         self._plans_writer = csv.writer(self._plans_csv)
@@ -134,8 +144,7 @@ class DatasetWriter(object):
             "start_world": start_world,
             "goal_world": goal_world,
             "initial_yaw": initial_yaw,
-            "schema_version": int(cfg.get("dataset_logging", {}).get(
-                "schema_version", 18)),
+            "schema_version": int(cfg.get("schema_version", 19)),
             "status": "inprogress",
             "created_at_ns": time.time_ns(),
         }
@@ -149,12 +158,15 @@ class DatasetWriter(object):
         row.update(fields)
         self._data_writer.writerow(row)
         self._rows_written += 1
+        if self._flush_interval_rows > 0 and \
+                self._rows_written % self._flush_interval_rows == 0:
+            self._data_csv.flush()
 
     def write_sync(self, frame_id, latency_ms, match_method, is_dropped,
-                   exact_matches, fallback_matches):
+                   exact_matches, unmatched_frames):
         self._sync_writer.writerow([
             frame_id, latency_ms, match_method, int(is_dropped),
-            exact_matches, fallback_matches])
+            exact_matches, unmatched_frames])
 
     # ── Depth ────────────────────────────────────────────────────────
     def write_depth(self, frame_id, depth_m, depth_valid_ratio):
@@ -167,7 +179,8 @@ class DatasetWriter(object):
         u16[...] = np.round(scaled).astype(np.uint16)
         from PIL import Image
         png_path = os.path.join(self._depth_dir, "%06d.png" % frame_id)
-        Image.fromarray(u16, mode="I;16").save(png_path)
+        Image.fromarray(u16, mode="I;16").save(
+            png_path, compress_level=self._depth_png_compress_level)
         self._depth_rows[frame_id] = {
             "depth_file": "depth/%06d.png" % frame_id,
             "depth_valid_mask_ratio": float(depth_valid_ratio),

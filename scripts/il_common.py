@@ -17,7 +17,6 @@ from __future__ import print_function, division
 
 import json, math, os, sys, time, struct, threading
 import numpy as np
-from typing import Optional
 
 import rospy
 
@@ -89,26 +88,6 @@ def ros_quat_to_unity_quat(quaternion_xyzw):
     return out.tolist()
 
 
-def world_vel_to_body(vx_w, vy_w, vz_w, yaw):
-    """World velocity -> RFU body (right, forward, up)."""
-    cos_y, sin_y = math.cos(yaw), math.sin(yaw)
-    return np.array([
-        cos_y * vx_w + sin_y * vy_w,
-        -sin_y * vx_w + cos_y * vy_w,
-        vz_w,
-    ], dtype=np.float64)
-
-
-def body_vel_to_world(vx_b, vy_b, vz_b, yaw):
-    """RFU body velocity -> world."""
-    cos_y, sin_y = math.cos(yaw), math.sin(yaw)
-    return np.array([
-        cos_y * vx_b - sin_y * vy_b,
-        sin_y * vx_b + cos_y * vy_b,
-        vz_b,
-    ], dtype=np.float64)
-
-
 def normalize_angle(angle):
     """Wrap to [-pi, pi)."""
     while angle >= math.pi:
@@ -118,31 +97,7 @@ def normalize_angle(angle):
     return angle
 
 
-def shortest_angle_diff(target, current):
-    return normalize_angle(target - current)
-
-
-def yaw_from_world_velocity(velocity, fallback_yaw, yaw_speed_threshold):
-    """Yaw convention B from a world-frame velocity vector."""
-    v = np.asarray(velocity, dtype=np.float64)
-    if len(v) >= 2 and math.hypot(v[0], v[1]) > yaw_speed_threshold:
-        return math.atan2(v[1], v[0]) - 0.5 * math.pi
-    return float(fallback_yaw)
-
-
 # ── FLU transforms (training frame: [forward, left, up], camera aligned) ──
-
-def body_rfu_to_flu(vector_rfu):
-    """RFU body [right, forward, up] -> FLU [forward, left, up]."""
-    v = np.asarray(vector_rfu, dtype=np.float64)
-    return np.array([v[1], -v[0], v[2]], dtype=np.float64)
-
-
-def body_flu_to_rfu(vector_flu):
-    """FLU [forward, left, up] -> RFU body [right, forward, up]."""
-    v = np.asarray(vector_flu, dtype=np.float64)
-    return np.array([-v[1], v[0], v[2]], dtype=np.float64)
-
 
 def world_vector_to_body_flu(vector_world, yaw):
     """World vector -> FLU using yaw only (level body)."""
@@ -179,14 +134,6 @@ def body_flu_to_flightlib_body(vector_flu):
     """FLU [forward, left, up] -> Flightlib body [right, forward, up]."""
     v = np.asarray(vector_flu, dtype=np.float64)
     return np.array([-v[1], v[0], v[2]], dtype=np.float64)
-
-
-def body_flu_to_world_quat(vector_flu, quaternion_xyzw):
-    """FLU vector -> world using the body->world quaternion."""
-    v = np.asarray(vector_flu, dtype=np.float64)
-    flightlib_body = np.array([-v[1], v[0], v[2]], dtype=np.float64)
-    r = quaternion_xyzw_to_rotation(quaternion_xyzw)
-    return r.dot(flightlib_body)
 
 
 def quantize_bounded_vector(vector, max_norm, decimals=3):
@@ -460,52 +407,3 @@ class UnityBridge:
                 return True
             time.sleep(0.2)
         return False
-
-
-# ============================================================================
-#  Frame synchronization buffer
-# ============================================================================
-
-class SyncBuffer:
-    """Match depth frames to control states using frame_id."""
-
-    def __init__(self, max_entries=128, max_sync_error_ms=100.0):
-        self._ring = []
-        self._max_entries = max_entries
-        self._max_sync_error = max_sync_error_ms * 0.001
-        self._lock = threading.Lock()
-
-    def push(self, entry):
-        with self._lock:
-            self._ring.append(dict(entry))
-            while len(self._ring) > self._max_entries:
-                self._ring.pop(0)
-
-    def match_and_remove(self, frame_id):
-        with self._lock:
-            found_idx = None
-            for i in range(len(self._ring) - 1, -1, -1):
-                if self._ring[i].get("frame_id") == frame_id:
-                    found_idx = i
-                    break
-            if found_idx is None:
-                return None
-            entry = dict(self._ring[found_idx])
-            del self._ring[:found_idx + 1]
-            return entry
-
-    def drain_to_latest(self):
-        with self._lock:
-            if not self._ring:
-                return None
-            latest = dict(self._ring[-1])
-            self._ring = []
-            return latest
-
-    def size(self):
-        with self._lock:
-            return len(self._ring)
-
-    def clear(self):
-        with self._lock:
-            self._ring = []

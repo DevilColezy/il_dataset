@@ -20,21 +20,29 @@ RecoverabilityResult LocalRecoverability::test(
     const VehicleState& state,
     const Eigen::Vector3d& direct_guide_world) const {
     RecoverabilityResult result;
-    result.rejoin_point = direct_guide_world;
     if (!map.esdfBuilt()) {
         result.status = RecoverabilityStatus::NO_SAFE_MOTION;
         result.reason = "observed_map_not_built";
         return result;
     }
 
-    // The direct guide lies along the goal ray; use it as the goal
-    // direction reference.
+    // The direct guide lies along the goal ray; the rejoin point is placed
+    // at the configured rejoin distance along that direction (clamped to
+    // the guide distance).  This makes `rejoin_distance_m` take real
+    // effect.
     const Eigen::Vector3d travel = direct_guide_world - state.position;
     const double travel_len = travel.norm();
     Eigen::Vector2d goal_dir(1.0, 0.0);
     if (travel_len > kEpsilon) {
         goal_dir = travel.head<2>() / travel_len;
     }
+    const Eigen::Vector3d rejoin_dir =
+        travel_len > kEpsilon ? travel / travel_len : Eigen::Vector3d::UnitX();
+    const double rejoin_dist =
+        std::min(std::max(0.1, travel_len), config_.rejoin_distance_m);
+    const Eigen::Vector3d rejoin_point =
+        state.position + rejoin_dir * rejoin_dist;
+    result.rejoin_point = rejoin_point;
 
     LocalSearchConfig search_config;
     search_config.search_clearance_m = config_.search_clearance_m;
@@ -42,17 +50,19 @@ RecoverabilityResult LocalRecoverability::test(
     search_config.forbid_unknown = true;
 
     LocalPathSearch search;
-    const LocalSearchResult search_result =
-        search.search(map, state, direct_guide_world, search_config);
-    result.minimum_clearance = search_result.min_clearance;
-    result.path_length = search_result.path_length;
+    const LocalPathResult search_result =
+        search.search(map, state, rejoin_point, search_config);
+    result.minimum_clearance = search_result.minimum_clearance;
+    result.path_length = search_result.path_cost;
 
-    if (search_result.success) {
+    // DIRECT_REJOIN_SUCCESS requires FULL arrival at the rejoin point
+    // (section VI).  A partial path is never "recoverable".
+    if (search_result.status == LocalPathResult::Status::FULL_GOAL_REACHED) {
         // Full path to the rejoin point found in known free space.
         result.known_free = true;
         result.feasible = true;
         result.estimated_duration =
-            search_result.path_length /
+            search_result.path_cost /
             std::max(0.1, config_.nominal_speed_mps);
         const Eigen::Vector3d terminal = search_result.terminal;
         const Eigen::Vector3d motion = terminal - state.position;
@@ -86,7 +96,7 @@ RecoverabilityResult LocalRecoverability::test(
         }
         const double straight = travel_len;
         if (straight > kEpsilon &&
-            search_result.path_length / straight > config_.max_loop_ratio) {
+            search_result.path_cost / straight > config_.max_loop_ratio) {
             result.status = RecoverabilityStatus::PARTIAL_PROGRESS_ONLY;
             result.reason = "path_loops_or_backtracks";
             result.feasible = false;
@@ -112,7 +122,7 @@ RecoverabilityResult LocalRecoverability::test(
     result.left_corridor_known = blocker.left_corridor_known;
     result.right_corridor_known = blocker.right_corridor_known;
 
-    if (!search_result.found_any) {
+    if (!search_result.found_partial) {
         // No safe motion at all.  Classify whether the immediate blockage
         // is known or unknown.
         const std::uint8_t state_at = map.occupancyAt(

@@ -50,6 +50,9 @@ struct TrajectoryOptimizationConfig {
     double lookahead_distance = 4.0;
     /// Fraction of nominal speed for non-final terminals (cruise-through).
     double terminal_speed_ratio = 0.85;
+    /// Distance tolerance for treating the trajectory terminal as the goal
+    /// (then the terminal velocity is driven to zero).  Section XVII.
+    double goal_stop_tolerance_m = 0.4;
 
     // Warm start / trajectory continuity
     double warm_start_max_age_s = 0.25;
@@ -96,6 +99,26 @@ public:
     /// `min_clearance`, plus finite state and dynamics feasibility.
     ValidationResult validateTrajectory(
         const std::vector<TrajectoryPoint>& trajectory) const;
+
+    /// Validate the SUFFIX of a previously planned trajectory that is being
+    /// re-executed from the cache (section VIII).  Checks the segment
+    /// [plan_start_time + controller_preview_time + current_time,
+    ///  end] against the CURRENT observed map.  Unknown or colliding points
+    /// invalidate the suffix.
+    ///  - plan_start_time: wall time when the trajectory was planned (s).
+    ///  - current_time:    wall time now (s).
+    ///  - controller_preview_time: look-ahead the controller needs.
+    /// Returns a ValidationResult (trajectory_time is the validated suffix
+    /// start time in trajectory-relative seconds).
+    ValidationResult validateTrajectorySuffix(
+        const std::vector<TrajectoryPoint>& trajectory,
+        double plan_start_time,
+        double current_time,
+        double controller_preview_time,
+        const VehicleState& state,
+        double min_clearance,
+        double max_position_error,
+        double max_velocity_error) const;
 
     uint64_t currentPlanId() const { return plan_id_counter_; }
     const TrajectoryOptimizationConfig& config() const { return config_; }

@@ -45,11 +45,25 @@ double YawPlanner::planYaw(std::vector<TrajectoryPoint>* trajectory,
         const double speed =
             point.velocity.head<2>().norm();
         if (speed > config_.speed_threshold_mps) {
-            // Moving: follow the horizontal motion so it stays in the FOV.
-            // The FOV constraint is satisfied structurally because the
-            // motion direction is centred in the camera.  During a bypass
-            // this deviates from the macro yaw temporarily.
-            desired = yawFromVelocity(point.velocity);
+            // Moving: the selected yaw must keep the horizontal motion
+            // direction inside the camera FOV, i.e.
+            //   abs(wrap(yaw_motion - yaw_selected)) <= half_fov - margin.
+            // Among all angles satisfying that constraint, pick the one
+            // closest to the macro yaw.  No fixed motion/macro weight
+            // blend is used (section XV).
+            const double yaw_motion = yawFromVelocity(point.velocity);
+            if (has_macro_yaw) {
+                const double delta =
+                    wrapAngleLocal(yaw_macro - yaw_motion);
+                if (std::abs(delta) <= fov_limit) {
+                    desired = wrapAngleLocal(yaw_macro);
+                } else {
+                    desired = wrapAngleLocal(
+                        yaw_motion + (delta > 0.0 ? fov_limit : -fov_limit));
+                }
+            } else {
+                desired = yaw_motion;
+            }
         } else if (has_macro_yaw) {
             // Stationary (OBSERVE rotation / hover): follow the macro yaw.
             desired = wrapAngleLocal(macro_yaw);

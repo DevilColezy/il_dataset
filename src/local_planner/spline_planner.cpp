@@ -899,6 +899,82 @@ ValidationResult LocalPlanner::validateTrajectory(
     return result;
 }
 
+ValidationResult LocalPlanner::validateTrajectorySuffix(
+    const std::vector<TrajectoryPoint>& trajectory,
+    double plan_start_time,
+    double current_time,
+    double controller_preview_time,
+    const VehicleState& state,
+    double min_clearance,
+    double max_position_error,
+    double max_velocity_error) const {
+    ValidationResult result;
+    result.all_clear = true;
+    if (map_ == nullptr || !map_->esdfBuilt()) {
+        result.all_clear = false;
+        result.any_collision = true;
+        result.any_unknown = true;
+        return result;
+    }
+    if (trajectory.empty() || !std::isfinite(plan_start_time) ||
+        !std::isfinite(current_time) || !std::isfinite(controller_preview_time)) {
+        result.all_clear = false;
+        result.any_collision = true;
+        return result;
+    }
+    // The controller needs a small preview window ahead of the current
+    // execution point; validation starts after it.
+    const double elapsed = current_time - plan_start_time;
+    const double suffix_start = std::max(0.0, elapsed + controller_preview_time);
+
+    double min_clear = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < trajectory.size(); ++i) {
+        const TrajectoryPoint& point = trajectory[i];
+        if (point.t < suffix_start - 1.0e-6) continue;
+        if (!point.position.allFinite() || !point.velocity.allFinite() ||
+            !point.acceleration.allFinite()) {
+            result.any_collision = true;
+            result.all_clear = false;
+            result.worst_position = point.position;
+            result.worst_time = point.t;
+            break;
+        }
+        const bool known =
+            map_->isKnown(point.position.x(), point.position.y(),
+                          point.position.z());
+        const double clearance =
+            map_->esdfValue(point.position.x(), point.position.y(),
+                            point.position.z());
+        if (std::isfinite(clearance)) {
+            min_clear = std::min(min_clear, clearance);
+        }
+        if (!known || !std::isfinite(clearance) ||
+            clearance <= min_clearance) {
+            result.any_collision = true;
+            result.all_clear = false;
+            result.clearance_violation_count++;
+            if (clearance < result.worst_clearance) {
+                result.worst_clearance = clearance;
+                result.worst_position = point.position;
+                result.worst_time = point.t;
+            }
+            if (!known) result.any_unknown = true;
+        }
+    }
+    // Track-vs-trajectory deviation at the current state.
+    const double position_error =
+        (state.position - trajectory.front().position).norm();
+    const double velocity_error =
+        (state.velocity - trajectory.front().velocity).norm();
+    if (position_error > max_position_error ||
+        velocity_error > max_velocity_error) {
+        result.all_clear = false;
+        result.any_collision = true;
+    }
+    result.min_clearance = std::isfinite(min_clear) ? min_clear : 0.0;
+    return result;
+}
+
 LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
     const auto planning_start = Clock::now();
     const auto planning_deadline =
@@ -940,9 +1016,9 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
     search_config.region_margin_m = config_.search_region_margin_m;
     search_config.forbid_unknown = request.forbid_unknown_space;
     LocalPathSearch search;
-    const LocalSearchResult search_result =
+    const LocalPathResult search_result =
         search.search(*map_, state, request.macro_guide_world, search_config);
-    if (!search_result.found_any) {
+    if (!search_result.found_partial) {
         result.status = PlannerStatus::SEARCH_FAILED;
         result.message = search_result.failure_reason.empty()
                              ? "no_local_path"
@@ -950,7 +1026,7 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
         result.search_status = 2;
         return finish();
     }
-    result.search_status = search_result.success ? 0 : 1;
+    result.search_status = search_result.full_goal_reached ? 0 : 1;
     Eigen::Vector3d terminal = search_result.terminal;
 
     // ── 2. Seed path (A* + warm start) ────────────────────────────
@@ -1050,7 +1126,17 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
 
     double terminal_speed = 0.0;
     Eigen::Vector3d terminal_velocity = Eigen::Vector3d::Zero();
-    if (!request.stop_at_goal) {
+    // Stop-at-goal is decided INTERNALLY (section XVII): the search fully
+    // reached the goal (not just a partial terminal), the terminal is
+    // within `goal_stop_tolerance_m` of the goal, and the goal is known
+    // free in the current map.
+    const bool stop_at_goal =
+        search_result.full_goal_reached &&
+        (terminal - request.goal_world).head<2>().norm() <=
+            config_.goal_stop_tolerance_m &&
+        map_->isKnownFree(request.goal_world.x(), request.goal_world.y(),
+                          request.goal_world.z(), config_.min_clearance);
+    if (!stop_at_goal) {
         const double distance_ratio = clamp(
             distance / std::max(0.5, config_.lookahead_distance), 0.55, 1.0);
         terminal_speed =
