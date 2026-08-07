@@ -151,7 +151,7 @@ RecoverabilityResult LocalRecoverability::test(
     blocker_config.min_candidate_clearance_m = config_.search_clearance_m;
     const GoalBlocker blocker =
         analyzeGoalBlocker(map, state, direct_guide_world, blocker_config);
-    result.blocking_component_id = blocker.component_id;
+    result.blocker_signature = blocker.blocker_signature;
     result.left_edge_visible = blocker.left_edge_visible;
     result.right_edge_visible = blocker.right_edge_visible;
     result.left_corridor_known = blocker.left_corridor_known;

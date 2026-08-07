@@ -18,12 +18,12 @@ import time
 
 import numpy as np
 
-# ── Schema (v21) ──────────────────────────────────────────────────────
+# ── Schema (v22) ──────────────────────────────────────────────────────
 # Order matters: this is the CSV header.  All fields are written on every
 # row; missing keys are filled with defaults by write_row().
 # NO depth-valid-mask fields: the student input is a single depth channel
 # (section XII).  raw_depth_finite_ratio is a PURE diagnostic.
-DATA_SCHEMA_V21_FIELDS = [
+DATA_SCHEMA_V22_FIELDS = [
     # time / matching
     "timestamp_ns", "receive_timestamp_ns", "episode_id", "frame_id",
     "episode_frame_index", "control_dt_s", "trajectory_time_s",
@@ -41,6 +41,7 @@ DATA_SCHEMA_V21_FIELDS = [
     "velocity_flu_x", "velocity_flu_y", "velocity_flu_z",
     # macro labels (5 Hz; held between ticks, macro_is_new_tick flags)
     "macro_is_new_tick", "macro_mode", "macro_committed_side",
+    "macro_observe_side",
     "macro_confidence", "macro_decision_reason",
     "macro_decision_observable", "macro_decision_confidence",
     "macro_decision_margin",
@@ -62,7 +63,8 @@ DATA_SCHEMA_V21_FIELDS = [
     "planning_status", "minimum_clearance", "trajectory_duration_s",
     "fresh_planning_status",
     # privileged diagnostics (never part of student inputs)
-    "local_recoverable", "blocking_component_id",
+    "local_recoverable", "blocker_signature", "blocker_ray_depth",
+    "blocker_cell_count", "blocker_track_id",
     "left_edge_visible", "right_edge_visible",
     "left_corridor_known", "right_corridor_known",
     "privileged_best_side",
@@ -76,6 +78,12 @@ DATA_SCHEMA_V21_FIELDS = [
     "observed_detour_ratio", "observed_terminal_alignment",
     "privileged_rejoin_distance", "privileged_terminal_alignment",
     "direct_no_progress_time", "observe_no_information_time",
+    # macro-interval feedback diagnostics (sections XXVIII/XXIX)
+    "macro_feedback_is_new",
+    "macro_interval_frame_count", "macro_interval_planning_failures",
+    "macro_interval_cached_frames", "macro_interval_brake_frames",
+    "macro_interval_emergency_frames",
+    "macro_interval_local_unrecoverable_frames",
     "global_cost_to_go", "global_clearance", "global_candidate_costs",
     # goal / plan bookkeeping — executed-plan semantics (XVII)
     "goal_world_x", "goal_world_y", "goal_world_z", "distance_to_final_goal",
@@ -84,7 +92,7 @@ DATA_SCHEMA_V21_FIELDS = [
     "scene_id", "task_id", "episode_valid",
 ]
 
-_DEFAULT_ROW = {field: "" for field in DATA_SCHEMA_V21_FIELDS}
+_DEFAULT_ROW = {field: "" for field in DATA_SCHEMA_V22_FIELDS}
 
 
 class DatasetWriter(object):
@@ -122,7 +130,7 @@ class DatasetWriter(object):
 
         self._data_csv = open(self._data_file, "w", newline="")
         self._data_writer = csv.DictWriter(
-            self._data_csv, fieldnames=DATA_SCHEMA_V21_FIELDS)
+            self._data_csv, fieldnames=DATA_SCHEMA_V22_FIELDS)
         self._data_writer.writeheader()
 
         self._sync_csv = open(self._sync_file, "w", newline="")
@@ -155,7 +163,7 @@ class DatasetWriter(object):
             "start_world": start_world,
             "goal_world": goal_world,
             "initial_yaw": initial_yaw,
-            "schema_version": int(cfg.get("schema_version", 21)),
+            "schema_version": int(cfg.get("schema_version", 22)),
             "status": "inprogress",
             "created_at_ns": time.time_ns(),
         }

@@ -133,8 +133,30 @@ def _validate_config(cfg):
     if lookahead > 0.9 * min(half_x, half_y):
         errors.append("macro_lookahead_distance_m must fit the observed map")
 
-    for key in ("causal_evidence_frames",):
-        _positive(me.get(key, 2), "macro_expert.%s" % key, errors, allow_zero=True)
+    # causal_feedback (sections XXV/XXVI): 30 Hz -> 5 Hz interval
+    # thresholds for DIRECT causal evidence.
+    cf = me.get("causal_feedback", {})
+    _positive(cf.get("interval_failure_threshold", 2),
+              "macro_expert.causal_feedback.interval_failure_threshold",
+              errors, allow_zero=True)
+    _positive(cf.get("local_failure_macro_ticks", 2),
+              "macro_expert.causal_feedback.local_failure_macro_ticks",
+              errors, allow_zero=True)
+    _bounded(cf.get("cached_ratio_threshold", 0.5),
+             "macro_expert.causal_feedback.cached_ratio_threshold",
+             0.0, 1.0, errors)
+    _positive(cf.get("cached_macro_ticks", 2),
+              "macro_expert.causal_feedback.cached_macro_ticks",
+              errors, allow_zero=True)
+    _bounded(cf.get("brake_ratio_threshold", 0.5),
+             "macro_expert.causal_feedback.brake_ratio_threshold",
+             0.0, 1.0, errors)
+    _positive(cf.get("brake_macro_ticks", 2),
+              "macro_expert.causal_feedback.brake_macro_ticks",
+              errors, allow_zero=True)
+    _positive(cf.get("emergency_macro_ticks", 1),
+              "macro_expert.causal_feedback.emergency_macro_ticks",
+              errors, allow_zero=True)
     _positive(me.get("goal_tolerance_m", 0.30), "macro_expert.goal_tolerance_m", errors)
     _positive(me.get("direct_intervention_timeout", 5.0),
               "macro_expert.direct_intervention_timeout", errors)
@@ -146,6 +168,12 @@ def _validate_config(cfg):
               "macro_expert.local_path_fail_threshold", errors)
     _positive(me.get("blocker_rebind_ticks", 2),
               "macro_expert.blocker_rebind_ticks", errors)
+    _positive(me.get("blocker_association_distance_m", 1.5),
+              "macro_expert.blocker_association_distance_m", errors)
+    _positive(me.get("blocker_overlap_pad_m", 0.5),
+              "macro_expert.blocker_overlap_pad_m", errors, allow_zero=True)
+    _positive(me.get("blocker_lost_grace_s", 2.0),
+              "macro_expert.blocker_lost_grace_s", errors)
     _positive(me.get("macro_intervention_absolute_safety_timeout", 45.0),
               "macro_expert.macro_intervention_absolute_safety_timeout",
               errors)
@@ -261,10 +289,10 @@ def _validate_config(cfg):
               "execution_safety.max_emergency_stop_seconds", errors)
 
     # dataset logging
-    _positive(ds.get("schema_version", 21),
+    _positive(ds.get("schema_version", 22),
               "dataset_logging.schema_version", errors)
-    if ds.get("schema_version", 21) != 21:
-        errors.append("dataset_logging.schema_version must be 21")
+    if ds.get("schema_version", 22) != 22:
+        errors.append("dataset_logging.schema_version must be 22")
     _positive(ds.get("perception_range_m", 5.0),
               "dataset_logging.perception_range_m", errors)
     _positive(ds.get("flush_interval_rows", 64),

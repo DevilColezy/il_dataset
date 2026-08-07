@@ -1,5 +1,5 @@
 # ============================================================================
-#  Imitation Learning Dataset Collection — Two-Level Navigation Expert (schema v21)
+#  Imitation Learning Dataset Collection — Two-Level Navigation Expert (schema v22)
 # ============================================================================
 #
 #  Architecture:
@@ -139,22 +139,34 @@ global:
     update_hz:               5.0
     # Direct-guide lookahead (min(goal_distance, this)).
     macro_lookahead_distance_m: 4.5
-    # Causal evidence: observed-recoverable DIRECT is upgraded to macro
-    # intervention after this many consecutive macro ticks with local
-    # replanning failures (cached / BRAKE_HOLD) — privilege never alone.
-    causal_evidence_frames:     2
     # DIRECT long no-progress (goal distance not decreasing for this long)
     # is ALSO causal evidence -> macro intervention, never an immediate
     # episode FAILED (section XI/XII).
     direct_intervention_timeout: 5.0
+    # 30 Hz -> 5 Hz interval feedback thresholds for DIRECT causal evidence
+    # (sections XXV/XXVI): counters accumulate per MACRO TICK with decay,
+    # so a single occasional bad frame never intervenes while consecutive
+    # unstable intervals do.
+    causal_feedback:
+      interval_failure_threshold:  2      # planning failures within one interval
+      local_failure_macro_ticks:   2      # consecutive bad intervals -> evidence
+      cached_ratio_threshold:      0.5    # cached_frames / interval_frames
+      cached_macro_ticks:          2
+      brake_ratio_threshold:       0.5
+      brake_macro_ticks:           2
+      emergency_macro_ticks:       1      # any emergency interval -> strong evidence
     # Rolling SIDE / OBSERVE progress thresholds (section VII/XVI).
     side_no_progress_seconds:   6.0
     observe_no_information_timeout: 4.0
     progress_cost_epsilon_m:    0.10
     local_path_fail_threshold:  2
-    # Side memory is rebound to a NEW blocker component only after this
-    # many consecutive identical blocker ids (hysteresis, section X).
-    blocker_rebind_ticks:       2
+    # Blocker tracking (sections VII/X): world-geometry association of the
+    # ACTIVE blocker; side memory is rebound to a confirmed NEW blocker
+    # only after blocker_rebind_ticks consecutive off-track observations.
+    blocker_association_distance_m: 1.5
+    blocker_overlap_pad_m:          0.5
+    blocker_lost_grace_s:           2.0
+    blocker_rebind_ticks:           2
     # Goal reached condition (distance + speed).
     goal_tolerance_m:           0.30
     goal_speed_tolerance_mps:   0.20
@@ -305,7 +317,7 @@ global:
 
   # ── Dataset logging (section XIV) ──────────────────────────────────
   dataset_logging:
-    schema_version: 21
+    schema_version: 22
     depth_in_memory: true
     write_local_plan_points: true
     collect_privileged_diagnostics: true

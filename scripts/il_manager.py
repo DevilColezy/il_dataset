@@ -368,9 +368,12 @@ class ILManager(object):
         self._last_velocity_world = None
         self._last_acceleration_world = None
         self._last_yaw_rate = 0.0
-        # Previous frame's execution mode: fed to the macro expert as
-        # cached / brake causal evidence (section V).
-        self._prev_execution_mode = None
+        # 30 Hz -> 5 Hz macro-interval feedback accumulator (sections
+        # XX-XXIII): aggregates the WHOLE 200 ms interval between macro
+        # ticks, never just the last frame before the tick.
+        self._macro_feedback = self._new_macro_feedback()
+        self._macro_feedback_log = None
+        self._macro_feedback_is_new = 0
         self._enter_state(State.START_RECORDING)
 
     def _st_start_recording(self):
@@ -462,15 +465,12 @@ class ILManager(object):
             is_macro_tick = (sample_index % macro_interval) == 0
             if is_macro_tick:
                 dt_macro = macro_interval * dt
-                prev_mode = self._prev_execution_mode
-                cached = prev_mode == module.ExecutionMode.TRACK_CACHED
-                brake = prev_mode in (
-                    module.ExecutionMode.BRAKE_HOLD,
-                    module.ExecutionMode.EMERGENCY_STOP)
+                interval_feedback = self._consume_macro_interval_feedback()
+                self._macro_feedback_log = interval_feedback
+                self._macro_feedback_is_new = 1
                 held_action = self._macro_expert.update(
                     goal, state, self._observed_map, dt_s=dt_macro,
-                    local_unrecoverable=self._local_unrecoverable_pending,
-                    cached=cached, brake=brake)
+                    interval_feedback=interval_feedback)
                 if held_action.mode == module.MacroMode.GOAL_REACHED:
                     self._trajectory_reached_goal = True
                     self._exit_reason = "goal_reached"
@@ -484,6 +484,9 @@ class ILManager(object):
                 # Very first frames: build a direct guide until the first
                 # macro tick.
                 held_action = self._macro_expert.make_direct_action(goal, state)
+            if not is_macro_tick:
+                self._macro_feedback_log = None
+                self._macro_feedback_is_new = 0
 
             # ── 5. Local planning (30 Hz, observed map only) ────────
             req = module.LocalPlanRequest()
@@ -552,9 +555,23 @@ class ILManager(object):
                     break
             else:
                 self._emergency_stop_time = 0.0
-            # Remember this frame's execution mode for the next macro tick
-            # (cached / brake causal evidence, section V).
-            self._prev_execution_mode = execution_mode
+            # Accumulate this frame into the macro-interval feedback
+            # (section XXII): the 5 Hz macro consumes the WHOLE interval,
+            # not just the last frame before its tick.
+            fb = self._macro_feedback
+            fb["interval_frame_count"] += 1
+            if not result.success:
+                fb["planning_failure_count"] += 1
+            if execution_mode == module.ExecutionMode.TRACK_FRESH:
+                fb["fresh_frame_count"] += 1
+            elif execution_mode == module.ExecutionMode.TRACK_CACHED:
+                fb["cached_frame_count"] += 1
+            elif execution_mode == module.ExecutionMode.BRAKE_HOLD:
+                fb["brake_frame_count"] += 1
+            elif execution_mode == module.ExecutionMode.EMERGENCY_STOP:
+                fb["emergency_frame_count"] += 1
+            if self._local_unrecoverable_pending:
+                fb["local_unrecoverable_count"] += 1
 
             # ── 7. Trajectory controller ────────────────────────────
             cmd = self._compute_command(
@@ -599,6 +616,26 @@ class ILManager(object):
         })
         self._trajectory_exit_reason = self._exit_reason
         self._enter_state(State.STOP_RECORDING)
+
+    # ── Macro-interval feedback (sections XX-XXIII) ──────────────────
+    def _new_macro_feedback(self):
+        return {
+            "interval_frame_count": 0,
+            "planning_failure_count": 0,
+            "fresh_frame_count": 0,
+            "cached_frame_count": 0,
+            "brake_frame_count": 0,
+            "emergency_frame_count": 0,
+            "local_unrecoverable_count": 0,
+        }
+
+    def _consume_macro_interval_feedback(self):
+        """Consume the aggregated 30 Hz feedback of the last macro
+        interval and reset the accumulator for the next one (section
+        XXIII)."""
+        feedback = dict(self._macro_feedback)
+        self._macro_feedback = self._new_macro_feedback()
+        return feedback
 
     # ── Depth request / match ────────────────────────────────────────
     def _request_depth_frame(self, frame_id, pos, quat):
@@ -921,14 +958,20 @@ class ILManager(object):
         blocker = self._macro_expert.last_blocker
         intervention = self._macro_expert.last_intervention
         local_recoverable = rec.status if rec is not None else -1
-        blocking_component = -1
+        blocker_signature = -1
+        blocker_ray_depth = -1.0
+        blocker_cell_count = 0
+        blocker_track_id = -1
         left_edge = right_edge = left_corridor = right_corridor = 0
         if blocker is not None:
-            blocking_component = blocker.component_id
+            blocker_signature = int(blocker.blocker_signature)
+            blocker_ray_depth = float(blocker.blocking_ray_depth)
+            blocker_cell_count = int(blocker.component_cell_count)
             left_edge = int(blocker.left_edge_visible)
             right_edge = int(blocker.right_edge_visible)
             left_corridor = int(blocker.left_corridor_known)
             right_corridor = int(blocker.right_corridor_known)
+        blocker_track_id = self._macro_expert.blocker_track_id
         privileged_side, margin = self._oracle.privileged_best_side(
             self._macro_expert.last_candidates)
         # The decision margin is computed by the macro from the viable
@@ -996,7 +1039,10 @@ class ILManager(object):
         ])
         if not collect_priv:
             local_recoverable = -1
-            blocking_component = -1
+            blocker_signature = -1
+            blocker_ray_depth = -1.0
+            blocker_cell_count = 0
+            blocker_track_id = -1
             left_edge = right_edge = left_corridor = right_corridor = 0
             privileged_side = 0
             margin = 0.0
@@ -1022,6 +1068,21 @@ class ILManager(object):
             causal_intervention_evidence = 0
             macro_decision_observable = 1
             macro_decision_confidence = 0.0
+
+        # Macro-interval feedback diagnostics (section XXVIII): recorded on
+        # the macro tick frame with real aggregated values; other frames
+        # record zeros with macro_feedback_is_new = 0 (section XXIX).
+        fb = self._macro_feedback_log if self._macro_feedback_is_new else {}
+        macro_feedback_is_new = int(self._macro_feedback_is_new)
+        macro_interval_frame_count = int(fb.get("interval_frame_count", 0))
+        macro_interval_planning_failures = int(
+            fb.get("planning_failure_count", 0))
+        macro_interval_cached_frames = int(fb.get("cached_frame_count", 0))
+        macro_interval_brake_frames = int(fb.get("brake_frame_count", 0))
+        macro_interval_emergency_frames = int(
+            fb.get("emergency_frame_count", 0))
+        macro_interval_local_unrecoverable_frames = int(
+            fb.get("local_unrecoverable_count", 0))
 
         desired_yaw = held_action.desired_yaw_world if \
             held_action.has_desired_yaw else state["yaw"]
@@ -1070,6 +1131,8 @@ class ILManager(object):
             "macro_is_new_tick": int(held_action.is_new_tick),
             "macro_mode": int(held_action.mode),
             "macro_committed_side": int(held_action.committed_side),
+            "macro_observe_side": int(
+                getattr(held_action, "observe_side", 0)),
             "macro_confidence": held_action.confidence,
             "macro_decision_reason": held_action.reason,
             "macro_decision_observable": macro_decision_observable,
@@ -1118,7 +1181,10 @@ class ILManager(object):
             "fresh_planning_status": int(planning_attempt.status),
             # privileged diagnostics
             "local_recoverable": local_recoverable,
-            "blocking_component_id": blocking_component,
+            "blocker_signature": blocker_signature,
+            "blocker_ray_depth": blocker_ray_depth,
+            "blocker_cell_count": blocker_cell_count,
+            "blocker_track_id": blocker_track_id,
             "left_edge_visible": left_edge,
             "right_edge_visible": right_edge,
             "left_corridor_known": left_corridor,
@@ -1141,6 +1207,17 @@ class ILManager(object):
             "privileged_terminal_alignment": privileged_terminal_alignment,
             "direct_no_progress_time": direct_no_progress_time,
             "observe_no_information_time": observe_no_information_time,
+            # macro-interval feedback diagnostics (section XXVIII/XXIX)
+            "macro_feedback_is_new": macro_feedback_is_new,
+            "macro_interval_frame_count": macro_interval_frame_count,
+            "macro_interval_planning_failures":
+                macro_interval_planning_failures,
+            "macro_interval_cached_frames": macro_interval_cached_frames,
+            "macro_interval_brake_frames": macro_interval_brake_frames,
+            "macro_interval_emergency_frames":
+                macro_interval_emergency_frames,
+            "macro_interval_local_unrecoverable_frames":
+                macro_interval_local_unrecoverable_frames,
             "global_cost_to_go": global_ctg if np.isfinite(global_ctg) else -1.0,
             "global_clearance": global_clearance if
             np.isfinite(global_clearance) else -1.0,

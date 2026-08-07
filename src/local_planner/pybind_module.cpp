@@ -224,6 +224,7 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("guide_distance", &MacroAction::guide_distance)
         .def_readwrite("is_new_tick", &MacroAction::is_new_tick)
         .def_readwrite("observe_subtype", &MacroAction::observe_subtype)
+        .def_readwrite("observe_side", &MacroAction::observe_side)
         .def_readwrite("reason", &MacroAction::reason);
 
     py::class_<RecoverabilityResult>(m, "RecoverabilityResult")
@@ -240,8 +241,8 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("rejoin_distance", &RecoverabilityResult::rejoin_distance)
         .def_readwrite("detour_ratio", &RecoverabilityResult::detour_ratio)
         .def_readwrite("rejoin_point", &RecoverabilityResult::rejoin_point)
-        .def_readwrite("blocking_component_id",
-                       &RecoverabilityResult::blocking_component_id)
+        .def_readwrite("blocker_signature",
+                       &RecoverabilityResult::blocker_signature)
         .def_readwrite("left_edge_visible", &RecoverabilityResult::left_edge_visible)
         .def_readwrite("right_edge_visible", &RecoverabilityResult::right_edge_visible)
         .def_readwrite("left_corridor_known", &RecoverabilityResult::left_corridor_known)
@@ -275,9 +276,13 @@ PYBIND11_MODULE(_il_local_planner, m) {
     py::class_<GoalBlocker>(m, "GoalBlocker")
         .def(py::init<>())
         .def_readwrite("found", &GoalBlocker::found)
-        .def_readwrite("component_id", &GoalBlocker::component_id)
+        .def_readwrite("blocker_signature", &GoalBlocker::blocker_signature)
         .def_readwrite("centroid", &GoalBlocker::centroid)
+        .def_readwrite("bbox_min_world", &GoalBlocker::bbox_min_world)
+        .def_readwrite("bbox_max_world", &GoalBlocker::bbox_max_world)
         .def_readwrite("extent", &GoalBlocker::extent)
+        .def_readwrite("blocking_ray_depth", &GoalBlocker::blocking_ray_depth)
+        .def_readwrite("component_cell_count", &GoalBlocker::component_cell_count)
         .def_readwrite("blocked_by_known", &GoalBlocker::blocked_by_known)
         .def_readwrite("left_edge_world", &GoalBlocker::left_edge_world)
         .def_readwrite("right_edge_world", &GoalBlocker::right_edge_world)

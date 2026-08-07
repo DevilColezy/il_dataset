@@ -97,7 +97,8 @@ struct RecoverabilityResult {
     /// detour_ratio = path_length / straight_rejoin_distance.
     double detour_ratio = 0.0;
     Eigen::Vector3d rejoin_point{Eigen::Vector3d::Zero()};
-    int blocking_component_id = -1;
+    /// Stable world-geometry blocker signature (same as GoalBlocker).
+    int blocker_signature = -1;
     bool left_edge_visible = false;
     bool right_edge_visible = false;
     bool left_corridor_known = false;
@@ -144,9 +145,20 @@ struct MacroCandidate {
 /// Identified goal blocker in the observed map (section IV.2).
 struct GoalBlocker {
     bool found = false;
-    int component_id = -1;
+    /// Stable world-geometry signature (quantized centroid + extent +
+    /// blocking-ray depth on a 0.5 m world grid).  It is NOT a map-native
+    /// component index: the macro layer performs the cross-tick
+    /// association using centroid distance + bbox overlap.
+    int blocker_signature = -1;
     Eigen::Vector3d centroid{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d bbox_min_world{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d bbox_max_world{Eigen::Vector3d::Zero()};
     double extent = 0.0;
+    /// Distance (m) from the vehicle to the first blocked cell along the
+    /// goal ray.
+    double blocking_ray_depth = -1.0;
+    /// Number of cells in the blocked connected component.
+    int component_cell_count = 0;
     /// True when the blocking component is known occupied (vs unknown).
     bool blocked_by_known = false;
     Eigen::Vector3d left_edge_world{Eigen::Vector3d::Zero()};
@@ -176,6 +188,10 @@ struct MacroAction {
     /// rotation, zero translation), 1 = OBSERVE_MOVE (planned observation
     /// viewpoint reached through the normal 30 Hz pipeline).
     int observe_subtype = 0;
+    /// OBSERVE direction metadata (LEFT / RIGHT / NONE).  Kept SEPARATE
+    /// from committed_side: it is observation intent only and must never
+    /// bias the local path search (section XIV).
+    Side observe_side = Side::NONE;
     std::string reason;
 };
 

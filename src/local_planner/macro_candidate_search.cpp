@@ -77,6 +77,10 @@ struct BlockComponent {
     Eigen::Vector3d centroid{Eigen::Vector3d::Zero()};
     double extent = 0.0;
     bool blocked_by_known = false;
+    int min_ix = std::numeric_limits<int>::max();
+    int max_ix = std::numeric_limits<int>::min();
+    int min_iy = std::numeric_limits<int>::max();
+    int max_iy = std::numeric_limits<int>::min();
 };
 
 BlockComponent floodBlockedComponent(const ObservedMap& map,
@@ -134,6 +138,10 @@ BlockComponent floodBlockedComponent(const ObservedMap& map,
         ++count;
         sum_x += ix;
         sum_y += iy;
+        comp.min_ix = std::min(comp.min_ix, ix);
+        comp.max_ix = std::max(comp.max_ix, ix);
+        comp.min_iy = std::min(comp.min_iy, iy);
+        comp.max_iy = std::max(comp.max_iy, iy);
         if (known_free_at(ix, iy)) continue;
         for (int n = 0; n < 8; ++n) {
             const int nxi = ix + di[n];
@@ -179,6 +187,7 @@ GoalBlocker analyzeGoalBlocker(const ObservedMap& map,
     GoalBlocker blocker;
     if (!map.esdfBuilt()) return blocker;
     const double res = map.resolution();
+    const Eigen::Vector3d origin = map.origin();
     const Eigen::Vector2d travel = goal_world.head<2>() - state.position.head<2>();
     const double travel_len = travel.norm();
     if (travel_len <= kEpsilon) return blocker;
@@ -207,6 +216,7 @@ GoalBlocker analyzeGoalBlocker(const ObservedMap& map,
     }
     if (!found) return blocker;
     blocker.found = true;
+    blocker.blocking_ray_depth = d;
 
     const int region_radius =
         std::max(8, static_cast<int>(std::ceil(config.edge_search_radius_m / res)));
@@ -214,12 +224,33 @@ GoalBlocker analyzeGoalBlocker(const ObservedMap& map,
         floodBlockedComponent(map, block_ix, block_iy, block_iz,
                               config.min_candidate_clearance_m,
                               region_radius);
-    blocker.component_id = comp.count > 0 ? 0 : -1;
-    blocker.blocked_by_known = comp.blocked_by_known;
     if (comp.count > 0) {
         blocker.centroid = comp.centroid;
         blocker.extent = comp.extent;
+        blocker.component_cell_count = comp.count;
+        blocker.bbox_min_world = Eigen::Vector3d(
+            origin.x() + (static_cast<double>(comp.min_ix) + 0.5) * res,
+            origin.y() + (static_cast<double>(comp.min_iy) + 0.5) * res,
+            z);
+        blocker.bbox_max_world = Eigen::Vector3d(
+            origin.x() + (static_cast<double>(comp.max_ix) + 0.5) * res,
+            origin.y() + (static_cast<double>(comp.max_iy) + 0.5) * res,
+            z);
+        // Stable-ish signature: quantize the world geometry on a 0.5 m
+        // grid (section VIII).  The macro layer still performs the real
+        // association via centroid distance + bbox overlap.
+        int signature = 2166136261;
+        auto mix = [&signature](int v) {
+            signature = (signature ^ v) * 16777619;
+        };
+        mix(static_cast<int>(std::floor(comp.centroid.x() / 0.5)));
+        mix(static_cast<int>(std::floor(comp.centroid.y() / 0.5)));
+        mix(static_cast<int>(std::floor(comp.centroid.z() / 0.5)));
+        mix(static_cast<int>(std::floor(comp.extent / 0.5)));
+        mix(static_cast<int>(std::floor(d / 0.5)));
+        blocker.blocker_signature = signature;
     }
+    blocker.blocked_by_known = comp.blocked_by_known;
 
     // ── Edge visibility + known corridor on each side ──────────────
     const Eigen::Vector2d perp(-goal_dir.y(), goal_dir.x());  // + = left
@@ -524,7 +555,22 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeFrontierCandidates(
         }
         MacroCandidate candidate;
         candidate.type = CandidateType::GOAL_FRONTIER;
-        candidate.side = Side::NONE;
+        // Classify the frontier by its lateral sign relative to the goal
+        // ray (section XVI): +left = LEFT, -left = RIGHT, |lateral| small
+        // -> NONE (central).  This lets OBSERVE_MOVE strictly follow the
+        // current observation side.
+        const Eigen::Vector2d rel_frontier =
+            pulled.head<2>() - state.position.head<2>();
+        const double lateral =
+            (-goal_dir.y()) * rel_frontier.x() + goal_dir.x() * rel_frontier.y();
+        const double side_eps = config_.candidate_spacing_m;
+        if (lateral > side_eps) {
+            candidate.side = Side::LEFT;
+        } else if (lateral < -side_eps) {
+            candidate.side = Side::RIGHT;
+        } else {
+            candidate.side = Side::NONE;
+        }
         candidate.position_world = pulled;
         candidate.source = "goal_frontier";
         candidates.push_back(candidate);

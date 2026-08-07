@@ -117,11 +117,16 @@ class MacroExpert(object):
         self._side_last_progress_time = None
         self._side_last_pos = None
         self._side_path_progress = 0.0
-        # Side memory (section VIII/X): bound to the ACTIVE blocker
-        # component with a light rebind hysteresis.
-        self._active_blocker_id = None
-        self._blocker_pending_id = None
-        self._blocker_pending_ticks = 0
+        # Side memory (section VIII/X): bound to the ACTIVE blocker TRACK
+        # (stable world-geometry association).  Side memory is reset only
+        # when a CONFIRMED new blocker appears or the old blocker is
+        # confirmed passed.
+        self._blocker_track = None
+        self._blocker_lost_since = None
+        self._blocker_new_pending = None
+        self._blocker_switch_ticks = 0
+        self._blocker_matches_current = False
+        self._next_blocker_id = 0
         self._failed_left = None
         self._failed_right = None
         self._side_local_fail_count = {
@@ -137,10 +142,20 @@ class MacroExpert(object):
         self._failed_reason = ""
 
     def _build_action(self, mode, guide_world, desired_yaw, has_yaw,
-                      confidence, reason):
+                      confidence, reason, observe_side=None):
         action = self._module.MacroAction()
         action.mode = mode
-        action.committed_side = self.committed_side
+        # Interface contract (sections XII/XIV): ONLY SIDE_GUIDE exports a
+        # LEFT/RIGHT committed side to the 30 Hz local planner.  DIRECT and
+        # OBSERVE always export NONE so a stale side topology never biases
+        # the local A*.  OBSERVE direction is carried in observe_side.
+        if mode == self._module.MacroMode.SIDE_GUIDE:
+            action.committed_side = self.committed_side
+        else:
+            action.committed_side = self._module.Side.NONE
+        if observe_side is None:
+            observe_side = self._module.Side.NONE
+        action.observe_side = int(observe_side)
         action.guide_world = guide_world
         if has_yaw and desired_yaw is not None:
             action.has_desired_yaw = True
@@ -177,7 +192,7 @@ class MacroExpert(object):
 
     # ── Per-tick update (called at 5 Hz) ─────────────────────────────
     def update(self, goal_world, state, observed_map, dt_s=0.2,
-               local_unrecoverable=False, cached=False, brake=False):
+               interval_feedback=None):
         goal = np.asarray(goal_world, dtype=np.float64)
         pos = np.asarray(state["position"], dtype=np.float64)
         yaw = float(state["yaw"])
@@ -223,8 +238,7 @@ class MacroExpert(object):
         # failures upgrade to macro intervention — never an immediate
         # episode FAILED.
         if self.mode == self._module.MacroMode.DIRECT_GUIDE:
-            self._update_direct_causal(now_s, goal_dist, local_unrecoverable,
-                                       cached, brake)
+            self._update_direct_causal(now_s, goal_dist, interval_feedback)
         elif self.mode == self._module.MacroMode.SIDE_GUIDE:
             self._update_side_progress(now_s, state)
 
@@ -237,7 +251,7 @@ class MacroExpert(object):
         return self._proceed_to_macro_intervention(
             goal, pos, yaw, direct_guide, observed_map, vs, dt_s, now_s)
 
-    # ── DIRECT session (sections III/X/XII/XXV) ──────────────────────
+    # ── DIRECT session (sections II/III/XXV) ─────────────────────────
     def _enter_direct_session(self, goal_dist, now_s):
         """Initialise the DIRECT causal window ONCE when entering DIRECT
         from SIDE_GUIDE / OBSERVE.  Never called on a DIRECT->DIRECT tick,
@@ -254,12 +268,29 @@ class MacroExpert(object):
         self._direct_brake_ticks = 0
         self.causal_intervention_evidence = False
 
-    def _update_direct_causal(self, now_s, goal_dist, local_unrecoverable,
-                              cached, brake):
-        """Rolling DIRECT-session update: best goal distance + last
-        improvement time, and consecutive local-failure / cached / brake
-        counts.  None of these are reset on a plain DIRECT tick, so causal
-        evidence accumulates across 5 Hz cycles (section V)."""
+    def _exit_direct_session(self):
+        """DIRECT session ends when the mode leaves DIRECT.  The causal
+        evidence has served its purpose (trigger macro intervention) and
+        must NOT keep blocking a later re-entry into DIRECT (sections
+        II/III, Case A)."""
+        self._direct_session_active = False
+        self.causal_intervention_evidence = False
+        self._direct_local_failure_ticks = 0
+        self._direct_cached_ticks = 0
+        self._direct_brake_ticks = 0
+        self._direct_best_goal_distance = None
+        self._direct_last_progress_time = None
+        self.direct_no_progress_time = 0.0
+
+    def _update_direct_causal(self, now_s, goal_dist, interval_feedback):
+        """Rolling DIRECT-session update using 30 Hz -> 5 Hz INTERVAL
+        feedback (sections XXIV-XXVI): per-interval planning-failure /
+        cached / brake / emergency aggregates drive macro-tick counters
+        with decay, so a single occasional bad frame never triggers
+        intervention while consecutive unstable intervals do."""
+        cf = self.cfg.get("causal_feedback", {})
+        feedback = interval_feedback or {}
+        interval_frames = max(1, int(feedback.get("interval_frame_count", 1)))
         if self._direct_best_goal_distance is None or \
                 goal_dist < self._direct_best_goal_distance - \
                 self.cfg.get("goal_progress_epsilon_m", 0.05):
@@ -268,31 +299,43 @@ class MacroExpert(object):
         if self._direct_last_progress_time is not None:
             self.direct_no_progress_time = \
                 now_s - self._direct_last_progress_time
-        # Consecutive 30 Hz local-layer feedback (manager flags): a single
-        # occasional failure (Case A) resets the count; a run of failures
-        # (Case B) accumulates.
-        if local_unrecoverable:
+
+        # Local planning failures within the interval (section XXVI).
+        bad_interval = int(feedback.get("planning_failure_count", 0)) >= \
+            int(cf.get("interval_failure_threshold", 2))
+        if bad_interval or int(feedback.get(
+                "local_unrecoverable_count", 0)) > 0:
             self._direct_local_failure_ticks += 1
         else:
-            self._direct_local_failure_ticks = 0
-        if cached:
+            self._direct_local_failure_ticks = max(
+                0, self._direct_local_failure_ticks - 1)
+        # Cached / brake ratio over the interval (Cases G/H).
+        cached_ratio = int(feedback.get("cached_frame_count", 0)) / \
+            interval_frames
+        brake_ratio = int(feedback.get("brake_frame_count", 0)) / \
+            interval_frames
+        if cached_ratio >= float(cf.get("cached_ratio_threshold", 0.5)):
             self._direct_cached_ticks += 1
         else:
-            self._direct_cached_ticks = 0
-        if brake:
+            self._direct_cached_ticks = max(
+                0, self._direct_cached_ticks - 1)
+        if brake_ratio >= float(cf.get("brake_ratio_threshold", 0.5)):
             self._direct_brake_ticks += 1
         else:
-            self._direct_brake_ticks = 0
+            self._direct_brake_ticks = max(
+                0, self._direct_brake_ticks - 1)
+
         evidence = (
             self._direct_local_failure_ticks >=
-            self.cfg.get("causal_evidence_frames", 2)
+            int(cf.get("local_failure_macro_ticks", 2))
             or self._direct_cached_ticks >=
-            self.cfg.get("causal_evidence_frames", 2)
+            int(cf.get("cached_macro_ticks", 2))
             or self._direct_brake_ticks >=
-            self.cfg.get("causal_evidence_frames", 2))
-        # DIRECT long no-progress (goal distance not improving) is CAUSAL
-        # EVIDENCE for macro intervention — never an immediate FAILED
-        # (section VII / Case C).
+            int(cf.get("brake_macro_ticks", 2))
+            or int(feedback.get("emergency_frame_count", 0)) >=
+            int(cf.get("emergency_macro_ticks", 1)))
+        # DIRECT long no-progress is CAUSAL evidence for macro intervention
+        # — never an immediate episode FAILED (section VII / Case C).
         if self._direct_last_progress_time is not None and \
                 self.direct_no_progress_time > \
                 self.cfg.get("direct_intervention_timeout", 5.0):
@@ -385,9 +428,9 @@ class MacroExpert(object):
         blocker = self._module.analyze_goal_blocker(
             observed_map, vs, goal, self._candidate_cfg)
         self._last_blocker = blocker
-        # Side memory is bound to the ACTIVE blocker component (section X):
-        # a confirmed new blocker gets a fresh side state.
-        self._update_blocker_binding(blocker)
+        # Side memory is bound to the ACTIVE blocker TRACK (section X):
+        # stable world-geometry association, lost-grace and release-on-pass.
+        self._update_blocker_tracking(blocker, now_s)
         prev_ptr = None
         if self._prev_guide_world is not None:
             prev_ptr = self._prev_guide_world
@@ -414,7 +457,7 @@ class MacroExpert(object):
                 viable[candidate.side].append(candidate)
 
         # ── Side failure memory (section VIII/XIV) ───────────────────
-        self._update_side_failures(viable, blocker, now_s)
+        self._update_side_failures(viable, now_s)
 
         # ── SIDE selection (section VI) ──────────────────────────────
         side = self._select_side(viable)
@@ -470,7 +513,7 @@ class MacroExpert(object):
             # Entering OBSERVE: initialise the observation reference and
             # close the DIRECT / SIDE sessions (their history stays frozen
             # until a fresh re-entry).
-            self._direct_session_active = False
+            self._exit_direct_session()
             self._side_session_active = False
             self._observe_reference_yaw_world = yaw
             self._observe_yaw_delta = 0.0
@@ -505,12 +548,30 @@ class MacroExpert(object):
             abs(self._observe_yaw_delta) >= fov_half_obs - 1e-6
 
         # FULL-reachable observation viewpoint candidates (OBSERVE_MOVE).
-        observe_move_cands = [
-            c for c in candidates
-            if c.type in (self._module.CandidateType.OBSERVE,
-                          self._module.CandidateType.GOAL_FRONTIER) and
-            c.full_goal_reached and c.known_reachable
-        ]
+        # Strictly follow the CURRENT observation side (sections XV/XVII):
+        # only candidates whose side equals the observe side qualify, and
+        # failed sides are masked (section XVIII / Case F).  When no side
+        # is committed (both failed) only central (NONE) candidates qualify.
+        observe_move_cands = []
+        for c in candidates:
+            if c.type not in (self._module.CandidateType.OBSERVE,
+                              self._module.CandidateType.GOAL_FRONTIER):
+                continue
+            if not c.full_goal_reached or not c.known_reachable:
+                continue
+            if side is None:
+                if c.side != self._module.Side.NONE:
+                    continue
+            else:
+                if c.side != side:
+                    continue
+                if (side == self._module.Side.LEFT and
+                        self._failed_left is not None):
+                    continue
+                if (side == self._module.Side.RIGHT and
+                        self._failed_right is not None):
+                    continue
+            observe_move_cands.append(c)
 
         # OBSERVED_NO_CORRIDOR (section XIV): only when the committed side's
         # edge is ACTUALLY visible AND it was observed for a while with no
@@ -577,7 +638,7 @@ class MacroExpert(object):
             ("right" if side == self._module.Side.RIGHT else "forward")
         action = self._build_action(
             self.mode, guide, desired_yaw_world, True, 0.5,
-            "observe_%s" % side_name)
+            "observe_%s" % side_name, observe_side=side)
         action.observe_subtype = observe_subtype
         self._macro_decision_observable = False
         self._macro_decision_confidence = 0.5
@@ -590,7 +651,7 @@ class MacroExpert(object):
         SIDE (or switching committed side).  Never called on a plain
         SIDE->SIDE tick, so no-progress accumulation is preserved."""
         self._side_session_active = True
-        self._direct_session_active = False
+        self._exit_direct_session()
         self._observe_time_s = 0.0
         self._observe_yaw_delta = 0.0
         self._observe_reference_yaw_world = None
@@ -609,43 +670,166 @@ class MacroExpert(object):
         self._side_best_target_dist = float(
             np.linalg.norm(self._side_target_world - pos))
 
-    def _update_blocker_binding(self, blocker):
-        """Bind side memory to the ACTIVE blocker component with a light
-        hysteresis (section X): a short detection jitter never wipes side
-        memory; only a CONFIRMED new blocker resets failed_left/right."""
-        bid = blocker.component_id
-        if bid < 0:
-            # No blocking component: keep the current binding.
-            self._blocker_pending_id = None
-            self._blocker_pending_ticks = 0
+    # ── Blocker tracking (sections V-XI) ─────────────────────────────
+    def _update_blocker_tracking(self, blocker, now_s):
+        """Associate the current GoalBlocker with the ACTIVE blocker track
+        using world geometry (centroid distance + expanded bbox overlap).
+        - same blocker          -> keep side memory
+        - confirmed new blocker -> fresh side state (section IX)
+        - short loss            -> grace keep (section X / Case C)
+        - confirmed disappearance -> release side memory (section XI)
+        """
+        if not blocker.found:
+            self._blocker_matches_current = False
+            if self._blocker_track is not None:
+                if self._blocker_lost_since is None:
+                    self._blocker_lost_since = now_s
+                if now_s - self._blocker_lost_since > \
+                        self.cfg.get("blocker_lost_grace_s", 2.0):
+                    # Confirmed passed: release side memory (section XI).
+                    self._release_blocker()
             return
-        if self._active_blocker_id is None:
-            self._active_blocker_id = bid
-            self._blocker_pending_id = None
-            self._blocker_pending_ticks = 0
+
+        centroid = np.asarray(blocker.centroid, dtype=np.float64)
+        bbox_min = np.asarray(blocker.bbox_min_world, dtype=np.float64)
+        bbox_max = np.asarray(blocker.bbox_max_world, dtype=np.float64)
+
+        if self._blocker_track is None:
+            if self._blocker_lost_since is not None and \
+                    now_s - self._blocker_lost_since <= \
+                    self.cfg.get("blocker_lost_grace_s", 2.0):
+                # Reappeared within grace: same blocker (Case C).
+                self._blocker_lost_since = None
+                self._refresh_blocker_track(centroid, bbox_min, bbox_max,
+                                            blocker, now_s)
+                self._blocker_matches_current = True
+            else:
+                self._create_blocker_track(centroid, bbox_min, bbox_max,
+                                           blocker, now_s)
+                self._blocker_matches_current = True
             return
-        if bid == self._active_blocker_id:
-            self._blocker_pending_id = None
-            self._blocker_pending_ticks = 0
+
+        if self._blocker_lost_since is not None:
+            # Back within grace: same blocker.
+            self._blocker_lost_since = None
+            self._refresh_blocker_track(centroid, bbox_min, bbox_max,
+                                        blocker, now_s)
+            self._blocker_matches_current = True
             return
-        if self._blocker_pending_id == bid:
-            self._blocker_pending_ticks += 1
+
+        if self._blocker_associated(self._blocker_track, centroid,
+                                    bbox_min, bbox_max):
+            self._refresh_blocker_track(centroid, bbox_min, bbox_max,
+                                        blocker, now_s)
+            self._blocker_switch_ticks = 0
+            self._blocker_new_pending = None
+            self._blocker_matches_current = True
+            return
+
+        # Different blocker candidate: confirm with hysteresis before
+        # switching side memory (section IX).
+        pending = {
+            "centroid": centroid,
+            "bbox_min": bbox_min,
+            "bbox_max": bbox_max,
+            "ray_depth": float(blocker.blocking_ray_depth),
+        }
+        if self._blocker_new_pending is not None and \
+                self._blocker_associated(self._blocker_new_pending,
+                                         centroid, bbox_min, bbox_max):
+            self._blocker_switch_ticks += 1
         else:
-            self._blocker_pending_id = bid
-            self._blocker_pending_ticks = 1
-        if self._blocker_pending_ticks >= self.cfg.get(
+            self._blocker_new_pending = pending
+            self._blocker_switch_ticks = 1
+        if self._blocker_switch_ticks >= self.cfg.get(
                 "blocker_rebind_ticks", 2):
-            # Confirmed new independent blocker: fresh side state.
-            self._active_blocker_id = bid
-            self._failed_left = None
-            self._failed_right = None
-            self._side_local_fail_count = {
-                self._module.Side.LEFT: 0,
-                self._module.Side.RIGHT: 0,
-            }
-            self.committed_side = self._module.Side.NONE
-            self._blocker_pending_id = None
-            self._blocker_pending_ticks = 0
+            self._create_blocker_track(centroid, bbox_min, bbox_max,
+                                       blocker, now_s)
+            self._blocker_new_pending = None
+            self._blocker_switch_ticks = 0
+            self._blocker_matches_current = True
+        else:
+            # Not yet confirmed: the current blocker is treated as NOT the
+            # active one (a single off-track observation never wipes the
+            # side memory or counts as a same-blocker consecutive failure).
+            self._blocker_matches_current = False
+
+    def _blocker_associated(self, track, centroid, bbox_min, bbox_max):
+        """Association (section VII): centroid distance + expanded bbox
+        overlap.  The observed component grows as the map expands, so a
+        small overlap pad is used."""
+        assoc_dist = self.cfg.get("blocker_association_distance_m", 1.5)
+        centroid_dist = float(
+            np.linalg.norm(track["centroid"] - centroid))
+        if centroid_dist > assoc_dist:
+            return False
+        pad = self.cfg.get("blocker_overlap_pad_m", 0.5)
+        a_min = track["bbox_min"][:2] - pad
+        a_max = track["bbox_max"][:2] + pad
+        b_min = bbox_min[:2]
+        b_max = bbox_max[:2]
+        ov_min = np.maximum(a_min, b_min)
+        ov_max = np.minimum(a_max, b_max)
+        overlap = float(np.prod(np.maximum(0.0, ov_max - ov_min)))
+        if overlap <= 0.0:
+            # No overlap: accept only if the centroids are very close.
+            return centroid_dist <= 0.5 * assoc_dist
+        return True
+
+    def _create_blocker_track(self, centroid, bbox_min, bbox_max,
+                              blocker, now_s):
+        self._next_blocker_id += 1
+        self._blocker_track = {
+            "id": self._next_blocker_id,
+            "centroid": centroid,
+            "bbox_min": bbox_min,
+            "bbox_max": bbox_max,
+            "ray_depth": float(blocker.blocking_ray_depth),
+            "extent": float(blocker.extent),
+            "last_seen": now_s,
+        }
+        self._blocker_lost_since = None
+        self._blocker_new_pending = None
+        self._blocker_switch_ticks = 0
+        # New independent blocker: fresh side state (section IX/Case B).
+        self._reset_side_memory()
+
+    def _refresh_blocker_track(self, centroid, bbox_min, bbox_max,
+                               blocker, now_s):
+        if self._blocker_track is None:
+            return
+        self._blocker_track["centroid"] = centroid
+        self._blocker_track["bbox_min"] = bbox_min
+        self._blocker_track["bbox_max"] = bbox_max
+        self._blocker_track["ray_depth"] = float(blocker.blocking_ray_depth)
+        self._blocker_track["extent"] = float(blocker.extent)
+        self._blocker_track["last_seen"] = now_s
+
+    def _release_blocker(self):
+        """Old blocker confirmed passed (section XI): release side memory
+        and topology preferences so they cannot bias later navigation."""
+        self._blocker_track = None
+        self._blocker_lost_since = None
+        self._blocker_new_pending = None
+        self._blocker_switch_ticks = 0
+        self._blocker_matches_current = False
+        self._reset_side_memory()
+
+    def _reset_side_memory(self):
+        self.committed_side = self._module.Side.NONE
+        self._failed_left = None
+        self._failed_right = None
+        self._side_local_fail_count = {
+            self._module.Side.LEFT: 0,
+            self._module.Side.RIGHT: 0,
+        }
+        self._side_session_active = False
+        self._side_best_cost = None
+        self._side_target_world = None
+        self._side_best_target_dist = None
+        self._side_last_progress_time = None
+        self._side_last_pos = None
+        self._side_path_progress = 0.0
 
     # ── Side failure memory (section VIII/XIV) ───────────────────────
     def _mark_side_failed(self, side, reason):
@@ -654,7 +838,7 @@ class MacroExpert(object):
         elif side == self._module.Side.RIGHT:
             self._failed_right = reason
 
-    def _update_side_failures(self, viable, blocker, now_s):
+    def _update_side_failures(self, viable, now_s):
         local_fail_threshold = self.cfg.get(
             "local_path_fail_threshold", 2)
         # PRIVILEGED_DISCONNECTED: an observed-FULL candidate exists on a
@@ -675,9 +859,7 @@ class MacroExpert(object):
                                         self._module.Side.RIGHT):
             committed = self.committed_side
             if not viable[committed]:
-                same_blocker = (
-                    self._active_blocker_id is not None and
-                    blocker.component_id == self._active_blocker_id)
+                same_blocker = bool(self._blocker_matches_current)
                 if same_blocker:
                     self._side_local_fail_count[committed] += 1
                     if self._side_local_fail_count[committed] >= \
@@ -789,3 +971,10 @@ class MacroExpert(object):
     @property
     def macro_decision_confidence(self):
         return float(self._macro_decision_confidence)
+
+    @property
+    def blocker_track_id(self):
+        """Stable id of the ACTIVE blocker track (diagnostic)."""
+        if self._blocker_track is not None:
+            return int(self._blocker_track["id"])
+        return -1
