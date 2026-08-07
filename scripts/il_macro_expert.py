@@ -127,6 +127,10 @@ class MacroExpert(object):
         self._blocker_switch_ticks = 0
         self._blocker_matches_current = False
         self._next_blocker_id = 0
+        # Stable DIRECT recovery (sections X-XV): consecutive macro ticks
+        # with DIRECT genuinely stable -> release old blocker memory.
+        self._direct_stable_ticks = 0
+        self._blocker_released_this_tick = False
         self._failed_left = None
         self._failed_right = None
         self._side_local_fail_count = {
@@ -200,6 +204,9 @@ class MacroExpert(object):
         self._current_position = pos
         self._current_yaw = yaw
         now_s = time.monotonic()
+        # Per-tick diagnostic: cleared here, set True only when the stable
+        # DIRECT release fires below (section XII).
+        self._blocker_released_this_tick = False
 
         goal_dist = float(np.linalg.norm(goal - pos))
         goal_dir_world = np.zeros(3, dtype=np.float64)
@@ -245,6 +252,27 @@ class MacroExpert(object):
         # ── Main decision table (section IV / XXII) ──────────────────
         observed_ok = rec.status == \
             self._module.RecoverabilityStatus.DIRECT_REJOIN_SUCCESS
+
+        # Stable DIRECT recovery (sections X-XV): accumulate macro ticks
+        # while DIRECT is genuinely stable (observed recoverable + no
+        # causal evidence + no local-unrecoverable interval).  Reaching
+        # `direct_release_ticks` confirms the old blocker is passed and
+        # releases its topology memory (sections XI/XII).  A single DIRECT
+        # tick (or a reappearing blocker) resets the counter (section XIV).
+        feedback_now = interval_feedback or {}
+        stable_local = int(feedback_now.get(
+            "local_unrecoverable_count", 0)) == 0
+        if observed_ok and not self.causal_intervention_evidence and \
+                stable_local:
+            self._direct_stable_ticks += 1
+            if self._direct_stable_ticks >= self.cfg.get(
+                    "direct_release_ticks", 3) and \
+                    self._blocker_track is not None:
+                self._blocker_released_this_tick = True
+                self._release_blocker()
+        else:
+            self._direct_stable_ticks = 0
+
         if observed_ok and not self.causal_intervention_evidence:
             return self._handle_direct(goal_dir_world, direct_guide, rec,
                                        goal_dist, now_s)
@@ -553,11 +581,19 @@ class MacroExpert(object):
         # failed sides are masked (section XVIII / Case F).  When no side
         # is committed (both failed) only central (NONE) candidates qualify.
         observe_move_cands = []
+        min_move = self.cfg.get("min_observe_move_distance_m", 0.15)
         for c in candidates:
             if c.type not in (self._module.CandidateType.OBSERVE,
                               self._module.CandidateType.GOAL_FRONTIER):
                 continue
             if not c.full_goal_reached or not c.known_reachable:
+                continue
+            # Safety net (section VIII): never emit a zero/near-zero
+            # displacement observation "move" — that would be a fake
+            # OBSERVE_MOVE (C++ already filters; this is a second guard).
+            move_dist = float(np.linalg.norm(
+                np.asarray(c.position_world) - pos))
+            if move_dist < min_move:
                 continue
             if side is None:
                 if c.side != self._module.Side.NONE:
@@ -806,13 +842,25 @@ class MacroExpert(object):
         self._blocker_track["last_seen"] = now_s
 
     def _release_blocker(self):
-        """Old blocker confirmed passed (section XI): release side memory
-        and topology preferences so they cannot bias later navigation."""
+        """Old blocker confirmed passed (sections XI/XII): release side
+        memory and ALL macro-intervention topology state so they cannot
+        bias navigation toward the next obstacle.  Does NOT touch episode
+        statistics, goal, observed map or trajectory cache."""
         self._blocker_track = None
         self._blocker_lost_since = None
         self._blocker_new_pending = None
         self._blocker_switch_ticks = 0
         self._blocker_matches_current = False
+        self._direct_stable_ticks = 0
+        # Observe side / reference state (section XII).
+        self._observe_time_s = 0.0
+        self._observe_yaw_delta = 0.0
+        self._observe_reference_yaw_world = None
+        self._observe_last_known = None
+        self._observe_last_edge_mask = None
+        self._observe_last_reachable_count = None
+        self._observe_last_info_time = None
+        self.observe_no_information_time = 0.0
         self._reset_side_memory()
 
     def _reset_side_memory(self):

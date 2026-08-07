@@ -26,6 +26,10 @@ struct MacroCandidateConfig {
     double candidate_spacing_m = 0.5;
     /// Forward step of OBSERVE candidates (kept very short / known-safe).
     double observe_step_m = 0.6;
+    /// Minimum candidate->current distance for an OBSERVE candidate to be
+    /// emitted at all.  A zero-distance probe must never be generated: it
+    /// would be trivially FULL-reachable and masquerade as an OBSERVE_MOVE.
+    double min_observe_move_distance_m = 0.15;
     /// Max number of goal-directed frontier candidates.
     int max_frontier_candidates = 8;
     /// Pull-back of frontier candidates into known space.

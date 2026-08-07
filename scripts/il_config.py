@@ -174,6 +174,8 @@ def _validate_config(cfg):
               "macro_expert.blocker_overlap_pad_m", errors, allow_zero=True)
     _positive(me.get("blocker_lost_grace_s", 2.0),
               "macro_expert.blocker_lost_grace_s", errors)
+    _positive(me.get("direct_release_ticks", 3),
+              "macro_expert.direct_release_ticks", errors)
     _positive(me.get("macro_intervention_absolute_safety_timeout", 45.0),
               "macro_expert.macro_intervention_absolute_safety_timeout",
               errors)
@@ -188,6 +190,8 @@ def _validate_config(cfg):
               "macro_candidates.side_corridor_radius_m", errors)
     _positive(mc.get("min_candidate_clearance_m", 0.25),
               "macro_candidates.min_candidate_clearance_m", errors)
+    _positive(mc.get("min_observe_move_distance_m", 0.15),
+              "macro_candidates.min_observe_move_distance_m", errors)
     if mc.get("side_corridor_radius_m", 0.55) <= veh.get("radius_m", 0.30):
         errors.append(
             "macro_candidates.side_corridor_radius_m must exceed vehicle.radius_m")
@@ -450,6 +454,8 @@ def build_macro_candidate_config(g, module):
     cfg.min_candidate_clearance_m = float(mc.get("min_candidate_clearance_m", 0.25))
     cfg.candidate_spacing_m = float(mc.get("candidate_spacing_m", 0.5))
     cfg.observe_step_m = float(mc.get("observe_step_m", 0.6))
+    cfg.min_observe_move_distance_m = float(
+        mc.get("min_observe_move_distance_m", 0.15))
     cfg.max_frontier_candidates = int(mc.get("max_frontier_candidates", 8))
     cfg.frontier_standoff_m = float(mc.get("frontier_standoff_m", 0.45))
     cfg.goal_frontier_cone_deg = float(mc.get("goal_frontier_cone_deg", 70.0))

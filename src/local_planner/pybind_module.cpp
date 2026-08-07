@@ -646,6 +646,8 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("candidate_spacing_m",
                        &MacroCandidateConfig::candidate_spacing_m)
         .def_readwrite("observe_step_m", &MacroCandidateConfig::observe_step_m)
+        .def_readwrite("min_observe_move_distance_m",
+                       &MacroCandidateConfig::min_observe_move_distance_m)
         .def_readwrite("max_frontier_candidates",
                        &MacroCandidateConfig::max_frontier_candidates)
         .def_readwrite("frontier_standoff_m",

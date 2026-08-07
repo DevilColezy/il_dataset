@@ -200,6 +200,9 @@ GoalBlocker analyzeGoalBlocker(const ObservedMap& map,
     int block_ix = 0;
     int block_iy = 0;
     int block_iz = 0;
+    // Explicitly saved ray depth: the loop variable `d` is scoped to the
+    // for-loop, so it can never be referenced afterwards (section II/IV).
+    double blocking_ray_depth = -1.0;
     for (double d = res; d <= max_walk + 1.0e-6; d += res) {
         const Eigen::Vector3d point(
             state.position.x() + goal_dir.x() * d,
@@ -207,6 +210,7 @@ GoalBlocker analyzeGoalBlocker(const ObservedMap& map,
         if (!map.isKnownFree(point.x(), point.y(), point.z(), 0.0)) {
             block_point = point;
             found = true;
+            blocking_ray_depth = d;
             const Eigen::Vector3i g = map.worldToGridInt(point);
             block_ix = g.x();
             block_iy = g.y();
@@ -216,7 +220,7 @@ GoalBlocker analyzeGoalBlocker(const ObservedMap& map,
     }
     if (!found) return blocker;
     blocker.found = true;
-    blocker.blocking_ray_depth = d;
+    blocker.blocking_ray_depth = blocking_ray_depth;
 
     const int region_radius =
         std::max(8, static_cast<int>(std::ceil(config.edge_search_radius_m / res)));
@@ -247,7 +251,7 @@ GoalBlocker analyzeGoalBlocker(const ObservedMap& map,
         mix(static_cast<int>(std::floor(comp.centroid.y() / 0.5)));
         mix(static_cast<int>(std::floor(comp.centroid.z() / 0.5)));
         mix(static_cast<int>(std::floor(comp.extent / 0.5)));
-        mix(static_cast<int>(std::floor(d / 0.5)));
+        mix(static_cast<int>(std::floor(blocking_ray_depth / 0.5)));
         blocker.blocker_signature = signature;
     }
     blocker.blocked_by_known = comp.blocked_by_known;
@@ -622,7 +626,12 @@ std::vector<MacroCandidate> MacroCandidateSearch::generateCandidates(
             }
         }
 
-        // ── Observe candidates (short known-safe moves, mostly yaw) ──
+        // ── Observe candidates (ONLY non-zero known-safe probes) ────
+        // A zero-distance probe (current_position) must NEVER be emitted:
+        // it would be trivially FULL-reachable and masquerade as an
+        // OBSERVE_MOVE while executing nothing (sections V-VII, Case B).
+        // If the probe is unknown / occupied / too close, no MOVE
+        // candidate is generated — OBSERVE_ROTATE still covers pure yaw.
         const Eigen::Vector2d perp(-goal_dir.y(), goal_dir.x());
         for (int side_sign = -1; side_sign <= 1; side_sign += 2) {
             const Side side = side_sign > 0 ? Side::LEFT : Side::RIGHT;
@@ -630,14 +639,16 @@ std::vector<MacroCandidate> MacroCandidateSearch::generateCandidates(
                 state.position.x() + perp.x() * side_sign * config_.observe_step_m,
                 state.position.y() + perp.y() * side_sign * config_.observe_step_m,
                 z);
+            const double move_dist = (probe - state.position).norm();
+            if (move_dist < config_.min_observe_move_distance_m) continue;
+            if (!map.isKnownFree(probe.x(), probe.y(), probe.z(),
+                                 config_.min_candidate_clearance_m)) {
+                continue;
+            }
             MacroCandidate observe;
             observe.type = CandidateType::OBSERVE;
             observe.side = side;
-            observe.position_world =
-                map.isKnownFree(probe.x(), probe.y(), probe.z(),
-                                config_.min_candidate_clearance_m)
-                    ? probe
-                    : state.position;
+            observe.position_world = probe;
             observe.source = side == Side::LEFT ? "observe_left" : "observe_right";
             candidates.push_back(observe);
         }

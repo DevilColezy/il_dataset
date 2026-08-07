@@ -167,6 +167,11 @@ global:
     blocker_overlap_pad_m:          0.5
     blocker_lost_grace_s:           2.0
     blocker_rebind_ticks:           2
+    # Stable DIRECT release (sections X-XV): after this many CONSECUTIVE
+    # macro ticks with DIRECT genuinely stable (observed recoverable + no
+    # causal evidence + no local-unrecoverable interval), the old blocker
+    # topology memory is released.  A single DIRECT tick never releases it.
+    direct_release_ticks:           3
     # Goal reached condition (distance + speed).
     goal_tolerance_m:           0.30
     goal_speed_tolerance_mps:   0.20
@@ -193,6 +198,9 @@ global:
     min_candidate_clearance_m:  0.25
     candidate_spacing_m:        0.5
     observe_step_m:             0.6
+    # Minimum candidate->current distance for an OBSERVE candidate to be
+    # emitted.  Zero-distance probes are never generated (no fake MOVE).
+    min_observe_move_distance_m: 0.15
     max_frontier_candidates:    8
     frontier_standoff_m:        0.45
     goal_frontier_cone_deg:     70.0
