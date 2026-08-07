@@ -28,6 +28,23 @@ else()
   set(IL_DATASET_ARCH_FLAGS -march=native)
 endif()
 
+# ── AddressSanitizer (optional native crash diagnosis) ────────────────
+# The C++ local planner can corrupt the heap (glibc abort: "double free or
+# corruption") only when obstacles are actually encountered.  Enable this
+# option to locate the exact out-of-bounds WRITE:
+#   catkin build il_dataset --cmake-args -DIL_DATASET_ASAN=ON
+# then re-run; AddressSanitizer prints the offending file:line.  Turn it
+# OFF again for normal collection (ASan is slower).
+option(IL_DATASET_ASAN "Build C++ local planner with AddressSanitizer" OFF)
+set(IL_DATASET_SAN_FLAGS "")
+if(IL_DATASET_ASAN)
+  set(IL_DATASET_SAN_FLAGS -fsanitize=address -fno-omit-frame-pointer)
+  set(IL_DATASET_OPT_FLAGS -O1 -g)
+  message(STATUS "il_dataset: AddressSanitizer ENABLED (native heap diagnosis)")
+else()
+  set(IL_DATASET_OPT_FLAGS -O3)
+endif()
+
 # ── Catkin ──────────────────────────────────────────────────────
 find_package(catkin REQUIRED COMPONENTS
   flightlib
@@ -106,9 +123,12 @@ set_target_properties(il_local_planner_lib PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 target_compile_options(il_local_planner_lib PRIVATE
-  -O3 -Wall -Wextra ${IL_DATASET_ARCH_FLAGS}
+  ${IL_DATASET_OPT_FLAGS} -Wall -Wextra ${IL_DATASET_SAN_FLAGS} ${IL_DATASET_ARCH_FLAGS}
 )
-target_link_libraries(il_local_planner_lib ${catkin_LIBRARIES})
+target_link_libraries(il_local_planner_lib
+  ${catkin_LIBRARIES}
+  ${IL_DATASET_SAN_FLAGS}
+)
 if(NLopt_FOUND)
   target_compile_definitions(il_local_planner_lib PRIVATE IL_DATASET_HAS_NLOPT=1)
 
@@ -143,11 +163,12 @@ pybind11_add_module(_il_local_planner
   src/local_planner/pybind_module.cpp
 )
 target_compile_options(_il_local_planner PRIVATE
-  -O3 -Wall -Wextra ${IL_DATASET_ARCH_FLAGS}
+  ${IL_DATASET_OPT_FLAGS} -Wall -Wextra ${IL_DATASET_SAN_FLAGS} ${IL_DATASET_ARCH_FLAGS}
 )
 target_link_libraries(_il_local_planner PRIVATE
   il_local_planner_lib
   ${catkin_LIBRARIES}
+  ${IL_DATASET_SAN_FLAGS}
   stdc++fs
 )
 

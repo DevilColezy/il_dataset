@@ -44,6 +44,9 @@ class GeneratedTask(object):
         self.target_task_class = target_task_class  # TaskClass
         self.task_seed = int(task_seed)
         self.metrics = metrics or {}
+        # Set by the manager when this task's quota has been resolved to
+        # exactly one of COMMITTED / FAILED / CANCELLED (section XI).
+        self.quota_resolved = False
 
     def to_dict(self):
         return {
@@ -61,17 +64,25 @@ class GeneratedTask(object):
 class DatasetQuota(object):
     """Dataset-level balancing across TaskClasses (sections LXII/LXVI).
 
-    Splits scheduling from outcome so balancing targets the COMMITTED
-    (successfully collected) distribution instead of the generated one:
-      - scheduled: tasks accepted into a per-scene task list (pending
-        execution) — only a small future credit;
+    Task lifecycle accounting is STRICTLY CONSERVED (section III):
+      - generated: cumulative history of tasks ever scheduled (diagnostic
+        only — NEVER used for quota fulfilment);
+      - pending: tasks generated but not yet resolved to a final outcome
+        (the ONLY live counter that feeds `need()`);
       - committed: episodes that reached the goal AND passed the quality
-        gates (the real imitation training data);
-      - failed: episodes that failed (macro FAILED / timeout / collision /
-        depth failure / any quality-gate rejection).
-    `need()` balances against `committed + pending_weight * scheduled`, so
-    a class whose success rate is low keeps being re-sampled until its
-    committed share approaches the target weights (section XXXIX).
+        gates AND were written by the dataset writer (real training data);
+      - failed: tasks executed but not committed;
+      - cancelled: tasks that were scheduled (pending) but never executed
+        (scene rejected / task list dropped / collection aborted).
+
+    Every task starts with `note_scheduled()` (generated+=1, pending+=1)
+    and MUST end with exactly ONE of note_committed / note_failed /
+    note_cancelled.  Pending is always released under the class the task
+    was SCHEDULED with (the target class); only the committed credit may
+    use a (reclassified) runtime class (sections VI/VII).  `need()`
+    balances against `committed + pending_weight * pending`, so a class
+    whose success rate is low keeps being re-sampled until its committed
+    share approaches the target weights (section XXXIX).
     """
 
     def __init__(self, class_weights, pending_weight=0.5):
@@ -85,27 +96,55 @@ class DatasetQuota(object):
         for cls in TaskClass:
             self.weights.setdefault(cls, 0.0)
         self.pending_weight = float(pending_weight)
-        self.scheduled = {cls: 0 for cls in TaskClass}
+        self.generated = {cls: 0 for cls in TaskClass}
+        self.pending = {cls: 0 for cls in TaskClass}
         self.committed = {cls: 0 for cls in TaskClass}
         self.failed = {cls: 0 for cls in TaskClass}
+        self.cancelled = {cls: 0 for cls in TaskClass}
 
     def note_scheduled(self, cls):
-        self.scheduled[cls] += 1
+        self.generated[cls] += 1
+        self.pending[cls] += 1
 
-    def note_committed(self, cls):
-        self.committed[cls] += 1
+    def _resolve_pending(self, cls):
+        # Underflow must be loud: it means a double resolution or a wrong
+        # class resolution (section XLVIII), never silently clamped.
+        if self.pending[cls] <= 0:
+            raise RuntimeError(
+                "quota pending underflow for %s" % cls)
+        self.pending[cls] -= 1
 
-    def note_failed(self, cls):
-        self.failed[cls] += 1
+    def note_committed(self, scheduled_class, committed_class):
+        self._resolve_pending(scheduled_class)
+        self.committed[committed_class] += 1
+
+    def note_failed(self, scheduled_class):
+        self._resolve_pending(scheduled_class)
+        self.failed[scheduled_class] += 1
+
+    def note_cancelled(self, scheduled_class):
+        self._resolve_pending(scheduled_class)
+        self.cancelled[scheduled_class] += 1
+
+    def cancel_all_pending(self):
+        """Cancel every currently pending task (collection abort / DONE)."""
+        total = 0
+        for cls in TaskClass:
+            n = self.pending[cls]
+            if n > 0:
+                self.pending[cls] = 0
+                self.cancelled[cls] += n
+                total += n
+        return total
 
     def effective_total(self):
         return sum(self.committed.values()) + \
-            self.pending_weight * sum(self.scheduled.values())
+            self.pending_weight * sum(self.pending.values())
 
     def need(self, cls):
         total = self.effective_total()
         effective = self.committed[cls] + \
-            self.pending_weight * self.scheduled[cls]
+            self.pending_weight * self.pending[cls]
         expected = self.weights[cls] * max(1.0, total)
         return max(0.0, expected - effective)
 
@@ -118,9 +157,11 @@ class DatasetQuota(object):
             outcome = self.committed[cls] + self.failed[cls]
             rate = (float(self.committed[cls]) / outcome) if outcome else None
             out[cls.value] = {
-                "scheduled": self.scheduled[cls],
+                "generated": self.generated[cls],
+                "pending": self.pending[cls],
                 "committed": self.committed[cls],
                 "failed": self.failed[cls],
+                "cancelled": self.cancelled[cls],
                 "success_rate": round(rate, 4) if rate is not None else None,
             }
         return out

@@ -57,6 +57,10 @@ global:
   # ── Point cloud export (privileged global map input) ───────────────
   # Completion is decided by the PLY file itself (existence + stable
   # size); get_pc_msg / save_pc_success messages are only diagnostics.
+  # VERIFIED AvoidBench semantics (SavePointCloud.cs): `origin` is the
+  # CENTER of the sampled box and `range` is the FULL extent, so the box
+  # is origin +/- range/2 = x[-12,15] y[-6,38] z[-0.5,7.5] — designed to
+  # cover the factory (Warehouse) WALLS.
   pointcloud:
     range:        [27.0, 44.0, 8.0]
     origin:       [1.5, 16.0, 3.5]
@@ -79,12 +83,15 @@ global:
     minimum_tasks_per_scene: 1
     max_generation_attempts: 24
     obstacle_region:
-      min_x: 1.5
-      max_x: 28.5
-      min_y: 16.0
-      max_y: 60.0
-      min_z: 3.5
-      max_z: 11.5
+      # Factory (Warehouse, scene_id=1) interior — VERIFIED 'fixed' values
+      # (x[-7,10] y[0,30] z[0,8]).  The point-cloud grid covers the walls
+      # around it; obstacles must stay inside this inner region.
+      min_x: -7.0
+      max_x: 10.0
+      min_y: 0.0
+      max_y: 30.0
+      min_z: 0.0
+      max_z: 8.0
     geometry:
       # Full-height cylinders (sections XV-XVIII): obstacle height and
       # center are DERIVED from the region vertical span
@@ -132,11 +139,15 @@ global:
   # never student inputs and never forced onto the macro expert mode.
   task_generation:
     enabled: true
-    flight_height_m: 5.0
+    # VERIFIED 'fixed' flight height: 1.8-2.2 m inside the factory z[0,8].
+    flight_height_m: 2.0
     clearance_m: 0.20            # extra margin on top of vehicle radius (ESDF)
     task_seed_base: 999983
-    region_min: [1.5, 16.0, 3.5]
-    region_max: [28.5, 60.0, 11.5]
+    # Factory drivable box covering all verified start/goal sampling
+    # regions (starts y~-1 / x~-8 / x~11.5; goals y~31 / x~-8 / x~11.5).
+    # Sits inside the point-cloud grid x[-12,15] y[-6,38] z[-0.5,7.5].
+    region_min: [-8.5, -1.5, 0.0]
+    region_max: [11.5, 32.0, 8.0]
     distance_bands:
       short:
         min_m: 4.0

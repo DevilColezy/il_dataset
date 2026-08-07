@@ -82,6 +82,19 @@ class ObstacleRegion(object):
         return (self.min_x <= x <= self.max_x and
                 self.min_y <= y <= self.max_y)
 
+    def contains_cylinder(self, x, y, radius, margin=0.0):
+        """True if a cylinder of `radius` fits fully inside the region with
+        its SURFACE at least `margin` from every wall.
+
+        The factory is walled (point cloud box == factory interior): a
+        cylinder whose center is inside but whose surface crosses the box
+        edge would poke through the wall, so placement and validation must
+        check center +/- radius, not just the center (section XX).
+        """
+        r = radius + margin
+        return (self.min_x + r <= x <= self.max_x - r and
+                self.min_y + r <= y <= self.max_y - r)
+
     def center(self):
         return np.array([0.5 * (self.min_x + self.max_x),
                          0.5 * (self.min_y + self.max_y)], dtype=np.float64)
@@ -226,15 +239,20 @@ class ProceduralSceneGenerator(object):
         return "independent"
 
     def _place_obstacle(self, rng, profile, placed):
-        """Rejection-sample one cylinder position with min surface gap."""
+        """Rejection-sample one cylinder position with min surface gap.
+
+        The center is inset by `boundary_margin + radius` so the obstacle
+        surface keeps a full `boundary_margin` clear of the factory walls.
+        """
         radius = rng.uniform(profile.radius_min_m, profile.radius_max_m)
-        margin = self.boundary_margin_m + radius
+        m = self.boundary_margin_m + radius
         for _ in range(300):
-            x = rng.uniform(self.region.min_x + margin,
-                            self.region.max_x - margin)
-            y = rng.uniform(self.region.min_y + margin,
-                            self.region.max_y - margin)
-            if not self.region.contains(x, y):
+            x = rng.uniform(self.region.min_x + m,
+                            self.region.max_x - m)
+            y = rng.uniform(self.region.min_y + m,
+                            self.region.max_y - m)
+            if not self.region.contains_cylinder(
+                    x, y, radius, self.boundary_margin_m):
                 continue
             ok = True
             for (px, py, pr) in placed:
@@ -280,11 +298,13 @@ class ProceduralSceneGenerator(object):
                 t = (i / max(1, n - 1)) - 0.5
                 x = center[0] + t * span + rng.uniform(-0.2, 0.2)
                 y = base_y + math.sin(t * 2.4) * 0.5 + rng.uniform(-0.15, 0.15)
-                if not self.region.contains(x, y):
-                    continue
                 radius = rng.uniform(profile.radius_min_m,
                                      min(profile.radius_max_m,
                                          self.region.width() / n / 2.0))
+                # Surface (not just center) must stay clear of the walls.
+                if not self.region.contains_cylinder(
+                        x, y, radius, self.boundary_margin_m):
+                    continue
                 obstacles.append(CylinderObstacleSpec(
                     x, y, self._obstacle_center_z, radius,
                     self._obstacle_height, "chain_%d" % i))
@@ -306,6 +326,9 @@ class ProceduralSceneGenerator(object):
                     x = cx + math.cos(ang) * rad
                     y = cy + math.sin(ang) * rad
                     if not self.region.contains(x, y):
+                        continue
+                    if not self.region.contains_cylinder(
+                            x, y, radius, self.boundary_margin_m):
                         continue
                     ok = all(math.hypot(x - px, y - py) >=
                              pr + radius + self.minimum_surface_gap_m
@@ -371,10 +394,12 @@ class SceneGeometryValidator(object):
             return False, "no_obstacles", {}
         margin = self.cfg.get("geometry", {}).get("boundary_margin_m", 0.6) \
             if self.cfg else 0.6
-        # 1) boundary margin.
+        # 1) boundary: the obstacle SURFACE (center +/- radius) must stay at
+        # least `margin` from every wall — a center-only check lets large
+        # cluster/chain cylinders poke through the factory walls (section
+        # XX).
         for ob in obstacles:
-            if not (region.min_x + margin <= ob.x <= region.max_x - margin and
-                    region.min_y + margin <= ob.y <= region.max_y - margin):
+            if not region.contains_cylinder(ob.x, ob.y, ob.radius, margin):
                 return False, "boundary_violation", {}
         # 2) raw surface gap between obstacle bodies (no severe overlap).
         for i in range(len(obstacles)):

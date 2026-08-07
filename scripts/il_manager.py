@@ -30,6 +30,7 @@ from __future__ import print_function, division
 import json
 import math
 import os
+import shutil
 import sys
 import time
 from enum import Enum
@@ -117,6 +118,14 @@ class State(Enum):
     ERROR = 16
 
 
+class TaskOutcome(Enum):
+    """Final quota lifecycle outcome of one scheduled task (sections
+    XI/XXXIV).  Every task resolves to exactly one of these."""
+    COMMITTED = 0
+    FAILED = 1
+    CANCELLED = 2
+
+
 class ILManager(object):
     def __init__(self, cfg):
         self.cfg = cfg
@@ -202,6 +211,7 @@ class ILManager(object):
         self._current_tasks = []
         self._current_task = None
         self._current_task_id = None
+        self._current_task_quota_resolved = False
         self._task_index = 0
         self._episode_index = 0
         self._scene_dir = None
@@ -254,11 +264,57 @@ class ILManager(object):
     # ═════════════════════════════════════════════════════════════════
     #  FSM
     # ═════════════════════════════════════════════════════════════════
+    def _cleanup_output(self):
+        """Clear the whole output root before a fresh collection run.
+
+        A previous crashed run can leave stale `_inprogress/` episode dirs,
+        cached `maps/*.ply`, `scenes/`, `_failed/` and `_debug/` entries.
+        If they are not removed, the next run re-creates an identical
+        episode id (e.g. `scene_..._task_004_ep04`) and DatasetWriter's
+        `os.makedirs()` raises FileExistsError.  This restores the
+        pre-reshape behavior of clearing the selected output folder at
+        startup (every run produces a fresh dataset).
+        """
+        if not os.path.isdir(self.output_root):
+            os.makedirs(self.output_root)
+            return
+        removed = 0
+        for entry in os.listdir(self.output_root):
+            entry_path = os.path.join(self.output_root, entry)
+            try:
+                if os.path.isfile(entry_path) or os.path.islink(entry_path):
+                    os.unlink(entry_path)
+                elif os.path.isdir(entry_path):
+                    shutil.rmtree(entry_path, ignore_errors=True)
+                removed += 1
+            except Exception as exc:  # noqa: BLE001
+                rospy.logwarn("[Manager] cleanup failed for %s: %s",
+                              entry_path, exc)
+        rospy.loginfo("[Manager] Output dir cleaned: %s (%d entries)",
+                      self.output_root, removed)
+        # Recreate the subdirs the FSM relies on.
+        for sub in ("_inprogress", "maps", "scenes", "_failed", "_debug"):
+            sub_path = os.path.join(self.output_root, sub)
+            if not os.path.isdir(sub_path):
+                os.makedirs(sub_path)
+
     def run(self):
+        # Fresh collection run: clear the whole output root first (stale
+        # _inprogress episodes / maps / scenes), exactly like the
+        # pre-reshape manager did.
+        self._cleanup_output()
         rate = rospy.Rate(10.0)
         while not rospy.is_shutdown():
             self._tick()
             if self.state == State.DONE:
+                # Normal completion: no task may still be pending (section
+                # XXXVII).  Any leftover is a lifecycle bug — cancel it so
+                # the final summary is honest.
+                leftover = self._quota.cancel_all_pending()
+                if leftover:
+                    rospy.logerr(
+                        "[Manager] DONE with %d unresolved pending tasks "
+                        "(auto-cancelled)", leftover)
                 rospy.loginfo(
                     "[Manager] Collection complete. scenes=%d episodes=%d "
                     "committed=%d quota=%s", self._total_scenes,
@@ -266,7 +322,12 @@ class ILManager(object):
                     self._quota.summary())
                 return
             if self.state == State.ERROR:
-                rospy.logerr("[Manager] ERROR: %s", self._error)
+                # Release every leftover pending on a fatal abort (section
+                # XXXVIII): current/future tasks cannot run.
+                leftover = self._quota.cancel_all_pending()
+                rospy.logerr(
+                    "[Manager] ERROR: %s (auto-cancelled %d pending tasks)",
+                    self._error, leftover)
                 return
             rate.sleep()
 
@@ -312,6 +373,11 @@ class ILManager(object):
         # XXI).  No user input is required after launch.
         if not self._bridge._bound:
             self._bridge.bind()
+            rospy.loginfo(
+                "[Manager] Bound ZMQ in=%s / out=%s; waiting for AvoidBench "
+                "ready handshake (scene id=%d)",
+                self.g.get("pub_port"), self.g.get("sub_port"),
+                self._unity_scene_id)
         if self._bridge.connect_handshake(
                 self._unity_scene_id, self._depth_cfg,
                 timeout=self._fsm.get("connect_timeout", 60.0)):
@@ -567,16 +633,29 @@ class ILManager(object):
     def _st_build_privileged_map(self):
         try:
             points = load_ply(self._pc_path)
-            region = self._current_scene.region
-            rmin = np.array([region.min_x, region.min_y, region.min_z],
-                            dtype=np.float64)
-            rmax = np.array([region.max_x, region.max_y, region.max_z],
-                            dtype=np.float64)
+            # Grid bounds = the AvoidBench point-cloud sampling box, NOT the
+            # obstacle placement region.  SavePointCloud.cs interprets the
+            # request origin as the CENTER and range as the FULL extent, so
+            # the box is origin +/- range/2 (verified 'fixed' config).  It
+            # is designed to cover the factory WALLS; the task start/goal
+            # regions sit inside it.  Using the smaller obstacle region here
+            # would clip the walls out of the privileged map and reject
+            # start/goal near the factory edges.
+            pc_cfg = self.g.get("pointcloud", {})
+            pc_origin = np.asarray(
+                pc_cfg.get("origin", [1.5, 16.0, 3.5]), dtype=np.float64)
+            pc_range = np.asarray(
+                pc_cfg.get("range", [27.0, 44.0, 8.0]), dtype=np.float64)
+            rmin = pc_origin - 0.5 * pc_range
+            rmax = pc_origin + 0.5 * pc_range
             if not self._oracle.build_scene(points, self._oracle_config,
                                             rmin, rmax):
                 raise ValueError("privileged scene build failed")
-            rospy.loginfo("[Manager] privileged map built: %d points",
-                          len(points))
+            rospy.loginfo(
+                "[Manager] privileged map built: %d points "
+                "(grid x[%.1f,%.1f] y[%.1f,%.1f] z[%.1f,%.1f])",
+                len(points), rmin[0], rmax[0], rmin[1], rmax[1], rmin[2],
+                rmax[2])
         except Exception as exc:  # noqa: BLE001
             self._error = "privileged_map_build_failed: %s" % exc
             self._enter_state(State.ERROR)
@@ -595,7 +674,18 @@ class ILManager(object):
             return
         if len(tasks) < self._min_tasks_per_scene:
             # This scene cannot produce enough valid tasks -> regenerate it
-            # with a new seed (section XXXVIII/XLIX).
+            # with a new seed (section XXXVIII/XLIX).  The generated tasks
+            # were already note_scheduled()'d; since the scene is rejected
+            # they will never run, so every one of them must be cancelled
+            # (sections IX/XXXII) — otherwise phantom pending would make
+            # these classes look over-satisfied.
+            for t in tasks:
+                try:
+                    self._quota.note_cancelled(t.target_task_class)
+                except RuntimeError as exc:
+                    rospy.logerr("[Manager] quota cancel error for %s: %s",
+                                 t.task_id, exc)
+                t.quota_resolved = True
             self._scene_attempt += 1
             GenerationFailureWriter.write(self._generation_failures_path, {
                 "event": "insufficient_tasks",
@@ -637,6 +727,41 @@ class ILManager(object):
             "reason": reason,
         })
 
+    def _resolve_current_task_quota(self, outcome, committed_class=None):
+        """Resolve the CURRENT task's quota exactly once (sections XII-XV).
+
+        Every scheduled task must end in exactly one of COMMITTED / FAILED /
+        CANCELLED; the per-task `_current_task_quota_resolved` guard makes
+        double resolution impossible (sections XI/XLVI).  pending is always
+        released under the task's TARGET (scheduled) class; only the
+        committed credit may use a runtime class (sections VI-VII).  Marks
+        `task.quota_resolved` so FINISH_SCENE can verify full resolution.
+        """
+        if self._current_task_quota_resolved:
+            rospy.logerr("[Manager] quota double-resolve attempt for %s",
+                         self._current_task_id)
+            return
+        self._current_task_quota_resolved = True
+        task = self._current_tasks[self._task_index]
+        task.quota_resolved = True
+        scheduled_class = task.target_task_class
+        try:
+            if outcome == TaskOutcome.COMMITTED:
+                cls = (committed_class if committed_class is not None
+                       else scheduled_class)
+                self._quota.note_committed(scheduled_class, cls)
+            elif outcome == TaskOutcome.FAILED:
+                self._quota.note_failed(scheduled_class)
+            elif outcome == TaskOutcome.CANCELLED:
+                self._quota.note_cancelled(scheduled_class)
+        except RuntimeError as exc:
+            # Pending underflow means a lifecycle bookkeeping bug; log it
+            # loudly but never crash the unattended collection (section X).
+            # The task stays marked resolved (no double attempts); any
+            # leftover pending is auto-cancelled at scene end / DONE.
+            rospy.logerr("[Manager] quota resolution error for %s: %s",
+                         self._current_task_id, exc)
+
     def _st_reset_drone(self):
         if self._task_index >= len(self._current_tasks):
             self._enter_state(State.FINISH_SCENE)
@@ -651,15 +776,26 @@ class ILManager(object):
             "generation_metrics": task.metrics,
         }
         self._current_task_id = task.task_id
+        self._current_task_quota_resolved = False
         # Goal-specific cost-to-go / connectivity for THIS task (the scene
-        # map is already built once, section XLIV/LXXI).
+        # map is already built once, section XLIV/LXXI).  A set_task failure
+        # must still release the task's pending quota (section XVI).
         if not self._oracle.set_task(task.start, task.goal):
             self._record_task_failure("set_task_unreachable")
+            self._resolve_current_task_quota(TaskOutcome.FAILED)
             self._task_index += 1
             self._enter_state(State.RESET_DRONE)
             return
-        # Reset drone + all per-task navigation state (section XLIII).
-        self._dynamics.reset(task.start, task.initial_yaw)
+        # A reset that the backend rejects is also a FAILED outcome — never
+        # a silent skip that leaves phantom pending (section XVII).
+        try:
+            self._dynamics.reset(task.start, task.initial_yaw)
+        except Exception as exc:  # noqa: BLE001
+            self._record_task_failure("reset_failed: %s" % exc)
+            self._resolve_current_task_quota(TaskOutcome.FAILED)
+            self._task_index += 1
+            self._enter_state(State.RESET_DRONE)
+            return
         self._observed_map.reset(task.start)
         self._observed_map.force_rebuild_esdf()
         self._macro_expert.reset()
@@ -685,8 +821,16 @@ class ILManager(object):
         self._macro_feedback = self._new_macro_feedback()
         self._macro_feedback_log = None
         self._macro_feedback_is_new = 0
-        # Per-episode writer.
+        # Per-episode writer.  A stale `_inprogress/<episode>.inprogress`
+        # dir from a previous crashed run would make DatasetWriter's
+        # os.makedirs() raise FileExistsError — remove it defensively even
+        # though the startup output cleanup normally guarantees a clean
+        # root.
         self._episode_id = "%s_ep%02d" % (task.task_id, self._episode_index)
+        stale_episode_dir = os.path.join(
+            self._inprogress_root, self._episode_id + ".inprogress")
+        if os.path.isdir(stale_episode_dir):
+            shutil.rmtree(stale_episode_dir, ignore_errors=True)
         self._writer = DatasetWriter(
             self.g.get("dataset_logging", {}), self._episode_id,
             self._inprogress_root, self._dataset_scene_key, task.task_id,
@@ -1623,8 +1767,6 @@ class ILManager(object):
         success = self._trajectory_reached_goal and not reject_reason
         if not success and not reject_reason:
             reject_reason = self._trajectory_exit_reason
-        if not success:
-            self._failed_tasks += 1
         extra = {
             "exit_reason": self._trajectory_exit_reason,
             "reject_reason": reject_reason,
@@ -1634,11 +1776,23 @@ class ILManager(object):
             "unmatched_pct": unmatched_pct,
             "latency_violation_pct": latency_violation_pct,
             "none_depth_pct": none_depth_pct,
-            "committed": success,
+            "quality_committed": success,
         }
-        self._writer.finish(success, reject_reason, extra)
-        if success:
+        # The dataset commit must ACTUALLY succeed before an episode may
+        # count as committed training data (sections XXII-XXIII): a write /
+        # rename failure is a FAILED outcome, never COMMITTED.
+        write_ok = False
+        try:
+            final_dir = self._writer.finish(success, reject_reason, extra)
+            write_ok = final_dir is not None
+        except Exception as exc:  # noqa: BLE001
+            rospy.logerr("[Manager] dataset write failed: %s", exc)
+            write_ok = False
+        committed = bool(success and write_ok)
+        if committed:
             self._committed_episodes += 1
+        else:
+            self._failed_tasks += 1
 
         # Task manifest output + runtime classification (section XLVII).
         # `initial_observed_recoverable` is the value FROZEN at the first
@@ -1648,9 +1802,10 @@ class ILManager(object):
         # XXXVII).
         task = self._current_tasks[self._task_index]
         runtime_info = {
-            "episode_result": "success" if success else "failed",
+            "episode_result": "success" if committed else "failed",
             "exit_reason": self._trajectory_exit_reason,
             "reject_reason": reject_reason,
+            "dataset_write_ok": write_ok,
         }
         runtime_cls = None
         if self._runtime_classify_enabled:
@@ -1671,30 +1826,32 @@ class ILManager(object):
             runtime_info["classification_mismatch"] = bool(
                 runtime_cls is not None and
                 runtime_cls != task.target_task_class)
-        # Quota accounting (sections XXXIII-XLI): only a successful,
-        # committed episode counts as training data; a failed episode only
-        # increments the failed counter.  The runtime class (when known) is
-        # the committed class, with the generation-time target class as
-        # fallback (sections XXXVI/XLI).
-        if success:
+        # Quota accounting (sections XXXIII-XLI) through the single task
+        # resolver: COMMITTED only after the writer commit succeeded;
+        # otherwise FAILED.  pending is released under the scheduled
+        # (target) class; the committed credit uses the runtime class with
+        # the target class as fallback (sections VI/VII/XXIV).
+        if committed:
             committed_cls = (runtime_cls if runtime_cls is not None
                              else task.target_task_class)
-            self._quota.note_committed(committed_cls)
+            self._resolve_current_task_quota(
+                TaskOutcome.COMMITTED, committed_class=committed_cls)
             runtime_info["committed_class"] = committed_cls.value
         else:
-            self._quota.note_failed(task.target_task_class)
+            self._resolve_current_task_quota(TaskOutcome.FAILED)
             runtime_info["committed_class"] = None
         task_dir = os.path.join(self._scene_dir, "tasks", task.task_id)
         TaskManifestWriter.write(
             os.path.join(task_dir, "task_manifest.json"),
             task.to_dict(), runtime_info)
-        if not success:
+        if not committed:
             GenerationFailureWriter.write(self._generation_failures_path, {
                 "event": "task_failed",
                 "task_id": task.task_id,
                 "scene_key": self._dataset_scene_key,
                 "exit_reason": self._trajectory_exit_reason,
                 "reject_reason": reject_reason,
+                "dataset_write_ok": write_ok,
             })
 
         self._episode_index += 1
@@ -1709,6 +1866,24 @@ class ILManager(object):
     def _st_finish_scene(self):
         rospy.loginfo("[Manager] Scene complete: %s (%d tasks)",
                       self._dataset_scene_key, len(self._current_tasks))
+        # Scene invariant (section XXX): every task of this scene must be
+        # resolved exactly once.  Any leftover is a lifecycle bug — cancel
+        # it here so no phantom pending leaks into the next scene.
+        unresolved = [t.task_id for t in self._current_tasks
+                      if not t.quota_resolved]
+        if unresolved:
+            rospy.logerr(
+                "[Manager] Scene %s: %d unresolved quota tasks: %s",
+                self._dataset_scene_key, len(unresolved), unresolved)
+            for t in self._current_tasks:
+                if not t.quota_resolved:
+                    try:
+                        self._quota.note_cancelled(t.target_task_class)
+                    except RuntimeError as exc:
+                        rospy.logerr(
+                            "[Manager] quota cancel error for %s: %s",
+                            t.task_id, exc)
+                    t.quota_resolved = True
         self._scene_index += 1
         self._scene_attempt = 0
         self._current_tasks = []
@@ -1727,6 +1902,15 @@ class ILManager(object):
 
 def main():
     rospy.init_node("il_dataset_manager")
+    # Dump the PYTHON stack on a native crash (SIGABRT/SIGSEGV, e.g. a C++
+    # heap corruption like "double free or corruption").  This pinpoints the
+    # exact Python call site that led into the aborting C++ module, which is
+    # essential for native debugging of the local planner.
+    try:
+        import faulthandler
+        faulthandler.enable()
+    except Exception:  # noqa: BLE001
+        pass
     cfg = load_config()
     # The launch file always sets the ~dry_run param (default false), so
     # we must check its VALUE, not mere existence (has_param would always

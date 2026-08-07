@@ -187,31 +187,53 @@ def quantize_bounded_vector(vector, max_norm, decimals=3):
 # ============================================================================
 
 def make_depth_vehicle(ros_pos, yaw, depth_cfg, quaternion_xyzw=None):
-    """Build the Unity vehicle dict with a depth camera.
+    """Return a Unity Vehicle_t dict with a depth camera.
 
-    Fixed camera geometry (FLU extrinsic: camera forward = body +Y, left =
-    -X, identity T_BC, 0.3 m z offset).  DO NOT modify.
+    VERIFIED AvoidBench wire contract (pre-reshape, working handshake):
+    the vehicle MUST be a `Vehicle_t` with `ID` / `size` / `cameras` /
+    `lidars` / `hasCollisionCheck`, and the camera MUST carry
+    `nearClipPlane` / `farClipPlane` / a 16-element 4x4 `T_BC` / `isDepth` /
+    `enabledLayers` / `outputIndex` / `depthScale`.
+
+    AvoidBench reads these fields during the handshake init:
+      - SettingsMessage_t.InitParamsters():  mainVehicle.cameras.Count()
+      - instantiateCameras():  camera.nearClipPlane[0], farClipPlane[0],
+        ListToMatrix4x4(camera.T_BC)  (requires 16 floats)
+    A missing / renamed field makes the handshake init throw, `ready` is
+    never sent, and the manager times out with unity_connect_timeout.
+    DO NOT change this schema without test proof.
     """
     pos = ros_pos_to_unity(ros_pos)
     if quaternion_xyzw is not None:
         quat = ros_quat_to_unity_quat(quaternion_xyzw)
     else:
         quat = yaw_to_unity_quat(yaw)
-    depth = {
-        "width": int(depth_cfg.get("width", 640)),
-        "height": int(depth_cfg.get("height", 480)),
-        "fov": float(depth_cfg.get("fov", 90.0)),
-        "near": float(depth_cfg.get("near", 0.01)),
-        "far": float(depth_cfg.get("far", 1000.0)),
-        "T_BC": [0.0, 0.0, 0.0],
-        "depthScale": 100.0,
-    }
+    near = float(depth_cfg.get("near", 0.01))
+    far = float(depth_cfg.get("far", 1000.0))
     return {
-        "name": "depth_vehicle",
-        "type": "Quadrotor",
+        "ID": "quadrotor0",
         "position": pos,
         "rotation": quat,
-        "depth": depth,
+        "size": [0.5, 0.5, 0.5],
+        "cameras": [{
+            "ID": "quadrotor0_0", "channels": 3,
+            "width": int(depth_cfg.get("width", 640)),
+            "height": int(depth_cfg.get("height", 480)),
+            "fov": float(depth_cfg.get("fov", 90.0)),
+            "nearClipPlane": [near] * 4,
+            "farClipPlane": [far, 100.0, far, far],
+            "T_BC": [1.0, 0.0, 0.0, 0.0,
+                     0.0, 1.0, 0.0, 0.0,
+                     0.0, 0.0, 1.0, 0.3,
+                     0.0, 0.0, 0.0, 1.0],
+            "isDepth": False,
+            "enabledLayers": [True, False, False],
+            "depthScale": 0.2,
+            "outputIndex": 0,
+        }],
+        "lidars": [],
+        "hasCollisionCheck": True,
+        "hasVehicleCollision": False,
     }
 
 
@@ -434,10 +456,25 @@ class UnityBridge:
         handshake_msg = {"scene_id": scene_id, "vehicles": [vehicle],
                          "objects": []}
         deadline = time.time() + timeout
+        rospy.loginfo(
+            "[Bridge] Waiting for AvoidBench ready handshake (scene id=%d, "
+            "tcp://*:%s / tcp://*:%s)...", scene_id, self.pub_port,
+            self.sub_port)
+        last_log = 0.0
         while time.time() < deadline and not rospy.is_shutdown():
             self.send_pose(handshake_msg)
             r = self.try_recv()
             if r is not None and r[0].get("ready"):
                 return True
+            now = time.time()
+            if now - last_log >= 5.0:
+                rospy.logwarn(
+                    "[Bridge] Still waiting for AvoidBench ready (%.0fs/%0.fs) "
+                    "— is AvoidBench running and connected to this host? "
+                    "Start it with: ./AvoidBench.x86_64 -input-port %s "
+                    "-output-port %s -client-ip 127.0.0.1",
+                    now - (deadline - timeout), timeout, self.pub_port,
+                    self.sub_port)
+                last_log = now
             time.sleep(0.2)
         return False

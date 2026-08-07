@@ -172,7 +172,11 @@ class MacroExpert(object):
             action.committed_side = self._module.Side.NONE
         if observe_side is None:
             observe_side = self._module.Side.NONE
-        action.observe_side = int(observe_side)
+        # pybind's MacroAction.observe_side is a `Side` enum member — the
+        # setter rejects an int (TypeError); assign the enum directly like
+        # committed_side.  int() conversion only happens when READING (CSV /
+        # trace), where pybind enum -> int is supported.
+        action.observe_side = observe_side
         action.guide_world = guide_world
         if has_yaw and desired_yaw is not None:
             action.has_desired_yaw = True
@@ -1079,10 +1083,10 @@ class MacroExpert(object):
             "direct_brake_ticks": int(self._direct_brake_ticks),
             "blocker_released_this_tick": bool(self._blocker_released_this_tick),
             "failed_left": _SIDE_FAILURE_NAMES.get(
-                int(self._failed_left), "NONE") if self._failed_left is not None
+                self._failed_left.value, "NONE") if self._failed_left is not None
             else "NONE",
             "failed_right": _SIDE_FAILURE_NAMES.get(
-                int(self._failed_right), "NONE") if self._failed_right is not None
+                self._failed_right.value, "NONE") if self._failed_right is not None
             else "NONE",
             "side_best_cost": self._round_opt(self._side_best_cost),
             "side_path_progress": self._round_opt(self._side_path_progress),

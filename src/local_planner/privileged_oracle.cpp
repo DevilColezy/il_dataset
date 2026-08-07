@@ -24,7 +24,9 @@ void edt1d(std::vector<double>& f) {
         double s = ((f[q] + static_cast<double>(q) * q) -
                     (f[v[k]] + static_cast<double>(v[k]) * v[k])) /
                    (2.0 * static_cast<double>(q - v[k]));
-        while (s <= z[k]) {
+        // Guard against popping below the first envelope vertex (never read
+        // v[-1]).
+        while (k > 0 && s <= z[k]) {
             --k;
             s = ((f[q] + static_cast<double>(q) * q) -
                  (f[v[k]] + static_cast<double>(v[k]) * v[k])) /
@@ -48,14 +50,17 @@ std::vector<double> squaredEdt3d(const std::vector<std::uint8_t>& seed,
     auto at = [&](int ix, int iy, int iz) {
         return (ix * gy + iy) * gz + iz;
     };
-    const double inf = std::numeric_limits<double>::infinity();
-    std::vector<double> f(static_cast<size_t>(gx) * gy * gz, inf);
+    // Finite sentinel for non-seed cells (same reason as the observed-map
+    // EDT): an +inf sentinel makes edt1d() produce s = -inf at a seed vs
+    // inf envelope vertex and underflow k past 0 (OOB read of v[-1]).
+    const double kBig = 1.0e12;
+    std::vector<double> f(static_cast<size_t>(gx) * gy * gz, kBig);
     for (size_t i = 0; i < seed.size(); ++i) {
         if (seed[i] != 0) f[i] = 0.0;
     }
     for (int iy = 0; iy < gy; ++iy) {
         for (int iz = 0; iz < gz; ++iz) {
-            std::vector<double> column(static_cast<size_t>(gx), inf);
+            std::vector<double> column(static_cast<size_t>(gx), kBig);
             for (int ix = 0; ix < gx; ++ix) {
                 column[static_cast<size_t>(ix)] =
                     f[static_cast<size_t>(at(ix, iy, iz))];
@@ -69,7 +74,7 @@ std::vector<double> squaredEdt3d(const std::vector<std::uint8_t>& seed,
     }
     for (int ix = 0; ix < gx; ++ix) {
         for (int iz = 0; iz < gz; ++iz) {
-            std::vector<double> column(static_cast<size_t>(gy), inf);
+            std::vector<double> column(static_cast<size_t>(gy), kBig);
             for (int iy = 0; iy < gy; ++iy) {
                 column[static_cast<size_t>(iy)] =
                     f[static_cast<size_t>(at(ix, iy, iz))];
@@ -83,7 +88,7 @@ std::vector<double> squaredEdt3d(const std::vector<std::uint8_t>& seed,
     }
     for (int ix = 0; ix < gx; ++ix) {
         for (int iy = 0; iy < gy; ++iy) {
-            std::vector<double> column(static_cast<size_t>(gz), inf);
+            std::vector<double> column(static_cast<size_t>(gz), kBig);
             for (int iz = 0; iz < gz; ++iz) {
                 column[static_cast<size_t>(iz)] =
                     f[static_cast<size_t>(at(ix, iy, iz))];

@@ -40,12 +40,25 @@
   <arg name="config_file"
        default="$(find il_dataset)/config/il_dataset_config.yaml"/>
   <arg name="dry_run" default="false"/>
+  <!-- Path to libasan for ASan debugging (native heap crash diagnosis).
+       Empty by default (normal runs are unaffected).  When debugging the
+       native "double free or corruption" crash, pass the full path, e.g.
+         roslaunch il_dataset il_dataset_collect.launch \
+           asan_libasan:=$(g++ -print-file-name=libasan.so)
+       LD_PRELOAD is applied to the MANAGER node ONLY (never to roslaunch /
+       roscore), because preloading it in the whole shell makes every child
+       process crash with "AddressSanitizer: DEADLYSIGNAL". -->
+  <arg name="asan_libasan" default=""/>
 
   <!-- ════════════════════════════════════════════════════════════
        IL Manager Node  (the ONLY node needed)
        ════════════════════════════════════════════════════════════ -->
   <node pkg="il_dataset" type="il_manager.py"
         name="il_dataset_manager" output="screen" required="true">
+    <env name="LD_PRELOAD" value="$(arg asan_libasan)"
+         unless="$(eval arg('asan_libasan') == '')"/>
+    <env name="ASAN_OPTIONS" value="detect_leaks=0:abort_on_error=1"
+         unless="$(eval arg('asan_libasan') == '')"/>
     <param name="config_file" value="$(arg config_file)"/>
     <param name="dry_run" value="$(arg dry_run)"/>
   </node>
