@@ -113,6 +113,10 @@ class DatasetWriter(object):
         self._flush_interval_rows = int(cfg.get("flush_interval_rows", 64))
         self._depth_png_compress_level = int(
             cfg.get("depth_png_compress_level", 4))
+        # Debug trace (section "debug"): when enabled, every 5 Hz macro
+        # tick writes the expert's internal state to trace.jsonl for
+        # post-hoc review with scripts/debug_viewer.py.
+        self._debug_trace = bool(cfg.get("debug_trace", False))
 
         self._inprogress_dir = os.path.join(output_root, "%s.inprogress" % episode_id)
         if not os.path.isdir(self._inprogress_dir):
@@ -154,6 +158,11 @@ class DatasetWriter(object):
             "plan_id", "point_index", "t", "x", "y", "z",
             "vx", "vy", "vz", "ax", "ay", "az",
             "yaw", "yaw_rate", "clearance"])
+
+        self._trace_csv = None
+        if self._debug_trace:
+            self._trace_file = os.path.join(self._inprogress_dir, "trace.jsonl")
+            self._trace_csv = open(self._trace_file, "w", newline="")
 
         self._depth_rows = {}        # frame_id -> row dict (depth + meta)
         self._metadata = {
@@ -212,6 +221,13 @@ class DatasetWriter(object):
         return row["depth_file"] if row else ""
 
     # ── Local plan logs ──────────────────────────────────────────────
+    def write_trace(self, record):
+        """Append one macro-tick trace line (debug mode only)."""
+        if self._trace_csv is None:
+            return
+        self._trace_csv.write(json.dumps(record, default=str) + "\n")
+        self._trace_csv.flush()
+
     def write_local_plan(self, plan_id, source_frame_id, status, success,
                          planning_time_ms, min_clearance, duration_s,
                          guide_waypoint, terminal, search_status,
@@ -248,6 +264,10 @@ class DatasetWriter(object):
         self._plans_csv.close()
         self._plan_points_csv.flush()
         self._plan_points_csv.close()
+        if self._trace_csv is not None:
+            self._trace_csv.flush()
+            self._trace_csv.close()
+            self._trace_csv = None
 
         self._metadata["status"] = "committed" if success else "rejected"
         self._metadata["exit_reason"] = reason

@@ -66,6 +66,18 @@ class SideFailure(Enum):
     NO_PROGRESS = 4
 
 
+# Human-readable names for the debug trace (scripts/debug_viewer.py).
+_MACRO_MODE_NAMES = {
+    0: "DIRECT_GUIDE", 1: "SIDE_GUIDE", 2: "OBSERVE",
+    3: "GOAL_REACHED", 4: "FAILED",
+}
+_SIDE_NAMES = {0: "NONE", 1: "LEFT", -1: "RIGHT"}
+_SIDE_FAILURE_NAMES = {
+    0: "NOT_YET_OBSERVED", 1: "OBSERVED_NO_CORRIDOR",
+    2: "LOCAL_PATH_FAILED", 3: "PRIVILEGED_DISCONNECTED", 4: "NO_PROGRESS",
+}
+
+
 class MacroExpert(object):
     """5 Hz macro expert consuming C++ recoverability / candidate / oracle
     results."""
@@ -141,6 +153,7 @@ class MacroExpert(object):
         self._last_intervention = None
         self._last_blocker = None
         self._last_candidates = []
+        self._last_trace = None
         self._macro_decision_observable = True
         self._macro_decision_confidence = 0.0
         self._failed_reason = ""
@@ -218,8 +231,10 @@ class MacroExpert(object):
                 speed <= self.cfg["goal_speed_tolerance_mps"]:
             self.mode = self._module.MacroMode.GOAL_REACHED
             self._prev_guide_world = pos
-            return self._build_action(
+            action = self._build_action(
                 self.mode, pos, None, False, 1.0, "goal_reached")
+            self._capture_trace(action)
+            return action
 
         # ── Direct guide (navigation intent, not a collision-free
         #     guarantee; small obstacles may sit between here and it). ──
@@ -274,10 +289,14 @@ class MacroExpert(object):
             self._direct_stable_ticks = 0
 
         if observed_ok and not self.causal_intervention_evidence:
-            return self._handle_direct(goal_dir_world, direct_guide, rec,
-                                       goal_dist, now_s)
-        return self._proceed_to_macro_intervention(
+            action = self._handle_direct(goal_dir_world, direct_guide, rec,
+                                         goal_dist, now_s)
+            self._capture_trace(action)
+            return action
+        action = self._proceed_to_macro_intervention(
             goal, pos, yaw, direct_guide, observed_map, vs, dt_s, now_s)
+        self._capture_trace(action)
+        return action
 
     # ── DIRECT session (sections II/III/XXV) ─────────────────────────
     def _enter_direct_session(self, goal_dist, now_s):
@@ -1026,3 +1045,82 @@ class MacroExpert(object):
         if self._blocker_track is not None:
             return int(self._blocker_track["id"])
         return -1
+
+    # ── Debug trace (section "debug") ────────────────────────────────
+    @staticmethod
+    def _round_opt(value, ndigits=4):
+        if value is None:
+            return None
+        try:
+            return round(float(value), ndigits)
+        except (TypeError, ValueError):
+            return None
+
+    def _capture_trace(self, action):
+        """Snapshot the macro expert's internal state for this tick.  The
+        manager writes it to trace.jsonl when dataset_logging.debug_trace
+        is enabled; it is NEVER part of the student input."""
+        rec = self._last_recoverability
+        priv = self._last_intervention
+        trace = {
+            "mode": int(action.mode),
+            "mode_name": _MACRO_MODE_NAMES.get(int(action.mode), "UNKNOWN"),
+            "reason": str(action.reason),
+            "committed_side": _SIDE_NAMES.get(int(action.committed_side), "?"),
+            "observe_side": _SIDE_NAMES.get(int(action.observe_side), "?"),
+            "observe_subtype": int(action.observe_subtype),
+            "confidence": float(action.confidence),
+            "macro_decision_observable": bool(self._macro_decision_observable),
+            "causal_intervention_evidence": bool(self.causal_intervention_evidence),
+            "direct_no_progress_time": self._round_opt(self.direct_no_progress_time),
+            "direct_stable_ticks": int(self._direct_stable_ticks),
+            "direct_local_failure_ticks": int(self._direct_local_failure_ticks),
+            "direct_cached_ticks": int(self._direct_cached_ticks),
+            "direct_brake_ticks": int(self._direct_brake_ticks),
+            "blocker_released_this_tick": bool(self._blocker_released_this_tick),
+            "failed_left": _SIDE_FAILURE_NAMES.get(
+                int(self._failed_left), "NONE") if self._failed_left is not None
+            else "NONE",
+            "failed_right": _SIDE_FAILURE_NAMES.get(
+                int(self._failed_right), "NONE") if self._failed_right is not None
+            else "NONE",
+            "side_best_cost": self._round_opt(self._side_best_cost),
+            "side_path_progress": self._round_opt(self._side_path_progress),
+            "observe_time_s": self._round_opt(self._observe_time_s),
+            "observe_yaw_delta_deg": self._round_opt(
+                math.degrees(float(self._observe_yaw_delta)), 2),
+            "observe_no_information_time": self._round_opt(
+                self.observe_no_information_time),
+            "blocker_track_id": self.blocker_track_id,
+            "blocker_matches_current": bool(self._blocker_matches_current),
+            "rec_status": int(rec.status) if rec is not None else -1,
+            "rec_min_clearance": self._round_opt(
+                rec.minimum_clearance) if rec is not None else -1.0,
+            "rec_detour_ratio": self._round_opt(
+                rec.detour_ratio) if rec is not None else -1.0,
+            "rec_terminal_alignment": self._round_opt(
+                rec.terminal_guide_alignment) if rec is not None else -1.0,
+            "rec_rejoin_distance": self._round_opt(
+                rec.rejoin_distance) if rec is not None else -1.0,
+            "priv_local_recoverable": bool(priv.privileged_local_recoverable)
+            if priv is not None else False,
+            "priv_reason": str(priv.reason) if priv is not None else "",
+        }
+        cands = []
+        if self._last_candidates:
+            top = sorted(self._last_candidates,
+                         key=lambda c: float(c.privileged_score))[:5]
+            cands = [
+                {"type": int(c.type), "side": _SIDE_NAMES.get(int(c.side), "?"),
+                 "source": str(c.source),
+                 "score": round(float(c.privileged_score), 4),
+                 "full": bool(c.full_goal_reached),
+                 "conn": bool(c.connected_to_goal)}
+                for c in top
+            ]
+        trace["candidates"] = cands
+        self._last_trace = trace
+
+    @property
+    def last_trace(self):
+        return self._last_trace

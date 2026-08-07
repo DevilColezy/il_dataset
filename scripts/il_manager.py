@@ -26,8 +26,19 @@ from __future__ import print_function, division
 import json
 import math
 import os
+import sys
 import time
 from enum import Enum
+
+# The compiled pybind module (_il_local_planner.so) is built into this
+# script's directory (CMake LIBRARY_OUTPUT_DIRECTORY = scripts/).  When
+# the manager is launched through the catkin-generated wrapper
+# (devel/lib/il_dataset/il_manager.py), the script's dir is NOT on
+# sys.path, so add it explicitly before importing the module and the
+# sibling il_* modules.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
 
 import numpy as np
 import rospy
@@ -471,6 +482,15 @@ class ILManager(object):
                 held_action = self._macro_expert.update(
                     goal, state, self._observed_map, dt_s=dt_macro,
                     interval_feedback=interval_feedback)
+                # Debug trace (section "debug"): one JSON line per macro
+                # tick with the expert's internal state for post-hoc review
+                # via scripts/debug_viewer.py.
+                if self.g.get("dataset_logging", {}).get(
+                        "debug_trace", False):
+                    trace = dict(self._macro_expert.last_trace or {})
+                    trace["frame"] = sample_index
+                    trace["trajectory_time_s"] = round(elapsed, 4)
+                    self._writer.write_trace(trace)
                 if held_action.mode == module.MacroMode.GOAL_REACHED:
                     self._trajectory_reached_goal = True
                     self._exit_reason = "goal_reached"
@@ -1301,7 +1321,10 @@ class ILManager(object):
 def main():
     rospy.init_node("il_dataset_manager")
     cfg = load_config()
-    if rospy.has_param("~dry_run"):
+    # The launch file always sets the ~dry_run param (default false), so
+    # we must check its VALUE, not mere existence (has_param would always
+    # be true and the manager would exit in dry-run every time).
+    if rospy.get_param("~dry_run", False):
         rospy.loginfo("[Manager] Config loaded (dry-run): %d global modules",
                       len(cfg.get("global", {})))
         return

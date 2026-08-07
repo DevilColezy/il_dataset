@@ -332,6 +332,11 @@ global:
     perception_range_m: 5.0
     flush_interval_rows: 64
     depth_png_compress_level: 4
+    # Debug mode (section "debug"): when true, every 5 Hz macro tick also
+    # writes the expert's internal state to trace.jsonl inside each
+    # episode directory, for post-hoc review with scripts/debug_viewer.py.
+    # Pure diagnostic — never part of the student input.
+    debug_trace: false
 
   # ── Sync & commit thresholds ───────────────────────────────────────
   sync:
