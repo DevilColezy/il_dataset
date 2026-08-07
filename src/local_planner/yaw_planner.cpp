@@ -54,9 +54,9 @@ double YawPlanner::planYaw(std::vector<TrajectoryPoint>* trajectory,
             const double yaw_motion = yawFromVelocity(point.velocity);
             if (has_macro_yaw) {
                 const double delta =
-                    wrapAngleLocal(yaw_macro - yaw_motion);
+                    wrapAngleLocal(macro_yaw - yaw_motion);
                 if (std::abs(delta) <= fov_limit) {
-                    desired = wrapAngleLocal(yaw_macro);
+                    desired = wrapAngleLocal(macro_yaw);
                 } else {
                     desired = wrapAngleLocal(
                         yaw_motion + (delta > 0.0 ? fov_limit : -fov_limit));

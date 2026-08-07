@@ -197,7 +197,6 @@ BrakeRiskResult ObservedMap::sweptBrakeRisk(
             ? speed * speed / (2.0 * deceleration_mps2)
             : 0.0;
     result.braking_distance = reaction_distance + braking_distance;
-    const double total_distance = result.braking_distance;
 
     const int reaction_samples = std::max(
         1, static_cast<int>(std::ceil(

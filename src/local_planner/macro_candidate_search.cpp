@@ -358,7 +358,6 @@ void MacroCandidateSearch::scoreObserved(MacroCandidate* candidate,
         candidate->goal_progress = delta.head<2>().dot(travel / travel_len);
     }
     // Information gain: unknown cells in a disk around the candidate.
-    const double z = state.position.z();
     const int radius_cells = std::max(
         2, static_cast<int>(std::ceil(0.8 / std::max(0.05, map.resolution()))));
     int unknown_count = 0;

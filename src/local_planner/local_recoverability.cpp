@@ -59,8 +59,13 @@ RecoverabilityResult LocalRecoverability::test(
     if (travel_len > kEpsilon) {
         goal_dir = travel.head<2>() / travel_len;
     }
-    const Eigen::Vector3d rejoin_dir =
-        travel_len > kEpsilon ? travel / travel_len : Eigen::Vector3d::UnitX();
+    // Unit rejoin direction (fallback +X when the guide is at the drone).
+    // Avoid a ternary between two Eigen expression types (different
+    // expression templates) — assign explicitly instead.
+    Eigen::Vector3d rejoin_dir = Eigen::Vector3d::UnitX();
+    if (travel_len > kEpsilon) {
+        rejoin_dir = travel / travel_len;
+    }
     const double rejoin_dist =
         std::min(std::max(0.1, travel_len), config_.rejoin_distance_m);
     const Eigen::Vector3d rejoin_point =
