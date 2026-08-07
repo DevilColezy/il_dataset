@@ -1,16 +1,20 @@
 <?xml version="1.0"?>
 <!-- ===================================================================
-  Two-level navigation-expert IL dataset collection (schema v18).
+  Automatic multi-scale IL dataset collection (two-level navigation
+  expert, schema v22).
 
-  The manager runs the sole supported pipeline: task manifest loading,
-  privileged global map build, causal observed map, 5 Hz macro expert
-  (DIRECT/SIDE/OBSERVE/GOAL_REACHED/FAILED), 30 Hz A*-seeded B-spline
-  local planner, execution safety, trajectory controller and lockstep
-  recording.
-
-  AvoidBench / Unity must be started manually BEFORE launching:
+  AvoidBench / Unity MUST already be running BEFORE launching (the ROS
+  launch never starts or stops AvoidBench):
     cd ~/flightmare_ws/RPG_Flightmare/AvoidBench_x
     ./AvoidBench.x86_64 -input-port 10253 -output-port 10254
+
+  After launch the manager runs fully unattended (section LXXVIII):
+    connect AvoidBench -> procedurally generate Scene -> send to Unity ->
+    wait ready -> export one scene point cloud -> build privileged scene
+    map -> generate many start-goal tasks -> run each task (5 Hz macro +
+    30 Hz local + recording) -> NEXT_TASK -> NEXT_SCENE -> NEXT_PROFILE ->
+    DONE.  No task manifests / manual start-goal / scene interaction is
+    required as input (manifests are written as OUTPUTS per scene/task).
 
   ── USAGE ──────────────────────────────────────────────────────
     roslaunch il_dataset il_dataset_collect.launch
@@ -19,7 +23,7 @@
     roslaunch il_dataset il_dataset_collect.launch \
       config_file:=/path/to/my_config.yaml
 
-    # Dry-run (config validation only):
+    # Dry-run (validate config + print the generation plan only):
     roslaunch il_dataset il_dataset_collect.launch dry_run:=true
   ==================================================================== -->
 <launch>

@@ -336,8 +336,35 @@ def _validate_config(cfg):
     _positive(to_.get("map_resolution_m", 0.10),
               "task_oracle.map_resolution_m", errors)
     _positive(to_.get("inflation_m", 0.30), "task_oracle.inflation_m", errors)
-    if not to_.get("task_manifest_dir"):
-        errors.append("task_oracle.task_manifest_dir must be set")
+
+    # scene generation (section LXXV)
+    sg = g.get("scene_generation", {})
+    if sg.get("enabled", True):
+        _positive(sg.get("seed", 12345), "scene_generation.seed", errors)
+        _positive(sg.get("tasks_per_scene", 12),
+                  "scene_generation.tasks_per_scene", errors, allow_zero=True)
+        _positive(sg.get("minimum_tasks_per_scene", 1),
+                  "scene_generation.minimum_tasks_per_scene", errors,
+                  allow_zero=True)
+        if sg.get("minimum_tasks_per_scene", 1) > \
+                sg.get("tasks_per_scene", 12):
+            errors.append(
+                "scene_generation.minimum_tasks_per_scene must be <= "
+                "tasks_per_scene")
+        if not sg.get("profiles"):
+            errors.append("scene_generation.profiles must not be empty")
+
+    # task generation (section LXXV)
+    tg = g.get("task_generation", {})
+    if tg.get("enabled", True):
+        _positive(tg.get("candidate_batch_size", 64),
+                  "task_generation.candidate_batch_size", errors)
+        _positive(tg.get("maximum_batches_per_scene", 6),
+                  "task_generation.maximum_batches_per_scene", errors)
+        _positive(tg.get("flight_height_m", 5.0),
+                  "task_generation.flight_height_m", errors)
+        if not tg.get("class_weights"):
+            errors.append("task_generation.class_weights must not be empty")
 
     # sync sanity
     sync = g.get("sync", {})
@@ -516,6 +543,55 @@ def build_recoverability_config(g, module):
     cfg.side_corridor_length_m = float(lr.get("side_corridor_length_m", 4.0))
     cfg.side_corridor_radius_m = float(lr.get("side_corridor_radius_m", 0.55))
     cfg.edge_search_radius_m = float(lr.get("edge_search_radius_m", 5.0))
+    return cfg
+
+
+def build_task_generation_config(g, module):
+    """Build the C++ TaskGenerationConfig (sections XXVIII/XXXIX).
+
+    The clearance uses the UNIFIED ESDF semantics: the global ESDF already
+    subtracts the vehicle radius, so `clearance_m` is an additional safety
+    margin (default = vehicle.safety_margin_m, section LVII).  The local
+    audit bounds come from local_recoverability / local_path_search so the
+    generated classes match the real behaviour scale.
+    """
+    tg = g.get("task_generation", {})
+    lr = g.get("local_recoverability", {})
+    lps = g.get("local_path_search", {})
+    veh = g.get("vehicle", {})
+    cfg = module.TaskGenerationConfig()
+    base_clearance = float(
+        tg.get("clearance_m", veh.get("safety_margin_m", 0.20)))
+    cfg.start_clearance_m = base_clearance
+    cfg.goal_clearance_m = base_clearance
+    cfg.direct_corridor_clearance_m = base_clearance
+    cfg.lateral_path_clearance_m = base_clearance
+    bands = tg.get("distance_bands", {}) or {}
+    mins = [float(b.get("min_m", 4.0)) for b in bands.values()]
+    maxs = [float(b.get("max_m", 28.0)) for b in bands.values()]
+    cfg.min_task_distance_m = float(min(mins)) if mins else 3.0
+    cfg.max_task_distance_m = float(max(maxs)) if maxs else 30.0
+    sampling = tg.get("sampling", {}) or {}
+    cfg.lateral_probe_offset_m = float(
+        sampling.get("lateral_probe_offset_m", 1.2))
+    cfg.lateral_probe_spacing_m = float(
+        sampling.get("lateral_probe_spacing_m", 0.6))
+    cfg.lateral_probe_count = int(sampling.get("lateral_probe_count", 4))
+    # Local-scale audit capability (same as local_recoverability).
+    cfg.search_clearance_m = float(lps.get("search_clearance_m", 0.25))
+    cfg.search_max_time_ms = float(lps.get("max_time_ms", 20.0))
+    cfg.rejoin_distance_m = float(lr.get("rejoin_distance_m", 2.5))
+    cfg.max_duration_s = float(lr.get("max_duration_s", 2.5))
+    cfg.max_path_length_m = float(lr.get("max_path_length_m", 6.0))
+    cfg.nominal_speed_mps = float(lr.get("nominal_speed_mps", 1.8))
+    cfg.max_detour_ratio = float(lr.get("max_detour_ratio", 1.6))
+    cfg.min_goal_progress_m = float(lr.get("min_goal_progress_m", 0.30))
+    cfg.min_terminal_alignment = float(lr.get("min_terminal_alignment", 0.5))
+    cfg.terminal_tangent_min_baseline = float(
+        lr.get("terminal_tangent_min_baseline", 0.3))
+    cfg.search_lateral_margin_m = float(lr.get("search_lateral_margin_m", 2.0))
+    cfg.search_longitudinal_margin_m = float(
+        lr.get("search_longitudinal_margin_m", 2.0))
     return cfg
 
 

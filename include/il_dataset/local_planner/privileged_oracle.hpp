@@ -60,8 +60,23 @@ class PrivilegedOracle {
 public:
     PrivilegedOracle() = default;
 
-    /// Build the global map from a point cloud (world frame).  Returns
-    /// false when the point cloud is empty or the grid is degenerate.
+    /// Build the SCENE map from a point cloud (world frame): grid +
+    /// occupancy + global ESDF only.  A scene is exported and built ONCE
+    /// and shared by all of its tasks (section XLIV/LXXI).  `region_min` /
+    /// `region_max` optionally force the grid to cover a task domain even
+    /// where the point cloud is sparse (e.g. OPEN_DIRECT scenes).
+    bool buildScene(const std::vector<Eigen::Vector3d>& points,
+                    const PrivilegedOracleConfig& config,
+                    const Eigen::Vector3d* region_min = nullptr,
+                    const Eigen::Vector3d* region_max = nullptr);
+
+    /// Prepare one TASK on the already-built scene: updates the goal
+    /// reversed cost-to-go / connectivity for this task's start-goal.
+    /// Returns whether the task is reachable.
+    bool setTask(const Eigen::Vector3d& start,
+                 const Eigen::Vector3d& goal);
+
+    /// Convenience: buildScene + setTask (single-task legacy path).
     bool build(const std::vector<Eigen::Vector3d>& points,
                const Eigen::Vector3d& start,
                const Eigen::Vector3d& goal,

@@ -100,21 +100,21 @@ std::vector<double> squaredEdt3d(const std::vector<std::uint8_t>& seed,
 
 }  // namespace
 
-bool PrivilegedOracle::build(const std::vector<Eigen::Vector3d>& points,
-                             const Eigen::Vector3d& start,
-                             const Eigen::Vector3d& goal,
-                             const PrivilegedOracleConfig& config) {
+bool PrivilegedOracle::buildScene(
+    const std::vector<Eigen::Vector3d>& points,
+    const PrivilegedOracleConfig& config,
+    const Eigen::Vector3d* region_min,
+    const Eigen::Vector3d* region_max) {
     config_ = config;
     built_ = false;
     task_reachable_ = false;
-    start_goal_distance_ = (goal - start).norm();
-    if (points.empty() || !start.allFinite() || !goal.allFinite()) {
-        return false;
-    }
+    start_goal_distance_ = 0.0;
+    if (points.empty()) return false;
     const double res = config_.resolution;
 
-    // Grid bounds from the point cloud, clamped to the start-goal bbox with
-    // a margin so cost-to-go and connectivity stay meaningful.
+    // Grid bounds from the point cloud, optionally forced to cover the
+    // configured task domain (`region_min`/`region_max`) so sparse scenes
+    // (e.g. OPEN_DIRECT) still have the whole flight region in the grid.
     Eigen::Vector3d min_p(std::numeric_limits<double>::infinity(),
                           std::numeric_limits<double>::infinity(),
                           std::numeric_limits<double>::infinity());
@@ -125,8 +125,12 @@ bool PrivilegedOracle::build(const std::vector<Eigen::Vector3d>& points,
         min_p = min_p.cwiseMin(p);
         max_p = max_p.cwiseMax(p);
     }
-    Eigen::Vector3d min_w = start.cwiseMin(goal).cwiseMin(min_p);
-    Eigen::Vector3d max_w = start.cwiseMax(goal).cwiseMax(max_p);
+    Eigen::Vector3d min_w = min_p;
+    Eigen::Vector3d max_w = max_p;
+    if (region_min != nullptr && region_max != nullptr) {
+        min_w = min_w.cwiseMin(*region_min);
+        max_w = max_w.cwiseMax(*region_max);
+    }
     min_w.array() -= config_.map_margin_m;
     max_w.array() += config_.map_margin_m;
     min_w.z() = std::max(min_w.z(), config_.min_z_m);
@@ -175,9 +179,32 @@ bool PrivilegedOracle::build(const std::vector<Eigen::Vector3d>& points,
             std::max(-max_val, std::min(max_val, value)));
     }
 
-    buildConnectivityAndCostToGo(start, goal);
+    // No task-dependent state yet: cleared until setTask().
+    cost_to_go_.clear();
+    connected_.clear();
+    cost_to_go_z_ = -1;
     built_ = true;
     return true;
+}
+
+bool PrivilegedOracle::setTask(const Eigen::Vector3d& start,
+                               const Eigen::Vector3d& goal) {
+    if (!built_ || !start.allFinite() || !goal.allFinite()) {
+        task_reachable_ = false;
+        start_goal_distance_ = 0.0;
+        return false;
+    }
+    start_goal_distance_ = (goal - start).norm();
+    buildConnectivityAndCostToGo(start, goal);
+    return task_reachable_;
+}
+
+bool PrivilegedOracle::build(const std::vector<Eigen::Vector3d>& points,
+                             const Eigen::Vector3d& start,
+                             const Eigen::Vector3d& goal,
+                             const PrivilegedOracleConfig& config) {
+    if (!buildScene(points, config)) return false;
+    return setTask(start, goal);
 }
 
 Eigen::Vector3i PrivilegedOracle::worldToGridInt(double x, double y,

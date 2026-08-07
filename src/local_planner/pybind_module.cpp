@@ -39,6 +39,7 @@
 #include "il_dataset/local_planner/macro_candidate_search.hpp"
 #include "il_dataset/local_planner/privileged_oracle.hpp"
 #include "il_dataset/local_planner/privileged_intervention_oracle.hpp"
+#include "il_dataset/local_planner/task_generation_oracle.hpp"
 #include "il_dataset/local_planner/spline_planner.hpp"
 #include "il_dataset/local_planner/yaw_planner.hpp"
 
@@ -762,6 +763,48 @@ PYBIND11_MODULE(_il_local_planner, m) {
              },
              py::arg("points_world"), py::arg("start"), py::arg("goal"),
              py::arg("config"))
+        .def("build_scene",
+             [](PrivilegedOracle& self,
+                py::array_t<double, py::array::c_style | py::array::forcecast> points,
+                const PrivilegedOracleConfig& config,
+                const py::object& region_min, const py::object& region_max) {
+                 py::buffer_info buf = points.request();
+                 if (buf.ndim != 2 || buf.shape[1] != 3) {
+                     throw std::invalid_argument(
+                         "points must be an (N, 3) float64 array");
+                 }
+                 const int n = static_cast<int>(buf.shape[0]);
+                 const double* ptr = static_cast<const double*>(buf.ptr);
+                 std::vector<Eigen::Vector3d> cloud;
+                 cloud.reserve(static_cast<size_t>(n));
+                 for (int i = 0; i < n; ++i) {
+                     cloud.emplace_back(ptr[3 * i + 0], ptr[3 * i + 1],
+                                        ptr[3 * i + 2]);
+                 }
+                 Eigen::Vector3d vmin;
+                 Eigen::Vector3d vmax;
+                 Eigen::Vector3d* pmin = nullptr;
+                 Eigen::Vector3d* pmax = nullptr;
+                 if (!region_min.is_none()) {
+                     vmin = region_min.cast<Eigen::Vector3d>();
+                     pmin = &vmin;
+                 }
+                 if (!region_max.is_none()) {
+                     vmax = region_max.cast<Eigen::Vector3d>();
+                     pmax = &vmax;
+                 }
+                 py::gil_scoped_release release;
+                 return self.buildScene(cloud, config, pmin, pmax);
+             },
+             py::arg("points_world"), py::arg("config"),
+             py::arg("region_min") = py::none(),
+             py::arg("region_max") = py::none())
+        .def("set_task",
+             [](PrivilegedOracle& self, const Eigen::Vector3d& start,
+                const Eigen::Vector3d& goal) {
+                 return self.setTask(start, goal);
+             },
+             py::arg("start"), py::arg("goal"))
         .def("built", &PrivilegedOracle::built)
         .def("task_reachable", &PrivilegedOracle::taskReachable)
         .def("start_goal_distance", &PrivilegedOracle::startGoalDistance)
@@ -930,4 +973,120 @@ PYBIND11_MODULE(_il_local_planner, m) {
              py::arg("min_clearance"), py::arg("max_position_error"),
              py::arg("max_velocity_error"))
         .def("current_plan_id", &LocalPlanner::currentPlanId);
+
+    // ── TaskGenerationOracle (scene/task generation time only) ──────
+    py::class_<TaskCandidateResult>(m, "TaskCandidateResult")
+        .def(py::init<>())
+        .def_readwrite("start_free", &TaskCandidateResult::start_free)
+        .def_readwrite("goal_free", &TaskCandidateResult::goal_free)
+        .def_readwrite("goal_reachable", &TaskCandidateResult::goal_reachable)
+        .def_readwrite("straight_distance",
+                       &TaskCandidateResult::straight_distance)
+        .def_readwrite("global_path_length",
+                       &TaskCandidateResult::global_path_length)
+        .def_readwrite("global_detour_ratio",
+                       &TaskCandidateResult::global_detour_ratio)
+        .def_readwrite("global_min_clearance",
+                       &TaskCandidateResult::global_min_clearance)
+        .def_readwrite("direct_blocked", &TaskCandidateResult::direct_blocked)
+        .def_readwrite("direct_blocker_count",
+                       &TaskCandidateResult::direct_blocker_count)
+        .def_readwrite("nearest_blocker_distance_m",
+                       &TaskCandidateResult::nearest_blocker_distance_m)
+        .def_readwrite("privileged_local_recoverable",
+                       &TaskCandidateResult::privileged_local_recoverable)
+        .def_readwrite("left_global_feasible",
+                       &TaskCandidateResult::left_global_feasible)
+        .def_readwrite("right_global_feasible",
+                       &TaskCandidateResult::right_global_feasible)
+        .def_readwrite("left_path_length",
+                       &TaskCandidateResult::left_path_length)
+        .def_readwrite("right_path_length",
+                       &TaskCandidateResult::right_path_length)
+        .def_readwrite("reason", &TaskCandidateResult::reason);
+
+    py::class_<TaskGenerationConfig>(m, "TaskGenerationConfig")
+        .def(py::init<>())
+        .def_readwrite("start_clearance_m",
+                       &TaskGenerationConfig::start_clearance_m)
+        .def_readwrite("goal_clearance_m",
+                       &TaskGenerationConfig::goal_clearance_m)
+        .def_readwrite("direct_corridor_clearance_m",
+                       &TaskGenerationConfig::direct_corridor_clearance_m)
+        .def_readwrite("min_task_distance_m",
+                       &TaskGenerationConfig::min_task_distance_m)
+        .def_readwrite("max_task_distance_m",
+                       &TaskGenerationConfig::max_task_distance_m)
+        .def_readwrite("lateral_probe_offset_m",
+                       &TaskGenerationConfig::lateral_probe_offset_m)
+        .def_readwrite("lateral_probe_spacing_m",
+                       &TaskGenerationConfig::lateral_probe_spacing_m)
+        .def_readwrite("lateral_probe_count",
+                       &TaskGenerationConfig::lateral_probe_count)
+        .def_readwrite("lateral_path_clearance_m",
+                       &TaskGenerationConfig::lateral_path_clearance_m)
+        .def_readwrite("search_clearance_m",
+                       &TaskGenerationConfig::search_clearance_m)
+        .def_readwrite("search_max_time_ms",
+                       &TaskGenerationConfig::search_max_time_ms)
+        .def_readwrite("rejoin_distance_m",
+                       &TaskGenerationConfig::rejoin_distance_m)
+        .def_readwrite("max_duration_s",
+                       &TaskGenerationConfig::max_duration_s)
+        .def_readwrite("max_path_length_m",
+                       &TaskGenerationConfig::max_path_length_m)
+        .def_readwrite("nominal_speed_mps",
+                       &TaskGenerationConfig::nominal_speed_mps)
+        .def_readwrite("max_detour_ratio",
+                       &TaskGenerationConfig::max_detour_ratio)
+        .def_readwrite("min_goal_progress_m",
+                       &TaskGenerationConfig::min_goal_progress_m)
+        .def_readwrite("min_terminal_alignment",
+                       &TaskGenerationConfig::min_terminal_alignment)
+        .def_readwrite("terminal_tangent_min_baseline",
+                       &TaskGenerationConfig::terminal_tangent_min_baseline)
+        .def_readwrite("search_lateral_margin_m",
+                       &TaskGenerationConfig::search_lateral_margin_m)
+        .def_readwrite("search_longitudinal_margin_m",
+                       &TaskGenerationConfig::search_longitudinal_margin_m);
+
+    py::class_<TaskGenerationOracle>(m, "TaskGenerationOracle")
+        .def(py::init<const TaskGenerationConfig&>(), py::arg("config"))
+        .def("evaluate",
+             [](const TaskGenerationOracle& self,
+                const PrivilegedOracle& oracle,
+                const Eigen::Vector3d& start,
+                const Eigen::Vector3d& goal) {
+                 return self.evaluate(oracle, start, goal);
+             },
+             py::arg("oracle"), py::arg("start"), py::arg("goal"))
+        .def("evaluate_candidates",
+             [](const TaskGenerationOracle& self,
+                const PrivilegedOracle& oracle,
+                py::array_t<double, py::array::c_style | py::array::forcecast> starts,
+                py::array_t<double, py::array::c_style | py::array::forcecast> goals) {
+                 auto starts_buf = starts.request();
+                 auto goals_buf = goals.request();
+                 if (starts_buf.ndim != 2 || starts_buf.shape[1] != 3 ||
+                     goals_buf.ndim != 2 || goals_buf.shape[1] != 3) {
+                     throw std::invalid_argument(
+                         "starts/goals must be (N, 3) float64 arrays");
+                 }
+                 const int n = static_cast<int>(starts_buf.shape[0]);
+                 const double* sp = static_cast<const double*>(starts_buf.ptr);
+                 const double* gp = static_cast<const double*>(goals_buf.ptr);
+                 std::vector<Eigen::Vector3d> sv;
+                 std::vector<Eigen::Vector3d> gv;
+                 sv.reserve(static_cast<size_t>(n));
+                 gv.reserve(static_cast<size_t>(n));
+                 for (int i = 0; i < n; ++i) {
+                     sv.emplace_back(sp[3 * i + 0], sp[3 * i + 1],
+                                     sp[3 * i + 2]);
+                     gv.emplace_back(gp[3 * i + 0], gp[3 * i + 1],
+                                     gp[3 * i + 2]);
+                 }
+                 py::gil_scoped_release release;
+                 return self.evaluateCandidates(oracle, sv, gv);
+             },
+             py::arg("oracle"), py::arg("starts"), py::arg("goals"));
 }

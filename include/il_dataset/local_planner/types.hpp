@@ -142,6 +142,70 @@ struct MacroCandidate {
     std::string source;
 };
 
+/// Result of evaluating one start-goal task candidate on the built scene
+/// map (task generation; sections XXVIII/XXXIX).  All fields are pure
+/// privileged diagnostics — never student inputs and never fed to the
+/// macro expert as a mode hint.
+struct TaskCandidateResult {
+    bool start_free = false;
+    bool goal_free = false;
+    bool goal_reachable = false;
+    double straight_distance = 0.0;
+    /// Global shortest-path length from start to goal (m).
+    double global_path_length = -1.0;
+    /// global_path_length / max(0.1, straight_distance).
+    double global_detour_ratio = -1.0;
+    /// Minimum ESDF clearance (vehicle radius already subtracted) along
+    /// the reconstructed global path.
+    double global_min_clearance = -1.0;
+    bool direct_blocked = false;
+    /// Number of distinct blocked runs along the direct start->goal ray.
+    int direct_blocker_count = 0;
+    /// Distance (m) from start to the first blocked cell on the direct ray.
+    double nearest_blocker_distance_m = -1.0;
+    /// Local-scale audit on the FULL map (short-range rejoin search with
+    /// bypass allowed) — the same semantics as PrivilegedInterventionOracle.
+    bool privileged_local_recoverable = false;
+    bool left_global_feasible = false;
+    bool right_global_feasible = false;
+    double left_path_length = -1.0;
+    double right_path_length = -1.0;
+    std::string reason;
+};
+
+/// Configuration for batch task-candidate evaluation (sections
+/// XXVIII/XXXIX/LIX).  The local-audit bounds mirror local_recoverability
+/// / privileged_intervention so generated classes match the real scale
+/// definition (behaviour scale, not obstacle size).
+struct TaskGenerationConfig {
+    /// Extra clearance for start/goal free tests (unified ESDF semantics:
+    /// vehicle radius already subtracted, so this is an additional margin).
+    double start_clearance_m = 0.45;
+    double goal_clearance_m = 0.45;
+    /// Extra clearance for the direct-corridor ray walk.
+    double direct_corridor_clearance_m = 0.45;
+    double min_task_distance_m = 3.0;
+    double max_task_distance_m = 30.0;
+    /// Lateral probe geometry for left/right global feasibility.
+    double lateral_probe_offset_m = 1.2;
+    double lateral_probe_spacing_m = 0.6;
+    int lateral_probe_count = 4;
+    double lateral_path_clearance_m = 0.45;
+    // ── Local-scale audit capability bounds (same as local_recoverability).
+    double search_clearance_m = 0.25;
+    double search_max_time_ms = 20.0;
+    double rejoin_distance_m = 2.5;
+    double max_duration_s = 2.5;
+    double max_path_length_m = 6.0;
+    double nominal_speed_mps = 1.8;
+    double max_detour_ratio = 1.6;
+    double min_goal_progress_m = 0.30;
+    double min_terminal_alignment = 0.5;
+    double terminal_tangent_min_baseline = 0.3;
+    double search_lateral_margin_m = 2.0;
+    double search_longitudinal_margin_m = 2.0;
+};
+
 /// Identified goal blocker in the observed map (section IV.2).
 struct GoalBlocker {
     bool found = false;

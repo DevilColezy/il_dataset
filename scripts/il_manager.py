@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 """
 il_manager.py  —  IL dataset collection manager (two-level navigation
-expert, schema v18).
+expert, schema v22).
 
-Data flow (section I / XVII):
-    task start/goal + global point cloud
-      -> PrivilegedOracle (global occupancy / ESDF / cost-to-go / connectivity)
-      -> 30 Hz: state + depth
-      -> observed-map integration (C++)
-      -> every 6th frame: 5 Hz macro expert (DIRECT/SIDE/OBSERVE/GOAL_REACHED/FAILED)
-      -> held world-frame macro guide (fixed for 200 ms)
-      -> 30 Hz local planner (A* + B-spline, observed map only)
-      -> execution safety (fresh / cached / rotate / brake / emergency)
-      -> trajectory controller -> FLU velocity + yaw rate
-      -> dataset recording (macro + local labels, student inputs, privileged
-         diagnostics kept separate)
+Automatic unattended lifecycle (section I/XX/XXIV-XXVIII):
+    connect AvoidBench (10253/10254)
+      -> procedurally generate Scene (cylinders, verified Object_t)
+      -> send scene to Unity, wait ready
+      -> export ONE scene-specific point cloud
+      -> build the privileged SCENE map (C++)
+      -> generate many start-goal tasks (C++ batch evaluation)
+      -> per task: reset drone + expert, run the 5/30 Hz lockstep loop,
+         record episode, write task manifest, NEXT_TASK
+      -> scene complete -> NEXT_SCENE -> NEXT_PROFILE -> DONE
+No external task manifests, manual start/goal or per-scene interaction is
+required (section LXXVIII).
 
-The manager is ROS entry `il_dataset_manager`.  All heavy loops run in C++
-(`_il_local_planner`); Python owns episode lifecycle, 5/30 Hz scheduling,
-state organization, recording and the low-frequency decision logic.
+Inside an episode the existing two-level loop is unchanged:
+    30 Hz: state + depth -> observed map (C++) -> 5 Hz macro expert ->
+    30 Hz local planner (A* + B-spline) -> execution safety -> FLU
+    controller -> dataset recording (labels match the executed command).
+
+The manager is ROS entry `il_dataset_manager`.  Heavy loops run in C++
+(`_il_local_planner`); Python owns lifecycle, scheduling and recording.
 """
 
 from __future__ import print_function, division
@@ -62,29 +66,46 @@ from il_config import (
     build_recoverability_config,
     build_planner_config,
     build_intervention_config,
+    build_task_generation_config,
 )
 from il_dynamics import create_dynamics_backend
 from il_macro_expert import MacroExpert
 from il_dataset_writer import DatasetWriter
+from il_scene_generator import (
+    ProceduralSceneGenerator,
+    SceneGeometryValidator,
+    SceneProfile,
+)
+from il_task_generator import (
+    MultiscaleTaskGenerator,
+    DatasetQuota,
+    runtime_classify,
+)
+from il_generation_manifest import (
+    SceneManifestWriter,
+    TaskManifestWriter,
+    GenerationFailureWriter,
+)
 
 
 class State(Enum):
     BOOT = 0
-    WAIT_UNITY_CONNECTED = 1
-    LOAD_TASK = 2
+    WAIT_UNITY = 1
+    GENERATE_SCENE = 2
     SEND_SCENE = 3
-    EXPORT_POINTCLOUD = 4
-    WAIT_POINTCLOUD_READY = 5
-    BUILD_PRIVILEGED_MAP = 6
-    RESET_DRONE = 7
-    WAIT_DRONE_STABLE = 8
-    INIT_LOCAL = 9
-    START_RECORDING = 10
-    ONLINE_PLAN_AND_RECORD = 11
-    STOP_RECORDING = 12
-    NEXT_TASK = 13
-    DONE = 14
-    ERROR = 15
+    WAIT_SCENE_READY = 4
+    EXPORT_POINTCLOUD = 5
+    WAIT_POINTCLOUD_READY = 6
+    BUILD_PRIVILEGED_MAP = 7
+    GENERATE_TASKS = 8
+    RESET_DRONE = 9
+    RUN_TASK = 10
+    FINISH_TASK = 11
+    FINISH_SCENE = 12
+    NEXT_SCENE = 13
+    NEXT_PROFILE = 14
+    DONE = 15
+    ERROR = 16
 
 
 class ILManager(object):
@@ -100,7 +121,6 @@ class ILManager(object):
         self._sync_cfg = self.g.get("sync", {})
         self._controller_cfg = self.g.get("trajectory_controller", {})
         self._safety_cfg = self.g.get("execution_safety", {})
-        self._oracle_cfg = self.g.get("task_oracle", {})
 
         # Outputs
         self.output_root = self.g.get("output_dir") or "dataset/il_data"
@@ -146,17 +166,62 @@ class ILManager(object):
         self._state_start = 0.0
         self._error = ""
 
-        # Task iteration
-        self._task_files = []
-        self._task_index = -1
+        # ── Scene / task generation (sections XXII-XXVIII) ───────────
+        sg = self.g.get("scene_generation", {})
+        veh = self.g.get("vehicle", {})
+        self._scene_generator = ProceduralSceneGenerator(
+            sg, float(veh.get("radius_m", 0.30)),
+            float(veh.get("safety_margin_m", 0.20)))
+        self._scene_validator = SceneGeometryValidator(
+            sg, float(veh.get("radius_m", 0.30)),
+            float(veh.get("safety_margin_m", 0.20)))
+        self._profiles = [SceneProfile(p) for p in sg.get("profiles", [])]
+        self._profile_index = 0
+        self._scene_index = 0
+        self._scene_attempt = 0
+        self._max_scene_attempts = int(sg.get("max_generation_attempts", 24))
+        self._tasks_per_scene = int(sg.get("tasks_per_scene", 12))
+        self._min_tasks_per_scene = int(
+            sg.get("minimum_tasks_per_scene", 1))
+        self._current_scene = None
+        self._current_tasks = []
         self._current_task = None
         self._current_task_id = None
-        self._scene_id = int(self.g.get("scene_id", 1))
+        self._task_index = 0
         self._episode_index = 0
+        self._scene_dir = None
+        self._pc_path = None
+        self._generation_rng = None
+
+        tg = self.g.get("task_generation", {})
+        self._task_gen_oracle = module.TaskGenerationOracle(
+            build_task_generation_config(self.g, module))
+        self._task_generator = MultiscaleTaskGenerator(
+            {
+                "flight_height_m": tg.get("flight_height_m", 5.0),
+                "region_min": tg.get("region_min", [1.5, 16.0, 3.5]),
+                "region_max": tg.get("region_max", [28.5, 60.0, 11.5]),
+                "distance_bands": tg.get("distance_bands", {}),
+                "sampling": tg.get("sampling", {}),
+                "classification": tg.get("classification", {}),
+                "initial_yaw": tg.get("initial_yaw", {}),
+                "task_seed_base": tg.get("task_seed_base", 999983),
+            },
+            module, self.g.get("task_oracle", {}), self._task_gen_oracle)
+        self._quota = DatasetQuota(tg.get("class_weights", {}))
+        self._runtime_classify_enabled = bool(
+            (tg.get("runtime_classification", {}) or {}).get(
+                "enabled", True))
+        self._handshake_scene_id = int(self.g.get("scene_id", 1))
+        self._scene_id = "scene_000000"
 
         # Stats
         self._total_episodes = 0
         self._committed_episodes = 0
+        self._total_scenes = 0
+        self._failed_tasks = 0
+        self._generation_failures_path = os.path.join(
+            self.output_root, "generation_failures.jsonl")
 
     # ═════════════════════════════════════════════════════════════════
     #  FSM
@@ -166,8 +231,11 @@ class ILManager(object):
         while not rospy.is_shutdown():
             self._tick()
             if self.state == State.DONE:
-                rospy.loginfo("[Manager] All tasks completed. %d/%d committed.",
-                              self._committed_episodes, self._total_episodes)
+                rospy.loginfo(
+                    "[Manager] Collection complete. scenes=%d episodes=%d "
+                    "committed=%d quota=%s", self._total_scenes,
+                    self._total_episodes, self._committed_episodes,
+                    self._quota.summary())
                 return
             if self.state == State.ERROR:
                 rospy.logerr("[Manager] ERROR: %s", self._error)
@@ -184,19 +252,20 @@ class ILManager(object):
     def _tick(self):
         handlers = {
             State.BOOT: self._st_boot,
-            State.WAIT_UNITY_CONNECTED: self._st_wait_unity,
-            State.LOAD_TASK: self._st_load_task,
+            State.WAIT_UNITY: self._st_wait_unity,
+            State.GENERATE_SCENE: self._st_generate_scene,
             State.SEND_SCENE: self._st_send_scene,
+            State.WAIT_SCENE_READY: self._st_wait_scene_ready,
             State.EXPORT_POINTCLOUD: self._st_export_pointcloud,
             State.WAIT_POINTCLOUD_READY: self._st_wait_pointcloud,
             State.BUILD_PRIVILEGED_MAP: self._st_build_privileged_map,
+            State.GENERATE_TASKS: self._st_generate_tasks,
             State.RESET_DRONE: self._st_reset_drone,
-            State.WAIT_DRONE_STABLE: self._st_wait_drone_stable,
-            State.INIT_LOCAL: self._st_init_local,
-            State.START_RECORDING: self._st_start_recording,
-            State.ONLINE_PLAN_AND_RECORD: self._st_online_plan_and_record,
-            State.STOP_RECORDING: self._st_stop_recording,
-            State.NEXT_TASK: self._st_next_task,
+            State.RUN_TASK: self._st_run_task,
+            State.FINISH_TASK: self._st_finish_task,
+            State.FINISH_SCENE: self._st_finish_scene,
+            State.NEXT_SCENE: self._st_next_scene,
+            State.NEXT_PROFILE: self._st_next_profile,
         }
         handler = handlers.get(self.state)
         if handler is not None:
@@ -204,94 +273,150 @@ class ILManager(object):
 
     # ── Boot / connection ────────────────────────────────────────────
     def _st_boot(self):
-        try:
-            self._load_task_manifests()
-        except Exception as exc:  # noqa: BLE001
-            self._error = "task_manifest_error: %s" % exc
+        if not self._profiles:
+            self._error = "no_scene_profiles"
             self._enter_state(State.ERROR)
             return
-        self._enter_state(State.WAIT_UNITY_CONNECTED)
+        self._enter_state(State.WAIT_UNITY)
 
     def _st_wait_unity(self):
+        # Auto-retry the ZMQ handshake until AvoidBench is ready (section
+        # XXI).  No user input is required after launch.
         if not self._bridge._bound:
             self._bridge.bind()
         if self._bridge.connect_handshake(
-                self._scene_id, self._depth_cfg,
+                self._handshake_scene_id, self._depth_cfg,
                 timeout=self._fsm.get("connect_timeout", 60.0)):
-            self._enter_state(State.LOAD_TASK)
+            rospy.loginfo("[Manager] Connected to AvoidBench")
+            self._enter_state(State.GENERATE_SCENE)
         elif self._timed_out(self._fsm.get("connect_timeout", 60.0)):
             self._error = "unity_connect_timeout"
             self._enter_state(State.ERROR)
 
-    # ── Task lifecycle ───────────────────────────────────────────────
-    def _load_task_manifests(self):
-        manifest_dir = self._oracle_cfg.get("task_manifest_dir", "tasks")
-        if not os.path.isabs(manifest_dir):
-            here = os.path.dirname(os.path.abspath(__file__))
-            manifest_dir = os.path.normpath(os.path.join(here, "..", manifest_dir))
-        if not os.path.isdir(manifest_dir):
-            raise ValueError("task_manifest_dir not found: %s" % manifest_dir)
-        self._task_files = sorted(
-            f for f in os.listdir(manifest_dir) if f.endswith(".json"))
-        self._task_dir = manifest_dir
+    # ── Scene lifecycle (sections XX-XXVII) ──────────────────────────
+    def _next_scene_seed_rng(self):
+        import random as _rng_mod
+        seed = (self._scene_generator.seed_base * 31 +
+                self._profile_index * 104729 +
+                self._scene_index * 15485863 +
+                self._scene_attempt * 40503) & 0x7FFFFFFF
+        return _rng_mod.Random(seed)
 
-    def _st_load_task(self):
-        self._task_index += 1
-        if self._task_index >= len(self._task_files):
+    def _st_generate_scene(self):
+        if self._profile_index >= len(self._profiles):
             self._enter_state(State.DONE)
             return
-        with open(os.path.join(self._task_dir, self._task_files[self._task_index])) as f:
-            task = json.load(f)
-        start = np.asarray(task["start"], dtype=np.float64)
-        goal = np.asarray(task["goal"], dtype=np.float64)
-        if start.shape != (3,) or goal.shape != (3,) or \
-                not np.all(np.isfinite(start)) or not np.all(np.isfinite(goal)):
-            self._error = "invalid_task_manifest"
-            self._enter_state(State.ERROR)
+        profile = self._profiles[self._profile_index]
+        if self._scene_index >= profile.scene_count:
+            self._profile_index += 1
+            self._scene_index = 0
+            self._scene_attempt = 0
+            self._enter_state(State.NEXT_PROFILE)
             return
-        self._current_task = {
-            "start": start,
-            "goal": goal,
-            "initial_yaw": float(task.get("initial_yaw", 0.0)),
-            "objects": task.get("objects", []),
-        }
-        self._current_task_id = os.path.splitext(
-            os.path.basename(self._task_files[self._task_index]))[0]
-        self._episode_index = 0
-        rospy.loginfo("[Manager] Task %s start=%s goal=%s",
-                      self._current_task_id, start.tolist(), goal.tolist())
+        try:
+            scene = self._scene_generator.generate(
+                profile, self._scene_index, self._scene_attempt)
+            ok, reason, _ = self._scene_validator.validate(scene)
+            if not ok:
+                raise ValueError("scene invalid: %s" % reason)
+        except Exception as exc:  # noqa: BLE001
+            self._scene_attempt += 1
+            GenerationFailureWriter.write(self._generation_failures_path, {
+                "event": "scene_generation",
+                "profile": profile.name,
+                "scene_index": self._scene_index,
+                "attempt": self._scene_attempt,
+                "reason": str(exc),
+            })
+            if self._scene_attempt >= self._max_scene_attempts:
+                self._error = "scene_generation_exhausted: %s" % exc
+                self._enter_state(State.ERROR)
+                return
+            rospy.logwarn("[Manager] Scene retry %d: %s",
+                          self._scene_attempt, exc)
+            self._enter_state(State.GENERATE_SCENE)
+            return
+        self._current_scene = scene
+        self._scene_id = scene.scene_id
+        self._generation_rng = self._next_scene_seed_rng()
+        self._scene_dir = os.path.join(
+            self.output_root, "scenes", scene.scene_id)
+        if not os.path.isdir(self._scene_dir):
+            os.makedirs(self._scene_dir)
+        rospy.loginfo("[Manager] Profile %s Scene %d/%d: generated %d "
+                      "obstacles (mode=%s)",
+                      profile.name, self._scene_index + 1,
+                      profile.scene_count, len(scene.obstacles),
+                      scene.metrics.get("mode"))
         self._enter_state(State.SEND_SCENE)
 
+    def _drain_bridge(self, seconds=0.4):
+        """Drain stale AvoidBench replies so old ready / PC acks from a
+        previous scene can never be mistaken for the current one (section
+        XXIV)."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not rospy.is_shutdown():
+            r = self._bridge.try_recv()
+            if r is None:
+                time.sleep(0.01)
+                continue
+
     def _st_send_scene(self):
+        self._drain_bridge(0.4)
         vehicle = make_depth_vehicle([0.0, 0.0, 5.0], 0.0, self._depth_cfg)
         msg = {
             "scene_id": self._scene_id,
             "frame_id": -1,
             "vehicles": [vehicle],
-            "objects": self._current_task["objects"],
+            "objects": self._current_scene.unity_objects,
         }
         self._bridge.send_settings(msg)
-        # Wait for a settled ready reply.
-        deadline = time.monotonic() + self._fsm.get("scene_settle_timeout", 10.0)
+        self._enter_state(State.WAIT_SCENE_READY)
+
+    def _st_wait_scene_ready(self):
+        # Wait for the settled ready reply with an optional scene keep-alive
+        # (section XXIII).  A timeout regenerates the scene (new seed).
+        deadline = self._state_start + \
+            self._fsm.get("scene_settle_timeout", 10.0)
+        keep_alive = self._fsm.get("keep_alive_period", 3.0)
+        last_alive = 0.0
         while time.monotonic() < deadline and not rospy.is_shutdown():
             r = self._bridge.try_recv()
             if r is not None and r[0].get("ready"):
+                rospy.loginfo("[Manager] Unity ready: %s", self._scene_id)
                 self._enter_state(State.EXPORT_POINTCLOUD)
                 return
-            time.sleep(0.1)
-        self._error = "scene_settle_timeout"
-        self._enter_state(State.ERROR)
+            if time.monotonic() - last_alive >= keep_alive:
+                vehicle = make_depth_vehicle(
+                    [0.0, 0.0, 5.0], 0.0, self._depth_cfg)
+                self._bridge.send_settings({
+                    "scene_id": self._scene_id,
+                    "frame_id": -1,
+                    "vehicles": [vehicle],
+                    "objects": self._current_scene.unity_objects,
+                })
+                last_alive = time.monotonic()
+            time.sleep(0.02)
+        self._scene_attempt += 1
+        GenerationFailureWriter.write(self._generation_failures_path, {
+            "event": "scene_ready_timeout",
+            "scene_id": self._scene_id,
+            "attempt": self._scene_attempt,
+        })
+        if self._scene_attempt >= self._max_scene_attempts:
+            self._error = "scene_ready_timeout"
+            self._enter_state(State.ERROR)
+            return
+        self._enter_state(State.GENERATE_SCENE)
 
     def _st_export_pointcloud(self):
         pc_cfg = self.g.get("pointcloud", {})
-        pc_dir = os.path.join(self.output_root, "pointclouds")
+        pc_dir = os.path.join(self.output_root, "maps")
         if not os.path.isdir(pc_dir):
             os.makedirs(pc_dir)
-        # Unity appends ".ply" itself, so strip any existing extension from
-        # the configured file name (section XI) to avoid a double extension.
-        export_file = pc_cfg.get("export_file", "obstacle_cloud.ply")
-        base = export_file[:-4] if export_file.lower().endswith(".ply") \
-            else export_file
+        # Scene-specific PLY name (section XXV/XXVI): never reuse a single
+        # obstacle_cloud.ply across scenes.
+        base = self._scene_id.replace("scene_", "")
         req = {
             "range": pc_cfg.get("range", [27.0, 44.0, 8.0]),
             "origin": pc_cfg.get("origin", [1.5, 16.0, 3.5]),
@@ -310,53 +435,120 @@ class ILManager(object):
         if r is not None and r[0].get("save_pc_success", False):
             if wait_for_stable_file(self._pc_path,
                                     timeout=self._fsm.get("pc_export_timeout", 600.0)):
+                rospy.loginfo("[Manager] point cloud exported: %s",
+                              self._pc_path)
                 self._enter_state(State.BUILD_PRIVILEGED_MAP)
                 return
         if self._timed_out(self._fsm.get("pc_export_timeout", 600.0)):
-            self._error = "pointcloud_export_timeout"
-            self._enter_state(State.ERROR)
+            self._scene_attempt += 1
+            GenerationFailureWriter.write(self._generation_failures_path, {
+                "event": "pointcloud_timeout",
+                "scene_id": self._scene_id,
+                "attempt": self._scene_attempt,
+            })
+            if self._scene_attempt >= self._max_scene_attempts:
+                self._error = "pointcloud_export_timeout"
+                self._enter_state(State.ERROR)
+                return
+            self._enter_state(State.GENERATE_SCENE)
 
     def _st_build_privileged_map(self):
         try:
             points = load_ply(self._pc_path)
-            # The exported PLY is already in the manager world frame
-            # (x-fwd, y-left, z-up).
-            if not self._oracle.build(
-                    points, self._current_task["start"],
-                    self._current_task["goal"], self._oracle_config):
-                raise ValueError("privileged oracle build failed")
-            if not self._oracle.task_reachable():
-                rospy.logwarn("[Manager] Task %s: start-goal not reachable in "
-                              "global map; skipping.", self._current_task_id)
-                self._enter_state(State.NEXT_TASK)
-                return
-            rospy.loginfo("[Manager] Privileged map built: %d points, "
-                          "reachable=%s", len(points), self._oracle.task_reachable())
+            region = self._current_scene.region
+            rmin = np.array([region.min_x, region.min_y, region.min_z],
+                            dtype=np.float64)
+            rmax = np.array([region.max_x, region.max_y, region.max_z],
+                            dtype=np.float64)
+            if not self._oracle.build_scene(points, self._oracle_config,
+                                            rmin, rmax):
+                raise ValueError("privileged scene build failed")
+            rospy.loginfo("[Manager] privileged map built: %d points",
+                          len(points))
         except Exception as exc:  # noqa: BLE001
             self._error = "privileged_map_build_failed: %s" % exc
             self._enter_state(State.ERROR)
             return
+        self._enter_state(State.GENERATE_TASKS)
+
+    def _st_generate_tasks(self):
+        rng = self._generation_rng
+        try:
+            tasks, note = self._task_generator.generate_tasks(
+                self._current_scene, self._oracle, self._quota, rng,
+                self._tasks_per_scene)
+        except Exception as exc:  # noqa: BLE001
+            self._error = "task_generation_failed: %s" % exc
+            self._enter_state(State.ERROR)
+            return
+        if len(tasks) < self._min_tasks_per_scene:
+            # This scene cannot produce enough valid tasks -> regenerate it
+            # with a new seed (section XXXVIII/XLIX).
+            self._scene_attempt += 1
+            GenerationFailureWriter.write(self._generation_failures_path, {
+                "event": "insufficient_tasks",
+                "scene_id": self._current_scene.scene_id,
+                "attempt": self._scene_attempt,
+                "task_count": len(tasks),
+            })
+            if self._scene_attempt >= self._max_scene_attempts:
+                self._error = "task_generation_exhausted"
+                self._enter_state(State.ERROR)
+                return
+            rospy.logwarn("[Manager] Scene %s: only %d tasks; regenerating",
+                          self._current_scene.scene_id, len(tasks))
+            self._enter_state(State.GENERATE_SCENE)
+            return
+        self._current_tasks = tasks
+        self._task_index = 0
+        self._episode_index = 0
+        self._total_scenes += 1
+        self._write_scene_manifest()
+        rospy.loginfo("[Manager] Scene %s: %s",
+                      self._current_scene.scene_id, note)
         self._enter_state(State.RESET_DRONE)
 
-    # ── Drone lifecycle ──────────────────────────────────────────────
+    def _write_scene_manifest(self):
+        path = os.path.join(self._scene_dir, "scene_manifest.json")
+        tasks = [t.to_dict() for t in self._current_tasks]
+        SceneManifestWriter.write(
+            path, self._current_scene.to_dict(), tasks, self._pc_path,
+            self._task_generator.task_seed_base)
+
+    # ── Task lifecycle (sections XLIII/LII) ──────────────────────────
+    def _record_task_failure(self, reason):
+        self._failed_tasks += 1
+        GenerationFailureWriter.write(self._generation_failures_path, {
+            "event": "task_skipped",
+            "scene_id": self._scene_id,
+            "task_id": self._current_task_id,
+            "reason": reason,
+        })
+
     def _st_reset_drone(self):
-        start = self._current_task["start"]
-        initial_yaw = self._current_task["initial_yaw"]
-        self._dynamics.reset(start, initial_yaw)
-        self._enter_state(State.WAIT_DRONE_STABLE)
-
-    def _st_wait_drone_stable(self):
-        ds = self._dynamics.get_state()
-        speed = float(np.linalg.norm(ds.velocity_world))
-        if speed < 0.05:
-            self._enter_state(State.INIT_LOCAL)
-        elif self._timed_out(self._fsm.get("drone_stable_timeout", 10.0)):
-            self._error = "drone_stable_timeout"
-            self._enter_state(State.ERROR)
-
-    def _st_init_local(self):
-        start = self._current_task["start"]
-        self._observed_map.reset(start)
+        if self._task_index >= len(self._current_tasks):
+            self._enter_state(State.FINISH_SCENE)
+            return
+        task = self._current_tasks[self._task_index]
+        self._current_task = {
+            "task_id": task.task_id,
+            "start": task.start,
+            "goal": task.goal,
+            "initial_yaw": task.initial_yaw,
+            "task_class": task.target_task_class,
+            "generation_metrics": task.metrics,
+        }
+        self._current_task_id = task.task_id
+        # Goal-specific cost-to-go / connectivity for THIS task (the scene
+        # map is already built once, section XLIV/LXXI).
+        if not self._oracle.set_task(task.start, task.goal):
+            self._record_task_failure("set_task_unreachable")
+            self._task_index += 1
+            self._enter_state(State.RESET_DRONE)
+            return
+        # Reset drone + all per-task navigation state (section XLIII).
+        self._dynamics.reset(task.start, task.initial_yaw)
+        self._observed_map.reset(task.start)
         self._observed_map.force_rebuild_esdf()
         self._macro_expert.reset()
         self._intervention_oracle.reset()
@@ -366,8 +558,6 @@ class ILManager(object):
         self._local_unrecoverable_pending = False
         self._brake_hold_time = 0.0
         self._emergency_stop_time = 0.0
-        # Executed-plan semantics (sections XVII/XVIII): the ACTIVE plan is
-        # the trajectory actually being executed (fresh or cached suffix).
         self._active_result = None
         self._active_plan_start_time = None
         self._total_plans = 0
@@ -379,34 +569,36 @@ class ILManager(object):
         self._last_velocity_world = None
         self._last_acceleration_world = None
         self._last_yaw_rate = 0.0
-        # 30 Hz -> 5 Hz macro-interval feedback accumulator (sections
-        # XX-XXIII): aggregates the WHOLE 200 ms interval between macro
-        # ticks, never just the last frame before the tick.
+        # 30 Hz -> 5 Hz macro-interval feedback accumulator (section XX).
         self._macro_feedback = self._new_macro_feedback()
         self._macro_feedback_log = None
         self._macro_feedback_is_new = 0
-        self._enter_state(State.START_RECORDING)
-
-    def _st_start_recording(self):
-        self._episode_id = "%s_%s_ep%03d" % (
-            self._current_task_id, "traj", self._episode_index)
-        # Pass ONLY the dataset_logging sub-config (section XXII); the
-        # writer expects that hierarchy, not the full global config.
+        # Per-episode writer.
+        self._episode_id = "%s_ep%02d" % (task.task_id, self._episode_index)
         self._writer = DatasetWriter(
             self.g.get("dataset_logging", {}), self._episode_id,
-            self._inprogress_root, self._scene_id, self._current_task_id,
-            self._current_task["start"], self._current_task["goal"],
-            self._current_task["initial_yaw"], self._depth_cfg)
+            self._inprogress_root, self._scene_id, task.task_id,
+            task.start, task.goal, task.initial_yaw, self._depth_cfg)
         self._recording_start_mono = time.monotonic()
         self._matched_frames = 0
         self._unmatched_frames = 0
         self._exact_matches = 0
-        self._enter_state(State.ONLINE_PLAN_AND_RECORD)
+        # Quick settle before the lockstep loop.
+        settle = time.monotonic() + 0.3
+        while time.monotonic() < settle:
+            ds = self._dynamics.get_state()
+            if float(np.linalg.norm(ds.velocity_world)) < 0.05:
+                break
+            time.sleep(0.01)
+        rospy.loginfo("[Manager] Task %d/%d %s [%s]",
+                      self._task_index + 1, len(self._current_tasks),
+                      task.task_id, task.target_task_class.value)
+        self._enter_state(State.RUN_TASK)
 
     # ═════════════════════════════════════════════════════════════════
     #  30 Hz online loop (blocking)
     # ═════════════════════════════════════════════════════════════════
-    def _st_online_plan_and_record(self):
+    def _st_run_task(self):
         dt = self._dt
         macro_interval = self._macro_interval
         goal = self._current_task["goal"]
@@ -635,7 +827,7 @@ class ILManager(object):
             "frame_invalid_reason": self._exit_reason,
         })
         self._trajectory_exit_reason = self._exit_reason
-        self._enter_state(State.STOP_RECORDING)
+        self._enter_state(State.FINISH_TASK)
 
     # ── Macro-interval feedback (sections XX-XXIII) ──────────────────
     def _new_macro_feedback(self):
@@ -665,7 +857,7 @@ class ILManager(object):
             "scene_id": self._scene_id,
             "frame_id": frame_id,
             "vehicles": [vehicle],
-            "objects": self._current_task["objects"],
+            "objects": self._current_scene.unity_objects,
         }
         t_sent = time.monotonic()
         self._bridge.send_pose(msg)
@@ -1266,8 +1458,8 @@ class ILManager(object):
                 executed_result.trajectory_terminal,
                 executed_result.search_status, executed_result.trajectory)
 
-    # ── End of episode ───────────────────────────────────────────────
-    def _st_stop_recording(self):
+    # ── End of episode / task / scene (sections L-LII) ───────────────
+    def _st_finish_task(self):
         self._total_episodes += 1
         # Sync-quality gates for the commit decision (section "sync").
         sync = self._sync_cfg
@@ -1297,6 +1489,8 @@ class ILManager(object):
         success = self._trajectory_reached_goal and not reject_reason
         if not success and not reject_reason:
             reject_reason = self._trajectory_exit_reason
+        if not success:
+            self._failed_tasks += 1
         extra = {
             "exit_reason": self._trajectory_exit_reason,
             "reject_reason": reject_reason,
@@ -1311,11 +1505,68 @@ class ILManager(object):
         self._writer.finish(success, reject_reason, extra)
         if success:
             self._committed_episodes += 1
-        self._episode_index += 1
-        self._enter_state(State.NEXT_TASK)
 
-    def _st_next_task(self):
-        self._enter_state(State.LOAD_TASK)
+        # Task manifest output + runtime classification (section XLVII).
+        task = self._current_tasks[self._task_index]
+        runtime_info = {
+            "episode_result": "success" if success else "failed",
+            "exit_reason": self._trajectory_exit_reason,
+            "reject_reason": reject_reason,
+        }
+        if self._runtime_classify_enabled:
+            rec = self._macro_expert.last_recoverability
+            initial_observed = bool(
+                rec is not None and
+                rec.status == module.RecoverabilityStatus.DIRECT_REJOIN_SUCCESS)
+            runtime_cls = runtime_classify(
+                task.target_task_class,
+                bool(task.metrics.get("privileged_local_recoverable")),
+                initial_observed)
+            runtime_info["runtime_task_class"] = \
+                runtime_cls.value if runtime_cls is not None else None
+            runtime_info["initial_observed_recoverable"] = initial_observed
+            runtime_info["classification_mismatch"] = bool(
+                runtime_cls is not None and
+                runtime_cls != task.target_task_class)
+        task_dir = os.path.join(self._scene_dir, "tasks", task.task_id)
+        TaskManifestWriter.write(
+            os.path.join(task_dir, "task_manifest.json"),
+            task.to_dict(), runtime_info)
+        if not success:
+            GenerationFailureWriter.write(self._generation_failures_path, {
+                "event": "task_failed",
+                "task_id": task.task_id,
+                "scene_id": self._scene_id,
+                "exit_reason": self._trajectory_exit_reason,
+                "reject_reason": reject_reason,
+            })
+
+        self._episode_index += 1
+        self._task_index += 1
+        if self._task_index < len(self._current_tasks):
+            # Next task on the SAME scene (section LII): no scene re-send,
+            # no point cloud re-export, no map rebuild.
+            self._enter_state(State.RESET_DRONE)
+        else:
+            self._enter_state(State.FINISH_SCENE)
+
+    def _st_finish_scene(self):
+        rospy.loginfo("[Manager] Scene complete: %s (%d tasks)",
+                      self._scene_id, len(self._current_tasks))
+        self._scene_index += 1
+        self._scene_attempt = 0
+        self._current_tasks = []
+        self._current_scene = None
+        self._episode_index = 0
+        self._enter_state(State.NEXT_SCENE)
+
+    def _st_next_scene(self):
+        self._enter_state(State.GENERATE_SCENE)
+
+    def _st_next_profile(self):
+        # _st_generate_scene advanced the profile index; loop back to the
+        # generation entry which re-checks completion.
+        self._enter_state(State.GENERATE_SCENE)
 
 
 def main():
@@ -1325,8 +1576,17 @@ def main():
     # we must check its VALUE, not mere existence (has_param would always
     # be true and the manager would exit in dry-run every time).
     if rospy.get_param("~dry_run", False):
-        rospy.loginfo("[Manager] Config loaded (dry-run): %d global modules",
-                      len(cfg.get("global", {})))
+        g = cfg.get("global", {})
+        sg = g.get("scene_generation", {})
+        tg = g.get("task_generation", {})
+        total_scenes = sum(
+            int(p.get("scene_count", 20)) for p in sg.get("profiles", []))
+        weights = tg.get("class_weights", {})
+        rospy.loginfo(
+            "[Manager] Config loaded (dry-run): profiles=%d scenes=%d "
+            "tasks_per_scene=%d class_weights=%s",
+            len(sg.get("profiles", [])), total_scenes,
+            sg.get("tasks_per_scene", 12), weights)
         return
     manager = ILManager(cfg)
     manager.run()

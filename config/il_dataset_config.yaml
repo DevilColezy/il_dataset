@@ -58,6 +58,101 @@ global:
     radius_m:        0.30
     safety_margin_m: 0.20
 
+  # ── Procedural scene generation (section XXII/XXXII-XXXVI) ─────────
+  scene_generation:
+    enabled: true
+    seed: 12345
+    tasks_per_scene: 12
+    minimum_tasks_per_scene: 1
+    max_generation_attempts: 24
+    obstacle_region:
+      min_x: 1.5
+      max_x: 28.5
+      min_y: 16.0
+      max_y: 60.0
+      min_z: 3.5
+      max_z: 11.5
+    geometry:
+      height_m:              8.0
+      minimum_surface_gap_m: 0.30
+      boundary_margin_m:     0.6
+      max_obstacles:       120
+    min_free_fraction:      0.35
+    coarse_grid:            24
+    profiles:
+      - name: sparse_mixed
+        scene_count: 20
+        radius_min_m: 0.15
+        radius_max_m: 1.2
+        target_occupancy: [0.05, 0.10]
+        cluster_probability: 0.10
+        chain_probability:   0.05
+      - name: dense_small
+        scene_count: 20
+        radius_min_m: 0.10
+        radius_max_m: 0.50
+        target_occupancy: [0.08, 0.15]
+        cluster_probability: 0.20
+        chain_probability:   0.10
+      - name: mixed_scale
+        scene_count: 30
+        radius_min_m: 0.10
+        radius_max_m: 2.5
+        target_occupancy: [0.08, 0.18]
+        cluster_probability: 0.15
+        chain_probability:   0.10
+      - name: clustered_barrier
+        scene_count: 30
+        radius_min_m: 0.10
+        radius_max_m: 1.0
+        target_occupancy: [0.10, 0.20]
+        cluster_probability: 0.30
+        chain_probability:   0.20
+
+  # ── Multi-scale task generation (section XXVIII/XXXVII-XXXIX) ──────
+  # Behavioural scale classes (TaskClass) are generation/diagnostic only —
+  # never student inputs and never forced onto the macro expert mode.
+  task_generation:
+    enabled: true
+    flight_height_m: 5.0
+    clearance_m: 0.20            # extra margin on top of vehicle radius (ESDF)
+    task_seed_base: 999983
+    region_min: [1.5, 16.0, 3.5]
+    region_max: [28.5, 60.0, 11.5]
+    distance_bands:
+      short:
+        min_m: 4.0
+        max_m: 8.0
+      medium:
+        min_m: 8.0
+        max_m: 16.0
+      long:
+        min_m: 16.0
+        max_m: 28.0
+    class_weights:
+      open_direct:       0.10
+      local_reactive:    0.30
+      near_occluded:     0.15
+      strategic_blocker: 0.20
+      asymmetric_side:   0.10
+      ambiguous_side:    0.05
+      compound_barrier:  0.10
+    sampling:
+      candidate_batch_size: 64
+      maximum_batches_per_scene: 6
+      lateral_probe_offset_m: 1.2
+      lateral_probe_spacing_m: 0.6
+      lateral_probe_count: 4
+    classification:
+      near_occluded_max_blocker_distance_m: 2.0
+      compound_min_blockers: 2
+      ambiguous_max_path_diff_m: 1.0
+    initial_yaw:
+      goal_aligned_probability: 0.5
+      random_offset_deg: 60.0
+    runtime_classification:
+      enabled: true
+
   # ── Recording rate ─────────────────────────────────────────────────
   control:
     # Unity depth at 640x480 cannot reliably be consumed at 50 Hz; 30 Hz is
@@ -95,9 +190,9 @@ global:
   # Free space is everywhere  esdf > inflation_m  (never re-subtracting the
   # vehicle radius).
   task_oracle:
-    # Task manifests: each JSON file provides start/goal/initial_yaw and an
-    # optional obstacle list sent to Unity.  Files are consumed in order.
-    task_manifest_dir: "tasks"
+    # Global privileged map config.  Tasks are now generated ONLINE per
+    # scene (scene_generation / task_generation); no external manifests
+    # are required as inputs (section VI).
     map_resolution_m:      0.10
     map_margin_m:          2.0
     inflation_m:           0.30
