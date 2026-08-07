@@ -144,6 +144,16 @@ def _validate_config(cfg):
               "macro_expert.observe_no_information_timeout", errors)
     _positive(me.get("local_path_fail_threshold", 2),
               "macro_expert.local_path_fail_threshold", errors)
+    _positive(me.get("blocker_rebind_ticks", 2),
+              "macro_expert.blocker_rebind_ticks", errors)
+    _positive(me.get("macro_intervention_absolute_safety_timeout", 45.0),
+              "macro_expert.macro_intervention_absolute_safety_timeout",
+              errors)
+    if me.get("macro_intervention_absolute_safety_timeout", 45.0) <= \
+            me.get("observe_no_information_timeout", 4.0):
+        errors.append(
+            "macro_expert.macro_intervention_absolute_safety_timeout must "
+            "be well above observe_no_information_timeout")
 
     # candidate geometry
     _positive(mc.get("side_corridor_radius_m", 0.55),

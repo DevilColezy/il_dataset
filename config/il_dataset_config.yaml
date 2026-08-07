@@ -151,18 +151,22 @@ global:
     side_no_progress_seconds:   6.0
     observe_no_information_timeout: 4.0
     progress_cost_epsilon_m:    0.10
-    progress_arc_epsilon_m:     0.05
     local_path_fail_threshold:  2
+    # Side memory is rebound to a NEW blocker component only after this
+    # many consecutive identical blocker ids (hysteresis, section X).
+    blocker_rebind_ticks:       2
     # Goal reached condition (distance + speed).
     goal_tolerance_m:           0.30
     goal_speed_tolerance_mps:   0.20
-    # OBSERVE abort limits.
-    max_observe_seconds:        8.0
+    # OBSERVE rotate sweep speed and cap.  OBSERVE never FAILs on a short
+    # fixed duration: it runs while it keeps gaining information (section
+    # XIX/XX).  The absolute safety limit below is only a large final
+    # anti-deadlock guard, well above any single observation window.
     observe_rotation_rate_rps:  1.5
     # OBSERVE yaw sweep cap (half-FOV of the camera).
     observe_fov_half_deg:      45.0
-    # Clearance required for the short OBSERVE move.
-    observe_clearance_m:        0.20
+    # Episode-level final anti-deadlock guard (section XXII).
+    macro_intervention_absolute_safety_timeout: 45.0
     # Fixed left preference for genuinely tied sides (never unconditional).
     left_preferred_on_tie:      true
     # Confidence gate: below this the macro marks labels ambiguous.

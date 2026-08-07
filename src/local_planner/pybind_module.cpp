@@ -598,13 +598,15 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def(py::init<>())
         .def_readwrite("rejoin_distance_m", &RecoverabilityConfig::rejoin_distance_m)
         .def_readwrite("search_clearance_m", &RecoverabilityConfig::search_clearance_m)
-        .def_readwrite("max_execution_time_s",
-                       &RecoverabilityConfig::max_execution_time_s)
+        .def_readwrite("max_duration_s", &RecoverabilityConfig::max_duration_s)
+        .def_readwrite("max_path_length_m", &RecoverabilityConfig::max_path_length_m)
         .def_readwrite("min_goal_progress_m", &RecoverabilityConfig::min_goal_progress_m)
         .def_readwrite("min_terminal_alignment",
                        &RecoverabilityConfig::min_terminal_alignment)
-        .def_readwrite("max_loop_ratio", &RecoverabilityConfig::max_loop_ratio)
+        .def_readwrite("max_detour_ratio", &RecoverabilityConfig::max_detour_ratio)
         .def_readwrite("nominal_speed_mps", &RecoverabilityConfig::nominal_speed_mps)
+        .def_readwrite("terminal_tangent_min_baseline",
+                       &RecoverabilityConfig::terminal_tangent_min_baseline)
         .def_readwrite("side_corridor_length_m",
                        &RecoverabilityConfig::side_corridor_length_m)
         .def_readwrite("side_corridor_radius_m",

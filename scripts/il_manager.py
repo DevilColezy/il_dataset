@@ -368,6 +368,9 @@ class ILManager(object):
         self._last_velocity_world = None
         self._last_acceleration_world = None
         self._last_yaw_rate = 0.0
+        # Previous frame's execution mode: fed to the macro expert as
+        # cached / brake causal evidence (section V).
+        self._prev_execution_mode = None
         self._enter_state(State.START_RECORDING)
 
     def _st_start_recording(self):
@@ -459,9 +462,15 @@ class ILManager(object):
             is_macro_tick = (sample_index % macro_interval) == 0
             if is_macro_tick:
                 dt_macro = macro_interval * dt
+                prev_mode = self._prev_execution_mode
+                cached = prev_mode == module.ExecutionMode.TRACK_CACHED
+                brake = prev_mode in (
+                    module.ExecutionMode.BRAKE_HOLD,
+                    module.ExecutionMode.EMERGENCY_STOP)
                 held_action = self._macro_expert.update(
                     goal, state, self._observed_map, dt_s=dt_macro,
-                    local_unrecoverable=self._local_unrecoverable_pending)
+                    local_unrecoverable=self._local_unrecoverable_pending,
+                    cached=cached, brake=brake)
                 if held_action.mode == module.MacroMode.GOAL_REACHED:
                     self._trajectory_reached_goal = True
                     self._exit_reason = "goal_reached"
@@ -543,6 +552,9 @@ class ILManager(object):
                     break
             else:
                 self._emergency_stop_time = 0.0
+            # Remember this frame's execution mode for the next macro tick
+            # (cached / brake causal evidence, section V).
+            self._prev_execution_mode = execution_mode
 
             # ── 7. Trajectory controller ────────────────────────────
             cmd = self._compute_command(
