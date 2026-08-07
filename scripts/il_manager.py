@@ -682,9 +682,12 @@ class ILManager(object):
                         return (module.ExecutionMode.TRACK_CACHED,
                                 last_trajectory, False, True, age)
 
-        # Macro OBSERVE -> rotate only (pure rotation, zero velocity).
+        # Macro OBSERVE_ROTATE -> rotate only (pure rotation, zero
+        # velocity).  OBSERVE_MOVE (observe_subtype == 1) has a forward
+        # observation-probe goal, so it falls through to normal planning.
         if held_action is not None and \
-                held_action.mode == module.MacroMode.OBSERVE:
+                held_action.mode == module.MacroMode.OBSERVE and \
+                getattr(held_action, "observe_subtype", 0) == 0:
             return (module.ExecutionMode.ROTATE_ONLY, [], False, False, 0.0)
 
         # Emergency brake when the swept braking volume collides (C++).
@@ -942,6 +945,27 @@ class ILManager(object):
         privileged_goal_progress = \
             float(intervention.privileged_goal_progress) \
             if intervention is not None else -1.0
+        # Observed/privileged recoverability audit (section XXV): unified
+        # rejoin capability bound + real-meter margins + terminal tangent.
+        observed_rejoin_distance = \
+            float(rec.rejoin_distance) if rec is not None else -1.0
+        observed_path_length = \
+            float(rec.path_length) if rec is not None else -1.0
+        observed_detour_ratio = \
+            float(rec.detour_ratio) if rec is not None else -1.0
+        observed_terminal_alignment = \
+            float(rec.terminal_guide_alignment) \
+            if rec is not None else -1.0
+        privileged_rejoin_distance = \
+            float(intervention.privileged_rejoin_distance) \
+            if intervention is not None else -1.0
+        privileged_terminal_alignment = \
+            float(intervention.privileged_terminal_alignment) \
+            if intervention is not None else -1.0
+        direct_no_progress_time = \
+            float(self._macro_expert.direct_no_progress_time)
+        observe_no_information_time = \
+            float(self._macro_expert.observe_no_information_time)
         causal_intervention_evidence = \
             int(self._macro_expert.causal_intervention_evidence)
         macro_decision_observable = \
@@ -975,6 +999,14 @@ class ILManager(object):
             privileged_detour_ratio = -1.0
             privileged_min_clearance = -1.0
             privileged_goal_progress = -1.0
+            observed_rejoin_distance = -1.0
+            observed_path_length = -1.0
+            observed_detour_ratio = -1.0
+            observed_terminal_alignment = -1.0
+            privileged_rejoin_distance = -1.0
+            privileged_terminal_alignment = -1.0
+            direct_no_progress_time = 0.0
+            observe_no_information_time = 0.0
             causal_intervention_evidence = 0
             macro_decision_observable = 1
             macro_decision_confidence = 0.0
@@ -1089,6 +1121,14 @@ class ILManager(object):
             "privileged_detour_ratio": privileged_detour_ratio,
             "privileged_min_clearance": privileged_min_clearance,
             "privileged_goal_progress": privileged_goal_progress,
+            "observed_rejoin_distance": observed_rejoin_distance,
+            "observed_path_length": observed_path_length,
+            "observed_detour_ratio": observed_detour_ratio,
+            "observed_terminal_alignment": observed_terminal_alignment,
+            "privileged_rejoin_distance": privileged_rejoin_distance,
+            "privileged_terminal_alignment": privileged_terminal_alignment,
+            "direct_no_progress_time": direct_no_progress_time,
+            "observe_no_information_time": observe_no_information_time,
             "global_cost_to_go": global_ctg if np.isfinite(global_ctg) else -1.0,
             "global_clearance": global_clearance if
             np.isfinite(global_clearance) else -1.0,

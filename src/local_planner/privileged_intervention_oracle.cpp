@@ -45,6 +45,30 @@ struct OpenEntry {
     }
 };
 
+/// Estimate the terminal TANGENT of a reconstructed path (section VI).
+/// Uses path.back() - path[k] for the farthest point back that is at least
+/// `min_baseline` away (so a tiny last segment cannot dominate).
+bool terminalTangent(const std::vector<Eigen::Vector3d>& path,
+                     double min_baseline,
+                     Eigen::Vector2d* tangent_out) {
+    if (path.size() < 2) return false;
+    const Eigen::Vector2d end = path.back().head<2>();
+    for (size_t i = path.size() - 1; i-- > 0;) {
+        const Eigen::Vector2d delta = end - path[i].head<2>();
+        const double len = delta.norm();
+        if (len >= min_baseline) {
+            *tangent_out = delta / len;
+            return true;
+        }
+    }
+    // Path too short overall: fall back to the whole path direction.
+    const Eigen::Vector2d delta = end - path.front().head<2>();
+    const double len = delta.norm();
+    if (len <= kEpsilon) return false;
+    *tangent_out = delta / len;
+    return true;
+}
+
 }  // namespace
 
 PrivilegedInterventionOracle::PrivilegedInterventionOracle(
@@ -123,9 +147,9 @@ PrivilegedInterventionResult PrivilegedInterventionOracle::evaluate(
 
     // ── Privileged LOCAL-SCALE recoverability (section II) ──────────
     // Run a short-range A* on the FULL map from the current state to the
-    // direct guide, ALLOWING local bypass (never a straight-line ray
-    // check).  This mirrors the observed local recoverability geometry as
-    // closely as the full map allows.
+    // REJOIN POINT (same target distance as the observed local
+    // recoverability — never the full 4.5 m macro guide), ALLOWING local
+    // bypass (never a straight-line ray check).
     const double z = state.position.z();
     const double res = oracle.resolution();
     const Eigen::Vector3d origin = oracle.origin();
@@ -142,19 +166,55 @@ PrivilegedInterventionResult PrivilegedInterventionOracle::evaluate(
         return oracle.isFree(p.x(), p.y(), p.z(), config_.search_clearance_m);
     };
 
-    const Eigen::Vector3d start_g = (state.position - origin) / res;
-    const Eigen::Vector3d goal_g = (direct_guide_world - origin) / res;
+    // Unify the rejoin target with the OBSERVED recoverability (section II):
+    //   rejoin_distance = min(configured_rejoin_distance, distance_to_guide)
+    //   rejoin_point = start + guide_dir * rejoin_distance
+    const Eigen::Vector3d travel = direct_guide_world - state.position;
+    const double travel_len = travel.norm();
+    Eigen::Vector2d guide_dir2(1.0, 0.0);
+    if (travel_len > kEpsilon) guide_dir2 = travel.head<2>() / travel_len;
+    const double rejoin_dist =
+        std::min(std::max(0.1, travel_len), config_.rejoin_distance_m);
+    const Eigen::Vector3d rejoin_point =
+        state.position + Eigen::Vector3d(guide_dir2.x(), guide_dir2.y(), 0.0) *
+                             rejoin_dist;
+    result.privileged_rejoin_distance = rejoin_dist;
+
+    // ── Search region (section III) ─────────────────────────────────
+    // bbox(start, rejoin) expanded in REAL METRES: `search_longitudinal`
+    // along the guide direction and `search_lateral` perpendicular, so the
+    // A* can genuinely route around a local obstacle.
+    const Eigen::Vector2d perp2(-guide_dir2.y(), guide_dir2.x());
+    const Eigen::Vector2d p_start = state.position.head<2>();
+    const Eigen::Vector2d p_rejoin = rejoin_point.head<2>();
+    double min_wx = std::min(p_start.x(), p_rejoin.x());
+    double max_wx = std::max(p_start.x(), p_rejoin.x());
+    double min_wy = std::min(p_start.y(), p_rejoin.y());
+    double max_wy = std::max(p_start.y(), p_rejoin.y());
+    for (int s1 = -1; s1 <= 1; s1 += 2) {
+        for (int s2 = -1; s2 <= 1; s2 += 2) {
+            const Eigen::Vector2d corner =
+                (s1 > 0 ? p_rejoin : p_start) +
+                guide_dir2 * (s1 * config_.search_longitudinal_margin_m) +
+                perp2 * (s2 * config_.search_lateral_margin_m);
+            min_wx = std::min(min_wx, corner.x());
+            max_wx = std::max(max_wx, corner.x());
+            min_wy = std::min(min_wy, corner.y());
+            max_wy = std::max(max_wy, corner.y());
+        }
+    }
     const int min_ix = std::max(0, static_cast<int>(std::floor(
-                                       std::min(start_g.x(), goal_g.x()))) - 2);
+                                       (min_wx - origin.x()) / res)));
     const int max_ix = std::min(gx - 1, static_cast<int>(std::floor(
-                                                std::max(start_g.x(), goal_g.x()))) + 2);
+                                                (max_wx - origin.x()) / res)));
     const int min_iy = std::max(0, static_cast<int>(std::floor(
-                                       std::min(start_g.y(), goal_g.y()))) - 2);
+                                       (min_wy - origin.y()) / res)));
     const int max_iy = std::min(gy - 1, static_cast<int>(std::floor(
-                                                std::max(start_g.y(), goal_g.y()))) + 2);
+                                                (max_wy - origin.y()) / res)));
     if (max_ix < min_ix || max_iy < min_iy) {
         result.privileged_local_recoverable = false;
         result.privileged_future_intervention_required = true;
+        result.failure_reason = PrivilegedRecoverabilityFailure::NO_REJOIN_PATH;
         result.reason = InterventionReason::NO_GLOBAL_ROUTE;
         return result;
     }
@@ -163,6 +223,8 @@ PrivilegedInterventionResult PrivilegedInterventionOracle::evaluate(
     const size_t total = static_cast<size_t>(nx) * ny;
     auto encode = [ny](int ix, int iy) { return ix * ny + iy; };
 
+    const Eigen::Vector3d start_g = (state.position - origin) / res;
+    const Eigen::Vector3d goal_g = (rejoin_point - origin) / res;
     const int start_ix =
         std::max(min_ix, std::min(max_ix, static_cast<int>(std::floor(start_g.x()))));
     const int start_iy =
@@ -179,6 +241,7 @@ PrivilegedInterventionResult PrivilegedInterventionOracle::evaluate(
                        config_.search_clearance_m)) {
         result.privileged_local_recoverable = false;
         result.privileged_future_intervention_required = true;
+        result.failure_reason = PrivilegedRecoverabilityFailure::NO_REJOIN_PATH;
         result.reason = InterventionReason::NO_GLOBAL_ROUTE;
         return result;
     }
@@ -190,7 +253,7 @@ PrivilegedInterventionResult PrivilegedInterventionOracle::evaluate(
     std::vector<std::uint8_t> closed(total, 0);
     std::priority_queue<OpenEntry> open;
     g_cost[static_cast<size_t>(start_index)] = 0.0;
-    open.push({(state.position - direct_guide_world).norm(), start_index, 0.0});
+    open.push({(state.position - rejoin_point).norm(), start_index, 0.0});
 
     const int di[8] = {1, -1, 0, 0, 1, 1, -1, -1};
     const int dj[8] = {0, 0, 1, -1, 1, -1, 1, -1};
@@ -224,7 +287,7 @@ PrivilegedInterventionResult PrivilegedInterventionOracle::evaluate(
             if (nxi < min_ix || nxi > max_ix || nyi < min_iy || nyi > max_iy) {
                 continue;
             }
-            // Diagonal corner-cutting rule (section XI): both orthogonal
+            // Diagonal corner-cutting rule (section VIII): both orthogonal
             // neighbours must be free.
             if (di[n] != 0 && dj[n] != 0) {
                 if (!cell_free(cx + di[n], cy) || !cell_free(cx, cy + dj[n])) {
@@ -241,7 +304,7 @@ PrivilegedInterventionResult PrivilegedInterventionOracle::evaluate(
             if (tentative >= g_cost[ni]) continue;
             g_cost[ni] = tentative;
             parent[ni] = current.index;
-            open.push({tentative + (next_world - direct_guide_world).norm(),
+            open.push({tentative + (next_world - rejoin_point).norm(),
                        next_index, tentative});
         }
     }
@@ -260,22 +323,28 @@ PrivilegedInterventionResult PrivilegedInterventionOracle::evaluate(
     };
 
     std::vector<Eigen::Vector3d> path;
-    Eigen::Vector3d terminal{Eigen::Vector3d::Zero()};
     if (goal_reached) {
         path = reconstruct(goal_index);
-        if (!path.empty()) {
-            path.front() = state.position;
-        }
-        // Rejoin requires the exact goal region to be free and the final
-        // segment continuous (no unknown here, only clearance).
+        if (!path.empty()) path.front() = state.position;
         const Eigen::Vector3d goal_cell = world_point(goal_ix, goal_iy);
-        if (!segmentFree(oracle, goal_cell, direct_guide_world,
-                         config_.search_clearance_m, res)) {
+        // Continuous validation of EVERY reconstructed edge (section VII):
+        // only fully clear paths may claim rejoin success.  The global map
+        // has no unknown cells, so this is a pure clearance check.
+        bool edges_clear = true;
+        for (size_t i = 0; i + 1 < path.size() && edges_clear; ++i) {
+            edges_clear = segmentFree(oracle, path[i], path[i + 1],
+                                      config_.search_clearance_m, res);
+        }
+        // Final continuous segment from the goal cell centre to the exact
+        // rejoin point.
+        const bool final_clear =
+            segmentFree(oracle, goal_cell, rejoin_point,
+                        config_.search_clearance_m, res);
+        if (!edges_clear || !final_clear) {
             goal_reached = false;
             path.clear();
         } else {
-            path.back() = direct_guide_world;
-            terminal = direct_guide_world;
+            path.back() = rejoin_point;
         }
     }
 
@@ -293,71 +362,86 @@ PrivilegedInterventionResult PrivilegedInterventionOracle::evaluate(
         std::isfinite(min_clearance) ? min_clearance : 0.0;
     result.privileged_local_duration =
         path_length / std::max(0.1, config_.nominal_speed_mps);
-    const double straight = (direct_guide_world - state.position).norm();
-    result.privileged_detour_ratio =
-        path_length / std::max(0.5, straight);
+    // Detour ratio relative to the STRAIGHT REJOIN distance (section V).
+    const double straight_rejoin =
+        std::max(0.1, (rejoin_point - state.position).norm());
+    result.privileged_detour_ratio = path_length / straight_rejoin;
 
-    // Goal progress: projection of terminal motion onto the goal ray.
-    const Eigen::Vector3d travel = direct_guide_world - state.position;
-    const double travel_len = travel.norm();
+    // Goal progress along the goal ray; terminal alignment from the path
+    // TERMINAL TANGENT (section VI).
     double goal_progress = 0.0;
     double terminal_alignment = 0.0;
-    double rejoin_lateral = 0.0;
     if (goal_reached && travel_len > kEpsilon) {
-        const Eigen::Vector3d motion = terminal - state.position;
+        const Eigen::Vector3d motion = rejoin_point - state.position;
         goal_progress = motion.dot(travel) / travel_len;
-        const double motion_len = motion.norm();
-        if (motion_len > kEpsilon) {
-            terminal_alignment =
-                motion.head<2>().dot(travel.head<2>() / travel_len) /
-                motion_len;
+        Eigen::Vector2d tangent;
+        if (terminalTangent(path, config_.terminal_tangent_min_baseline,
+                            &tangent)) {
+            terminal_alignment = tangent.dot(guide_dir2);
         }
-        // Lateral offset of the terminal from the direct-guide ray: the
-        // terminal must re-enter the guide's forward region.
-        const Eigen::Vector2d ray_dir = travel.head<2>() / travel_len;
-        const Eigen::Vector2d rel = motion.head<2>();
-        const Eigen::Vector2d proj = ray_dir * rel.dot(ray_dir);
-        rejoin_lateral = (rel - proj).norm();
     }
     result.privileged_goal_progress = goal_progress;
+    result.privileged_terminal_alignment = terminal_alignment;
 
-    // Rejoin condition (mirrors observed local recoverability):
-    // full arrival + within local path budget + sufficient progress +
-    // terminal re-enters the direct guide's forward region (aligned +
-    // laterally within rejoin_radius_m) + minimum clearance.
+    // Rejoin condition (mirrors observed local recoverability, section IX):
+    // full arrival + within path/duration budget + detour ratio + minimum
+    // clearance + goal progress + terminal tangent alignment.
     const bool within_budget =
         path_length <= config_.max_path_length_m + 1.0e-3 &&
-        result.privileged_local_duration <= config_.horizon_time_s + 1.0e-3;
+        result.privileged_local_duration <= config_.max_duration_s + 1.0e-3;
+    const bool detour_ok =
+        straight_rejoin <= 1.0e-3 ||
+        result.privileged_detour_ratio <= config_.max_detour_ratio + 1.0e-3;
     const bool progress_ok =
         goal_progress >= config_.min_goal_progress_m;
     const bool alignment_ok =
-        terminal_alignment >= config_.min_terminal_alignment &&
-        rejoin_lateral <= config_.rejoin_radius_m;
+        terminal_alignment >= config_.min_terminal_alignment;
     const bool clearance_ok =
         result.privileged_min_clearance >= config_.search_clearance_m;
 
     result.privileged_rejoin_reached =
-        goal_reached && within_budget && progress_ok && alignment_ok &&
-        clearance_ok;
+        goal_reached && within_budget && detour_ok && progress_ok &&
+        alignment_ok && clearance_ok;
     result.privileged_local_recoverable =
         result.privileged_rejoin_reached && !loop_risk;
     result.privileged_future_intervention_required =
         !result.privileged_local_recoverable;
 
-    // ── Reason (enumerated) ──────────────────────────────────────────
+    // ── Failure reason + macro reason (enumerated) ───────────────────
     const bool state_connected = oracle.connectedToGoal(
         state.position.x(), state.position.y(), state.position.z());
     if (!state_connected) {
+        result.failure_reason = PrivilegedRecoverabilityFailure::NO_REJOIN_PATH;
         result.reason = InterventionReason::NO_GLOBAL_ROUTE;
     } else if (loop_risk) {
         result.reason = InterventionReason::DIRECT_LOOP_RISK;
     } else if (!goal_reached) {
+        result.failure_reason = PrivilegedRecoverabilityFailure::NO_REJOIN_PATH;
         result.reason = InterventionReason::DIRECT_LONG_WALL_BLOCKED;
-    } else if (!within_budget) {
+    } else if (path_length > config_.max_path_length_m + 1.0e-3) {
+        result.failure_reason =
+            PrivilegedRecoverabilityFailure::EXCESSIVE_PATH_LENGTH;
+        result.reason = InterventionReason::DIRECT_EXCESSIVE_DETOUR;
+    } else if (result.privileged_local_duration >
+               config_.max_duration_s + 1.0e-3) {
+        result.failure_reason =
+            PrivilegedRecoverabilityFailure::EXCESSIVE_DURATION;
+        result.reason = InterventionReason::DIRECT_EXCESSIVE_DETOUR;
+    } else if (!detour_ok) {
+        result.failure_reason =
+            PrivilegedRecoverabilityFailure::EXCESSIVE_DETOUR;
         result.reason = InterventionReason::DIRECT_EXCESSIVE_DETOUR;
     } else if (!clearance_ok) {
+        result.failure_reason =
+            PrivilegedRecoverabilityFailure::LOW_CLEARANCE;
         result.reason = InterventionReason::DIRECT_LONG_WALL_BLOCKED;
-    } else if (!progress_ok || !alignment_ok) {
+    } else if (!progress_ok) {
+        result.failure_reason =
+            PrivilegedRecoverabilityFailure::LOW_GOAL_PROGRESS;
+        result.reason = InterventionReason::DIRECT_EXCESSIVE_DETOUR;
+    } else if (!alignment_ok) {
+        result.failure_reason =
+            PrivilegedRecoverabilityFailure::BAD_TERMINAL_ALIGNMENT;
         result.reason = InterventionReason::DIRECT_EXCESSIVE_DETOUR;
     } else {
         result.reason = InterventionReason::DIRECT_GLOBALLY_VALID;

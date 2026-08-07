@@ -18,12 +18,12 @@ import time
 
 import numpy as np
 
-# ── Schema (v20) ──────────────────────────────────────────────────────
+# ── Schema (v21) ──────────────────────────────────────────────────────
 # Order matters: this is the CSV header.  All fields are written on every
 # row; missing keys are filled with defaults by write_row().
 # NO depth-valid-mask fields: the student input is a single depth channel
 # (section XII).  raw_depth_finite_ratio is a PURE diagnostic.
-DATA_SCHEMA_V20_FIELDS = [
+DATA_SCHEMA_V21_FIELDS = [
     # time / matching
     "timestamp_ns", "receive_timestamp_ns", "episode_id", "frame_id",
     "episode_frame_index", "control_dt_s", "trajectory_time_s",
@@ -71,6 +71,11 @@ DATA_SCHEMA_V20_FIELDS = [
     "privileged_local_path_length", "privileged_local_duration",
     "privileged_detour_ratio", "privileged_min_clearance",
     "privileged_goal_progress",
+    # observed/privileged recoverability audit fields (section XXV)
+    "observed_rejoin_distance", "observed_path_length",
+    "observed_detour_ratio", "observed_terminal_alignment",
+    "privileged_rejoin_distance", "privileged_terminal_alignment",
+    "direct_no_progress_time", "observe_no_information_time",
     "global_cost_to_go", "global_clearance", "global_candidate_costs",
     # goal / plan bookkeeping — executed-plan semantics (XVII)
     "goal_world_x", "goal_world_y", "goal_world_z", "distance_to_final_goal",
@@ -79,7 +84,7 @@ DATA_SCHEMA_V20_FIELDS = [
     "scene_id", "task_id", "episode_valid",
 ]
 
-_DEFAULT_ROW = {field: "" for field in DATA_SCHEMA_V20_FIELDS}
+_DEFAULT_ROW = {field: "" for field in DATA_SCHEMA_V21_FIELDS}
 
 
 class DatasetWriter(object):
@@ -117,7 +122,7 @@ class DatasetWriter(object):
 
         self._data_csv = open(self._data_file, "w", newline="")
         self._data_writer = csv.DictWriter(
-            self._data_csv, fieldnames=DATA_SCHEMA_V20_FIELDS)
+            self._data_csv, fieldnames=DATA_SCHEMA_V21_FIELDS)
         self._data_writer.writeheader()
 
         self._sync_csv = open(self._sync_file, "w", newline="")
@@ -150,7 +155,7 @@ class DatasetWriter(object):
             "start_world": start_world,
             "goal_world": goal_world,
             "initial_yaw": initial_yaw,
-            "schema_version": int(cfg.get("schema_version", 20)),
+            "schema_version": int(cfg.get("schema_version", 21)),
             "status": "inprogress",
             "created_at_ns": time.time_ns(),
         }

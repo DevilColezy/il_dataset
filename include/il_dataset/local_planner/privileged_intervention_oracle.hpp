@@ -15,27 +15,36 @@ class PrivilegedOracle;
 /// The oracle runs a short-range A* on the FULL map with geometry as
 /// consistent as possible with the OBSERVED local recoverability.  It
 /// ALLOWS local bypass around obstacles — it never requires the direct
-/// ray to be collision free.
+/// ray to be collision free.  It uses the SAME rejoin target distance and
+/// the SAME capability bounds as the observed local recoverability.
 struct PrivilegedInterventionConfig {
     /// Additional clearance (m) required for the privileged search; the
     /// global ESDF already subtracts the vehicle radius, so this is the
     /// same "extra safety margin" used by every global module.
     double search_clearance_m = 0.25;
     double search_max_time_ms = 20.0;
-    /// Local planning horizon used to bound the privileged search.
-    double horizon_time_s = 2.5;
-    /// Max allowed local path length (m) = horizon * nominal speed.
+    /// Rejoin target distance (m) — SAME as local_recoverability.
+    double rejoin_distance_m = 2.5;
+    /// Search region expansion (m) perpendicular to the guide direction.
+    /// Must be real metres (a few cells of 0.1 m is NOT enough to bypass).
+    double search_lateral_margin_m = 2.0;
+    /// Search region expansion (m) along the guide direction.
+    double search_longitudinal_margin_m = 2.0;
+    /// Local planning horizon / duration bound (s).
+    double max_duration_s = 2.5;
+    /// Max allowed local path length (m).
     double max_path_length_m = 6.0;
     double nominal_speed_mps = 1.8;
+    /// Max detour ratio relative to the STRAIGHT rejoin distance.
+    double max_detour_ratio = 1.6;
     /// Minimum forward progress along the goal ray the local path must
     /// yield before "rejoin" counts.
     double min_goal_progress_m = 0.30;
-    /// Minimum cosine alignment between the terminal motion and the guide
+    /// Minimum cosine alignment between the terminal TANGENT and the guide
     /// direction.
     double min_terminal_alignment = 0.5;
-    /// Lateral tolerance (m) for the terminal to count as "re-joining the
-    /// direct guide's forward region".
-    double rejoin_radius_m = 0.6;
+    /// Minimum segment length (m) used to estimate the terminal tangent.
+    double terminal_tangent_min_baseline = 0.3;
     // ── Loop detection (section IX) ─────────────────────────────────
     /// Recent history within this window (s) is ignored (normal motion).
     double loop_ignore_recent_s = 2.5;

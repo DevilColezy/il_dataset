@@ -97,6 +97,8 @@ public:
 
     /// Strict validation: every point must be known AND clearance above
     /// `min_clearance`, plus finite state and dynamics feasibility.
+    /// Spatially interpolates so the max collision-check spacing along the
+    /// trajectory is <= collision_check_spacing (section XVI).
     ValidationResult validateTrajectory(
         const std::vector<TrajectoryPoint>& trajectory) const;
 
@@ -104,8 +106,9 @@ public:
     /// re-executed from the cache (section VIII/X).  The current state is
     /// compared against the trajectory INTERPOLATED at the current age
     /// (position_at_age, velocity_at_age) — never against trajectory[0].
-    /// Safety validation starts AT the current age (the segment between the
-    /// actual state and the preview reference is validated too).
+    /// Safety validation starts AT the current age and uses the SAME
+    /// spatial interpolation (collision_check_spacing) as the fresh final
+    /// validation (sections XIX/XX).
     ///  - plan_start_time: wall time when the trajectory was planned (s).
     ///  - current_time:    wall time now (s).
     /// Returns a ValidationResult.
@@ -122,6 +125,16 @@ public:
     const TrajectoryOptimizationConfig& config() const { return config_; }
 
 private:
+    /// Shared continuous spatial validator used by BOTH the fresh final
+    /// validation and the cached suffix validation.  Checks every sample
+    /// with t >= start_t and spatially interpolates so the maximum gap is
+    /// <= collision_check_spacing.  Every interpolated point is checked for
+    /// known + clearance.
+    ValidationResult validateTrajectorySegmentSpatially(
+        const std::vector<TrajectoryPoint>& trajectory,
+        double start_t,
+        double min_clearance) const;
+
     TrajectoryOptimizationConfig config_;
     const ObservedMap* map_ = nullptr;
     mutable std::uint64_t plan_id_counter_ = 0;

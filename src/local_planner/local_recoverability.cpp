@@ -10,7 +10,31 @@ namespace il_dataset {
 
 namespace {
 constexpr double kEpsilon = 1.0e-9;
+
+/// Estimate the terminal TANGENT of a reconstructed path (section VI).
+/// Uses path.back() - path[k] for the farthest point back that is at least
+/// `min_baseline` away (a tiny last segment cannot dominate).
+bool terminalTangent(const std::vector<Eigen::Vector3d>& path,
+                     double min_baseline,
+                     Eigen::Vector2d* tangent_out) {
+    if (path.size() < 2) return false;
+    const Eigen::Vector2d end = path.back().head<2>();
+    for (size_t i = path.size() - 1; i-- > 0;) {
+        const Eigen::Vector2d delta = end - path[i].head<2>();
+        const double len = delta.norm();
+        if (len >= min_baseline) {
+            *tangent_out = delta / len;
+            return true;
+        }
+    }
+    const Eigen::Vector2d delta = end - path.front().head<2>();
+    const double len = delta.norm();
+    if (len <= kEpsilon) return false;
+    *tangent_out = delta / len;
+    return true;
 }
+
+}  // namespace
 
 LocalRecoverability::LocalRecoverability(const RecoverabilityConfig& config)
     : config_(config) {}
@@ -28,8 +52,7 @@ RecoverabilityResult LocalRecoverability::test(
 
     // The direct guide lies along the goal ray; the rejoin point is placed
     // at the configured rejoin distance along that direction (clamped to
-    // the guide distance).  This makes `rejoin_distance_m` take real
-    // effect.
+    // the guide distance).  Same geometry as the privileged audit.
     const Eigen::Vector3d travel = direct_guide_world - state.position;
     const double travel_len = travel.norm();
     Eigen::Vector2d goal_dir(1.0, 0.0);
@@ -43,6 +66,7 @@ RecoverabilityResult LocalRecoverability::test(
     const Eigen::Vector3d rejoin_point =
         state.position + rejoin_dir * rejoin_dist;
     result.rejoin_point = rejoin_point;
+    result.rejoin_distance = rejoin_dist;
 
     LocalSearchConfig search_config;
     search_config.search_clearance_m = config_.search_clearance_m;
@@ -54,6 +78,12 @@ RecoverabilityResult LocalRecoverability::test(
         search.search(map, state, rejoin_point, search_config);
     result.minimum_clearance = search_result.minimum_clearance;
     result.path_length = search_result.path_cost;
+    const double straight_rejoin =
+        std::max(0.1, (rejoin_point - state.position).norm());
+    result.detour_ratio =
+        straight_rejoin > kEpsilon
+            ? result.path_length / straight_rejoin
+            : 1.0;
 
     // DIRECT_REJOIN_SUCCESS requires FULL arrival at the rejoin point
     // (section VI).  A partial path is never "recoverable".
@@ -64,17 +94,17 @@ RecoverabilityResult LocalRecoverability::test(
         result.estimated_duration =
             search_result.path_cost /
             std::max(0.1, config_.nominal_speed_mps);
-        const Eigen::Vector3d terminal = search_result.terminal;
-        const Eigen::Vector3d motion = terminal - state.position;
-        const double motion_len = motion.norm();
         if (travel_len > kEpsilon) {
+            const Eigen::Vector3d motion = rejoin_point - state.position;
             result.goal_progress = motion.dot(travel) / travel_len;
         }
-        if (motion_len > kEpsilon) {
-            result.terminal_guide_alignment =
-                motion.head<2>().dot(goal_dir) / motion_len;
+        // Terminal alignment uses the path TERMINAL TANGENT (section VI),
+        // not the start-end chord.
+        Eigen::Vector2d tangent;
+        if (terminalTangent(search_result.path,
+                            config_.terminal_tangent_min_baseline, &tangent)) {
+            result.terminal_guide_alignment = tangent.dot(goal_dir);
         }
-        // Rejoin point must be at least at the direct-guide distance.
         if (result.goal_progress < config_.min_goal_progress_m) {
             result.status = RecoverabilityStatus::PARTIAL_PROGRESS_ONLY;
             result.reason = "insufficient_goal_progress";
@@ -88,15 +118,20 @@ RecoverabilityResult LocalRecoverability::test(
             result.feasible = false;
             return result;
         }
-        if (result.estimated_duration > config_.max_execution_time_s) {
+        if (result.estimated_duration > config_.max_duration_s) {
             result.status = RecoverabilityStatus::PARTIAL_PROGRESS_ONLY;
             result.reason = "exceeds_local_horizon";
             result.feasible = false;
             return result;
         }
-        const double straight = travel_len;
-        if (straight > kEpsilon &&
-            search_result.path_cost / straight > config_.max_loop_ratio) {
+        if (result.path_length > config_.max_path_length_m) {
+            result.status = RecoverabilityStatus::PARTIAL_PROGRESS_ONLY;
+            result.reason = "exceeds_local_path_length";
+            result.feasible = false;
+            return result;
+        }
+        if (straight_rejoin > kEpsilon &&
+            result.detour_ratio > config_.max_detour_ratio) {
             result.status = RecoverabilityStatus::PARTIAL_PROGRESS_ONLY;
             result.reason = "path_loops_or_backtracks";
             result.feasible = false;

@@ -54,13 +54,17 @@ LocalSearchConfig makeSearchConfig(const MacroCandidateConfig& config,
 }
 
 /// World delta -> FLU using yaw only (level body).  UNIFIED FLU convention
-/// (section XX): +x forward, +y left, +z up.  This is the exact same math
-/// as Python `il_common.world_vector_to_body_flu`.
+/// (section XVIII): +x forward, +y left, +z up.
+///   yaw = 0  =>  nose points toward world +Y
+///   nose world direction  = (-sin yaw,  cos yaw)
+///   left  world direction = (-cos yaw, -sin yaw)
+/// This is the exact same math as Python `il_common.world_to_flu_xy` and
+/// matches the quaternion version numerically at level attitude.
 Eigen::Vector3d worldToFlu(const Eigen::Vector3d& world_delta, double yaw) {
     const double c = std::cos(yaw);
     const double s = std::sin(yaw);
-    return Eigen::Vector3d(c * world_delta.x() + s * world_delta.y(),
-                           -s * world_delta.x() + c * world_delta.y(),
+    return Eigen::Vector3d(-s * world_delta.x() + c * world_delta.y(),
+                           -c * world_delta.x() - s * world_delta.y(),
                            world_delta.z());
 }
 

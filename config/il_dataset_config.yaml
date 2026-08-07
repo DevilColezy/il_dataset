@@ -1,5 +1,5 @@
 # ============================================================================
-#  Imitation Learning Dataset Collection — Two-Level Navigation Expert (schema v20)
+#  Imitation Learning Dataset Collection — Two-Level Navigation Expert (schema v21)
 # ============================================================================
 #
 #  Architecture:
@@ -140,23 +140,24 @@ global:
     # Direct-guide lookahead (min(goal_distance, this)).
     macro_lookahead_distance_m: 4.5
     # Causal evidence: observed-recoverable DIRECT is upgraded to macro
-    # intervention only after this many consecutive macro ticks with local
+    # intervention after this many consecutive macro ticks with local
     # replanning failures (cached / BRAKE_HOLD) — privilege never alone.
     causal_evidence_frames:     2
-    # Rolling SIDE / OBSERVE progress thresholds (section VII).
+    # DIRECT long no-progress (goal distance not decreasing for this long)
+    # is ALSO causal evidence -> macro intervention, never an immediate
+    # episode FAILED (section XI/XII).
+    direct_intervention_timeout: 5.0
+    # Rolling SIDE / OBSERVE progress thresholds (section VII/XVI).
     side_no_progress_seconds:   6.0
-    observe_no_progress_seconds: 4.0
+    observe_no_information_timeout: 4.0
     progress_cost_epsilon_m:    0.10
     progress_arc_epsilon_m:     0.05
     local_path_fail_threshold:  2
-    # Minimum goal-progress rate (m/s) that keeps the current state valid.
-    min_goal_progress_m_s:      0.15
     # Goal reached condition (distance + speed).
     goal_tolerance_m:           0.30
     goal_speed_tolerance_mps:   0.20
     # OBSERVE abort limits.
     max_observe_seconds:        8.0
-    max_no_progress_seconds:   12.0
     observe_rotation_rate_rps:  1.5
     # OBSERVE yaw sweep cap (half-FOV of the camera).
     observe_fov_half_deg:      45.0
@@ -183,16 +184,25 @@ global:
 
   # ── Local recoverability query (section VI) ────────────────────────
   # The search clearance is owned by local_path_search (single source).
+  # These bounds define the LOCAL capability and are shared with the
+  # privileged local-scale audit (section II): observed and privileged use
+  # the SAME rejoin distance, duration, path-length and detour limits.
   local_recoverability:
-    rejoin_distance_m:       2.5
-    max_execution_time_s:    2.5
-    min_goal_progress_m:     0.30
-    min_terminal_alignment:  0.5
-    max_loop_ratio:          1.6
-    nominal_speed_mps:       1.8
-    side_corridor_length_m:  4.0
-    side_corridor_radius_m:  0.55
-    edge_search_radius_m:    5.0
+    rejoin_distance_m:           2.5
+    # Privileged A* search-region expansion in REAL METRES (section III):
+    # perpendicular / along the guide direction, so the search can route
+    # around a local obstacle (a few 0.1 m cells is NOT enough).
+    search_lateral_margin_m:     2.0
+    search_longitudinal_margin_m: 2.0
+    max_path_length_m:           6.0
+    max_duration_s:              2.5
+    max_detour_ratio:            1.6
+    min_terminal_alignment:      0.5
+    min_goal_progress_m:         0.30
+    nominal_speed_mps:           1.8
+    side_corridor_length_m:      4.0
+    side_corridor_radius_m:      0.55
+    edge_search_radius_m:        5.0
 
   # ── Observed-map A* (section X.2) ──────────────────────────────────
   local_path_search:
@@ -205,18 +215,13 @@ global:
 
   # ── Privileged LOCAL-SCALE audit (section II/III) ──────────────────
   # Runs a short-range A* on the FULL map with geometry matching the
-  # observed local recoverability; ALLOWS local bypass (never a direct-ray
-  # collision check).  Its result is an auxiliary label / audit — it never
-  # directly changes the main macro mode without causal evidence.
+  # observed local recoverability (same rejoin distance and capability
+  # bounds from local_recoverability); ALLOWS local bypass.  Its result is
+  # an auxiliary label / audit — it never directly changes the main macro
+  # mode without causal evidence.
   privileged_intervention:
     search_clearance_m:     0.25
     search_max_time_ms:    20.0
-    horizon_time_s:         2.5
-    max_path_length_m:      6.0
-    nominal_speed_mps:      1.8
-    min_goal_progress_m:    0.30
-    min_terminal_alignment: 0.5
-    rejoin_radius_m:        0.6
     # Loop detection (section IX).
     loop_ignore_recent_s:   2.5
     loop_leave_radius_m:    1.6
@@ -296,7 +301,7 @@ global:
 
   # ── Dataset logging (section XIV) ──────────────────────────────────
   dataset_logging:
-    schema_version: 20
+    schema_version: 21
     depth_in_memory: true
     write_local_plan_points: true
     collect_privileged_diagnostics: true

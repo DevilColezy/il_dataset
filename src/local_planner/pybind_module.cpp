@@ -223,6 +223,7 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("confidence", &MacroAction::confidence)
         .def_readwrite("guide_distance", &MacroAction::guide_distance)
         .def_readwrite("is_new_tick", &MacroAction::is_new_tick)
+        .def_readwrite("observe_subtype", &MacroAction::observe_subtype)
         .def_readwrite("reason", &MacroAction::reason);
 
     py::class_<RecoverabilityResult>(m, "RecoverabilityResult")
@@ -236,6 +237,8 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("terminal_guide_alignment",
                        &RecoverabilityResult::terminal_guide_alignment)
         .def_readwrite("path_length", &RecoverabilityResult::path_length)
+        .def_readwrite("rejoin_distance", &RecoverabilityResult::rejoin_distance)
+        .def_readwrite("detour_ratio", &RecoverabilityResult::detour_ratio)
         .def_readwrite("rejoin_point", &RecoverabilityResult::rejoin_point)
         .def_readwrite("blocking_component_id",
                        &RecoverabilityResult::blocking_component_id)
@@ -347,12 +350,25 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .value("NO_GLOBAL_ROUTE", InterventionReason::NO_GLOBAL_ROUTE)
         .export_values();
 
+    py::enum_<PrivilegedRecoverabilityFailure>(m, "PrivilegedRecoverabilityFailure")
+        .value("NONE", PrivilegedRecoverabilityFailure::NONE)
+        .value("NO_REJOIN_PATH", PrivilegedRecoverabilityFailure::NO_REJOIN_PATH)
+        .value("EXCESSIVE_PATH_LENGTH", PrivilegedRecoverabilityFailure::EXCESSIVE_PATH_LENGTH)
+        .value("EXCESSIVE_DURATION", PrivilegedRecoverabilityFailure::EXCESSIVE_DURATION)
+        .value("EXCESSIVE_DETOUR", PrivilegedRecoverabilityFailure::EXCESSIVE_DETOUR)
+        .value("LOW_CLEARANCE", PrivilegedRecoverabilityFailure::LOW_CLEARANCE)
+        .value("LOW_GOAL_PROGRESS", PrivilegedRecoverabilityFailure::LOW_GOAL_PROGRESS)
+        .value("BAD_TERMINAL_ALIGNMENT", PrivilegedRecoverabilityFailure::BAD_TERMINAL_ALIGNMENT)
+        .export_values();
+
     py::class_<PrivilegedInterventionResult>(m, "PrivilegedInterventionResult")
         .def(py::init<>())
         .def_readwrite("privileged_local_recoverable",
                        &PrivilegedInterventionResult::privileged_local_recoverable)
         .def_readwrite("privileged_rejoin_reached",
                        &PrivilegedInterventionResult::privileged_rejoin_reached)
+        .def_readwrite("privileged_rejoin_distance",
+                       &PrivilegedInterventionResult::privileged_rejoin_distance)
         .def_readwrite("privileged_local_path_length",
                        &PrivilegedInterventionResult::privileged_local_path_length)
         .def_readwrite("privileged_local_duration",
@@ -363,8 +379,12 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &PrivilegedInterventionResult::privileged_min_clearance)
         .def_readwrite("privileged_goal_progress",
                        &PrivilegedInterventionResult::privileged_goal_progress)
+        .def_readwrite("privileged_terminal_alignment",
+                       &PrivilegedInterventionResult::privileged_terminal_alignment)
         .def_readwrite("privileged_future_intervention_required",
                        &PrivilegedInterventionResult::privileged_future_intervention_required)
+        .def_readwrite("failure_reason",
+                       &PrivilegedInterventionResult::failure_reason)
         .def_readwrite("current_cost_to_go",
                        &PrivilegedInterventionResult::current_cost_to_go)
         .def_readwrite("direct_cost_to_go",
@@ -378,18 +398,26 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &PrivilegedInterventionConfig::search_clearance_m)
         .def_readwrite("search_max_time_ms",
                        &PrivilegedInterventionConfig::search_max_time_ms)
-        .def_readwrite("horizon_time_s",
-                       &PrivilegedInterventionConfig::horizon_time_s)
+        .def_readwrite("rejoin_distance_m",
+                       &PrivilegedInterventionConfig::rejoin_distance_m)
+        .def_readwrite("search_lateral_margin_m",
+                       &PrivilegedInterventionConfig::search_lateral_margin_m)
+        .def_readwrite("search_longitudinal_margin_m",
+                       &PrivilegedInterventionConfig::search_longitudinal_margin_m)
+        .def_readwrite("max_duration_s",
+                       &PrivilegedInterventionConfig::max_duration_s)
         .def_readwrite("max_path_length_m",
                        &PrivilegedInterventionConfig::max_path_length_m)
         .def_readwrite("nominal_speed_mps",
                        &PrivilegedInterventionConfig::nominal_speed_mps)
+        .def_readwrite("max_detour_ratio",
+                       &PrivilegedInterventionConfig::max_detour_ratio)
         .def_readwrite("min_goal_progress_m",
                        &PrivilegedInterventionConfig::min_goal_progress_m)
         .def_readwrite("min_terminal_alignment",
                        &PrivilegedInterventionConfig::min_terminal_alignment)
-        .def_readwrite("rejoin_radius_m",
-                       &PrivilegedInterventionConfig::rejoin_radius_m)
+        .def_readwrite("terminal_tangent_min_baseline",
+                       &PrivilegedInterventionConfig::terminal_tangent_min_baseline)
         .def_readwrite("loop_ignore_recent_s",
                        &PrivilegedInterventionConfig::loop_ignore_recent_s)
         .def_readwrite("loop_leave_radius_m",

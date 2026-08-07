@@ -16,15 +16,22 @@ struct RecoverabilityConfig {
     /// Clearance required along the local path.
     double search_clearance_m = 0.25;
     /// Fixed local planning horizon: the path must be executable within it.
-    double max_execution_time_s = 2.5;
+    double max_duration_s = 2.5;
+    /// Max allowed local path length (m).
+    double max_path_length_m = 6.0;
     /// Minimum forward progress toward the goal the local path must yield.
     double min_goal_progress_m = 0.30;
-    /// Minimum cosine alignment between terminal motion and the guide ray.
+    /// Minimum cosine alignment between the terminal TANGENT and the guide
+    /// direction.
     double min_terminal_alignment = 0.5;
-    /// Maximum path_length / straight-line ratio (no loops / backtracking).
-    double max_loop_ratio = 1.6;
+    /// Maximum path_length / straight_REJOIN_distance ratio (no loops /
+    /// backtracking).  The denominator is the actual rejoin distance, not
+    /// the macro-guide distance.
+    double max_detour_ratio = 1.6;
     /// Cruise speed used to estimate path duration.
     double nominal_speed_mps = 1.8;
+    /// Minimum segment length (m) used to estimate the terminal tangent.
+    double terminal_tangent_min_baseline = 0.3;
     /// Side-corridor geometry passed to the blocker analysis.
     double side_corridor_length_m = 4.0;
     double side_corridor_radius_m = 0.55;

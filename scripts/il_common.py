@@ -98,16 +98,53 @@ def normalize_angle(angle):
 
 
 # ── FLU transforms (training frame: [forward, left, up], camera aligned) ──
+#
+# PROJECT YAW CONVENTION (unified, section XVIII):
+#   yaw = atan2(world_y, world_x) - pi/2
+#   yaw = 0  =>  nose (forward) points toward world +Y
+#   nose world direction        = (-sin yaw,  cos yaw)
+#   body-left world direction   = (-cos yaw, -sin yaw)
+#   FLU: +x forward, +y left, +z up.
+# All yaw-only transforms below are derived from these basis vectors, so
+# they match the quaternion version numerically at level attitude.
 
-def world_vector_to_body_flu(vector_world, yaw):
-    """World vector -> FLU using yaw only (level body)."""
-    v = np.asarray(vector_world, dtype=np.float64)
+def forward_world_from_yaw(yaw):
+    """Nose (FLU +x) direction in the world XY plane for a level body."""
+    return np.array([-math.sin(yaw), math.cos(yaw), 0.0], dtype=np.float64)
+
+
+def left_world_from_yaw(yaw):
+    """Body-left (FLU +y) direction in the world XY plane (level body)."""
+    return np.array([-math.cos(yaw), -math.sin(yaw), 0.0], dtype=np.float64)
+
+
+def world_to_flu_xy(v_world, yaw):
+    """Project a world XY vector onto the FLU XY basis (level body)."""
+    v = np.asarray(v_world, dtype=np.float64)
     cos_y, sin_y = math.cos(yaw), math.sin(yaw)
     return np.array([
-        cos_y * v[0] + sin_y * v[1],
-        -sin_y * v[0] + cos_y * v[1],
-        v[2],
+        -sin_y * v[0] + cos_y * v[1],   # forward
+        -cos_y * v[0] - sin_y * v[1],   # left
     ], dtype=np.float64)
+
+
+def flu_to_world_xy(v_flu, yaw):
+    """Inverse of world_to_flu_xy (level body)."""
+    v = np.asarray(v_flu, dtype=np.float64)
+    cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+    # [f; l] = R [vx; vy]; R = [[-sin, cos], [-cos, -sin]]; R^-1 = R^T.
+    return np.array([
+        -sin_y * v[0] - cos_y * v[1],
+        cos_y * v[0] - sin_y * v[1],
+    ], dtype=np.float64)
+
+
+def world_vector_to_body_flu(vector_world, yaw):
+    """World vector -> FLU using yaw only (level body).  Matches the
+    quaternion version numerically at level attitude (section XVIII)."""
+    v = np.asarray(vector_world, dtype=np.float64)
+    flu_xy = world_to_flu_xy(v, yaw)
+    return np.array([flu_xy[0], flu_xy[1], v[2]], dtype=np.float64)
 
 
 def quaternion_xyzw_to_rotation(quaternion_xyzw):

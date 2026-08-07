@@ -88,8 +88,14 @@ struct RecoverabilityResult {
     double minimum_clearance = 0.0;
     double estimated_duration = 0.0;
     double goal_progress = 0.0;
+    /// Terminal TANGENT alignment with the direct-guide direction (uses the
+    /// path end tangent, not the start-end chord).
     double terminal_guide_alignment = 0.0;
     double path_length = 0.0;
+    /// Actual rejoin target distance (min(configured, guide distance)).
+    double rejoin_distance = 0.0;
+    /// detour_ratio = path_length / straight_rejoin_distance.
+    double detour_ratio = 0.0;
     Eigen::Vector3d rejoin_point{Eigen::Vector3d::Zero()};
     int blocking_component_id = -1;
     bool left_edge_visible = false;
@@ -166,6 +172,10 @@ struct MacroAction {
     double confidence = 1.0;
     double guide_distance = 0.0;
     bool is_new_tick = false;
+    /// OBSERVE behaviour subtype (section XV): 0 = OBSERVE_ROTATE (pure
+    /// rotation, zero translation), 1 = OBSERVE_MOVE (planned observation
+    /// viewpoint reached through the normal 30 Hz pipeline).
+    int observe_subtype = 0;
     std::string reason;
 };
 
@@ -258,6 +268,19 @@ enum class InterventionReason : int {
     NO_GLOBAL_ROUTE = 5,            // current region has no global route to the goal
 };
 
+/// Precise failure category of the privileged LOCAL recoverability search
+/// (section IX).  Only used for diagnostics / auxiliary labels.
+enum class PrivilegedRecoverabilityFailure : int {
+    NONE = 0,
+    NO_REJOIN_PATH = 1,
+    EXCESSIVE_PATH_LENGTH = 2,
+    EXCESSIVE_DURATION = 3,
+    EXCESSIVE_DETOUR = 4,
+    LOW_CLEARANCE = 5,
+    LOW_GOAL_PROGRESS = 6,
+    BAD_TERMINAL_ALIGNMENT = 7,
+};
+
 /// Result of the privileged LOCAL-SCALE audit (section II/III).
 ///
 /// The oracle answers the question: "given the full map, would the 30 Hz
@@ -270,14 +293,19 @@ struct PrivilegedInterventionResult {
     /// Full map says the direct intent is locally recoverable.
     bool privileged_local_recoverable = true;
     bool privileged_rejoin_reached = false;
+    double privileged_rejoin_distance = 0.0;
     double privileged_local_path_length = 0.0;
     double privileged_local_duration = 0.0;
     double privileged_detour_ratio = 0.0;
     double privileged_min_clearance = 0.0;
     double privileged_goal_progress = 0.0;
+    /// Terminal TANGENT alignment with the direct-guide direction.
+    double privileged_terminal_alignment = 0.0;
     /// Future macro intervention will likely be required (auxiliary label /
     /// episode analysis ONLY — never gates the main macro mode).
     bool privileged_future_intervention_required = false;
+    PrivilegedRecoverabilityFailure failure_reason =
+        PrivilegedRecoverabilityFailure::NONE;
     double current_cost_to_go = 0.0;
     double direct_cost_to_go = 0.0;
     bool loop_risk = false;

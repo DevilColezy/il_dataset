@@ -845,13 +845,15 @@ LocalPlanner::LocalPlanner(const TrajectoryOptimizationConfig& config)
 
 void LocalPlanner::setMap(const ObservedMap* map) { map_ = map; }
 
-ValidationResult LocalPlanner::validateTrajectory(
-    const std::vector<TrajectoryPoint>& trajectory) const {
+ValidationResult LocalPlanner::validateTrajectorySegmentSpatially(
+    const std::vector<TrajectoryPoint>& trajectory,
+    double start_t,
+    double min_clearance) const {
     ValidationResult result;
+    result.all_clear = true;
     if (trajectory.empty()) {
         result.all_clear = false;
         result.any_collision = true;
-        result.any_unknown = false;
         return result;
     }
     if (map_ == nullptr || !map_->esdfBuilt()) {
@@ -860,8 +862,7 @@ ValidationResult LocalPlanner::validateTrajectory(
         result.any_unknown = true;
         return result;
     }
-    result.all_clear = true;
-    double min_clearance = std::numeric_limits<double>::infinity();
+    double min_clear = std::numeric_limits<double>::infinity();
 
     auto check_point = [&](const TrajectoryPoint& point, bool* clear_ok) {
         if (!point.position.allFinite() || !point.velocity.allFinite() ||
@@ -880,10 +881,10 @@ ValidationResult LocalPlanner::validateTrajectory(
             map_->esdfValue(point.position.x(), point.position.y(),
                             point.position.z());
         if (std::isfinite(clearance)) {
-            min_clearance = std::min(min_clearance, clearance);
+            min_clear = std::min(min_clear, clearance);
         }
         if (!known || !std::isfinite(clearance) ||
-            clearance <= config_.min_clearance) {
+            clearance <= min_clearance) {
             result.any_collision = true;
             result.all_clear = false;
             result.clearance_violation_count++;
@@ -898,13 +899,13 @@ ValidationResult LocalPlanner::validateTrajectory(
     };
 
     for (size_t i = 0; i < trajectory.size(); ++i) {
+        if (trajectory[i].t < start_t - 1.0e-6) continue;
         bool ok = true;
         check_point(trajectory[i], &ok);
         if (!ok) return result;
-        // Spatial interpolation (section XVI): the maximum collision-check
-        // spacing along the trajectory must be <= collision_check_spacing,
-        // regardless of the output time step (dt).  Between two samples
-        // farther apart than the spacing, interpolate and check each point.
+        // Spatial interpolation (sections XVI/XIX): the maximum
+        // collision-check spacing along the trajectory must be <=
+        // collision_check_spacing, regardless of the output time step (dt).
         if (i + 1 < trajectory.size()) {
             const Eigen::Vector3d seg =
                 trajectory[i + 1].position - trajectory[i].position;
@@ -928,8 +929,20 @@ ValidationResult LocalPlanner::validateTrajectory(
         }
     }
     result.min_clearance =
-        std::isfinite(min_clearance) ? min_clearance : 0.0;
+        std::isfinite(min_clear) ? min_clear : 0.0;
     return result;
+}
+
+ValidationResult LocalPlanner::validateTrajectory(
+    const std::vector<TrajectoryPoint>& trajectory) const {
+    if (trajectory.empty()) {
+        ValidationResult result;
+        result.all_clear = false;
+        result.any_collision = true;
+        return result;
+    }
+    return validateTrajectorySegmentSpatially(
+        trajectory, trajectory.front().t, config_.min_clearance);
 }
 
 ValidationResult LocalPlanner::validateTrajectorySuffix(
@@ -996,44 +1009,9 @@ ValidationResult LocalPlanner::validateTrajectorySuffix(
         return result;
     }
 
-    // Safety validation starts AT the current age (the segment between the
-    // actual state and the controller preview reference is validated too).
-    double min_clear = std::numeric_limits<double>::infinity();
-    for (size_t i = 0; i < trajectory.size(); ++i) {
-        const TrajectoryPoint& point = trajectory[i];
-        if (point.t < age - 1.0e-6) continue;
-        if (!point.position.allFinite() || !point.velocity.allFinite() ||
-            !point.acceleration.allFinite()) {
-            result.any_collision = true;
-            result.all_clear = false;
-            result.worst_position = point.position;
-            result.worst_time = point.t;
-            break;
-        }
-        const bool known =
-            map_->isKnown(point.position.x(), point.position.y(),
-                          point.position.z());
-        const double clearance =
-            map_->esdfValue(point.position.x(), point.position.y(),
-                            point.position.z());
-        if (std::isfinite(clearance)) {
-            min_clear = std::min(min_clear, clearance);
-        }
-        if (!known || !std::isfinite(clearance) ||
-            clearance <= min_clearance) {
-            result.any_collision = true;
-            result.all_clear = false;
-            result.clearance_violation_count++;
-            if (clearance < result.worst_clearance) {
-                result.worst_clearance = clearance;
-                result.worst_position = point.position;
-                result.worst_time = point.t;
-            }
-            if (!known) result.any_unknown = true;
-        }
-    }
-    result.min_clearance = std::isfinite(min_clear) ? min_clear : 0.0;
-    return result;
+    // Safety validation from the current age (section XX), with the SAME
+    // spatial interpolation strictness as the fresh trajectory.
+    return validateTrajectorySegmentSpatially(trajectory, age, min_clearance);
 }
 
 LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
