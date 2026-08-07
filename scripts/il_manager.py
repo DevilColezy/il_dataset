@@ -34,15 +34,25 @@ import sys
 import time
 from enum import Enum
 
-# The compiled pybind module (_il_local_planner.so) is built into this
-# script's directory (CMake LIBRARY_OUTPUT_DIRECTORY = scripts/), together
-# with the sibling il_* modules.  Everything runs from the source
-# workspace (no catkin install), so adding the script's own directory to
-# sys.path is sufficient for `import _il_local_planner` and the il_*
-# modules.
+# The compiled pybind module (_il_local_planner.so) is built into the
+# source scripts/ directory (CMake LIBRARY_OUTPUT_DIRECTORY = scripts/),
+# together with the sibling il_* modules.  The manager can be launched
+# directly from the source tree OR through the catkin-installed
+# executable (devel/lib/il_dataset/il_manager.py, catkin_install_python),
+# so add the script's own directory AND the rospack-resolved source
+# scripts/ directory to sys.path.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
+try:
+    import rospkg
+    _PKG_SCRIPTS_DIR = os.path.join(
+        rospkg.RosPack().get_path("il_dataset"), "scripts")
+    if os.path.isdir(_PKG_SCRIPTS_DIR) and \
+            _PKG_SCRIPTS_DIR not in sys.path:
+        sys.path.insert(0, _PKG_SCRIPTS_DIR)
+except Exception:  # noqa: BLE001 — rospkg optional outside a ROS shell
+    pass
 
 import numpy as np
 import rospy
@@ -56,7 +66,6 @@ from il_common import (
     normalize_angle,
     quantize_bounded_vector,
     load_ply,
-    wait_for_stable_file,
 )
 from il_config import (
     load_config,
@@ -93,9 +102,9 @@ class State(Enum):
     WAIT_UNITY = 1
     GENERATE_SCENE = 2
     SEND_SCENE = 3
-    WAIT_SCENE_READY = 4
+    SETTLE_SCENE = 4
     EXPORT_POINTCLOUD = 5
-    WAIT_POINTCLOUD_READY = 6
+    WAIT_POINTCLOUD = 6
     BUILD_PRIVILEGED_MAP = 7
     GENERATE_TASKS = 8
     RESET_DRONE = 9
@@ -121,6 +130,12 @@ class ILManager(object):
         self._sync_cfg = self.g.get("sync", {})
         self._controller_cfg = self.g.get("trajectory_controller", {})
         self._safety_cfg = self.g.get("execution_safety", {})
+        # Scene settle + point-cloud completion config (sections VIII/XXIV).
+        self._scene_runtime = self.g.get("scene_runtime", {})
+        _pc_cfg = self.g.get("pointcloud", {})
+        self._pc_stable_window_s = float(_pc_cfg.get("stable_window_s", 0.5))
+        self._pc_min_file_bytes = int(_pc_cfg.get("min_file_bytes", 1024))
+        self._pc_max_retries = int(_pc_cfg.get("max_retries", 3))
 
         # Outputs
         self.output_root = self.g.get("output_dir") or "dataset/il_data"
@@ -191,6 +206,14 @@ class ILManager(object):
         self._episode_index = 0
         self._scene_dir = None
         self._pc_path = None
+        self._pc_retries = 0
+        self._pc_request_time = 0.0
+        self._pc_ack_received = False
+        self._pc_save_success_received = False
+        self._pc_last_keepalive = 0.0
+        self._last_ply_size = -1
+        self._ply_stable_since = None
+        self._settle_last_keepalive = 0.0
         self._generation_rng = None
 
         tg = self.g.get("task_generation", {})
@@ -260,9 +283,9 @@ class ILManager(object):
             State.WAIT_UNITY: self._st_wait_unity,
             State.GENERATE_SCENE: self._st_generate_scene,
             State.SEND_SCENE: self._st_send_scene,
-            State.WAIT_SCENE_READY: self._st_wait_scene_ready,
+            State.SETTLE_SCENE: self._st_settle_scene,
             State.EXPORT_POINTCLOUD: self._st_export_pointcloud,
-            State.WAIT_POINTCLOUD_READY: self._st_wait_pointcloud,
+            State.WAIT_POINTCLOUD: self._st_wait_pointcloud,
             State.BUILD_PRIVILEGED_MAP: self._st_build_privileged_map,
             State.GENERATE_TASKS: self._st_generate_tasks,
             State.RESET_DRONE: self._st_reset_drone,
@@ -344,6 +367,7 @@ class ILManager(object):
             return
         self._current_scene = scene
         self._dataset_scene_key = scene.scene_key
+        self._pc_retries = 0  # fresh scene -> fresh point-cloud retry budget
         self._generation_rng = self._next_scene_seed_rng()
         self._scene_dir = os.path.join(
             self.output_root, "scenes", scene.scene_key)
@@ -357,21 +381,27 @@ class ILManager(object):
                       scene.metrics.get("mode"))
         self._enter_state(State.SEND_SCENE)
 
-    def _drain_bridge(self, seconds=0.4):
-        """Drain stale AvoidBench replies so old ready / PC acks from a
-        previous scene can never be mistaken for the current one (section
-        XXIV)."""
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline and not rospy.is_shutdown():
+    def _drain_bridge_messages(self):
+        """Drain EVERY pending AvoidBench message (returns the count).
+
+        A single `try_recv()` would leave a backlog; scene switches and the
+        settle / point-cloud phases must never mistake a stale reply from a
+        previous scene for the current one (sections X-XI).  An empty queue
+        (`try_recv() == None`) simply means no new message — it is NOT a
+        connection failure (section XLVII).
+        """
+        drained = 0
+        while True:
             r = self._bridge.try_recv()
             if r is None:
-                time.sleep(0.01)
-                continue
+                break
+            drained += 1
+        return drained
 
     def _build_scene_pose_message(self):
         """One unified scene Pose message shared by SEND_SCENE and the
-        WAIT_SCENE_READY keep-alive (section XLVI).  Uses the numeric
-        `unity_scene_id` — never the dataset scene key."""
+        SETTLE_SCENE / WAIT_POINTCLOUD keep-alives (section XLVI).  Uses
+        the numeric `unity_scene_id` — never the dataset scene key."""
         vehicle = make_depth_vehicle([0.0, 0.0, 5.0], 0.0, self._depth_cfg)
         return {
             "scene_id": self._unity_scene_id,
@@ -381,44 +411,41 @@ class ILManager(object):
         }
 
     def _st_send_scene(self):
-        self._drain_bridge(0.4)
+        self._drain_bridge_messages()
         self._scene_pose_msg = self._build_scene_pose_message()
         self._bridge.send_pose(self._scene_pose_msg)
-        self._enter_state(State.WAIT_SCENE_READY)
+        self._settle_last_keepalive = 0.0
+        rospy.loginfo("[Manager] Scene sent via Pose: %s (unity id=%d)",
+                      self._dataset_scene_key, self._unity_scene_id)
+        self._enter_state(State.SETTLE_SCENE)
 
-    def _st_wait_scene_ready(self):
-        # Wait for the settled ready reply with an optional scene keep-alive
-        # (section XXIII).  The keep-alive re-sends the SAME scene Pose
-        # message through the verified `Pose` topic (section XLV).  A
-        # timeout regenerates the scene (new seed).
-        deadline = self._state_start + \
-            self._fsm.get("scene_settle_timeout", 10.0)
-        keep_alive = self._fsm.get("keep_alive_period", 3.0)
-        last_alive = 0.0
-        while time.monotonic() < deadline and not rospy.is_shutdown():
-            r = self._bridge.try_recv()
-            if r is not None and r[0].get("ready"):
-                rospy.loginfo("[Manager] Unity ready: %s",
-                              self._dataset_scene_key)
-                self._enter_state(State.EXPORT_POINTCLOUD)
-                return
-            if time.monotonic() - last_alive >= keep_alive:
-                self._bridge.send_pose(self._scene_pose_msg)
-                last_alive = time.monotonic()
-            time.sleep(0.02)
-        self._scene_attempt += 1
-        GenerationFailureWriter.write(self._generation_failures_path, {
-            "event": "scene_ready_timeout",
-            "scene_key": self._dataset_scene_key,
-            "attempt": self._scene_attempt,
-        })
-        if self._scene_attempt >= self._max_scene_attempts:
-            self._error = "scene_ready_timeout"
-            self._enter_state(State.ERROR)
-            return
-        self._enter_state(State.GENERATE_SCENE)
+    def _st_settle_scene(self):
+        """Time-based scene settle (sections IV-IX).
+
+        AvoidBench does NOT re-send `ready` after a procedural object
+        update — `ready` is only an initial handshake condition (section
+        II).  While settling we re-send the SAME scene Pose as keep-alive
+        and drain the whole incoming queue; when `settle_time_s` elapses
+        we proceed to the point cloud export regardless of whether any new
+        `ready` arrived.  A missing second `ready` is never a scene
+        generation failure (section IX).
+        """
+        sr = self._scene_runtime
+        settle_time = float(sr.get("settle_time_s", 8.0))
+        keep_interval = 1.0 / max(0.1, float(sr.get(
+            "settle_keepalive_hz", 5.0)))
+        self._drain_bridge_messages()
+        now = time.monotonic()
+        if now - self._settle_last_keepalive >= keep_interval:
+            self._bridge.send_pose(self._scene_pose_msg)
+            self._settle_last_keepalive = now
+        if now - self._state_start >= settle_time:
+            rospy.loginfo("[Manager] Scene settled: %s",
+                          self._dataset_scene_key)
+            self._enter_state(State.EXPORT_POINTCLOUD)
 
     def _st_export_pointcloud(self):
+        self._drain_bridge_messages()
         pc_cfg = self.g.get("pointcloud", {})
         # Absolute directory with a trailing separator in the request
         # (sections XIX-XXI): AvoidBench joins `path` + `file_name`.
@@ -437,32 +464,105 @@ class ILManager(object):
             "file_name": base,
         }
         self._pc_path = os.path.join(pc_dir, base + ".ply")
+        # A stale PLY from an earlier identical scene key must never be
+        # mistaken for this fresh export (section XXXI).
         if os.path.exists(self._pc_path):
-            os.remove(self._pc_path)
+            try:
+                os.remove(self._pc_path)
+            except OSError:
+                pass
+        # Per-request state.  The request is sent exactly ONCE per entry
+        # (section XVIII); completion is decided by the PLY file itself.
+        self._pc_request_time = time.monotonic()
+        self._pc_ack_received = False
+        self._pc_save_success_received = False
+        self._pc_last_keepalive = 0.0
+        self._last_ply_size = -1
+        self._ply_stable_since = None
         self._bridge.send_pc_request(req)
-        self._enter_state(State.WAIT_POINTCLOUD_READY)
+        self._enter_state(State.WAIT_POINTCLOUD)
 
     def _st_wait_pointcloud(self):
-        r = self._bridge.try_recv()
-        if r is not None and r[0].get("save_pc_success", False):
-            if wait_for_stable_file(self._pc_path,
-                                    timeout=self._fsm.get("pc_export_timeout", 600.0)):
-                rospy.loginfo("[Manager] point cloud exported: %s",
-                              self._pc_path)
-                self._enter_state(State.BUILD_PRIVILEGED_MAP)
-                return
-        if self._timed_out(self._fsm.get("pc_export_timeout", 600.0)):
-            self._scene_attempt += 1
+        timeout = self._fsm.get("pc_export_timeout", 600.0)
+        keep_interval = max(
+            0.5, float(self._fsm.get("keep_alive_period", 3.0)))
+        # Drain the WHOLE queue every tick; ACK / save_pc_success are only
+        # diagnostics (sections XX-XXII).
+        while True:
+            r = self._bridge.try_recv()
+            if r is None:
+                break
+            meta = r[0] if r else {}
+            if meta.get("get_pc_msg"):
+                self._pc_ack_received = True
+            if meta.get("save_pc_success"):
+                self._pc_save_success_received = True
+        # Keep Unity communication alive without starting any episode
+        # (sections XXV-XXVII): re-send the current scene Pose.
+        now = time.monotonic()
+        if now - self._pc_last_keepalive >= keep_interval:
+            self._bridge.send_pose(self._scene_pose_msg)
+            self._pc_last_keepalive = now
+        # The PLY file itself is the final source of truth (sections
+        # XXIII/XXVIII): existence + stability, independent of any ACK.
+        if self._ply_is_stable():
+            rospy.loginfo(
+                "[Manager] point cloud stable: %s (ack=%s save_ok=%s)",
+                self._pc_path, self._pc_ack_received,
+                self._pc_save_success_received)
+            self._enter_state(State.BUILD_PRIVILEGED_MAP)
+            return
+        # Real timeout only when the PLY never completed (section XXIX) —
+        # a missing ACK / save_pc_success alone is never a failure.
+        if now - self._pc_request_time > timeout:
+            self._pc_retries += 1
             GenerationFailureWriter.write(self._generation_failures_path, {
                 "event": "pointcloud_timeout",
                 "scene_key": self._dataset_scene_key,
-                "attempt": self._scene_attempt,
+                "attempt": self._pc_retries,
+                "ply_exists": os.path.isfile(self._pc_path),
             })
-            if self._scene_attempt >= self._max_scene_attempts:
-                self._error = "pointcloud_export_timeout"
-                self._enter_state(State.ERROR)
+            if self._pc_retries >= self._pc_max_retries:
+                # Give up on this scene: regenerate it (new seed).  Only
+                # repeated global failures abort the whole collection
+                # (section XXX).
+                self._scene_attempt += 1
+                if self._scene_attempt >= self._max_scene_attempts:
+                    self._error = "pointcloud_export_exhausted"
+                    self._enter_state(State.ERROR)
+                    return
+                self._enter_state(State.GENERATE_SCENE)
                 return
-            self._enter_state(State.GENERATE_SCENE)
+            # Retry the SAME scene's point cloud export.
+            rospy.logwarn("[Manager] point cloud timeout retry %d/%d",
+                          self._pc_retries, self._pc_max_retries)
+            self._enter_state(State.EXPORT_POINTCLOUD)
+
+    def _ply_is_stable(self):
+        """Non-blocking PLY stability check (section XXIV).  The file must
+        exist, exceed the minimum size and keep an identical size for the
+        stable window before it counts as complete."""
+        try:
+            if not os.path.isfile(self._pc_path):
+                self._last_ply_size = -1
+                self._ply_stable_since = None
+                return False
+            size = os.path.getsize(self._pc_path)
+            now = time.monotonic()
+            if size < self._pc_min_file_bytes:
+                self._last_ply_size = size
+                self._ply_stable_since = None
+                return False
+            if size == self._last_ply_size:
+                if self._ply_stable_since is None:
+                    self._ply_stable_since = now
+                return (now - self._ply_stable_since) >= \
+                    self._pc_stable_window_s
+            self._last_ply_size = size
+            self._ply_stable_since = None
+            return False
+        except OSError:
+            return False
 
     def _st_build_privileged_map(self):
         try:
@@ -1552,6 +1652,7 @@ class ILManager(object):
             "exit_reason": self._trajectory_exit_reason,
             "reject_reason": reject_reason,
         }
+        runtime_cls = None
         if self._runtime_classify_enabled:
             initial_observed = self._initial_observed_recoverable
             runtime_info["initial_observed_recoverable"] = initial_observed
@@ -1570,6 +1671,19 @@ class ILManager(object):
             runtime_info["classification_mismatch"] = bool(
                 runtime_cls is not None and
                 runtime_cls != task.target_task_class)
+        # Quota accounting (sections XXXIII-XLI): only a successful,
+        # committed episode counts as training data; a failed episode only
+        # increments the failed counter.  The runtime class (when known) is
+        # the committed class, with the generation-time target class as
+        # fallback (sections XXXVI/XLI).
+        if success:
+            committed_cls = (runtime_cls if runtime_cls is not None
+                             else task.target_task_class)
+            self._quota.note_committed(committed_cls)
+            runtime_info["committed_class"] = committed_cls.value
+        else:
+            self._quota.note_failed(task.target_task_class)
+            runtime_info["committed_class"] = None
         task_dir = os.path.join(self._scene_dir, "tasks", task.task_id)
         TaskManifestWriter.write(
             os.path.join(task_dir, "task_manifest.json"),

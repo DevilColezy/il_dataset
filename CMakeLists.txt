@@ -162,3 +162,15 @@ catkin_package(
   LIBRARIES il_local_planner_lib
 )
 
+# ── ROS Python node installation (sections XIII/XVII) ────────────
+# Install the manager so `roslaunch il_dataset il_dataset_collect.launch`
+# resolves the node executable directly, without any manual chmod or
+# `python3 scripts/il_manager.py` invocation.  Only true ROS executables
+# are listed; the il_* helper modules are plain import modules and stay in
+# the source tree (they are found via _SCRIPT_DIR / rospack on sys.path).
+catkin_install_python(
+  PROGRAMS
+    scripts/il_manager.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+

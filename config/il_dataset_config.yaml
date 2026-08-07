@@ -31,11 +31,19 @@ global:
   # ── FSM timeouts (seconds) ─────────────────────────────────────────
   fsm:
     connect_timeout:         60.0
-    scene_settle_timeout:    10.0
     pc_export_timeout:      600.0
     drone_stable_timeout:    10.0
     trajectory_timeout:     120.0
     keep_alive_period:        3.0
+
+  # ── Scene runtime / settle (section VIII) ─────────────────────────
+  # `ready` is ONLY an initial AvoidBench handshake condition.  After a
+  # procedural object update we settle by TIME (no second ready is
+  # expected): keep re-sending the scene Pose and drain the queue, then
+  # proceed to the point cloud export once settle_time_s elapses.
+  scene_runtime:
+    settle_time_s:           8.0
+    settle_keepalive_hz:     5.0
 
   # ── Depth camera ───────────────────────────────────────────────────
   depth:
@@ -47,11 +55,16 @@ global:
     far:  1000.0
 
   # ── Point cloud export (privileged global map input) ───────────────
+  # Completion is decided by the PLY file itself (existence + stable
+  # size); get_pc_msg / save_pc_success messages are only diagnostics.
   pointcloud:
     range:        [27.0, 44.0, 8.0]
     origin:       [1.5, 16.0, 3.5]
     resolution:   0.10
     export_file:  "obstacle_cloud.ply"
+    min_file_bytes: 1024
+    stable_window_s:  0.5
+    max_retries:      3
 
   # ── Vehicle geometry ───────────────────────────────────────────────
   vehicle:

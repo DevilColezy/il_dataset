@@ -59,9 +59,22 @@ class GeneratedTask(object):
 
 
 class DatasetQuota(object):
-    """Dataset-level balancing across TaskClasses (section LXII)."""
+    """Dataset-level balancing across TaskClasses (sections LXII/LXVI).
 
-    def __init__(self, class_weights):
+    Splits scheduling from outcome so balancing targets the COMMITTED
+    (successfully collected) distribution instead of the generated one:
+      - scheduled: tasks accepted into a per-scene task list (pending
+        execution) — only a small future credit;
+      - committed: episodes that reached the goal AND passed the quality
+        gates (the real imitation training data);
+      - failed: episodes that failed (macro FAILED / timeout / collision /
+        depth failure / any quality-gate rejection).
+    `need()` balances against `committed + pending_weight * scheduled`, so
+    a class whose success rate is low keeps being re-sampled until its
+    committed share approaches the target weights (section XXXIX).
+    """
+
+    def __init__(self, class_weights, pending_weight=0.5):
         self.weights = {}
         for name, w in (class_weights or {}).items():
             try:
@@ -71,28 +84,46 @@ class DatasetQuota(object):
             self.weights[cls] = float(w)
         for cls in TaskClass:
             self.weights.setdefault(cls, 0.0)
-        self.accepted = {cls: 0 for cls in TaskClass}
-        self.attempted = {cls: 0 for cls in TaskClass}
+        self.pending_weight = float(pending_weight)
+        self.scheduled = {cls: 0 for cls in TaskClass}
+        self.committed = {cls: 0 for cls in TaskClass}
+        self.failed = {cls: 0 for cls in TaskClass}
 
-    def note_attempted(self, cls):
-        self.attempted[cls] += 1
+    def note_scheduled(self, cls):
+        self.scheduled[cls] += 1
 
-    def note_accepted(self, cls):
-        self.accepted[cls] += 1
+    def note_committed(self, cls):
+        self.committed[cls] += 1
+
+    def note_failed(self, cls):
+        self.failed[cls] += 1
+
+    def effective_total(self):
+        return sum(self.committed.values()) + \
+            self.pending_weight * sum(self.scheduled.values())
 
     def need(self, cls):
-        total = sum(self.accepted.values())
-        expected = self.weights[cls] * max(1, total)
-        return max(0.0, expected - self.accepted[cls])
+        total = self.effective_total()
+        effective = self.committed[cls] + \
+            self.pending_weight * self.scheduled[cls]
+        expected = self.weights[cls] * max(1.0, total)
+        return max(0.0, expected - effective)
 
     def needs_class(self, cls):
         return self.need(cls) > 0.0
 
     def summary(self):
-        return {
-            "accepted": {c.value: n for c, n in self.accepted.items()},
-            "attempted": {c.value: n for c, n in self.attempted.items()},
-        }
+        out = {}
+        for cls in TaskClass:
+            outcome = self.committed[cls] + self.failed[cls]
+            rate = (float(self.committed[cls]) / outcome) if outcome else None
+            out[cls.value] = {
+                "scheduled": self.scheduled[cls],
+                "committed": self.committed[cls],
+                "failed": self.failed[cls],
+                "success_rate": round(rate, 4) if rate is not None else None,
+            }
+        return out
 
 
 class MultiscaleTaskGenerator(object):
@@ -233,7 +264,6 @@ class MultiscaleTaskGenerator(object):
                 cls = self.classify(r)
                 if cls is None:
                     continue
-                quota.note_attempted(cls)
                 coord_candidates.append((cls, r, s, g, band_name))
             if len(coord_candidates) >= 4 * tasks_per_scene:
                 break
@@ -250,7 +280,10 @@ class MultiscaleTaskGenerator(object):
         for cls, r, s, g, band_name in coord_candidates:
             if len(tasks) >= tasks_per_scene:
                 break
-            quota.note_accepted(cls)
+            # Scheduling only — this is NOT committed training data yet
+            # (sections XXXV/LXI): committed accounting happens in the
+            # manager after a successful episode.
+            quota.note_scheduled(cls)
             task_id = "%s_task_%03d" % (scene.scene_key, len(tasks))
             task_seed = (self.task_seed_base + len(tasks) * 131) & 0x7FFFFFFF
             tasks.append(GeneratedTask(
