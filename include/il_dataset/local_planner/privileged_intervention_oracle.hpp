@@ -2,6 +2,7 @@
 
 #include <Eigen/Core>
 #include <deque>
+#include <utility>
 
 #include "il_dataset/local_planner/types.hpp"
 
@@ -9,64 +10,78 @@ namespace il_dataset {
 
 class PrivilegedOracle;
 
-/// Configuration for the privileged macro-intervention evaluation
-/// (section III).
+/// Configuration for the privileged LOCAL-SCALE audit (section II/III).
+///
+/// The oracle runs a short-range A* on the FULL map with geometry as
+/// consistent as possible with the OBSERVED local recoverability.  It
+/// ALLOWS local bypass around obstacles — it never requires the direct
+/// ray to be collision free.
 struct PrivilegedInterventionConfig {
-    /// Lateral offset (m) used to sample the left/right alternatives at
-    /// the direct guide point.
-    double lateral_offset_m = 1.5;
-    /// Minimum global clearance (m) required along the direct ray.
-    double min_global_clearance_m = 0.20;
-    /// Max ratio of direct cost-to-go over straight-line distance before
-    /// the direct corridor is considered excessively long.
-    double max_direct_detour_ratio = 1.6;
-    /// A side alternative must beat the direct cost-to-go by at least this
-    /// margin (m) to be a "wrong homotopy" signal.
-    double cost_margin_m = 2.0;
-    /// Distance ahead (m) at which the direct guide consequence is sampled.
-    double lookahead_sampling_m = 4.0;
-    // Loop-risk history (section III / XIV).
+    /// Additional clearance (m) required for the privileged search; the
+    /// global ESDF already subtracts the vehicle radius, so this is the
+    /// same "extra safety margin" used by every global module.
+    double search_clearance_m = 0.25;
+    double search_max_time_ms = 20.0;
+    /// Local planning horizon used to bound the privileged search.
+    double horizon_time_s = 2.5;
+    /// Max allowed local path length (m) = horizon * nominal speed.
+    double max_path_length_m = 6.0;
+    double nominal_speed_mps = 1.8;
+    /// Minimum forward progress along the goal ray the local path must
+    /// yield before "rejoin" counts.
+    double min_goal_progress_m = 0.30;
+    /// Minimum cosine alignment between the terminal motion and the guide
+    /// direction.
+    double min_terminal_alignment = 0.5;
+    /// Lateral tolerance (m) for the terminal to count as "re-joining the
+    /// direct guide's forward region".
+    double rejoin_radius_m = 0.6;
+    // ── Loop detection (section IX) ─────────────────────────────────
+    /// Recent history within this window (s) is ignored (normal motion).
+    double loop_ignore_recent_s = 2.5;
+    /// A real revisit requires having left the region beyond this radius.
+    double loop_leave_radius_m = 1.6;
     double loop_revisit_radius_m = 0.8;
-    int loop_history_size = 40;
-    /// Revisit count (after leaving the radius) that signals a loop.
-    int loop_min_revisits = 2;
     double loop_min_speed_mps = 0.3;
+    int loop_min_revisits = 2;
+    int loop_history_size = 60;
 };
 
-/// Low-frequency privileged evaluator: decides whether the direct goal
-/// intent remains globally viable, i.e. whether continuing to provide a
-/// direct-to-goal macro guide lets the 30 Hz local system reach the goal
-/// efficiently.  It never outputs hidden waypoints or a hidden "right/left
-/// answer"; it only reports whether macro intervention is needed and
-/// ranks sides that are already observable.
+/// Low-frequency privileged evaluator (sections II, III, IX, XXI).
 ///
-/// Evaluated over: global connectivity, global cost-to-go, direct-ray
-/// clearance and detour ratio, wrong-homotopy margin, and loop history.
+/// Responsibilities (ONLY):
+///  - true local-scale audit (privileged local recoverability),
+///  - long-term candidate / route evaluation (via PrivilegedOracle),
+///  - global-connectivity filtering of candidates,
+///  - loop / dead-end identification,
+///  - future-intervention diagnosis (auxiliary labels, never the main
+///    macro mode).
+///
+/// It never emits hidden waypoints and never directly changes the main
+/// macro mode without causal history evidence.
 class PrivilegedInterventionOracle {
 public:
     explicit PrivilegedInterventionOracle(
         const PrivilegedInterventionConfig& config);
 
-    /// Evaluate the direct intent.  Keeps a bounded position history for
-    /// loop-risk detection.
+    /// Evaluate the direct intent on the full map.  `current_time_s` is
+    /// used for loop detection (wall-clock, seconds).
     PrivilegedInterventionResult evaluate(const PrivilegedOracle& oracle,
                                           const VehicleState& state,
                                           const Eigen::Vector3d& direct_guide_world,
-                                          const Eigen::Vector3d& goal_world);
+                                          const Eigen::Vector3d& goal_world,
+                                          double current_time_s);
 
     /// Clear the loop-history at episode start.
     void reset();
 
 private:
-    bool detectLoopRisk(const Eigen::Vector3d& position,
-                        double speed) const;
+    bool detectLoopRisk(const Eigen::Vector2d& position,
+                        double now_s) const;
 
     PrivilegedInterventionConfig config_;
-    // Position history (bounded) for loop-risk detection.
-    std::deque<Eigen::Vector3d> history_;
-    // Number of times the drone left and re-entered the revisit radius.
-    int revisit_count_ = 0;
-    bool outside_revisit_radius_ = true;
+    // Position history (bounded) for loop detection: (2D position, time).
+    std::deque<std::pair<Eigen::Vector2d, double>> history_;
 };
 
 }  // namespace il_dataset

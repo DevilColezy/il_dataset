@@ -341,52 +341,67 @@ PYBIND11_MODULE(_il_local_planner, m) {
     py::enum_<InterventionReason>(m, "InterventionReason")
         .value("DIRECT_GLOBALLY_VALID", InterventionReason::DIRECT_GLOBALLY_VALID)
         .value("DIRECT_LONG_WALL_BLOCKED", InterventionReason::DIRECT_LONG_WALL_BLOCKED)
-        .value("DIRECT_WRONG_HOMOTOPY", InterventionReason::DIRECT_WRONG_HOMOTOPY)
         .value("DIRECT_GLOBAL_DISCONNECTED", InterventionReason::DIRECT_GLOBAL_DISCONNECTED)
         .value("DIRECT_EXCESSIVE_DETOUR", InterventionReason::DIRECT_EXCESSIVE_DETOUR)
         .value("DIRECT_LOOP_RISK", InterventionReason::DIRECT_LOOP_RISK)
-        .value("LEFT_ONLY_FEASIBLE", InterventionReason::LEFT_ONLY_FEASIBLE)
-        .value("RIGHT_ONLY_FEASIBLE", InterventionReason::RIGHT_ONLY_FEASIBLE)
-        .value("BOTH_SIDES_FEASIBLE", InterventionReason::BOTH_SIDES_FEASIBLE)
         .value("NO_GLOBAL_ROUTE", InterventionReason::NO_GLOBAL_ROUTE)
         .export_values();
 
     py::class_<PrivilegedInterventionResult>(m, "PrivilegedInterventionResult")
         .def(py::init<>())
-        .def_readwrite("direct_viable", &PrivilegedInterventionResult::direct_viable)
-        .def_readwrite("intervention_required",
-                       &PrivilegedInterventionResult::intervention_required)
-        .def_readwrite("left_globally_feasible",
-                       &PrivilegedInterventionResult::left_globally_feasible)
-        .def_readwrite("right_globally_feasible",
-                       &PrivilegedInterventionResult::right_globally_feasible)
-        .def_readwrite("direct_cost_to_go", &PrivilegedInterventionResult::direct_cost_to_go)
-        .def_readwrite("left_cost_to_go", &PrivilegedInterventionResult::left_cost_to_go)
-        .def_readwrite("right_cost_to_go", &PrivilegedInterventionResult::right_cost_to_go)
-        .def_readwrite("direct_detour_ratio", &PrivilegedInterventionResult::direct_detour_ratio)
-        .def_readwrite("direct_min_clearance",
-                       &PrivilegedInterventionResult::direct_min_clearance)
-        .def_readwrite("decision_margin", &PrivilegedInterventionResult::decision_margin)
+        .def_readwrite("privileged_local_recoverable",
+                       &PrivilegedInterventionResult::privileged_local_recoverable)
+        .def_readwrite("privileged_rejoin_reached",
+                       &PrivilegedInterventionResult::privileged_rejoin_reached)
+        .def_readwrite("privileged_local_path_length",
+                       &PrivilegedInterventionResult::privileged_local_path_length)
+        .def_readwrite("privileged_local_duration",
+                       &PrivilegedInterventionResult::privileged_local_duration)
+        .def_readwrite("privileged_detour_ratio",
+                       &PrivilegedInterventionResult::privileged_detour_ratio)
+        .def_readwrite("privileged_min_clearance",
+                       &PrivilegedInterventionResult::privileged_min_clearance)
+        .def_readwrite("privileged_goal_progress",
+                       &PrivilegedInterventionResult::privileged_goal_progress)
+        .def_readwrite("privileged_future_intervention_required",
+                       &PrivilegedInterventionResult::privileged_future_intervention_required)
+        .def_readwrite("current_cost_to_go",
+                       &PrivilegedInterventionResult::current_cost_to_go)
+        .def_readwrite("direct_cost_to_go",
+                       &PrivilegedInterventionResult::direct_cost_to_go)
+        .def_readwrite("loop_risk", &PrivilegedInterventionResult::loop_risk)
         .def_readwrite("reason", &PrivilegedInterventionResult::reason);
 
     py::class_<PrivilegedInterventionConfig>(m, "PrivilegedInterventionConfig")
         .def(py::init<>())
-        .def_readwrite("lateral_offset_m", &PrivilegedInterventionConfig::lateral_offset_m)
-        .def_readwrite("min_global_clearance_m",
-                       &PrivilegedInterventionConfig::min_global_clearance_m)
-        .def_readwrite("max_direct_detour_ratio",
-                       &PrivilegedInterventionConfig::max_direct_detour_ratio)
-        .def_readwrite("cost_margin_m", &PrivilegedInterventionConfig::cost_margin_m)
-        .def_readwrite("lookahead_sampling_m",
-                       &PrivilegedInterventionConfig::lookahead_sampling_m)
+        .def_readwrite("search_clearance_m",
+                       &PrivilegedInterventionConfig::search_clearance_m)
+        .def_readwrite("search_max_time_ms",
+                       &PrivilegedInterventionConfig::search_max_time_ms)
+        .def_readwrite("horizon_time_s",
+                       &PrivilegedInterventionConfig::horizon_time_s)
+        .def_readwrite("max_path_length_m",
+                       &PrivilegedInterventionConfig::max_path_length_m)
+        .def_readwrite("nominal_speed_mps",
+                       &PrivilegedInterventionConfig::nominal_speed_mps)
+        .def_readwrite("min_goal_progress_m",
+                       &PrivilegedInterventionConfig::min_goal_progress_m)
+        .def_readwrite("min_terminal_alignment",
+                       &PrivilegedInterventionConfig::min_terminal_alignment)
+        .def_readwrite("rejoin_radius_m",
+                       &PrivilegedInterventionConfig::rejoin_radius_m)
+        .def_readwrite("loop_ignore_recent_s",
+                       &PrivilegedInterventionConfig::loop_ignore_recent_s)
+        .def_readwrite("loop_leave_radius_m",
+                       &PrivilegedInterventionConfig::loop_leave_radius_m)
         .def_readwrite("loop_revisit_radius_m",
                        &PrivilegedInterventionConfig::loop_revisit_radius_m)
-        .def_readwrite("loop_history_size",
-                       &PrivilegedInterventionConfig::loop_history_size)
+        .def_readwrite("loop_min_speed_mps",
+                       &PrivilegedInterventionConfig::loop_min_speed_mps)
         .def_readwrite("loop_min_revisits",
                        &PrivilegedInterventionConfig::loop_min_revisits)
-        .def_readwrite("loop_min_speed_mps",
-                       &PrivilegedInterventionConfig::loop_min_speed_mps);
+        .def_readwrite("loop_history_size",
+                       &PrivilegedInterventionConfig::loop_history_size);
 
     py::class_<PrivilegedInterventionOracle>(m, "PrivilegedInterventionOracle")
         .def(py::init<const PrivilegedInterventionConfig&>())
@@ -395,11 +410,15 @@ PYBIND11_MODULE(_il_local_planner, m) {
                 const PrivilegedOracle& oracle,
                 const VehicleState& state,
                 const Eigen::Vector3d& direct_guide_world,
-                const Eigen::Vector3d& goal_world) {
+                const Eigen::Vector3d& goal_world,
+                double current_time_s) {
                  py::gil_scoped_release release;
                  return self.evaluate(oracle, state, direct_guide_world,
-                                      goal_world);
-             })
+                                      goal_world, current_time_s);
+             },
+             py::arg("oracle"), py::arg("state"),
+             py::arg("direct_guide_world"), py::arg("goal_world"),
+             py::arg("current_time_s"))
         .def("reset", &PrivilegedInterventionOracle::reset);
 
     // ── Local path search result (exposed read-only) ─────────────────
@@ -525,16 +544,15 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def("swept_brake_risk",
              [](const ObservedMap& self, const VehicleState& state,
                 double reaction_delay_s, double deceleration_mps2,
-                double body_radius_m, double safety_margin_m,
-                double sample_spacing_m) {
+                double safety_margin_m, double sample_spacing_m) {
                  py::gil_scoped_release release;
                  return self.sweptBrakeRisk(
                      state, reaction_delay_s, deceleration_mps2,
-                     body_radius_m, safety_margin_m, sample_spacing_m);
+                     safety_margin_m, sample_spacing_m);
              },
              py::arg("state"), py::arg("reaction_delay_s"),
-             py::arg("deceleration_mps2"), py::arg("body_radius_m"),
-             py::arg("safety_margin_m"), py::arg("sample_spacing_m"));
+             py::arg("deceleration_mps2"), py::arg("safety_margin_m"),
+             py::arg("sample_spacing_m"));
 
     // ── ESDFGrid (debug) ────────────────────────────────────────────
     py::class_<ESDFGrid>(m, "ESDFGrid")
@@ -679,7 +697,6 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("map_margin_m", &PrivilegedOracleConfig::map_margin_m)
         .def_readwrite("min_z_m", &PrivilegedOracleConfig::min_z_m)
         .def_readwrite("max_z_m", &PrivilegedOracleConfig::max_z_m)
-        .def_readwrite("free_clearance_m", &PrivilegedOracleConfig::free_clearance_m)
         .def_readwrite("cost_to_go_cap_m", &PrivilegedOracleConfig::cost_to_go_cap_m)
         .def_readwrite("scoring", &PrivilegedOracleConfig::scoring);
 
@@ -719,6 +736,12 @@ PYBIND11_MODULE(_il_local_planner, m) {
              [](const PrivilegedOracle& self, const Eigen::Vector3d& p) {
                  return self.clearance(p.x(), p.y(), p.z());
              })
+        .def("is_free",
+             [](const PrivilegedOracle& self, const Eigen::Vector3d& p,
+                double required_clearance) {
+                 return self.isFree(p.x(), p.y(), p.z(), required_clearance);
+             },
+             py::arg("point_world"), py::arg("required_clearance"))
         .def("cost_to_go",
              [](const PrivilegedOracle& self, const Eigen::Vector3d& p) {
                  return self.costToGo(p.x(), p.y(), p.z());
@@ -774,12 +797,6 @@ PYBIND11_MODULE(_il_local_planner, m) {
                  const auto& ctg = self.costToGoGrid();
                  return py::array_t<float>({self.gx(), self.gy()},
                                            ctg.data());
-             })
-        .def("get_inflated_occupancy",
-             [](const PrivilegedOracle& self) {
-                 const auto& occ = self.inflatedOccupancy();
-                 return py::array_t<std::uint8_t>({self.gx(), self.gy()},
-                                                  occ.data());
              });
 
     // ── LocalPlanner (B-spline) ─────────────────────────────────────
@@ -863,18 +880,17 @@ PYBIND11_MODULE(_il_local_planner, m) {
              [](const LocalPlanner& self,
                 const std::vector<TrajectoryPoint>& trajectory,
                 double plan_start_time, double current_time,
-                double controller_preview_time, const VehicleState& state,
+                const VehicleState& state,
                 double min_clearance, double max_position_error,
                 double max_velocity_error) {
                  py::gil_scoped_release release;
                  return self.validateTrajectorySuffix(
-                     trajectory, plan_start_time, current_time,
-                     controller_preview_time, state, min_clearance,
-                     max_position_error, max_velocity_error);
+                     trajectory, plan_start_time, current_time, state,
+                     min_clearance, max_position_error, max_velocity_error);
              },
              py::arg("trajectory"), py::arg("plan_start_time"),
-             py::arg("current_time"), py::arg("controller_preview_time"),
-             py::arg("state"), py::arg("min_clearance"),
-             py::arg("max_position_error"), py::arg("max_velocity_error"))
+             py::arg("current_time"), py::arg("state"),
+             py::arg("min_clearance"), py::arg("max_position_error"),
+             py::arg("max_velocity_error"))
         .def("current_plan_id", &LocalPlanner::currentPlanId);
 }

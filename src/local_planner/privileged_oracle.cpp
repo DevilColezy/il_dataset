@@ -142,7 +142,6 @@ bool PrivilegedOracle::build(const std::vector<Eigen::Vector3d>& points,
     gz_ = std::max(2, static_cast<int>(std::ceil((max_w.z() - min_w.z()) / res)));
     const size_t total = static_cast<size_t>(gx_) * gy_ * gz_;
     occupancy_.assign(total, 0);
-    inflated_.assign(static_cast<size_t>(gx_) * gy_, 0);
 
     auto voxelize = [&](double x, double y, double z) -> bool {
         const Eigen::Vector3d g = (Eigen::Vector3d(x, y, z) - origin_world_) / res;
@@ -158,7 +157,11 @@ bool PrivilegedOracle::build(const std::vector<Eigen::Vector3d>& points,
     };
     for (const Eigen::Vector3d& p : points) voxelize(p.x(), p.y(), p.z());
 
-    // Global ESDF (distance to occupied surface, radius subtracted).
+    // Global ESDF.  UNIFIED SEMANTICS (section XIV/XV): the ESDF value is
+    //   esdf = distance_to_obstacle_surface - vehicle_radius
+    // i.e. clearance from the INFLATED vehicle body.  Free space is
+    // everywhere defined by  esdf > inflation_m  (never re-subtracting the
+    // vehicle radius).
     const std::vector<double> dist2 =
         squaredEdt3d(occupancy_, gx_, gy_, gz_);
     esdf_.resize(total);
@@ -242,6 +245,22 @@ double PrivilegedOracle::clearance(double x, double y, double z) const {
     return c0 * (1.0 - fz) + c1 * fz;
 }
 
+bool PrivilegedOracle::isFree(double x, double y, double z,
+                              double required_clearance) const {
+    if (!built_) return false;
+    const Eigen::Vector3d g =
+        (Eigen::Vector3d(x, y, z) - origin_world_) / config_.resolution;
+    const int ix = static_cast<int>(std::floor(g.x()));
+    const int iy = static_cast<int>(std::floor(g.y()));
+    const int iz = static_cast<int>(std::floor(g.z()));
+    if (ix < 0 || ix >= gx_ || iy < 0 || iy >= gy_ || iz < 0 || iz >= gz_) {
+        return false;
+    }
+    const size_t index = (static_cast<size_t>(ix) * gy_ + iy) * gz_ + iz;
+    if (occupancy_[index] != 0) return false;
+    return esdf_[index] > static_cast<float>(required_clearance);
+}
+
 void PrivilegedOracle::buildConnectivityAndCostToGo(
     const Eigen::Vector3d& start, const Eigen::Vector3d& goal) {
     const int z = zIndexAt(0.5 * (start.z() + goal.z()));
@@ -250,34 +269,15 @@ void PrivilegedOracle::buildConnectivityAndCostToGo(
     cost_to_go_.assign(slice, std::numeric_limits<float>::infinity());
     connected_.assign(slice, 0);
 
-    // Free = not occupied AND clearance above the free threshold.
+    // UNIFIED free-space definition (section XIV): free = not occupied AND
+    // esdf > inflation_m  (ESDF already subtracts the vehicle radius).
+    const double free_threshold = config_.inflation_m;
     auto cell_free = [&](int ix, int iy) {
         if (ix < 0 || ix >= gx_ || iy < 0 || iy >= gy_) return false;
         const size_t index = (static_cast<size_t>(ix) * gy_ + iy) * gz_ + z;
         if (occupancy_[index] != 0) return false;
-        return esdf_[index] > config_.free_clearance_m;
+        return esdf_[index] > static_cast<float>(free_threshold);
     };
-    // Inflated occupancy (for the diagnostics grid).
-    const int inflate_cells =
-        static_cast<int>(std::ceil((config_.inflation_m + config_.vehicle_radius_m) /
-                                   config_.resolution));
-    for (int ix = 0; ix < gx_; ++ix) {
-        for (int iy = 0; iy < gy_; ++iy) {
-            const size_t index = (static_cast<size_t>(ix) * gy_ + iy) * gz_ + z;
-            if (occupancy_[index] != 0) {
-                for (int dx = -inflate_cells; dx <= inflate_cells; ++dx) {
-                    for (int dy = -inflate_cells; dy <= inflate_cells; ++dy) {
-                        const int nix = ix + dx;
-                        const int niy = iy + dy;
-                        if (nix < 0 || nix >= gx_ || niy < 0 || niy >= gy_) {
-                            continue;
-                        }
-                        inflated_[static_cast<size_t>(niy) * gx_ + nix] = 1;
-                    }
-                }
-            }
-        }
-    }
 
     const Eigen::Vector3i start_g = worldToGridInt(start.x(), start.y(), start.z());
     const Eigen::Vector3i goal_g = worldToGridInt(goal.x(), goal.y(), goal.z());
@@ -289,12 +289,21 @@ void PrivilegedOracle::buildConnectivityAndCostToGo(
     const int start_index = start_g.y() * gx_ + start_g.x();
     const int goal_index = goal_g.y() * gx_ + goal_g.x();
 
+    // 8-connected with NO diagonal corner cutting (section XI): a diagonal
+    // move requires BOTH orthogonal neighbours to be free as well.
+    const int di[8] = {1, -1, 0, 0, 1, 1, -1, -1};
+    const int dj[8] = {0, 0, 1, -1, 1, -1, 1, -1};
+    auto diagonal_corner_free = [&](int ix, int iy, int n) {
+        if (di[n] != 0 && dj[n] != 0) {
+            return cell_free(ix + di[n], iy) && cell_free(ix, iy + dj[n]);
+        }
+        return true;
+    };
+
     // Flood fill from the start to check goal connectivity.
     std::vector<int> stack;
     stack.reserve(slice);
     std::vector<std::uint8_t> visited(slice, 0);
-    const int di[8] = {1, -1, 0, 0, 1, 1, -1, -1};
-    const int dj[8] = {0, 0, 1, -1, 1, -1, 1, -1};
     visited[static_cast<size_t>(start_index)] = 1;
     stack.push_back(start_index);
     bool goal_connected = false;
@@ -310,6 +319,7 @@ void PrivilegedOracle::buildConnectivityAndCostToGo(
             const int nxi = ix + di[n];
             const int nyi = iy + dj[n];
             if (nxi < 0 || nxi >= gx_ || nyi < 0 || nyi >= gy_) continue;
+            if (!diagonal_corner_free(ix, iy, n)) continue;
             const int nindex = nyi * gx_ + nxi;
             if (visited[static_cast<size_t>(nindex)] != 0) continue;
             if (!cell_free(nxi, nyi)) continue;
@@ -323,7 +333,8 @@ void PrivilegedOracle::buildConnectivityAndCostToGo(
     task_reachable_ = goal_connected;
     if (!goal_connected) return;
 
-    // Dijkstra cost-to-go from the goal over free cells.
+    // Dijkstra cost-to-go from the goal over free cells (corner-cutting
+    // rule applied, section XI).
     struct Entry {
         double cost;
         int index;
@@ -345,6 +356,7 @@ void PrivilegedOracle::buildConnectivityAndCostToGo(
             const int nxi = ix + di[n];
             const int nyi = iy + dj[n];
             if (nxi < 0 || nxi >= gx_ || nyi < 0 || nyi >= gy_) continue;
+            if (!diagonal_corner_free(ix, iy, n)) continue;
             const int nindex = nyi * gx_ + nxi;
             if (!cell_free(nxi, nyi)) continue;
             const double step =

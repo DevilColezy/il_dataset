@@ -189,22 +189,39 @@ LocalPathResult LocalPathSearch::search(const ObservedMap& map,
         const int cx = current.index / ny + min_ix;
         const int cy = current.index % ny + min_iy;
         const Eigen::Vector3d current_world = worldPoint(cx, cy);
+        auto cellPassable = [&](int ix, int iy) {
+            if (ix < min_ix || ix > max_ix || iy < min_iy || iy > max_iy) {
+                return false;
+            }
+            if (config.forbid_unknown) {
+                const Eigen::Vector3d w = worldPoint(ix, iy);
+                if (!map.isKnownFree(w.x(), w.y(), w.z(),
+                                     config.search_clearance_m)) {
+                    return false;
+                }
+            }
+            return true;
+        };
         for (int n = 0; n < 8; ++n) {
             const int nxi = cx + di[n];
             const int nyi = cy + dj[n];
             if (nxi < min_ix || nxi > max_ix || nyi < min_iy || nyi > max_iy) {
                 continue;
             }
+            // Diagonal corner-cutting rule (section XI): a diagonal move
+            // requires BOTH orthogonal neighbours to be passable.
+            if (di[n] != 0 && dj[n] != 0) {
+                if (!cellPassable(cx + di[n], cy) ||
+                    !cellPassable(cx, cy + dj[n])) {
+                    continue;
+                }
+            }
+            if (!cellPassable(nxi, nyi)) continue;
             const int next_index = encode(nxi - min_ix, nyi - min_iy);
             const size_t ni = static_cast<size_t>(next_index);
             if (closed[ni] != 0) continue;
             const Eigen::Vector3d next_world = worldPoint(nxi, nyi);
             const double step = (next_world - current_world).norm();
-            if (config.forbid_unknown &&
-                !map.isKnownFree(next_world.x(), next_world.y(),
-                                 next_world.z(), config.search_clearance_m)) {
-                continue;
-            }
             double cost = step;
             // Committed-side lateral bias (soft, never hard-blocking).
             if (config.committed_side != Side::NONE &&
@@ -245,6 +262,23 @@ LocalPathResult LocalPathSearch::search(const ObservedMap& map,
     };
 
     double min_clearance = inf;
+    // Continuous verification of EVERY reconstructed edge (section XI):
+    // only fully clear paths may claim FULL_GOAL_REACHED.
+    auto verify_edges = [&](std::vector<Eigen::Vector3d>* path) {
+        size_t verified_end = 0;
+        for (size_t i = 0; i + 1 < path->size(); ++i) {
+            if (segmentClear(map, (*path)[i], (*path)[i + 1],
+                             config.search_clearance_m,
+                             0.5 * config.search_clearance_m)) {
+                verified_end = i + 1;
+            } else {
+                break;
+            }
+        }
+        path->resize(verified_end + 1);
+        return verified_end;
+    };
+
     if (goal_reached) {
         std::vector<Eigen::Vector3d> path = reconstruct(goal_index);
         if (path.empty() ||
@@ -253,19 +287,27 @@ LocalPathResult LocalPathSearch::search(const ObservedMap& map,
             return result;
         }
         path.front() = state.position;
-        // Verify the continuous segment from the goal cell centre to the
-        // exact goal.  Only then is the terminal the exact goal.
         path.back() = goal_cell_center;
-        if (segmentClear(map, goal_cell_center, goal_world,
+        const size_t original_size = path.size();
+        const size_t verified_end = verify_edges(&path);
+        // Final continuous segment from the goal cell centre to the exact
+        // goal.  Only then is the terminal the exact goal.
+        const bool final_clear =
+            segmentClear(map, goal_cell_center, goal_world,
                          config.search_clearance_m,
-                         0.5 * config.search_clearance_m)) {
+                         0.5 * config.search_clearance_m);
+        const bool all_edges_ok = verified_end + 1 == original_size;
+        if (final_clear && all_edges_ok) {
             path.back() = goal_world;
             result.status = LocalPathResult::Status::FULL_GOAL_REACHED;
             result.terminal = goal_world;
         } else {
             result.status = LocalPathResult::Status::PARTIAL_TERMINAL_REACHED;
-            result.terminal = goal_cell_center;
-            result.failure_reason = "goal_cell_to_exact_goal_not_clear";
+            result.terminal = path.back();
+            result.failure_reason =
+                all_edges_ok
+                    ? "goal_cell_to_exact_goal_not_clear"
+                    : "continuous_path_not_fully_clear";
         }
         result.full_goal_reached =
             result.status == LocalPathResult::Status::FULL_GOAL_REACHED;
@@ -275,6 +317,11 @@ LocalPathResult LocalPathSearch::search(const ObservedMap& map,
         std::vector<Eigen::Vector3d> path = reconstruct(best_index);
         if (!path.empty()) {
             path.front() = state.position;
+            const size_t verified_end = verify_edges(&path);
+            if (verified_end == 0 || path.size() < 2) {
+                result.failure_reason = "no_verified_safe_segment";
+                return result;
+            }
             result.status = LocalPathResult::Status::PARTIAL_TERMINAL_REACHED;
             result.found_partial = true;
             result.path = std::move(path);

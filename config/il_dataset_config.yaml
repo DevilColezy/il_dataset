@@ -1,5 +1,5 @@
 # ============================================================================
-#  Imitation Learning Dataset Collection — Two-Level Navigation Expert (schema v19)
+#  Imitation Learning Dataset Collection — Two-Level Navigation Expert (schema v20)
 # ============================================================================
 #
 #  Architecture:
@@ -11,7 +11,7 @@
 #    local_path_search  observed-map A* (C++, 30 Hz)
 #    trajectory_optimization  B-spline trajectory optimization (C++, 30 Hz)
 #    yaw_planning       FOV-constrained yaw trajectory (C++)
-#    privileged_intervention  low-frequency global viability evaluator (C++)
+#    privileged_intervention  privileged LOCAL-SCALE audit (C++, section II)
 #    trajectory_controller  30 Hz command extraction + limits
 #    execution_safety   fresh/cached/rotate/brake/emergency selection
 #    dataset_logging    recorded fields and files
@@ -90,6 +90,10 @@ global:
       initial_angular_velocity_noise_std_rps: [0.0, 0.0, 0.0]
 
   # ── Privileged global map (section VII) ────────────────────────────
+  # UNIFIED ESDF semantics (section XIV/XV): the global ESDF value is
+  #   esdf = distance_to_obstacle_surface - vehicle_radius
+  # Free space is everywhere  esdf > inflation_m  (never re-subtracting the
+  # vehicle radius).
   task_oracle:
     # Task manifests: each JSON file provides start/goal/initial_yaw and an
     # optional obstacle list sent to Unity.  Files are consumed in order.
@@ -100,7 +104,6 @@ global:
     max_esdf_distance_m:   8.0
     min_z_m:              -5.0
     max_z_m:               8.0
-    free_clearance_m:      0.10
     cost_to_go_cap_m:     30.0
     # Candidate scoring weights (lower score = better).
     weight_observed_cost:  1.0
@@ -136,10 +139,16 @@ global:
     update_hz:               5.0
     # Direct-guide lookahead (min(goal_distance, this)).
     macro_lookahead_distance_m: 4.5
-    # Hysteresis: DIRECT -> SIDE/OBSERVE after N non-recoverable ticks.
-    direct_to_side_frames:      2
-    # SIDE -> DIRECT after N consecutive recoverable ticks with progress.
-    side_to_direct_frames:      3
+    # Causal evidence: observed-recoverable DIRECT is upgraded to macro
+    # intervention only after this many consecutive macro ticks with local
+    # replanning failures (cached / BRAKE_HOLD) — privilege never alone.
+    causal_evidence_frames:     2
+    # Rolling SIDE / OBSERVE progress thresholds (section VII).
+    side_no_progress_seconds:   6.0
+    observe_no_progress_seconds: 4.0
+    progress_cost_epsilon_m:    0.10
+    progress_arc_epsilon_m:     0.05
+    local_path_fail_threshold:  2
     # Minimum goal-progress rate (m/s) that keeps the current state valid.
     min_goal_progress_m_s:      0.15
     # Goal reached condition (distance + speed).
@@ -194,20 +203,30 @@ global:
     region_margin_m:     2.0
     forbid_unknown:     true
 
-  # ── Privileged macro-intervention evaluation (section III) ─────────
-  # Decides, at low frequency, whether the direct goal intent remains
-  # globally viable.  It never emits hidden waypoints or a hidden side
-  # answer; it only gates intervention and ranks observable sides.
+  # ── Privileged LOCAL-SCALE audit (section II/III) ──────────────────
+  # Runs a short-range A* on the FULL map with geometry matching the
+  # observed local recoverability; ALLOWS local bypass (never a direct-ray
+  # collision check).  Its result is an auxiliary label / audit — it never
+  # directly changes the main macro mode without causal evidence.
   privileged_intervention:
-    lateral_offset_m:          1.5
-    min_global_clearance_m:    0.20
-    max_direct_detour_ratio:   1.6
-    cost_margin_m:             2.0
-    lookahead_sampling_m:      4.0
-    loop_revisit_radius_m:     0.8
-    loop_history_size:        40
-    loop_min_revisits:         2
-    loop_min_speed_mps:        0.3
+    search_clearance_m:     0.25
+    search_max_time_ms:    20.0
+    horizon_time_s:         2.5
+    max_path_length_m:      6.0
+    nominal_speed_mps:      1.8
+    min_goal_progress_m:    0.30
+    min_terminal_alignment: 0.5
+    rejoin_radius_m:        0.6
+    # Loop detection (section IX).
+    loop_ignore_recent_s:   2.5
+    loop_leave_radius_m:    1.6
+    loop_revisit_radius_m:  0.8
+    loop_min_speed_mps:     0.3
+    loop_min_revisits:      2
+    loop_history_size:     60
+    # Side-selection cost margin (Python): only switch sides when the
+    # privileged global cost difference is at least this large.
+    cost_margin_m:          2.0
 
   # ── B-spline trajectory optimization (section X.4) ─────────────────
   # The A* search and yaw parameters live in local_path_search and
@@ -277,7 +296,7 @@ global:
 
   # ── Dataset logging (section XIV) ──────────────────────────────────
   dataset_logging:
-    schema_version: 19
+    schema_version: 20
     depth_in_memory: true
     write_local_plan_points: true
     collect_privileged_diagnostics: true

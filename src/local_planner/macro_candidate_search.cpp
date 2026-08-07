@@ -53,6 +53,9 @@ LocalSearchConfig makeSearchConfig(const MacroCandidateConfig& config,
     return search_config;
 }
 
+/// World delta -> FLU using yaw only (level body).  UNIFIED FLU convention
+/// (section XX): +x forward, +y left, +z up.  This is the exact same math
+/// as Python `il_common.world_vector_to_body_flu`.
 Eigen::Vector3d worldToFlu(const Eigen::Vector3d& world_delta, double yaw) {
     const double c = std::cos(yaw);
     const double s = std::sin(yaw);

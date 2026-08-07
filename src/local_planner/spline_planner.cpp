@@ -862,15 +862,16 @@ ValidationResult LocalPlanner::validateTrajectory(
     }
     result.all_clear = true;
     double min_clearance = std::numeric_limits<double>::infinity();
-    for (size_t i = 0; i < trajectory.size(); ++i) {
-        const TrajectoryPoint& point = trajectory[i];
+
+    auto check_point = [&](const TrajectoryPoint& point, bool* clear_ok) {
         if (!point.position.allFinite() || !point.velocity.allFinite() ||
             !point.acceleration.allFinite()) {
             result.any_collision = true;
             result.all_clear = false;
             result.worst_position = point.position;
             result.worst_time = point.t;
-            return result;
+            *clear_ok = false;
+            return;
         }
         const bool known =
             map_->isKnown(point.position.x(), point.position.y(),
@@ -892,6 +893,38 @@ ValidationResult LocalPlanner::validateTrajectory(
                 result.worst_time = point.t;
             }
             if (!known) result.any_unknown = true;
+            *clear_ok = false;
+        }
+    };
+
+    for (size_t i = 0; i < trajectory.size(); ++i) {
+        bool ok = true;
+        check_point(trajectory[i], &ok);
+        if (!ok) return result;
+        // Spatial interpolation (section XVI): the maximum collision-check
+        // spacing along the trajectory must be <= collision_check_spacing,
+        // regardless of the output time step (dt).  Between two samples
+        // farther apart than the spacing, interpolate and check each point.
+        if (i + 1 < trajectory.size()) {
+            const Eigen::Vector3d seg =
+                trajectory[i + 1].position - trajectory[i].position;
+            const double seg_len = seg.norm();
+            const double spacing =
+                std::max(0.02, config_.collision_check_spacing);
+            if (seg_len > spacing) {
+                const int steps = static_cast<int>(std::ceil(seg_len / spacing));
+                for (int k = 1; k < steps; ++k) {
+                    TrajectoryPoint interp;
+                    const double alpha = static_cast<double>(k) / steps;
+                    interp.t = trajectory[i].t +
+                               alpha * (trajectory[i + 1].t - trajectory[i].t);
+                    interp.position =
+                        trajectory[i].position + alpha * seg;
+                    bool interp_ok = true;
+                    check_point(interp, &interp_ok);
+                    if (!interp_ok) return result;
+                }
+            }
         }
     }
     result.min_clearance =
@@ -903,7 +936,6 @@ ValidationResult LocalPlanner::validateTrajectorySuffix(
     const std::vector<TrajectoryPoint>& trajectory,
     double plan_start_time,
     double current_time,
-    double controller_preview_time,
     const VehicleState& state,
     double min_clearance,
     double max_position_error,
@@ -917,20 +949,59 @@ ValidationResult LocalPlanner::validateTrajectorySuffix(
         return result;
     }
     if (trajectory.empty() || !std::isfinite(plan_start_time) ||
-        !std::isfinite(current_time) || !std::isfinite(controller_preview_time)) {
+        !std::isfinite(current_time)) {
         result.all_clear = false;
         result.any_collision = true;
         return result;
     }
-    // The controller needs a small preview window ahead of the current
-    // execution point; validation starts after it.
     const double elapsed = current_time - plan_start_time;
-    const double suffix_start = std::max(0.0, elapsed + controller_preview_time);
+    const double age = std::max(0.0, elapsed);
 
+    // Interpolate the reference position / velocity AT the current age
+    // (section X) — the drone is re-executing the REMAINING segment, so
+    // the state must match the trajectory sampled at `age`, not at t=0.
+    auto sample_at = [&](double t, Eigen::Vector3d* pos,
+                         Eigen::Vector3d* vel) {
+        if (t <= trajectory.front().t) {
+            *pos = trajectory.front().position;
+            *vel = trajectory.front().velocity;
+            return;
+        }
+        if (t >= trajectory.back().t) {
+            *pos = trajectory.back().position;
+            *vel = trajectory.back().velocity;
+            return;
+        }
+        for (size_t i = 0; i + 1 < trajectory.size(); ++i) {
+            if (trajectory[i + 1].t < t) continue;
+            const TrajectoryPoint& a = trajectory[i];
+            const TrajectoryPoint& b = trajectory[i + 1];
+            const double dt = std::max(1.0e-6, b.t - a.t);
+            const double alpha = std::max(0.0, std::min(1.0, (t - a.t) / dt));
+            *pos = (1.0 - alpha) * a.position + alpha * b.position;
+            *vel = (1.0 - alpha) * a.velocity + alpha * b.velocity;
+            return;
+        }
+    };
+    Eigen::Vector3d ref_pos, ref_vel;
+    sample_at(age, &ref_pos, &ref_vel);
+    const double position_error = (state.position - ref_pos).norm();
+    const double velocity_error = (state.velocity - ref_vel).norm();
+    if (position_error > max_position_error ||
+        velocity_error > max_velocity_error) {
+        result.all_clear = false;
+        result.any_collision = true;
+        result.worst_position = state.position;
+        result.worst_time = age;
+        return result;
+    }
+
+    // Safety validation starts AT the current age (the segment between the
+    // actual state and the controller preview reference is validated too).
     double min_clear = std::numeric_limits<double>::infinity();
     for (size_t i = 0; i < trajectory.size(); ++i) {
         const TrajectoryPoint& point = trajectory[i];
-        if (point.t < suffix_start - 1.0e-6) continue;
+        if (point.t < age - 1.0e-6) continue;
         if (!point.position.allFinite() || !point.velocity.allFinite() ||
             !point.acceleration.allFinite()) {
             result.any_collision = true;
@@ -960,16 +1031,6 @@ ValidationResult LocalPlanner::validateTrajectorySuffix(
             }
             if (!known) result.any_unknown = true;
         }
-    }
-    // Track-vs-trajectory deviation at the current state.
-    const double position_error =
-        (state.position - trajectory.front().position).norm();
-    const double velocity_error =
-        (state.velocity - trajectory.front().velocity).norm();
-    if (position_error > max_position_error ||
-        velocity_error > max_velocity_error) {
-        result.all_clear = false;
-        result.any_collision = true;
     }
     result.min_clearance = std::isfinite(min_clear) ? min_clear : 0.0;
     return result;

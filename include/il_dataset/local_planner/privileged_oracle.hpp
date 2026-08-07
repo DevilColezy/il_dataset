@@ -10,19 +10,26 @@
 namespace il_dataset {
 
 /// Configuration for the privileged global map (section VII).
+///
+/// UNIFIED ESDF SEMANTICS (section XIV/XV): the global ESDF value is
+///     esdf = distance_to_obstacle_surface - vehicle_radius
+/// i.e. it represents clearance from the INFLATED vehicle body.  Free
+/// space everywhere uses
+///     esdf > additional_safety_margin
+/// where the additional safety margin is `inflation_m` (connectivity,
+/// Dijkstra, candidate feasibility, privileged local recoverability).
+/// The vehicle radius is NEVER double counted.
 struct PrivilegedOracleConfig {
     double resolution = 0.10;
     double vehicle_radius_m = 0.30;
-    /// Extra inflation added on top of the vehicle radius for the
-    /// connectivity / cost-to-go free-space definition.
+    /// The single additional safety margin (m) on top of the vehicle
+    /// radius used for ALL global free-space definitions.
     double inflation_m = 0.30;
     double max_esdf_distance_m = 8.0;
     /// Margin added around the start-goal bounding box for the grid.
     double map_margin_m = 2.0;
     double min_z_m = 0.0;
     double max_z_m = 8.0;
-    /// Minimum clearance for a cell to be considered free (connectivity).
-    double free_clearance_m = 0.10;
     /// Cap for cost-to-go values.
     double cost_to_go_cap_m = 30.0;
     /// Candidate scoring weights (lower score = better).
@@ -44,10 +51,11 @@ struct PrivilegedOracleConfig {
 };
 
 /// Privileged global map built once per task from the exported global
-/// point cloud: occupancy, inflated obstacle map, global ESDF, global
-/// connectivity and a goal-reversed cost-to-go.  Used ONLY for macro
-/// candidate evaluation and dataset diagnostics — never for the 30 Hz
-/// observed-map planning or the student inputs.
+/// point cloud: occupancy, global ESDF (distance - vehicle_radius), global
+/// connectivity and a goal-reversed cost-to-go.  Free space is everywhere
+///  esdf > inflation_m  (unified definition, section XIV).  Used ONLY for
+/// macro candidate evaluation and dataset diagnostics — never for the
+/// 30 Hz observed-map planning or the student inputs.
 class PrivilegedOracle {
 public:
     PrivilegedOracle() = default;
@@ -67,6 +75,11 @@ public:
     bool isOccupied(double x, double y, double z) const;
     /// Global ESDF clearance (vehicle radius already subtracted).
     double clearance(double x, double y, double z) const;
+    /// Unified global free-space test: in-bounds AND
+    /// clearance(x,y,z) > required_clearance.  The vehicle radius is
+    /// already inside the ESDF value, so `required_clearance` is an extra
+    /// safety margin (same definition as inflation_m).
+    bool isFree(double x, double y, double z, double required_clearance) const;
     /// Goal-reversed cost-to-go at the drone's height slice (NaN when the
     /// cell is not free / outside the grid).
     double costToGo(double x, double y, double z) const;
@@ -99,9 +112,6 @@ public:
     double resolution() const { return config_.resolution; }
     const std::vector<float>& esdf() const { return esdf_; }
     const std::vector<float>& costToGoGrid() const { return cost_to_go_; }
-    const std::vector<std::uint8_t>& inflatedOccupancy() const {
-        return inflated_;
-    }
 
 private:
     Eigen::Vector3i worldToGridInt(double x, double y, double z) const;
@@ -118,7 +128,6 @@ private:
     int gz_ = 0;
     Eigen::Vector3d origin_world_{Eigen::Vector3d::Zero()};
     std::vector<std::uint8_t> occupancy_;  // 0 free, 1 occupied
-    std::vector<std::uint8_t> inflated_;   // 0 free, 1 blocked (inflated)
     std::vector<float> esdf_;
     std::vector<float> cost_to_go_;  // 2D [gx, gy] at a reference z slice
     int cost_to_go_z_ = -1;

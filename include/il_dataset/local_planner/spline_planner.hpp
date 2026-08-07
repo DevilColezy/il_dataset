@@ -101,20 +101,18 @@ public:
         const std::vector<TrajectoryPoint>& trajectory) const;
 
     /// Validate the SUFFIX of a previously planned trajectory that is being
-    /// re-executed from the cache (section VIII).  Checks the segment
-    /// [plan_start_time + controller_preview_time + current_time,
-    ///  end] against the CURRENT observed map.  Unknown or colliding points
-    /// invalidate the suffix.
+    /// re-executed from the cache (section VIII/X).  The current state is
+    /// compared against the trajectory INTERPOLATED at the current age
+    /// (position_at_age, velocity_at_age) — never against trajectory[0].
+    /// Safety validation starts AT the current age (the segment between the
+    /// actual state and the preview reference is validated too).
     ///  - plan_start_time: wall time when the trajectory was planned (s).
     ///  - current_time:    wall time now (s).
-    ///  - controller_preview_time: look-ahead the controller needs.
-    /// Returns a ValidationResult (trajectory_time is the validated suffix
-    /// start time in trajectory-relative seconds).
+    /// Returns a ValidationResult.
     ValidationResult validateTrajectorySuffix(
         const std::vector<TrajectoryPoint>& trajectory,
         double plan_start_time,
         double current_time,
-        double controller_preview_time,
         const VehicleState& state,
         double min_clearance,
         double max_position_error,

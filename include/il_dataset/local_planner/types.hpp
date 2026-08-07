@@ -247,34 +247,40 @@ struct BrakeRiskResult {
 };
 
 /// Reason code of the privileged intervention evaluation (section III).
-/// Enumerated — never free-form strings.
+/// Enumerated — never free-form strings.  Describes WHY the direct intent
+/// is NOT locally recoverable in the full map.
 enum class InterventionReason : int {
-    DIRECT_GLOBALLY_VALID = 0,
-    DIRECT_LONG_WALL_BLOCKED = 1,
-    DIRECT_WRONG_HOMOTOPY = 2,
-    DIRECT_GLOBAL_DISCONNECTED = 3,
-    DIRECT_EXCESSIVE_DETOUR = 4,
-    DIRECT_LOOP_RISK = 5,
-    LEFT_ONLY_FEASIBLE = 6,
-    RIGHT_ONLY_FEASIBLE = 7,
-    BOTH_SIDES_FEASIBLE = 8,
-    NO_GLOBAL_ROUTE = 9,
+    DIRECT_GLOBALLY_VALID = 0,      // privileged local recoverable
+    DIRECT_LONG_WALL_BLOCKED = 1,   // local horizon cannot bypass (long wall / large area)
+    DIRECT_GLOBAL_DISCONNECTED = 2, // guide region disconnected from the goal
+    DIRECT_EXCESSIVE_DETOUR = 3,    // local bypass path too long / detours
+    DIRECT_LOOP_RISK = 4,           // persistent loop in the trajectory history
+    NO_GLOBAL_ROUTE = 5,            // current region has no global route to the goal
 };
 
-/// Result of the privileged macro-intervention evaluation (section III).
+/// Result of the privileged LOCAL-SCALE audit (section II/III).
+///
+/// The oracle answers the question: "given the full map, would the 30 Hz
+/// local layer — with its own finite horizon and bypass ability — be able
+/// to recover the direct intent (re-enter the direct guide)?"  It runs a
+/// short-range search with geometry as consistent as possible with the
+/// OBSERVED local recoverability, ALLOWING local bypass.  It never uses a
+/// straight-line direct-ray collision check.
 struct PrivilegedInterventionResult {
-    /// Direct intent can still efficiently connect to the goal.
-    bool direct_viable = true;
-    /// The macro layer should intervene (provide strategic guidance).
-    bool intervention_required = false;
-    bool left_globally_feasible = false;
-    bool right_globally_feasible = false;
+    /// Full map says the direct intent is locally recoverable.
+    bool privileged_local_recoverable = true;
+    bool privileged_rejoin_reached = false;
+    double privileged_local_path_length = 0.0;
+    double privileged_local_duration = 0.0;
+    double privileged_detour_ratio = 0.0;
+    double privileged_min_clearance = 0.0;
+    double privileged_goal_progress = 0.0;
+    /// Future macro intervention will likely be required (auxiliary label /
+    /// episode analysis ONLY — never gates the main macro mode).
+    bool privileged_future_intervention_required = false;
+    double current_cost_to_go = 0.0;
     double direct_cost_to_go = 0.0;
-    double left_cost_to_go = 0.0;
-    double right_cost_to_go = 0.0;
-    double direct_detour_ratio = 0.0;
-    double direct_min_clearance = 0.0;
-    double decision_margin = 0.0;
+    bool loop_risk = false;
     InterventionReason reason = InterventionReason::DIRECT_GLOBALLY_VALID;
 };
 

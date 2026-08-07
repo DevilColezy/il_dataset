@@ -102,7 +102,7 @@ class ILManager(object):
         # Bridge
         self._bridge = UnityBridge(self.g["pub_port"], self.g["sub_port"])
         self._frame_latencies = []
-        self._frame_valid_ratios = []
+        self._frame_finite_ratios = []
 
         # C++ modules
         self._observed_map = module.ObservedMap(build_observed_map_config(self.g, module))
@@ -355,10 +355,14 @@ class ILManager(object):
         self._local_unrecoverable_pending = False
         self._brake_hold_time = 0.0
         self._emergency_stop_time = 0.0
+        # Executed-plan semantics (sections XVII/XVIII): the ACTIVE plan is
+        # the trajectory actually being executed (fresh or cached suffix).
+        self._active_result = None
+        self._active_plan_start_time = None
         self._total_plans = 0
         self._successful_plans = 0
         self._frame_latencies = []
-        self._frame_valid_ratios = []
+        self._frame_finite_ratios = []
         self._unmatched_frames = 0
         self._exact_matches = 0
         self._last_velocity_world = None
@@ -431,14 +435,19 @@ class ILManager(object):
             if depth_frame is None:
                 self._exit_reason = "depth_frame_timeout"
                 break
-            depth_m, depth_valid_ratio, latency_ms = depth_frame
+            depth_m_raw, depth_student, raw_finite_ratio, latency_ms = \
+                depth_frame
             self._frame_latencies.append(latency_ms)
-            self._frame_valid_ratios.append(depth_valid_ratio)
+            self._frame_finite_ratios.append(raw_finite_ratio)
 
             # ── 3. Observed map integration (C++) ───────────────────
+            # The RAW depth (with NaN/Inf preserved) is integrated; the C++
+            # map classifies ray validity itself (section XII).  The
+            # canonicalised student depth is ONLY recorded, never used for
+            # ray integration.
             recentered = self._observed_map.recenter_if_needed(pos)
             self._observed_map.integrate_depth(
-                depth_m.astype(np.float32), pos, quat, timestamp)
+                depth_m_raw.astype(np.float32), pos, quat, timestamp)
             if recentered:
                 # The map was wiped; integrate first, then rebuild so the
                 # free bubble and rays are reflected.
@@ -498,11 +507,25 @@ class ILManager(object):
                 self._local_unrecoverable_pending = False
                 last_trajectory = result.trajectory
                 last_plan_time = elapsed
-            elif execution_mode == module.ExecutionMode.TRACK_CACHED:
+
+            # Executed-plan semantics (sections XVII/XVIII): the training
+            # labels and plan metadata must describe the ACTIVE executed
+            # trajectory, not the failed planning attempt of this frame.
+            if execution_mode == module.ExecutionMode.TRACK_FRESH:
+                self._active_result = result
+                self._active_plan_start_time = elapsed
+                executed_result = result
+            elif execution_mode == module.ExecutionMode.TRACK_CACHED and \
+                    self._active_result is not None:
+                executed_result = self._active_result
+            else:
+                executed_result = result
+            if execution_mode == module.ExecutionMode.TRACK_CACHED:
                 # Cached execution: the planner failed but the previous
                 # trajectory suffix is still safe (no episode abort).
                 pass
-            else:
+            elif execution_mode not in (
+                    module.ExecutionMode.TRACK_FRESH,):
                 self._consecutive_plan_failures += 1
                 self._local_unrecoverable_pending = \
                     self._consecutive_plan_failures >= 2
@@ -540,10 +563,13 @@ class ILManager(object):
             self._writer.write_sync(
                 frame_id, latency_ms, "frame_id_exact", False,
                 self._exact_matches, self._unmatched_frames)
+            plan_age_s = elapsed - self._active_plan_start_time \
+                if self._active_plan_start_time is not None else 0.0
             self._write_row(frame_id, sample_index, elapsed, state, ds,
-                            depth_m, depth_valid_ratio, latency_ms,
-                            held_action, result, execution_mode, fresh_plan,
-                            cached_used, cmd)
+                            depth_student, raw_finite_ratio, latency_ms,
+                            held_action, executed_result, result,
+                            execution_mode, fresh_plan, cached_used, cmd,
+                            plan_age_s)
             self._matched_frames += 1
 
             sample_index += 1
@@ -596,16 +622,30 @@ class ILManager(object):
                         (self._depth_cfg.get("height", 480),
                          self._depth_cfg.get("width", 640)))
                     # AvoidBench validated convention: raw * 100 = metres.
-                    valid = np.isfinite(depth) & (depth > 0)
-                    valid_ratio = float(np.mean(valid))
-                    depth_m = np.flipud(depth * 100.0)
-                    depth_m = np.nan_to_num(
-                        depth_m, nan=self._depth_cfg.get("max_m", 5.0),
-                        posinf=self._depth_cfg.get("max_m", 5.0), neginf=0.0)
-                    depth_m = np.clip(depth_m, 0.0,
-                                      self._depth_cfg.get("max_m", 5.0))
+                    # Section XII: validity is decided on the RAW frame
+                    # BEFORE any NaN/Inf -> max replacement.  NaN/Inf/<=0
+                    # pixels are "no valid measurement" (they must NOT be
+                    # interpreted as free-to-max rays).  The RAW metres are
+                    # handed to the C++ observed map which performs the
+                    # ray-validity classification itself.
+                    depth_m_raw = np.flipud(depth * 100.0)
+                    valid = np.isfinite(depth_m_raw) & (depth_m_raw > 0.0)
+                    raw_finite_ratio = float(np.mean(valid))
+                    # Canonicalised STUDENT depth (network input, single
+                    # channel, no mask): invalid / no-return -> perception
+                    # range, clipped.  Never re-used for map integration.
+                    perception_range = self.g.get(
+                        "dataset_logging", {}).get("perception_range_m",
+                                                   self._depth_cfg.get(
+                                                       "max_m", 5.0))
+                    depth_student = np.nan_to_num(
+                        depth_m_raw, nan=perception_range,
+                        posinf=perception_range, neginf=0.0)
+                    depth_student = np.clip(
+                        depth_student, 0.0, perception_range)
                     self._exact_matches += 1
-                    return depth_m, valid_ratio, latency_ms
+                    return depth_m_raw, depth_student, raw_finite_ratio, \
+                        latency_ms
         self._unmatched_frames += 1
         return None
 
@@ -633,10 +673,8 @@ class ILManager(object):
                     vs.yaw = state["yaw"]
                     vs.yaw_rate = state["yaw_rate"]
                     valid = self._local_planner.validate_trajectory_suffix(
-                        last_trajectory, last_plan_time, elapsed,
-                        self._controller_cfg.get(
-                            "velocity_lookahead_time_s", 0.08),
-                        vs, self.g.get("trajectory_optimization", {}).get(
+                        last_trajectory, last_plan_time, elapsed, vs,
+                        self.g.get("trajectory_optimization", {}).get(
                             "min_clearance", 0.02),
                         safety.get("max_position_error_m", 0.50),
                         safety.get("max_velocity_error_mps", 1.00))
@@ -681,7 +719,6 @@ class ILManager(object):
             vs,
             self._safety_cfg.get("brake_reaction_delay_s", 0.10),
             self._safety_cfg.get("emergency_deceleration_mps2", 5.0),
-            self.g.get("vehicle", {}).get("radius_m", 0.30),
             self.g.get("vehicle", {}).get("safety_margin_m", 0.20),
             0.05)
         return bool(brake_result.risk)
@@ -825,8 +862,9 @@ class ILManager(object):
 
     # ── Dataset row (section XIV) ────────────────────────────────────
     def _write_row(self, frame_id, sample_index, elapsed, state, ds,
-                   depth_m, depth_valid_ratio, latency_ms, held_action,
-                   result, execution_mode, fresh_plan, cached_used, cmd):
+                   depth_student, raw_finite_ratio, latency_ms, held_action,
+                   executed_result, planning_attempt, execution_mode,
+                   fresh_plan, cached_used, cmd, plan_age_s):
         pos = state["position"]
         quat = ds.quaternion_world_body
         goal = self._current_task["goal"]
@@ -848,9 +886,15 @@ class ILManager(object):
                 guide_flu = world_vector_to_body_flu_quat(delta, quat)
                 guide_dir_flu = guide_flu / guide_dist
 
+        # Executed-plan semantics (section XVIII): local_terminal,
+        # minimum_clearance, plan age and plan status all describe the
+        # ACTIVE executed trajectory (fresh or cached), while the fresh
+        # planning attempt status is kept as a pure diagnostic.
+        executed_ok = executed_result.success and \
+            len(executed_result.trajectory) > 0
         local_terminal_flu = np.zeros(3)
-        if result.success and len(result.trajectory) > 0:
-            terminal = result.trajectory_terminal
+        if executed_ok:
+            terminal = executed_result.trajectory_terminal
             tdelta = terminal - pos
             if np.linalg.norm(tdelta) > 1e-9:
                 local_terminal_flu = world_vector_to_body_flu_quat(tdelta, quat)
@@ -872,15 +916,34 @@ class ILManager(object):
             right_corridor = int(blocker.right_corridor_known)
         privileged_side, margin = self._oracle.privileged_best_side(
             self._macro_expert.last_candidates)
-        # The intervention evaluator is the authoritative decision-margin
-        # source (section III).
-        if intervention is not None:
-            margin = float(intervention.decision_margin)
-        privileged_intervention_required = \
-            int(intervention.intervention_required) if \
-            intervention is not None else 0
-        privileged_direct_viable = \
-            int(intervention.direct_viable) if intervention is not None else 1
+        # The decision margin is computed by the macro from the viable
+        # candidate global costs (section VI).
+        privileged_local_recoverable = \
+            int(intervention.privileged_local_recoverable) \
+            if intervention is not None else 1
+        privileged_future_intervention_required = \
+            int(intervention.privileged_future_intervention_required) \
+            if intervention is not None else 0
+        privileged_rejoin_reached = \
+            int(intervention.privileged_rejoin_reached) \
+            if intervention is not None else 0
+        privileged_local_path_length = \
+            float(intervention.privileged_local_path_length) \
+            if intervention is not None else -1.0
+        privileged_local_duration = \
+            float(intervention.privileged_local_duration) \
+            if intervention is not None else -1.0
+        privileged_detour_ratio = \
+            float(intervention.privileged_detour_ratio) \
+            if intervention is not None else -1.0
+        privileged_min_clearance = \
+            float(intervention.privileged_min_clearance) \
+            if intervention is not None else -1.0
+        privileged_goal_progress = \
+            float(intervention.privileged_goal_progress) \
+            if intervention is not None else -1.0
+        causal_intervention_evidence = \
+            int(self._macro_expert.causal_intervention_evidence)
         macro_decision_observable = \
             int(self._macro_expert.macro_decision_observable)
         macro_decision_confidence = \
@@ -904,8 +967,15 @@ class ILManager(object):
             global_ctg = -1.0
             global_clearance = -1.0
             candidate_costs = ""
-            privileged_intervention_required = 0
-            privileged_direct_viable = 1
+            privileged_local_recoverable = 1
+            privileged_future_intervention_required = 0
+            privileged_rejoin_reached = 0
+            privileged_local_path_length = -1.0
+            privileged_local_duration = -1.0
+            privileged_detour_ratio = -1.0
+            privileged_min_clearance = -1.0
+            privileged_goal_progress = -1.0
+            causal_intervention_evidence = 0
             macro_decision_observable = 1
             macro_decision_confidence = 0.0
 
@@ -914,7 +984,7 @@ class ILManager(object):
         yaw = state["yaw"]
         desired_yaw_delta = normalize_angle(desired_yaw - yaw)
 
-        self._writer.write_depth(frame_id, depth_m, depth_valid_ratio)
+        self._writer.write_depth(frame_id, depth_student, raw_finite_ratio)
         depth_file = self._writer.depth_file_for(frame_id)
         row = {
             "timestamp_ns": time.time_ns(),
@@ -942,7 +1012,7 @@ class ILManager(object):
             "gravity_dy_flu": gravity_flu[1],
             "gravity_dz_flu": gravity_flu[2],
             "depth_file": depth_file,
-            "depth_valid_mask_ratio": depth_valid_ratio,
+            "raw_depth_finite_ratio": raw_finite_ratio,
             "goal_direction_flu_x": goal_dir_flu[0],
             "goal_direction_flu_y": goal_dir_flu[1],
             "goal_direction_flu_z": goal_dir_flu[2],
@@ -961,6 +1031,7 @@ class ILManager(object):
             "macro_decision_observable": macro_decision_observable,
             "macro_decision_confidence": macro_decision_confidence,
             "macro_decision_margin": margin,
+            "causal_intervention_evidence": causal_intervention_evidence,
             "macro_guide_world_x": held_action.guide_world[0] if
             held_action.guide_world is not None else 0.0,
             "macro_guide_world_y": held_action.guide_world[1] if
@@ -978,13 +1049,13 @@ class ILManager(object):
             "desired_yaw_delta": desired_yaw_delta,
             "desired_yaw_sin": math.sin(desired_yaw_delta),
             "desired_yaw_cos": math.cos(desired_yaw_delta),
-            # local labels
-            "local_terminal_world_x": result.trajectory_terminal[0] if
-            result.success else 0.0,
-            "local_terminal_world_y": result.trajectory_terminal[1] if
-            result.success else 0.0,
-            "local_terminal_world_z": result.trajectory_terminal[2] if
-            result.success else 0.0,
+            # local labels — EXECUTED plan semantics (section XVIII)
+            "local_terminal_world_x": executed_result.trajectory_terminal[0]
+            if executed_ok else 0.0,
+            "local_terminal_world_y": executed_result.trajectory_terminal[1]
+            if executed_ok else 0.0,
+            "local_terminal_world_z": executed_result.trajectory_terminal[2]
+            if executed_ok else 0.0,
             "local_terminal_flu_x": local_terminal_flu[0],
             "local_terminal_flu_y": local_terminal_flu[1],
             "local_terminal_flu_z": local_terminal_flu[2],
@@ -995,8 +1066,12 @@ class ILManager(object):
             "yaw_rate_command": cmd["yaw_rate"],
             "fresh_plan": int(fresh_plan),
             "cached_plan_used": int(cached_used),
-            "planning_status": int(result.status),
-            "minimum_clearance": result.min_clearance,
+            "active_plan_is_fresh": int(fresh_plan),
+            "active_plan_is_cached": int(cached_used),
+            "planning_status": int(executed_result.status),
+            "minimum_clearance": executed_result.min_clearance,
+            "trajectory_duration_s": executed_result.duration_s,
+            "fresh_planning_status": int(planning_attempt.status),
             # privileged diagnostics
             "local_recoverable": local_recoverable,
             "blocking_component_id": blocking_component,
@@ -1005,34 +1080,42 @@ class ILManager(object):
             "left_corridor_known": left_corridor,
             "right_corridor_known": right_corridor,
             "privileged_best_side": int(privileged_side),
-            "privileged_intervention_required": privileged_intervention_required,
-            "privileged_direct_viable": privileged_direct_viable,
-            "macro_decision_margin": margin,
+            "privileged_local_recoverable": privileged_local_recoverable,
+            "privileged_rejoin_reached": privileged_rejoin_reached,
+            "privileged_future_intervention_required":
+                privileged_future_intervention_required,
+            "privileged_local_path_length": privileged_local_path_length,
+            "privileged_local_duration": privileged_local_duration,
+            "privileged_detour_ratio": privileged_detour_ratio,
+            "privileged_min_clearance": privileged_min_clearance,
+            "privileged_goal_progress": privileged_goal_progress,
             "global_cost_to_go": global_ctg if np.isfinite(global_ctg) else -1.0,
             "global_clearance": global_clearance if
             np.isfinite(global_clearance) else -1.0,
             "global_candidate_costs": candidate_costs,
-            # goal / plan bookkeeping
+            # goal / plan bookkeeping — executed-plan semantics (XVII)
             "goal_world_x": goal[0], "goal_world_y": goal[1], "goal_world_z": goal[2],
             "distance_to_final_goal": goal_dist,
-            "plan_id": result.plan_id,
-            "plan_age_s": 0.0 if fresh_plan else self._dt,
+            "plan_id": executed_result.plan_id,
+            "plan_age_s": plan_age_s,
             "plan_is_fresh": int(fresh_plan),
-            "plan_status": int(result.status),
-            "plan_compute_ms": result.planning_time_ms,
+            "plan_status": int(executed_result.status),
+            "plan_compute_ms": executed_result.planning_time_ms,
             "scene_id": self._scene_id,
             "task_id": self._current_task_id,
             "episode_valid": 1,
         }
         self._writer.write_row(row)
         if self.g.get("dataset_logging", {}).get(
-                "write_local_plan_points", True) and result.success:
+                "write_local_plan_points", True) and executed_ok:
             self._writer.write_local_plan(
-                result.plan_id, frame_id, str(result.status), result.success,
-                result.planning_time_ms, result.min_clearance,
-                result.duration_s, result.guide_waypoint,
-                result.trajectory_terminal, result.search_status,
-                result.trajectory)
+                executed_result.plan_id, frame_id,
+                str(executed_result.status), executed_result.success,
+                executed_result.planning_time_ms,
+                executed_result.min_clearance, executed_result.duration_s,
+                executed_result.guide_waypoint,
+                executed_result.trajectory_terminal,
+                executed_result.search_status, executed_result.trajectory)
 
     # ── End of episode ───────────────────────────────────────────────
     def _st_stop_recording(self):
@@ -1048,9 +1131,9 @@ class ILManager(object):
         catastrophic = any(
             ms > sync.get("catastrophic_latency_ms", 5000.0)
             for ms in self._frame_latencies)
-        mean_valid_ratio = float(np.mean(self._frame_valid_ratios)) if \
-            self._frame_valid_ratios else 0.0
-        none_depth_pct = 100.0 * (1.0 - mean_valid_ratio)
+        mean_finite_ratio = float(np.mean(self._frame_finite_ratios)) if \
+            self._frame_finite_ratios else 0.0
+        none_depth_pct = 100.0 * (1.0 - mean_finite_ratio)
 
         reject_reason = ""
         if unmatched_pct > sync.get("max_unmatched_pct", 1.0):

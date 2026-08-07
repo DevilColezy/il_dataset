@@ -120,12 +120,16 @@ public:
     /// Swept-volume braking-risk check (section XVIII).  Predicts the
     /// braking trajectory (reaction delay at constant velocity, then
     /// deceleration to a stop) and samples it continuously.  Unknown space
-    /// counts as unsafe.  `body_radius_m` + `safety_margin_m` define the
-    /// swept clearance requirement.
+    /// counts as unsafe.
+    ///
+    /// ESDF SEMANTICS (section XV): the observed ESDF value already equals
+    ///   distance_to_obstacle_surface - vehicle_radius
+    /// (clearance from the inflated vehicle body), so the braking check
+    /// requires  esdf > safety_margin  — the vehicle radius is NEVER
+    /// double counted here.
     BrakeRiskResult sweptBrakeRisk(const VehicleState& state,
                                    double reaction_delay_s,
                                    double deceleration_mps2,
-                                   double body_radius_m,
                                    double safety_margin_m,
                                    double sample_spacing_m) const;
 

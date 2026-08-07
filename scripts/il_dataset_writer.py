@@ -18,10 +18,12 @@ import time
 
 import numpy as np
 
-# ── Schema (v19) ──────────────────────────────────────────────────────
+# ── Schema (v20) ──────────────────────────────────────────────────────
 # Order matters: this is the CSV header.  All fields are written on every
 # row; missing keys are filled with defaults by write_row().
-DATA_SCHEMA_V19_FIELDS = [
+# NO depth-valid-mask fields: the student input is a single depth channel
+# (section XII).  raw_depth_finite_ratio is a PURE diagnostic.
+DATA_SCHEMA_V20_FIELDS = [
     # time / matching
     "timestamp_ns", "receive_timestamp_ns", "episode_id", "frame_id",
     "episode_frame_index", "control_dt_s", "trajectory_time_s",
@@ -32,8 +34,8 @@ DATA_SCHEMA_V19_FIELDS = [
     "state_vx_flu", "state_vy_flu", "state_vz_flu",
     "yaw", "yaw_rate",
     "gravity_dx_flu", "gravity_dy_flu", "gravity_dz_flu",
-    # student inputs
-    "depth_file", "depth_valid_mask_ratio",
+    # student inputs (single-channel depth, no mask)
+    "depth_file", "raw_depth_finite_ratio",
     "goal_direction_flu_x", "goal_direction_flu_y", "goal_direction_flu_z",
     "goal_distance_m", "goal_distance_norm",
     "velocity_flu_x", "velocity_flu_y", "velocity_flu_z",
@@ -42,38 +44,42 @@ DATA_SCHEMA_V19_FIELDS = [
     "macro_confidence", "macro_decision_reason",
     "macro_decision_observable", "macro_decision_confidence",
     "macro_decision_margin",
+    "causal_intervention_evidence",
     "macro_guide_world_x", "macro_guide_world_y", "macro_guide_world_z",
     "macro_guide_flu_x", "macro_guide_flu_y", "macro_guide_flu_z",
     "macro_guide_direction_flu_x", "macro_guide_direction_flu_y",
     "macro_guide_direction_flu_z", "macro_guide_distance_m",
     "desired_yaw_world", "desired_yaw_delta",
     "desired_yaw_sin", "desired_yaw_cos",
-    # local labels (30 Hz)
+    # local labels (30 Hz) — EXECUTED plan semantics (section XVIII)
     "local_terminal_world_x", "local_terminal_world_y", "local_terminal_world_z",
     "local_terminal_flu_x", "local_terminal_flu_y", "local_terminal_flu_z",
     "execution_mode",
     "velocity_command_flu_x", "velocity_command_flu_y", "velocity_command_flu_z",
     "yaw_rate_command",
-    "fresh_plan", "cached_plan_used", "planning_status", "minimum_clearance",
+    "fresh_plan", "cached_plan_used",
+    "active_plan_is_fresh", "active_plan_is_cached",
+    "planning_status", "minimum_clearance", "trajectory_duration_s",
+    "fresh_planning_status",
     # privileged diagnostics (never part of student inputs)
     "local_recoverable", "blocking_component_id",
     "left_edge_visible", "right_edge_visible",
     "left_corridor_known", "right_corridor_known",
-    "privileged_best_side", "privileged_intervention_required",
-    "privileged_direct_viable",
+    "privileged_best_side",
+    "privileged_local_recoverable", "privileged_rejoin_reached",
+    "privileged_future_intervention_required",
+    "privileged_local_path_length", "privileged_local_duration",
+    "privileged_detour_ratio", "privileged_min_clearance",
+    "privileged_goal_progress",
     "global_cost_to_go", "global_clearance", "global_candidate_costs",
-    # goal / plan bookkeeping
+    # goal / plan bookkeeping — executed-plan semantics (XVII)
     "goal_world_x", "goal_world_y", "goal_world_z", "distance_to_final_goal",
     "plan_id", "plan_age_s", "plan_is_fresh", "plan_status", "plan_compute_ms",
     # episode
     "scene_id", "task_id", "episode_valid",
 ]
 
-_DEFAULT_ROW = {field: "" for field in DATA_SCHEMA_V19_FIELDS}
-
-# Backwards-compatible alias (v18 name) so external tooling can still
-# import the schema under the old name.
-DATA_SCHEMA_V18_FIELDS = DATA_SCHEMA_V19_FIELDS
+_DEFAULT_ROW = {field: "" for field in DATA_SCHEMA_V20_FIELDS}
 
 
 class DatasetWriter(object):
@@ -111,7 +117,7 @@ class DatasetWriter(object):
 
         self._data_csv = open(self._data_file, "w", newline="")
         self._data_writer = csv.DictWriter(
-            self._data_csv, fieldnames=DATA_SCHEMA_V19_FIELDS)
+            self._data_csv, fieldnames=DATA_SCHEMA_V20_FIELDS)
         self._data_writer.writeheader()
 
         self._sync_csv = open(self._sync_file, "w", newline="")
@@ -144,7 +150,7 @@ class DatasetWriter(object):
             "start_world": start_world,
             "goal_world": goal_world,
             "initial_yaw": initial_yaw,
-            "schema_version": int(cfg.get("schema_version", 19)),
+            "schema_version": int(cfg.get("schema_version", 20)),
             "status": "inprogress",
             "created_at_ns": time.time_ns(),
         }
@@ -169,8 +175,10 @@ class DatasetWriter(object):
             exact_matches, unmatched_frames])
 
     # ── Depth ────────────────────────────────────────────────────────
-    def write_depth(self, frame_id, depth_m, depth_valid_ratio):
-        """Encode and store the depth frame (16-bit PNG)."""
+    def write_depth(self, frame_id, depth_m, raw_finite_ratio):
+        """Encode and store the canonicalised single-channel depth frame
+        (16-bit PNG).  raw_finite_ratio is a pure diagnostic (the fraction
+        of finite/valid pixels in the RAW frame), never a student input."""
         valid = np.isfinite(depth_m) & (depth_m > 0)
         u16 = np.zeros(depth_m.shape, dtype=np.uint16)
         finite = depth_m.copy()
@@ -183,7 +191,7 @@ class DatasetWriter(object):
             png_path, compress_level=self._depth_png_compress_level)
         self._depth_rows[frame_id] = {
             "depth_file": "depth/%06d.png" % frame_id,
-            "depth_valid_mask_ratio": float(depth_valid_ratio),
+            "raw_depth_finite_ratio": float(raw_finite_ratio),
         }
 
     def depth_file_for(self, frame_id):

@@ -133,9 +133,15 @@ def _validate_config(cfg):
     if lookahead > 0.9 * min(half_x, half_y):
         errors.append("macro_lookahead_distance_m must fit the observed map")
 
-    for key in ("direct_to_side_frames", "side_to_direct_frames"):
-        _positive(me.get(key), "macro_expert.%s" % key, errors, allow_zero=True)
+    for key in ("causal_evidence_frames",):
+        _positive(me.get(key, 2), "macro_expert.%s" % key, errors, allow_zero=True)
     _positive(me.get("goal_tolerance_m", 0.30), "macro_expert.goal_tolerance_m", errors)
+    _positive(me.get("side_no_progress_seconds", 6.0),
+              "macro_expert.side_no_progress_seconds", errors)
+    _positive(me.get("observe_no_progress_seconds", 4.0),
+              "macro_expert.observe_no_progress_seconds", errors)
+    _positive(me.get("local_path_fail_threshold", 2),
+              "macro_expert.local_path_fail_threshold", errors)
 
     # candidate geometry
     _positive(mc.get("side_corridor_radius_m", 0.55),
@@ -235,10 +241,10 @@ def _validate_config(cfg):
               "execution_safety.max_emergency_stop_seconds", errors)
 
     # dataset logging
-    _positive(ds.get("schema_version", 19),
+    _positive(ds.get("schema_version", 20),
               "dataset_logging.schema_version", errors)
-    if ds.get("schema_version", 19) != 19:
-        errors.append("dataset_logging.schema_version must be 19")
+    if ds.get("schema_version", 20) != 20:
+        errors.append("dataset_logging.schema_version must be 20")
     _positive(ds.get("perception_range_m", 5.0),
               "dataset_logging.perception_range_m", errors)
     _positive(ds.get("flush_interval_rows", 64),
@@ -246,19 +252,40 @@ def _validate_config(cfg):
     _bounded(ds.get("depth_png_compress_level", 4),
              "dataset_logging.depth_png_compress_level", 0, 9, errors)
 
-    # privileged intervention
+    # privileged intervention (privileged LOCAL-SCALE audit, section II)
     pi = g.get("privileged_intervention", {})
-    _positive(pi.get("lateral_offset_m", 1.5),
-              "privileged_intervention.lateral_offset_m", errors)
-    _positive(pi.get("min_global_clearance_m", 0.20),
-              "privileged_intervention.min_global_clearance_m", errors)
-    if pi.get("max_direct_detour_ratio", 1.6) < 1.0:
+    _positive(pi.get("search_clearance_m", 0.25),
+              "privileged_intervention.search_clearance_m", errors)
+    _positive(pi.get("search_max_time_ms", 20.0),
+              "privileged_intervention.search_max_time_ms", errors)
+    _positive(pi.get("horizon_time_s", 2.5),
+              "privileged_intervention.horizon_time_s", errors)
+    _positive(pi.get("max_path_length_m", 6.0),
+              "privileged_intervention.max_path_length_m", errors)
+    _positive(pi.get("nominal_speed_mps", 1.8),
+              "privileged_intervention.nominal_speed_mps", errors)
+    _positive(pi.get("min_goal_progress_m", 0.30),
+              "privileged_intervention.min_goal_progress_m", errors)
+    _bounded(pi.get("min_terminal_alignment", 0.5),
+             "privileged_intervention.min_terminal_alignment", 0.0, 1.0, errors)
+    _positive(pi.get("rejoin_radius_m", 0.6),
+              "privileged_intervention.rejoin_radius_m", errors)
+    _positive(pi.get("loop_ignore_recent_s", 2.5),
+              "privileged_intervention.loop_ignore_recent_s", errors)
+    if pi.get("loop_leave_radius_m", 1.6) < pi.get("loop_revisit_radius_m", 0.8):
         errors.append(
-            "privileged_intervention.max_direct_detour_ratio must be >= 1.0")
-    _positive(pi.get("cost_margin_m", 2.0),
-              "privileged_intervention.cost_margin_m", errors)
+            "privileged_intervention.loop_leave_radius_m must be >= "
+            "loop_revisit_radius_m")
+    _positive(pi.get("loop_revisit_radius_m", 0.8),
+              "privileged_intervention.loop_revisit_radius_m", errors)
+    _positive(pi.get("loop_leave_radius_m", 1.6),
+              "privileged_intervention.loop_leave_radius_m", errors)
+    _positive(pi.get("loop_min_speed_mps", 0.3),
+              "privileged_intervention.loop_min_speed_mps", errors)
     _positive(pi.get("loop_min_revisits", 2),
               "privileged_intervention.loop_min_revisits", errors)
+    _positive(pi.get("cost_margin_m", 2.0),
+              "privileged_intervention.cost_margin_m", errors)
 
     # task oracle
     to_ = g.get("task_oracle", {})
@@ -355,7 +382,6 @@ def build_oracle_config(g, module):
     cfg.map_margin_m = float(to_.get("map_margin_m", 2.0))
     cfg.min_z_m = float(to_.get("min_z_m", 0.0))
     cfg.max_z_m = float(to_.get("max_z_m", 8.0))
-    cfg.free_clearance_m = float(to_.get("free_clearance_m", 0.10))
     cfg.cost_to_go_cap_m = float(to_.get("cost_to_go_cap_m", 30.0))
     s = cfg.scoring
     s.weight_observed_cost = float(to_.get("weight_observed_cost", 1.0))
@@ -401,15 +427,20 @@ def build_macro_candidate_config(g, module):
 def build_intervention_config(g, module):
     pi = g.get("privileged_intervention", {})
     cfg = module.PrivilegedInterventionConfig()
-    cfg.lateral_offset_m = float(pi.get("lateral_offset_m", 1.5))
-    cfg.min_global_clearance_m = float(pi.get("min_global_clearance_m", 0.20))
-    cfg.max_direct_detour_ratio = float(pi.get("max_direct_detour_ratio", 1.6))
-    cfg.cost_margin_m = float(pi.get("cost_margin_m", 2.0))
-    cfg.lookahead_sampling_m = float(pi.get("lookahead_sampling_m", 4.0))
+    cfg.search_clearance_m = float(pi.get("search_clearance_m", 0.25))
+    cfg.search_max_time_ms = float(pi.get("search_max_time_ms", 20.0))
+    cfg.horizon_time_s = float(pi.get("horizon_time_s", 2.5))
+    cfg.max_path_length_m = float(pi.get("max_path_length_m", 6.0))
+    cfg.nominal_speed_mps = float(pi.get("nominal_speed_mps", 1.8))
+    cfg.min_goal_progress_m = float(pi.get("min_goal_progress_m", 0.30))
+    cfg.min_terminal_alignment = float(pi.get("min_terminal_alignment", 0.5))
+    cfg.rejoin_radius_m = float(pi.get("rejoin_radius_m", 0.6))
+    cfg.loop_ignore_recent_s = float(pi.get("loop_ignore_recent_s", 2.5))
+    cfg.loop_leave_radius_m = float(pi.get("loop_leave_radius_m", 1.6))
     cfg.loop_revisit_radius_m = float(pi.get("loop_revisit_radius_m", 0.8))
-    cfg.loop_history_size = int(pi.get("loop_history_size", 40))
-    cfg.loop_min_revisits = int(pi.get("loop_min_revisits", 2))
     cfg.loop_min_speed_mps = float(pi.get("loop_min_speed_mps", 0.3))
+    cfg.loop_min_revisits = int(pi.get("loop_min_revisits", 2))
+    cfg.loop_history_size = int(pi.get("loop_history_size", 60))
     return cfg
 
 

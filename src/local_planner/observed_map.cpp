@@ -172,7 +172,6 @@ BrakeRiskResult ObservedMap::sweptBrakeRisk(
     const VehicleState& state,
     double reaction_delay_s,
     double deceleration_mps2,
-    double body_radius_m,
     double safety_margin_m,
     double sample_spacing_m) const {
     BrakeRiskResult result;
@@ -182,7 +181,10 @@ BrakeRiskResult ObservedMap::sweptBrakeRisk(
         result.min_clearance = 0.0;
         return result;
     }
-    const double required_clearance = body_radius_m + safety_margin_m;
+    // The ESDF already subtracts the vehicle radius (clearance from the
+    // inflated vehicle body, section XV).  Only the extra safety margin is
+    // required here — the vehicle radius must NOT be double counted.
+    const double required_clearance = safety_margin_m;
     const double speed = state.velocity.norm();
     Eigen::Vector3d vel_dir(Eigen::Vector3d::Zero());
     if (speed > kEpsilon) vel_dir = state.velocity / speed;
@@ -284,31 +286,52 @@ void ObservedMap::integrateDepth(const float* depth,
 
     purgeExpired(timestamp_s);
 
-    // ── Pass 1: occupied endpoints ──────────────────────────────
-    std::vector<Eigen::Vector3d> endpoints;
+    // ── Pass 1: classify rays (section XII) ─────────────────────────
+    // Depth semantics:
+    //   NaN / Inf / <= 0   -> NO valid measurement: the ray is NOT updated
+    //                         at all (never "free to max range").
+    //   0 < z < max_depth  -> valid hit: occupied endpoint + free before it.
+    //   z >= max_depth - margin -> valid no-hit (unambiguous range): the
+    //                         ray is known free out to max_depth (no
+    //                         occupied endpoint).
+    std::vector<Eigen::Vector3d> endpoints;      // valid hits (occupied)
+    std::vector<Eigen::Vector3d> free_ray_dirs;  // valid no-hits (world dirs)
     endpoints.reserve(static_cast<size_t>(height / step + 1) *
                       (width / step + 1));
+    free_ray_dirs.reserve(static_cast<size_t>(height / step + 1) *
+                          (width / step + 1));
     for (int row = 0; row < height; row += step) {
         for (int col = 0; col < width; col += step) {
             const float z = depth[static_cast<size_t>(row) * width + col];
-            if (!std::isfinite(z) || z <= 0.0f || z >= 1000.0f) continue;
+            if (!std::isfinite(z) || z <= 0.0f) continue;  // invalid: no update
             const double cam_x = (static_cast<double>(col) - cx) * z / fx;
             const double cam_y = (static_cast<double>(row) - cy) * z / fy;
             const double cam_z = static_cast<double>(z);
-            // flightlib body frame: [x_right, y_forward, z_up]
+            if (cam_z >= max_depth - occ_margin) {
+                // Valid no-hit: mark the ray free out to max_depth only.
+                const double dir_x = (static_cast<double>(col) - cx) / fx;
+                const double dir_y = (static_cast<double>(row) - cy) / fy;
+                // flightlib body frame: [x_right, y_forward, z_up].
+                const Eigen::Vector3d flightlib_dir(
+                    dir_x, 1.0, -dir_y);
+                const double dir_norm = flightlib_dir.norm();
+                if (dir_norm <= 1.0e-9) continue;
+                free_ray_dirs.push_back(
+                    body_to_world * (flightlib_dir / dir_norm));
+                continue;
+            }
+            // flightlib body frame: [x_right, y_forward, z_up].
             const Eigen::Vector3d flightlib_body(cam_x, cam_z, -cam_y);
             const Eigen::Vector3d world_point =
                 body_to_world * flightlib_body + cam_pos_world;
-            if (cam_z < max_depth - occ_margin) {
-                const Eigen::Vector3i g = worldToGridInt(world_point);
-                const std::int64_t index = indexOf(g.x(), g.y(), g.z());
-                if (index >= 0) {
-                    if (occ_[static_cast<size_t>(index)] != OCCUPIED) {
-                        occ_[static_cast<size_t>(index)] = OCCUPIED;
-                        last_obs_time_[static_cast<size_t>(index)] =
-                            timestamp_s;
-                        ++revision_;
-                    }
+            const Eigen::Vector3i g = worldToGridInt(world_point);
+            const std::int64_t index = indexOf(g.x(), g.y(), g.z());
+            if (index >= 0) {
+                if (occ_[static_cast<size_t>(index)] != OCCUPIED) {
+                    occ_[static_cast<size_t>(index)] = OCCUPIED;
+                    last_obs_time_[static_cast<size_t>(index)] =
+                        timestamp_s;
+                    ++revision_;
                 }
             }
             endpoints.push_back(world_point);
@@ -318,18 +341,16 @@ void ObservedMap::integrateDepth(const float* depth,
     // ── Pass 2: free-space ray casting ──────────────────────────
     const double spacing =
         std::max(config_.free_space_spacing_m, config_.resolution);
-    for (const Eigen::Vector3d& endpoint : endpoints) {
-        const Eigen::Vector3d delta = endpoint - cam_pos_world;
-        const double length = delta.norm();
-        const double effective = std::max(0.0, length - occ_margin);
-        if (effective <= 1.0e-6) continue;
-        const Eigen::Vector3d direction = delta / length;
+    auto cast_free_ray = [&](const Eigen::Vector3d& start,
+                             const Eigen::Vector3d& direction,
+                             double length) {
+        if (length <= 1.0e-6) return;
         const int samples =
-            std::max(1, static_cast<int>(std::ceil(effective / spacing)));
+            std::max(1, static_cast<int>(std::ceil(length / spacing)));
         for (int i = 0; i < samples; ++i) {
             const Eigen::Vector3d point =
-                cam_pos_world + direction *
-                    (static_cast<double>(i) * spacing + 0.5 * spacing);
+                start + direction * (static_cast<double>(i) * spacing +
+                                     0.5 * spacing);
             const Eigen::Vector3i g = worldToGridInt(point);
             const std::int64_t index = indexOf(g.x(), g.y(), g.z());
             if (index < 0) continue;
@@ -339,6 +360,17 @@ void ObservedMap::integrateDepth(const float* depth,
                 ++revision_;
             }
         }
+    };
+    for (const Eigen::Vector3d& endpoint : endpoints) {
+        const Eigen::Vector3d delta = endpoint - cam_pos_world;
+        const double length = delta.norm();
+        const double effective = std::max(0.0, length - occ_margin);
+        if (effective <= 1.0e-6) continue;
+        cast_free_ray(cam_pos_world, delta / length, effective);
+    }
+    for (const Eigen::Vector3d& dir : free_ray_dirs) {
+        cast_free_ray(cam_pos_world, dir,
+                      std::max(0.0, max_depth - occ_margin));
     }
 
     markVehicleFreeBubble(cam_pos_world, timestamp_s);
