@@ -429,16 +429,13 @@ class UnityBridge:
         with self._send_lock:
             self.pub.send_multipart([b"PointCloud", json.dumps(req_dict).encode("utf-8")])
 
-    def send_settings(self, msg_dict):
-        with self._send_lock:
-            self.pub.send_multipart([b"Settings", json.dumps(msg_dict).encode("utf-8")])
-
     def connect_handshake(self, scene_id, depth_cfg, timeout=60.0):
         vehicle = make_depth_vehicle([0, 0, 5], 0, depth_cfg)
-        settings = {"scene_id": scene_id, "vehicles": [vehicle], "objects": []}
+        handshake_msg = {"scene_id": scene_id, "vehicles": [vehicle],
+                         "objects": []}
         deadline = time.time() + timeout
         while time.time() < deadline and not rospy.is_shutdown():
-            self.send_pose(settings)
+            self.send_pose(handshake_msg)
             r = self.try_recv()
             if r is not None and r[0].get("ready"):
                 return True

@@ -35,11 +35,11 @@ import time
 from enum import Enum
 
 # The compiled pybind module (_il_local_planner.so) is built into this
-# script's directory (CMake LIBRARY_OUTPUT_DIRECTORY = scripts/).  When
-# the manager is launched through the catkin-generated wrapper
-# (devel/lib/il_dataset/il_manager.py), the script's dir is NOT on
-# sys.path, so add it explicitly before importing the module and the
-# sibling il_* modules.
+# script's directory (CMake LIBRARY_OUTPUT_DIRECTORY = scripts/), together
+# with the sibling il_* modules.  Everything runs from the source
+# workspace (no catkin install), so adding the script's own directory to
+# sys.path is sufficient for `import _il_local_planner` and the il_*
+# modules.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
@@ -212,8 +212,13 @@ class ILManager(object):
         self._runtime_classify_enabled = bool(
             (tg.get("runtime_classification", {}) or {}).get(
                 "enabled", True))
-        self._handshake_scene_id = int(self.g.get("scene_id", 1))
-        self._scene_id = "scene_000000"
+        # AvoidBench wire identifier (numeric, from config) vs dataset
+        # scene key (string, procedural) are kept strictly separate
+        # (sections VII-IX): `_unity_scene_id` is the only value ever sent
+        # as AvoidBench "scene_id"; `_dataset_scene_key` only names
+        # dataset dirs / manifests / PLY files.
+        self._unity_scene_id = int(self.g.get("scene_id", 1))
+        self._dataset_scene_key = None
 
         # Stats
         self._total_episodes = 0
@@ -285,9 +290,10 @@ class ILManager(object):
         if not self._bridge._bound:
             self._bridge.bind()
         if self._bridge.connect_handshake(
-                self._handshake_scene_id, self._depth_cfg,
+                self._unity_scene_id, self._depth_cfg,
                 timeout=self._fsm.get("connect_timeout", 60.0)):
-            rospy.loginfo("[Manager] Connected to AvoidBench")
+            rospy.loginfo("[Manager] Connected to AvoidBench "
+                          "(unity scene id=%d)", self._unity_scene_id)
             self._enter_state(State.GENERATE_SCENE)
         elif self._timed_out(self._fsm.get("connect_timeout", 60.0)):
             self._error = "unity_connect_timeout"
@@ -337,16 +343,17 @@ class ILManager(object):
             self._enter_state(State.GENERATE_SCENE)
             return
         self._current_scene = scene
-        self._scene_id = scene.scene_id
+        self._dataset_scene_key = scene.scene_key
         self._generation_rng = self._next_scene_seed_rng()
         self._scene_dir = os.path.join(
-            self.output_root, "scenes", scene.scene_id)
+            self.output_root, "scenes", scene.scene_key)
         if not os.path.isdir(self._scene_dir):
             os.makedirs(self._scene_dir)
-        rospy.loginfo("[Manager] Profile %s Scene %d/%d: generated %d "
+        rospy.loginfo("[Manager] Profile %s Scene %d/%d: %s generated %d "
                       "obstacles (mode=%s)",
                       profile.name, self._scene_index + 1,
-                      profile.scene_count, len(scene.obstacles),
+                      profile.scene_count, scene.scene_key,
+                      len(scene.obstacles),
                       scene.metrics.get("mode"))
         self._enter_state(State.SEND_SCENE)
 
@@ -361,21 +368,29 @@ class ILManager(object):
                 time.sleep(0.01)
                 continue
 
-    def _st_send_scene(self):
-        self._drain_bridge(0.4)
+    def _build_scene_pose_message(self):
+        """One unified scene Pose message shared by SEND_SCENE and the
+        WAIT_SCENE_READY keep-alive (section XLVI).  Uses the numeric
+        `unity_scene_id` — never the dataset scene key."""
         vehicle = make_depth_vehicle([0.0, 0.0, 5.0], 0.0, self._depth_cfg)
-        msg = {
-            "scene_id": self._scene_id,
-            "frame_id": -1,
+        return {
+            "scene_id": self._unity_scene_id,
+            "frame_id": 0,
             "vehicles": [vehicle],
             "objects": self._current_scene.unity_objects,
         }
-        self._bridge.send_settings(msg)
+
+    def _st_send_scene(self):
+        self._drain_bridge(0.4)
+        self._scene_pose_msg = self._build_scene_pose_message()
+        self._bridge.send_pose(self._scene_pose_msg)
         self._enter_state(State.WAIT_SCENE_READY)
 
     def _st_wait_scene_ready(self):
         # Wait for the settled ready reply with an optional scene keep-alive
-        # (section XXIII).  A timeout regenerates the scene (new seed).
+        # (section XXIII).  The keep-alive re-sends the SAME scene Pose
+        # message through the verified `Pose` topic (section XLV).  A
+        # timeout regenerates the scene (new seed).
         deadline = self._state_start + \
             self._fsm.get("scene_settle_timeout", 10.0)
         keep_alive = self._fsm.get("keep_alive_period", 3.0)
@@ -383,24 +398,18 @@ class ILManager(object):
         while time.monotonic() < deadline and not rospy.is_shutdown():
             r = self._bridge.try_recv()
             if r is not None and r[0].get("ready"):
-                rospy.loginfo("[Manager] Unity ready: %s", self._scene_id)
+                rospy.loginfo("[Manager] Unity ready: %s",
+                              self._dataset_scene_key)
                 self._enter_state(State.EXPORT_POINTCLOUD)
                 return
             if time.monotonic() - last_alive >= keep_alive:
-                vehicle = make_depth_vehicle(
-                    [0.0, 0.0, 5.0], 0.0, self._depth_cfg)
-                self._bridge.send_settings({
-                    "scene_id": self._scene_id,
-                    "frame_id": -1,
-                    "vehicles": [vehicle],
-                    "objects": self._current_scene.unity_objects,
-                })
+                self._bridge.send_pose(self._scene_pose_msg)
                 last_alive = time.monotonic()
             time.sleep(0.02)
         self._scene_attempt += 1
         GenerationFailureWriter.write(self._generation_failures_path, {
             "event": "scene_ready_timeout",
-            "scene_id": self._scene_id,
+            "scene_key": self._dataset_scene_key,
             "attempt": self._scene_attempt,
         })
         if self._scene_attempt >= self._max_scene_attempts:
@@ -411,17 +420,20 @@ class ILManager(object):
 
     def _st_export_pointcloud(self):
         pc_cfg = self.g.get("pointcloud", {})
-        pc_dir = os.path.join(self.output_root, "maps")
+        # Absolute directory with a trailing separator in the request
+        # (sections XIX-XXI): AvoidBench joins `path` + `file_name`.
+        pc_dir = os.path.abspath(os.path.join(self.output_root, "maps"))
         if not os.path.isdir(pc_dir):
             os.makedirs(pc_dir)
-        # Scene-specific PLY name (section XXV/XXVI): never reuse a single
-        # obstacle_cloud.ply across scenes.
-        base = self._scene_id.replace("scene_", "")
+        # Scene-specific PLY name (section XXV/XXVI): use the DATASET scene
+        # key, never the numeric Unity scene id.
+        base = self._dataset_scene_key
+        pc_request_path = pc_dir.rstrip("/\\") + os.sep
         req = {
             "range": pc_cfg.get("range", [27.0, 44.0, 8.0]),
             "origin": pc_cfg.get("origin", [1.5, 16.0, 3.5]),
             "resolution": pc_cfg.get("resolution", 0.10),
-            "path": pc_dir,
+            "path": pc_request_path,
             "file_name": base,
         }
         self._pc_path = os.path.join(pc_dir, base + ".ply")
@@ -443,7 +455,7 @@ class ILManager(object):
             self._scene_attempt += 1
             GenerationFailureWriter.write(self._generation_failures_path, {
                 "event": "pointcloud_timeout",
-                "scene_id": self._scene_id,
+                "scene_key": self._dataset_scene_key,
                 "attempt": self._scene_attempt,
             })
             if self._scene_attempt >= self._max_scene_attempts:
@@ -487,7 +499,7 @@ class ILManager(object):
             self._scene_attempt += 1
             GenerationFailureWriter.write(self._generation_failures_path, {
                 "event": "insufficient_tasks",
-                "scene_id": self._current_scene.scene_id,
+                "scene_key": self._current_scene.scene_key,
                 "attempt": self._scene_attempt,
                 "task_count": len(tasks),
             })
@@ -496,7 +508,7 @@ class ILManager(object):
                 self._enter_state(State.ERROR)
                 return
             rospy.logwarn("[Manager] Scene %s: only %d tasks; regenerating",
-                          self._current_scene.scene_id, len(tasks))
+                          self._current_scene.scene_key, len(tasks))
             self._enter_state(State.GENERATE_SCENE)
             return
         self._current_tasks = tasks
@@ -505,7 +517,7 @@ class ILManager(object):
         self._total_scenes += 1
         self._write_scene_manifest()
         rospy.loginfo("[Manager] Scene %s: %s",
-                      self._current_scene.scene_id, note)
+                      self._current_scene.scene_key, note)
         self._enter_state(State.RESET_DRONE)
 
     def _write_scene_manifest(self):
@@ -513,14 +525,14 @@ class ILManager(object):
         tasks = [t.to_dict() for t in self._current_tasks]
         SceneManifestWriter.write(
             path, self._current_scene.to_dict(), tasks, self._pc_path,
-            self._task_generator.task_seed_base)
+            self._task_generator.task_seed_base, self._unity_scene_id)
 
     # ── Task lifecycle (sections XLIII/LII) ──────────────────────────
     def _record_task_failure(self, reason):
         self._failed_tasks += 1
         GenerationFailureWriter.write(self._generation_failures_path, {
             "event": "task_skipped",
-            "scene_id": self._scene_id,
+            "scene_key": self._dataset_scene_key,
             "task_id": self._current_task_id,
             "reason": reason,
         })
@@ -577,12 +589,18 @@ class ILManager(object):
         self._episode_id = "%s_ep%02d" % (task.task_id, self._episode_index)
         self._writer = DatasetWriter(
             self.g.get("dataset_logging", {}), self._episode_id,
-            self._inprogress_root, self._scene_id, task.task_id,
+            self._inprogress_root, self._dataset_scene_key, task.task_id,
             task.start, task.goal, task.initial_yaw, self._depth_cfg)
         self._recording_start_mono = time.monotonic()
         self._matched_frames = 0
         self._unmatched_frames = 0
         self._exact_matches = 0
+        # Initial observed recoverability cache (sections XXX-XLII): frozen
+        # at the FIRST valid observed evaluation of this episode, never at
+        # the end.  None means no valid initial evaluation was obtained.
+        self._initial_observed_recoverable = None
+        self._initial_observed_recoverability_status = None
+        self._initial_observed_recoverability_tick = None
         # Quick settle before the lockstep loop.
         settle = time.monotonic() + 0.3
         while time.monotonic() < settle:
@@ -674,6 +692,22 @@ class ILManager(object):
                 held_action = self._macro_expert.update(
                     goal, state, self._observed_map, dt_s=dt_macro,
                     interval_feedback=interval_feedback)
+                # Freeze the initial OBSERVED recoverability at the FIRST
+                # valid evaluation of this episode (sections XXX-XLII):
+                # only once the observed map actually holds integrated data
+                # and the macro expert has computed a current
+                # recoverability.  Never refrozen later; never replaced at
+                # FINISH_TASK by the last evaluation.
+                if self._initial_observed_recoverable is None and \
+                        self._observed_map.known_count() > 0 and \
+                        self._macro_expert.last_recoverability is not None:
+                    status = \
+                        self._macro_expert.last_recoverability.status
+                    self._initial_observed_recoverable = bool(
+                        status == module.RecoverabilityStatus
+                        .DIRECT_REJOIN_SUCCESS)
+                    self._initial_observed_recoverability_status = status
+                    self._initial_observed_recoverability_tick = sample_index
                 # Debug trace (section "debug"): one JSON line per macro
                 # tick with the expert's internal state for post-hoc review
                 # via scripts/debug_viewer.py.
@@ -854,7 +888,7 @@ class ILManager(object):
         vehicle = make_depth_vehicle(pos, 0.0, self._depth_cfg,
                                      quaternion_xyzw=quat)
         msg = {
-            "scene_id": self._scene_id,
+            "scene_id": self._unity_scene_id,
             "frame_id": frame_id,
             "vehicles": [vehicle],
             "objects": self._current_scene.unity_objects,
@@ -1442,7 +1476,7 @@ class ILManager(object):
             "plan_is_fresh": int(fresh_plan),
             "plan_status": int(executed_result.status),
             "plan_compute_ms": executed_result.planning_time_ms,
-            "scene_id": self._scene_id,
+            "scene_id": self._dataset_scene_key,
             "task_id": self._current_task_id,
             "episode_valid": 1,
         }
@@ -1507,6 +1541,11 @@ class ILManager(object):
             self._committed_episodes += 1
 
         # Task manifest output + runtime classification (section XLVII).
+        # `initial_observed_recoverable` is the value FROZEN at the first
+        # valid observed evaluation (sections XXXVI/LXV) — never the last
+        # episode recoverability.  None is recorded as null (not False)
+        # when no valid initial evaluation was ever obtained (section
+        # XXXVII).
         task = self._current_tasks[self._task_index]
         runtime_info = {
             "episode_result": "success" if success else "failed",
@@ -1514,17 +1553,20 @@ class ILManager(object):
             "reject_reason": reject_reason,
         }
         if self._runtime_classify_enabled:
-            rec = self._macro_expert.last_recoverability
-            initial_observed = bool(
-                rec is not None and
-                rec.status == module.RecoverabilityStatus.DIRECT_REJOIN_SUCCESS)
+            initial_observed = self._initial_observed_recoverable
+            runtime_info["initial_observed_recoverable"] = initial_observed
+            runtime_info["initial_observed_recoverability_status"] = \
+                int(self._initial_observed_recoverability_status) if \
+                self._initial_observed_recoverability_status is not None \
+                else None
+            runtime_info["initial_observed_recoverability_tick"] = \
+                self._initial_observed_recoverability_tick
             runtime_cls = runtime_classify(
                 task.target_task_class,
                 bool(task.metrics.get("privileged_local_recoverable")),
                 initial_observed)
             runtime_info["runtime_task_class"] = \
                 runtime_cls.value if runtime_cls is not None else None
-            runtime_info["initial_observed_recoverable"] = initial_observed
             runtime_info["classification_mismatch"] = bool(
                 runtime_cls is not None and
                 runtime_cls != task.target_task_class)
@@ -1536,7 +1578,7 @@ class ILManager(object):
             GenerationFailureWriter.write(self._generation_failures_path, {
                 "event": "task_failed",
                 "task_id": task.task_id,
-                "scene_id": self._scene_id,
+                "scene_key": self._dataset_scene_key,
                 "exit_reason": self._trajectory_exit_reason,
                 "reject_reason": reject_reason,
             })
@@ -1552,7 +1594,7 @@ class ILManager(object):
 
     def _st_finish_scene(self):
         rospy.loginfo("[Manager] Scene complete: %s (%d tasks)",
-                      self._scene_id, len(self._current_tasks))
+                      self._dataset_scene_key, len(self._current_tasks))
         self._scene_index += 1
         self._scene_attempt = 0
         self._current_tasks = []

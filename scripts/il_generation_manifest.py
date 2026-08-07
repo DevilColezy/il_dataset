@@ -19,10 +19,16 @@ def _ensure_dir(path):
 
 class SceneManifestWriter(object):
     @staticmethod
-    def write(path, scene_dict, tasks_dicts, pointcloud_path, task_seed):
+    def write(path, scene_dict, tasks_dicts, pointcloud_path, task_seed,
+              unity_scene_id=None):
         record = dict(scene_dict)
         record["pointcloud_path"] = pointcloud_path
         record["task_seed_base"] = int(task_seed)
+        # Both identifiers are recorded (section XI): `scene_key` is the
+        # dataset-internal scene name; `unity_scene_id` is the numeric
+        # AvoidBench wire identifier.  Only `scene_key` identifies the
+        # scene inside the dataset.
+        record["unity_scene_id"] = unity_scene_id
         record["tasks"] = tasks_dicts
         _ensure_dir(path)
         with open(path, "w") as f:

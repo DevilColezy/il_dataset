@@ -34,10 +34,10 @@ class TaskClass(Enum):
 
 
 class GeneratedTask(object):
-    def __init__(self, task_id, scene_id, start, goal, initial_yaw,
+    def __init__(self, task_id, scene_key, start, goal, initial_yaw,
                  target_task_class, task_seed, metrics):
         self.task_id = str(task_id)
-        self.scene_id = str(scene_id)
+        self.scene_key = str(scene_key)
         self.start = np.asarray(start, dtype=np.float64)
         self.goal = np.asarray(goal, dtype=np.float64)
         self.initial_yaw = float(initial_yaw)
@@ -48,7 +48,7 @@ class GeneratedTask(object):
     def to_dict(self):
         return {
             "task_id": self.task_id,
-            "scene_id": self.scene_id,
+            "scene_key": self.scene_key,
             "start": self.start.tolist(),
             "goal": self.goal.tolist(),
             "initial_yaw": round(self.initial_yaw, 5),
@@ -117,6 +117,8 @@ class MultiscaleTaskGenerator(object):
         self.candidate_batch_size = int(sampling.get("candidate_batch_size", 64))
         self.maximum_batches_per_scene = int(
             sampling.get("maximum_batches_per_scene", 6))
+        self.max_goal_sample_attempts = int(
+            sampling.get("max_goal_sample_attempts", 40))
         cl = self.cfg.get("classification", {}) or {}
         self.near_occluded_max_blocker_m = float(
             cl.get("near_occluded_max_blocker_distance_m", 2.0))
@@ -135,18 +137,29 @@ class MultiscaleTaskGenerator(object):
         return np.array([x, y, z], dtype=np.float64)
 
     def _sample_batch(self, rng, band_min, band_max):
+        """Strict per-band sampling (sections XXXVIII-XLII).
+
+        Every returned candidate satisfies `band_min <= d <= band_max`.
+        A start whose goal never lands in the band after
+        `max_goal_sample_attempts` is REJECTED (no fall-through with an
+        out-of-band goal), so the C++ evaluator never sees a candidate
+        that violates its requested distance band.
+        """
         n = self.candidate_batch_size
         starts = []
         goals = []
         z = self.flight_height_m
         for _ in range(n):
             start = self._sample_point(rng, z)
-            # Rejection-sample a goal in the requested distance band.
-            for _ in range(40):
+            found = False
+            for _ in range(self.max_goal_sample_attempts):
                 goal = self._sample_point(rng, z)
                 d = float(np.linalg.norm(goal - start))
                 if band_min <= d <= band_max:
+                    found = True
                     break
+            if not found:
+                continue  # sample exhausted -> skip this candidate
             starts.append(start)
             goals.append(goal)
         return starts, goals
@@ -205,8 +218,13 @@ class MultiscaleTaskGenerator(object):
             band = self.distance_bands[
                 batch_i % len(self.distance_bands)] if self.distance_bands \
                 else (None, 4.0, 28.0)
-            _, bmin, bmax = band
+            band_name, bmin, bmax = band
             starts, goals = self._sample_batch(rng, bmin, bmax)
+            if not starts:
+                # Band sampling exhausted for the whole batch: skip this
+                # batch instead of feeding an empty/out-of-band candidate
+                # list to the C++ evaluator (section XLII).
+                continue
             starts_arr = np.asarray(starts, dtype=np.float64)
             goals_arr = np.asarray(goals, dtype=np.float64)
             results = self._gen.evaluate_candidates(oracle, starts_arr,
@@ -216,7 +234,7 @@ class MultiscaleTaskGenerator(object):
                 if cls is None:
                     continue
                 quota.note_attempted(cls)
-                coord_candidates.append((cls, r, s, g))
+                coord_candidates.append((cls, r, s, g, band_name))
             if len(coord_candidates) >= 4 * tasks_per_scene:
                 break
 
@@ -228,17 +246,18 @@ class MultiscaleTaskGenerator(object):
 
         used_rng = random.Random(
             (self.task_seed_base +
-             zlib.crc32(scene.scene_id.encode("utf-8"))) & 0x7FFFFFFF)
-        for cls, r, s, g in coord_candidates:
+             zlib.crc32(scene.scene_key.encode("utf-8"))) & 0x7FFFFFFF)
+        for cls, r, s, g, band_name in coord_candidates:
             if len(tasks) >= tasks_per_scene:
                 break
             quota.note_accepted(cls)
-            task_id = "%s_task_%03d" % (scene.scene_id, len(tasks))
+            task_id = "%s_task_%03d" % (scene.scene_key, len(tasks))
             task_seed = (self.task_seed_base + len(tasks) * 131) & 0x7FFFFFFF
             tasks.append(GeneratedTask(
-                task_id, scene.scene_id, s, g,
+                task_id, scene.scene_key, s, g,
                 self._initial_yaw(np.asarray(s), np.asarray(g), used_rng),
                 cls, task_seed, {
+                    "distance_band": band_name,
                     "straight_distance": round(float(r.straight_distance), 4),
                     "global_path_length": round(float(r.global_path_length), 4),
                     "global_detour_ratio": round(float(r.global_detour_ratio), 4),
@@ -272,9 +291,17 @@ def runtime_classify(target_class, privileged_local_recoverable,
                      initial_observed_recoverable):
     """Runtime re-classification (sections XL/XLI/LXIII).  NEAR_OCCLUDED is
     only certain once the first observed frames confirm that the local
-    layer cannot see a way out even though the privileged audit can."""
+    layer cannot see a way out even though the privileged audit can.
+
+    `initial_observed_recoverable` must be the FROZEN value from the first
+    valid observed evaluation of the episode (never the last one).  None
+    means no valid initial evaluation was ever obtained (e.g. depth lost,
+    early abort): the generation-time target class is kept and no
+    refinement is attempted (sections XXXVII/LXV)."""
     if target_class is None:
         return None
+    if initial_observed_recoverable is None:
+        return target_class
     if target_class == TaskClass.NEAR_OCCLUDED:
         if initial_observed_recoverable:
             return TaskClass.LOCAL_REACTIVE

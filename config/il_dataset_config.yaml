@@ -73,6 +73,11 @@ global:
       min_z: 3.5
       max_z: 11.5
     geometry:
+      # Full-height cylinders (sections XV-XVIII): obstacle height and
+      # center are DERIVED from the region vertical span
+      # (height = max_z - min_z, center_z = 0.5*(min_z + max_z)) so all
+      # independent/cluster/chain obstacles cover the whole flight range
+      # (2.5D LEFT/RIGHT topology).  `height_m` is informational only.
       height_m:              8.0
       minimum_surface_gap_m: 0.30
       boundary_margin_m:     0.6
@@ -140,6 +145,7 @@ global:
     sampling:
       candidate_batch_size: 64
       maximum_batches_per_scene: 6
+      max_goal_sample_attempts: 40   # per start; exhausted -> candidate rejected
       lateral_probe_offset_m: 1.2
       lateral_probe_spacing_m: 0.6
       lateral_probe_count: 4

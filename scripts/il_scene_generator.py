@@ -42,13 +42,17 @@ class CylinderObstacleSpec(object):
         self.obj_id = str(obj_id)
 
     def to_dict(self):
+        # Full-height cylinders: bottom_z / top_z make the vertical coverage
+        # of the flight region explicit for post-hoc static checks (section
+        # LXIII).
         return {
             "obj_id": self.obj_id,
-            "x": round(self.x, 4),
-            "y": round(self.y, 4),
-            "z": round(self.z, 4),
-            "radius": round(self.radius, 4),
-            "height": round(self.height, 4),
+            "center_world": [round(self.x, 4), round(self.y, 4),
+                             round(self.z, 4)],
+            "radius_m": round(self.radius, 4),
+            "height_m": round(self.height, 4),
+            "bottom_z": round(self.z - 0.5 * self.height, 4),
+            "top_z": round(self.z + 0.5 * self.height, 4),
         }
 
     def unity_object(self):
@@ -129,10 +133,21 @@ class SceneProfile(object):
 
 
 class GeneratedScene(object):
-    def __init__(self, scene_id, profile, seed, generation_attempt,
-                 region, obstacles, metrics):
-        self.scene_id = str(scene_id)
+    """A generated procedural scene.
+
+    `scene_key` is the dataset-internal unique scene name (e.g.
+    "scene_mixed_scale_000003") — it is NEVER sent to AvoidBench as
+    "scene_id".  The AvoidBench numeric scene id lives in the manager
+    (`unity_scene_id`, from `global.scene_id`) and is kept separate
+    (sections VII-IX).
+    """
+
+    def __init__(self, scene_key, profile, scene_index, seed,
+                 generation_attempt, region, obstacles, metrics):
+        self.scene_key = str(scene_key)
         self.profile = profile
+        self.profile_name = profile.name if profile else None
+        self.scene_index = int(scene_index)
         self.seed = int(seed)
         self.generation_attempt = int(generation_attempt)
         self.region = region
@@ -142,8 +157,9 @@ class GeneratedScene(object):
 
     def to_dict(self):
         return {
-            "scene_id": self.scene_id,
-            "profile": self.profile.name if self.profile else None,
+            "scene_key": self.scene_key,
+            "profile_name": self.profile_name,
+            "scene_index": self.scene_index,
             "seed": self.seed,
             "generation_attempt": self.generation_attempt,
             "obstacle_region": self.region.to_dict(),
@@ -168,7 +184,19 @@ class ProceduralSceneGenerator(object):
             region.get("min_y", 16.0), region.get("max_y", 60.0),
             region.get("min_z", 3.5), region.get("max_z", 11.5))
         geom = cfg.get("geometry", {}) if cfg else {}
-        self.height_m = float(geom.get("height_m", 8.0))
+        # Full-height cylinders (sections XV-XVIII): the obstacle must cover
+        # the whole configured vertical flight range so the 2.5D LEFT/RIGHT
+        # macro topology cannot be bypassed by flying over the top.  Height
+        # and center are derived from the region vertical span — never from
+        # an unrelated `height_m` knob.
+        self._obstacle_height = float(self.region.max_z - self.region.min_z)
+        self._obstacle_center_z = 0.5 * (self.region.min_z +
+                                         self.region.max_z)
+        if self._obstacle_height <= 0.0:
+            # Defensive fallback only: degenerate region.
+            h = float(geom.get("height_m", 8.0))
+            self._obstacle_height = h
+            self._obstacle_center_z = self.region.min_z + 0.5 * h
         self.minimum_surface_gap_m = float(
             geom.get("minimum_surface_gap_m", 0.30))
         self.boundary_margin_m = float(geom.get("boundary_margin_m", 0.6))
@@ -229,7 +257,7 @@ class ProceduralSceneGenerator(object):
         """Generate one deterministic scene.  Returns a GeneratedScene."""
         rng = self._rng(profile, scene_index, attempt)
         seed = self._scene_seed(profile, scene_index, attempt)
-        scene_id = "scene_%s_%06d" % (profile.name, scene_index)
+        scene_key = "scene_%s_%06d" % (profile.name, scene_index)
         mode = self._pick_mode(profile, rng)
         obstacles = []
         placed = []  # (x, y, radius)
@@ -258,8 +286,8 @@ class ProceduralSceneGenerator(object):
                                      min(profile.radius_max_m,
                                          self.region.width() / n / 2.0))
                 obstacles.append(CylinderObstacleSpec(
-                    x, y, self.region.min_z, radius, self.height_m,
-                    "chain_%d" % i))
+                    x, y, self._obstacle_center_z, radius,
+                    self._obstacle_height, "chain_%d" % i))
                 placed.append((x, y, radius))
 
         while len(obstacles) < count_target:
@@ -285,8 +313,8 @@ class ProceduralSceneGenerator(object):
                     if not ok:
                         continue
                     obstacles.append(CylinderObstacleSpec(
-                        x, y, self.region.min_z, radius, self.height_m,
-                        "cluster_%d" % len(obstacles)))
+                        x, y, self._obstacle_center_z, radius,
+                        self._obstacle_height, "cluster_%d" % len(obstacles)))
                     placed.append((x, y, radius))
                     placed_anchor = True
                 if not placed_anchor:
@@ -297,13 +325,13 @@ class ProceduralSceneGenerator(object):
                     break  # region saturated; accept what we have
                 x, y, radius = placed_ob
                 obstacles.append(CylinderObstacleSpec(
-                    x, y, self.region.min_z, radius, self.height_m,
-                    "ob_%d" % len(obstacles)))
+                    x, y, self._obstacle_center_z, radius,
+                    self._obstacle_height, "ob_%d" % len(obstacles)))
                 placed.append((x, y, radius))
 
         metrics = self._compute_metrics(obstacles, count_target, mode)
-        return GeneratedScene(scene_id, profile, seed, attempt, self.region,
-                              obstacles, metrics)
+        return GeneratedScene(scene_key, profile, scene_index, seed, attempt,
+                              self.region, obstacles, metrics)
 
     def _compute_metrics(self, obstacles, count_target, mode):
         radii = [ob.radius for ob in obstacles]

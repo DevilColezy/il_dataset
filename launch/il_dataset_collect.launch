@@ -3,28 +3,36 @@
   Automatic multi-scale IL dataset collection (two-level navigation
   expert, schema v22).
 
-  AvoidBench / Unity MUST already be running BEFORE launching (the ROS
-  launch never starts or stops AvoidBench):
-    cd ~/flightmare_ws/RPG_Flightmare/AvoidBench_x
-    ./AvoidBench.x86_64 -input-port 10253 -output-port 10254
+  Wire contract (verified topics): scene + runtime messages use the
+  `Pose` topic; point cloud export uses the `PointCloud` topic.  The
+  AvoidBench `scene_id` is the numeric `global.scene_id` from the config;
+  the procedural dataset scene key (`scene_*_NNNNNN`) is NEVER sent to
+  AvoidBench — it only names dataset directories / manifests / PLY files.
 
-  After launch the manager runs fully unattended (section LXXVIII):
-    connect AvoidBench -> procedurally generate Scene -> send to Unity ->
-    wait ready -> export one scene point cloud -> build privileged scene
-    map -> generate many start-goal tasks -> run each task (5 Hz macro +
-    30 Hz local + recording) -> NEXT_TASK -> NEXT_SCENE -> NEXT_PROFILE ->
-    DONE.  No task manifests / manual start-goal / scene interaction is
-    required as input (manifests are written as OUTPUTS per scene/task).
+  USAGE (collection starts automatically after launch):
 
-  ── USAGE ──────────────────────────────────────────────────────
-    roslaunch il_dataset il_dataset_collect.launch
+    1. Start AvoidBench externally in another terminal (the launch never
+       starts or stops AvoidBench):
+         cd ~/flightmare_ws/RPG_Flightmare/AvoidBench_x
+         ./AvoidBench.x86_64 -input-port 10253 -output-port 10254
 
-    # Custom config:
-    roslaunch il_dataset il_dataset_collect.launch \
-      config_file:=/path/to/my_config.yaml
+    2. Run:
+         roslaunch il_dataset il_dataset_collect.launch
 
-    # Dry-run (validate config + print the generation plan only):
-    roslaunch il_dataset il_dataset_collect.launch dry_run:=true
+    3. Collection starts automatically: connect AvoidBench -> generate
+       scene -> send via Pose -> wait ready -> export one point cloud ->
+       build privileged scene map -> generate multiscale tasks -> run each
+       task (5 Hz macro + 30 Hz local + recording) -> NEXT_TASK ->
+       NEXT_SCENE -> NEXT_PROFILE -> DONE.  No task manifests / manual
+       start-goal / scene interaction is required as input (manifests are
+       written as OUTPUTS per scene/task).
+
+    Custom config:
+      roslaunch il_dataset il_dataset_collect.launch \
+        config_file:=/path/to/my_config.yaml
+
+    Dry-run (validate config + print the generation plan only):
+      roslaunch il_dataset il_dataset_collect.launch dry_run:=true
   ==================================================================== -->
 <launch>
   <param name="use_sim_time" value="false"/>
