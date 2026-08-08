@@ -1797,6 +1797,54 @@ class ILManager(object):
             "scene_id": self._dataset_scene_key,
             "task_id": self._current_task_id,
             "episode_valid": 1,
+            # Active-observation diagnostics (section XLVII-XLIX): pure
+            # diagnostics, never part of any student input.  Held from the
+            # last 5 Hz macro tick.
+            "observe_scan_side": self._macro_expert.observe_scan_side,
+            "left_scan_exhausted": self._macro_expert.left_scan_exhausted,
+            "right_scan_exhausted": self._macro_expert.right_scan_exhausted,
+            "observe_rotation_exhausted":
+                self._macro_expert.observe_rotation_exhausted,
+            "observe_stagnant_rotate_time":
+                self._macro_expert.observe_stagnant_rotate_time,
+            "observe_raw_candidate_count":
+                self._macro_expert.observe_raw_candidate_count,
+            "observe_lattice_candidate_count":
+                self._macro_expert.observe_lattice_candidate_count,
+            "observe_frontier_candidate_count":
+                self._macro_expert.observe_frontier_candidate_count,
+            "observe_endpoint_known_free_count":
+                self._macro_expert.observe_endpoint_known_free_count,
+            "observe_local_full_count":
+                self._macro_expert.observe_local_full_count,
+            "observe_reject_unknown": self._macro_expert.observe_reject_unknown,
+            "observe_reject_endpoint_clearance":
+                self._macro_expert.observe_reject_endpoint_clearance,
+            "observe_reject_min_distance":
+                self._macro_expert.observe_reject_min_distance,
+            "observe_reject_max_distance":
+                self._macro_expert.observe_reject_max_distance,
+            "observe_reject_partial": self._macro_expert.observe_reject_partial,
+            "observe_reject_no_path": self._macro_expert.observe_reject_no_path,
+            "observe_reject_failed_side":
+                self._macro_expert.observe_reject_failed_side,
+            "observe_left_valid_count":
+                self._macro_expert.observe_left_valid_count,
+            "observe_right_valid_count":
+                self._macro_expert.observe_right_valid_count,
+            "observe_center_valid_count":
+                self._macro_expert.observe_center_valid_count,
+            "observe_selected_source":
+                self._macro_expert.observe_selected_source,
+            "observe_selected_side": self._macro_expert.observe_selected_side,
+            "observe_selected_distance":
+                self._macro_expert.observe_selected_distance,
+            "observe_selected_path_length":
+                self._macro_expert.observe_selected_path_length,
+            "observe_selected_info_gain":
+                self._macro_expert.observe_selected_info_gain,
+            "observe_selected_clearance":
+                self._macro_expert.observe_selected_clearance,
         }
         self._writer.write_row(row)
         if self.g.get("dataset_logging", {}).get(

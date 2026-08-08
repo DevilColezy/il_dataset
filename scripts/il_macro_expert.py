@@ -106,6 +106,45 @@ class MacroExpert(object):
         self._observe_last_reachable_count = None
         self._observe_last_info_time = None
         self._prev_guide_world = None
+        # Active-observation scan lifecycle (sections XXI-XXXV): per-side
+        # scan exhaustion is SEPARATE from side failure memory (failed_*).
+        # Scan exhaustion means "rotation alone no longer yields new
+        # information here" — never "this side is infeasible".
+        self._observe_scan_side = None
+        self._left_scan_exhausted = False
+        self._right_scan_exhausted = False
+        self._observe_stagnant_time = 0.0
+        self._observe_last_target_yaw = None
+        self._observe_last_move_guide = None
+        self._prev_observe_viewpoint = None
+        # Per-tick OBSERVE diagnostics (pure diagnostics, never student
+        # input).  Held between 5 Hz ticks so the 30 Hz recorder sees them.
+        self.observe_scan_side = 0
+        self.left_scan_exhausted = 0
+        self.right_scan_exhausted = 0
+        self.observe_rotation_exhausted = 0
+        self.observe_stagnant_rotate_time = 0.0
+        self.observe_raw_candidate_count = 0
+        self.observe_lattice_candidate_count = 0
+        self.observe_frontier_candidate_count = 0
+        self.observe_endpoint_known_free_count = 0
+        self.observe_local_full_count = 0
+        self.observe_reject_unknown = 0
+        self.observe_reject_endpoint_clearance = 0
+        self.observe_reject_min_distance = 0
+        self.observe_reject_max_distance = 0
+        self.observe_reject_partial = 0
+        self.observe_reject_no_path = 0
+        self.observe_reject_failed_side = 0
+        self.observe_left_valid_count = 0
+        self.observe_right_valid_count = 0
+        self.observe_center_valid_count = 0
+        self.observe_selected_source = ""
+        self.observe_selected_side = 0
+        self.observe_selected_distance = 0.0
+        self.observe_selected_path_length = 0.0
+        self.observe_selected_info_gain = 0.0
+        self.observe_selected_clearance = 0.0
         # DIRECT session (section XXV): history is initialised ONLY when
         # entering DIRECT from another mode; a DIRECT->DIRECT tick only
         # UPDATES the history so causal evidence accumulates across 5 Hz
@@ -224,6 +263,9 @@ class MacroExpert(object):
         # Per-tick diagnostic: cleared here, set True only when the stable
         # DIRECT release fires below (section XII).
         self._blocker_released_this_tick = False
+        # Per-tick OBSERVE diagnostics are reset here and populated only in
+        # the OBSERVE branch (section XLVII); non-OBSERVE ticks record zeros.
+        self._reset_observe_diagnostics()
 
         goal_dist = float(np.linalg.norm(goal - pos))
         goal_dir_world = np.zeros(3, dtype=np.float64)
@@ -441,6 +483,7 @@ class MacroExpert(object):
                 self._observe_time_s = 0.0
                 self._observe_yaw_delta = 0.0
                 self._observe_reference_yaw_world = None
+                self._clear_observe_scan_state()
             self._enter_direct_session(goal_dist, now_s)
         self.mode = self._module.MacroMode.DIRECT_GUIDE
         yaw_world = math.atan2(goal_dir_world[1], goal_dir_world[0]) - \
@@ -545,33 +588,33 @@ class MacroExpert(object):
             return action
 
         # ── No viable candidate -> OBSERVE (section XV) ──────────────
-        # OBSERVE side: committed (if not failed) or first non-failed or
-        # LEFT.  If both sides are failed -> NO_VALID_SIDE (side == None).
+        # OBSERVE side is a PREFERENCE (committed if not failed, else first
+        # non-failed), NOT a hard topology commitment: only a PROVEN-failed
+        # side is excluded from movement (sections XVIII-XX).  If both sides
+        # are failed -> NO_VALID_SIDE (side == None).
         side = self._observe_side()
         self.committed_side = side if side is not None \
             else self._module.Side.NONE
+        pref_side = side
 
-        # Rolling OBSERVE information-gain window (section XVI): compare
-        # against the LAST progress point (not the entry reference).
+        # Rolling OBSERVE information-gain window (section XVI/XLII):
+        # known cells, edge visibility, SIDE-candidate availability and a
+        # newly FULL-reachable movement candidate all count as progress.
         known = int(observed_map.known_count())
         edge_mask = (int(blocker.left_edge_visible),
                      int(blocker.right_edge_visible))
         reachable = len([c for c in candidates
                          if c.type == self._module.CandidateType.SIDE and
                          c.full_goal_reached])
+        info_gained = False
         if self.mode != self._module.MacroMode.OBSERVE or \
                 self._observe_reference_yaw_world is None:
-            # Entering OBSERVE: initialise the observation reference and
-            # close the DIRECT / SIDE sessions (their history stays frozen
-            # until a fresh re-entry).
+            # Entering OBSERVE: initialise a fresh scan session and close
+            # the DIRECT / SIDE sessions (sections XXIV-XXV).
             self._exit_direct_session()
             self._side_session_active = False
-            self._observe_reference_yaw_world = yaw
-            self._observe_yaw_delta = 0.0
-            self._observe_last_known = known
-            self._observe_last_edge_mask = edge_mask
-            self._observe_last_reachable_count = reachable
-            self._observe_last_info_time = now_s
+            self._reset_observe_scan(pref_side, yaw, now_s)
+            info_gained = True
         else:
             if known > self._observe_last_known or \
                     edge_mask != self._observe_last_edge_mask or \
@@ -580,6 +623,7 @@ class MacroExpert(object):
                 self._observe_last_edge_mask = edge_mask
                 self._observe_last_reachable_count = reachable
                 self._observe_last_info_time = now_s
+                info_gained = True
         if self._observe_last_info_time is not None:
             self.observe_no_information_time = \
                 now_s - self._observe_last_info_time
@@ -590,63 +634,66 @@ class MacroExpert(object):
 
         # OBSERVE no-information timeout (section XVI): change strategy
         # (OBSERVE_MOVE) or try the other side — never an immediate FAILED.
-        no_new_info = self._observe_last_info_time is not None and \
-            self.observe_no_information_time > \
+        no_new_info = self.observe_no_information_time > \
             self.cfg.get("observe_no_information_timeout", 4.0)
 
         fov_half_obs = math.radians(self.cfg.get("observe_fov_half_deg", 45.0))
         rotation_exhausted = \
             abs(self._observe_yaw_delta) >= fov_half_obs - 1e-6
 
-        # FULL-reachable observation viewpoint candidates (OBSERVE_MOVE).
-        # Strictly follow the CURRENT observation side (sections XV/XVII):
-        # only candidates whose side equals the observe side qualify, and
-        # failed sides are masked (section XVIII / Case F).  When no side
-        # is committed (both failed) only central (NONE) candidates qualify.
-        observe_move_cands = []
+        # ── FULL-reachable movement candidates (sections XV/XIX) ─────
+        # OBSERVE + GOAL_FRONTIER candidates whose observed LocalPathSearch
+        # FULLY reached the viewpoint (never a straight-corridor proxy).  A
+        # viewpoint may need a detour around known obstacles — that is fine,
+        # the 30 Hz planner can route it.  Only PROVEN-failed sides are
+        # hard-excluded; the observe preference never blocks the other side.
         min_move = self.cfg.get("min_observe_move_distance_m", 0.15)
+        move_cands = []
         for c in candidates:
             if c.type not in (self._module.CandidateType.OBSERVE,
                               self._module.CandidateType.GOAL_FRONTIER):
                 continue
             if not c.full_goal_reached or not c.known_reachable:
                 continue
-            # Safety net (section VIII): never emit a zero/near-zero
-            # displacement observation "move" — that would be a fake
-            # OBSERVE_MOVE (C++ already filters; this is a second guard).
-            move_dist = float(np.linalg.norm(
-                np.asarray(c.position_world) - pos))
-            if move_dist < min_move:
+            # Safety net (section XIII): never emit a zero/near-zero
+            # displacement observation "move" (C++ already filters).
+            if float(np.linalg.norm(
+                    np.asarray(c.position_world) - pos)) < min_move:
                 continue
-            if side is None:
-                if c.side != self._module.Side.NONE:
-                    continue
-            else:
-                if c.side != side:
-                    continue
-                if (side == self._module.Side.LEFT and
-                        self._failed_left is not None):
-                    continue
-                if (side == self._module.Side.RIGHT and
-                        self._failed_right is not None):
-                    continue
-            observe_move_cands.append(c)
+            if c.side == self._module.Side.LEFT and \
+                    self._failed_left is not None:
+                self.observe_reject_failed_side += 1
+                continue
+            if c.side == self._module.Side.RIGHT and \
+                    self._failed_right is not None:
+                self.observe_reject_failed_side += 1
+                continue
+            move_cands.append(c)
+        # Valid movement counts per side (diagnostics).
+        self.observe_left_valid_count = len([c for c in move_cands
+            if c.side == self._module.Side.LEFT])
+        self.observe_right_valid_count = len([c for c in move_cands
+            if c.side == self._module.Side.RIGHT])
+        self.observe_center_valid_count = len([c for c in move_cands
+            if c.side == self._module.Side.NONE])
 
-        # OBSERVED_NO_CORRIDOR (section XIV): only when the committed side's
-        # edge is ACTUALLY visible AND it was observed for a while with no
-        # new info AND no usable observation move remains.  A single 45°
-        # yaw sweep never marks a side failed (section XIII).
-        if no_new_info and side is not None:
+        # OBSERVED_NO_CORRIDOR (section XIV/XLV): ONLY with strong evidence —
+        # the preferred side's edge is ACTUALLY visible, it has been observed
+        # for a while with no new info AND no usable movement candidate
+        # remains.  Scan exhaustion alone NEVER marks a side failed.
+        if no_new_info and pref_side is not None and not move_cands:
             edge_visible = (
-                (side == self._module.Side.LEFT and
+                (pref_side == self._module.Side.LEFT and
                  bool(blocker.left_edge_visible)) or
-                (side == self._module.Side.RIGHT and
+                (pref_side == self._module.Side.RIGHT and
                  bool(blocker.right_edge_visible)))
-            if edge_visible and not observe_move_cands:
-                self._mark_side_failed(side, SideFailure.OBSERVED_NO_CORRIDOR)
+            if edge_visible:
+                self._mark_side_failed(pref_side,
+                                       SideFailure.OBSERVED_NO_CORRIDOR)
+                pref_side = self._observe_side()
 
         # ── NO_VALID_SIDE (section XVII) ─────────────────────────────
-        if side is None:
+        if pref_side is None:
             priv = self._last_intervention
             route_ok = priv is not None and self._oracle.built() and \
                 priv.reason != self._module.InterventionReason.NO_GLOBAL_ROUTE
@@ -660,44 +707,137 @@ class MacroExpert(object):
                     self.mode, pos, None, False, 0.0, "no_valid_side_no_route")
             # Unknown space remains: keep OBSERVE facing forward, never
             # re-selecting a failed side.
-            side = None
             self.committed_side = self._module.Side.NONE
+
+        # ── Active observation decision (section LXIX) ───────────────
+        # Movement candidate with preference + fallback: preferred side,
+        # then centre / neutral frontier, then the other non-failed side.
+        # Once both scans are exhausted this is exactly the expanded search
+        # over every non-failed viewpoint (sections XXX-XXXI).
+        best_move = self._best_observe_move(move_cands, pos, pref_side)
+        clearly_better = (best_move is not None and
+                          float(best_move.unknown_information_gain) >=
+                          self.cfg.get("observe_info_gain_move_threshold",
+                                       0.05))
+        stagnant = self._observe_stagnant_time > \
+            self.cfg.get("max_stagnant_rotate_s", 2.0)
+
+        if not self._both_scans_exhausted() and not stagnant and \
+                ((not no_new_info) or (not rotation_exhausted)):
+            # Rotation still yields information (or is still sweeping): keep
+            # OBSERVE_ROTATE unless a clearly better viewpoint exists
+            # (sections LXVIII/LXIX).
+            if clearly_better:
+                guide = np.asarray(best_move.position_world)
+                desired_yaw_world = normalize_angle(
+                    math.atan2(guide[1] - pos[1], guide[0] - pos[0]) -
+                    0.5 * math.pi)
+                observe_subtype = 1
+            else:
+                guide, desired_yaw_world, observe_subtype = \
+                    self._observe_rotate_action(pos, yaw, dt_s, fov_half_obs)
+        elif best_move is not None:
+            # Active perception target: preferred side, then centre, then
+            # other non-failed side (expanded search included).
+            guide = np.asarray(best_move.position_world)
+            desired_yaw_world = normalize_angle(
+                math.atan2(guide[1] - pos[1], guide[0] - pos[0]) -
+                0.5 * math.pi)
+            observe_subtype = 1
+        elif not self._both_scans_exhausted():
+            # No movement candidate: advance the per-side scan lifecycle
+            # (sections XXVI-XXXI).  Exhausted rotation + no new info marks
+            # the current scan exhausted and hands over to the OTHER
+            # non-failed side with a fresh sweep reference.
+            if rotation_exhausted or no_new_info or stagnant:
+                if not self._scan_side_is_exhausted():
+                    self._mark_current_scan_exhausted()
+                other = self._other_scan_side()
+                if other is not None:
+                    self._switch_scan_side(other, yaw, now_s)
+                    guide, desired_yaw_world, observe_subtype = \
+                        self._observe_rotate_action(pos, yaw, dt_s,
+                                                    fov_half_obs)
+                else:
+                    # No other usable side: run a RECONSIDERATION sweep from
+                    # the current yaw so the yaw target keeps changing (the
+                    # observed map can grow; never a fixed-yaw loop).
+                    self._observe_reference_yaw_world = yaw
+                    self._observe_yaw_delta = 0.0
+                    self._observe_stagnant_time = 0.0
+                    guide, desired_yaw_world, observe_subtype = \
+                        self._observe_rotate_action(pos, yaw, dt_s,
+                                                    fov_half_obs)
+            else:
+                guide, desired_yaw_world, observe_subtype = \
+                    self._observe_rotate_action(pos, yaw, dt_s, fov_half_obs)
+        else:
+            # BOTH scans exhausted and no FULL-reachable viewpoint anywhere
+            # (section XXIX/XXXII): NEVER repeat the same fixed yaw for tens
+            # of seconds.  Expanded search already produced nothing, so run a
+            # reconsideration sweep from the current yaw — a fresh sweep
+            # phase keeps the yaw target changing while the map grows.
             self._observe_reference_yaw_world = yaw
             self._observe_yaw_delta = 0.0
+            self._observe_stagnant_time = 0.0
+            guide, desired_yaw_world, observe_subtype = \
+                self._observe_rotate_action(pos, yaw, dt_s, fov_half_obs)
 
-        # ── OBSERVE_MOVE vs OBSERVE_ROTATE (section XV) ──────────────
-        if no_new_info and observe_move_cands and \
-                (rotation_exhausted or side is None):
-            move_candidate = max(
-                observe_move_cands,
-                key=lambda c: c.unknown_information_gain)
-            guide = np.asarray(move_candidate.position_world)
-            desired_yaw_world = normalize_angle(
-                math.atan2(guide[1] - pos[1], guide[0] - pos[0]) - 0.5 * math.pi)
-            observe_subtype = 1
+        # Stagnation bookkeeping for the NEXT tick (fixed-yaw + no-move +
+        # no-info accumulation; section XXXIII/XXXV).
+        self._update_observe_stagnation(
+            desired_yaw_world, observe_subtype == 0, info_gained, dt_s)
+
+        # Selected-viewpoint diagnostics (section XLIX).
+        if observe_subtype == 1 and best_move is not None:
+            self._prev_observe_viewpoint = np.asarray(guide)
+            self.observe_selected_source = best_move.source
+            self.observe_selected_side = int(best_move.side)
+            self.observe_selected_distance = round(float(np.linalg.norm(
+                np.asarray(best_move.position_world) - pos)), 3)
+            self.observe_selected_path_length = round(
+                float(best_move.observed_path_length), 3)
+            self.observe_selected_info_gain = round(
+                float(best_move.unknown_information_gain), 4)
+            self.observe_selected_clearance = round(
+                float(best_move.minimum_clearance), 3)
         else:
-            # OBSERVE_ROTATE: pure rotation about the current position.
-            # The actual execution is ROTATE_ONLY (zero velocity), so the
-            # macro label must carry zero translation: guide == position
-            # (section XXV, Case E).  The sweep advances from the FIXED
-            # reference yaw captured at OBSERVE entry.
-            if side is not None:
-                sign = 1.0 if side == self._module.Side.LEFT else -1.0
-                sweep_step = self.cfg.get("observe_rotation_rate_rps", 1.5) * \
-                    dt_s
-                self._observe_yaw_delta += sign * sweep_step
-                self._observe_yaw_delta = \
-                    sign * min(abs(self._observe_yaw_delta), fov_half_obs)
-            desired_yaw_world = normalize_angle(
-                self._observe_reference_yaw_world + self._observe_yaw_delta)
-            guide = pos
-            observe_subtype = 0
+            self._prev_observe_viewpoint = None
+            self.observe_selected_source = ""
+            self.observe_selected_side = 0
+            self.observe_selected_distance = 0.0
+            self.observe_selected_path_length = 0.0
+            self.observe_selected_info_gain = 0.0
+            self.observe_selected_clearance = 0.0
 
-        side_name = "left" if side == self._module.Side.LEFT else \
-            ("right" if side == self._module.Side.RIGHT else "forward")
+        # ── OBSERVE per-tick diagnostics (section XLVII/XLVIII) ──────
+        self.observe_scan_side = int(self._observe_scan_side) \
+            if self._observe_scan_side is not None else 0
+        self.left_scan_exhausted = int(self._left_scan_exhausted)
+        self.right_scan_exhausted = int(self._right_scan_exhausted)
+        self.observe_rotation_exhausted = int(rotation_exhausted)
+        self.observe_stagnant_rotate_time = round(
+            self._observe_stagnant_time, 3)
+        diag = self._candidate_search.last_observe_diagnostics()
+        self.observe_raw_candidate_count = int(diag.raw_candidate_count)
+        self.observe_lattice_candidate_count = int(diag.lattice_candidate_count)
+        self.observe_frontier_candidate_count = int(diag.frontier_candidate_count)
+        self.observe_endpoint_known_free_count = int(
+            diag.endpoint_known_free_count)
+        self.observe_local_full_count = int(diag.full_local_count)
+        self.observe_reject_unknown = int(diag.reject_unknown)
+        self.observe_reject_endpoint_clearance = int(
+            diag.reject_endpoint_clearance)
+        self.observe_reject_min_distance = int(diag.reject_min_distance)
+        self.observe_reject_max_distance = int(diag.reject_max_distance)
+        self.observe_reject_partial = int(diag.partial_count)
+        self.observe_reject_no_path = int(diag.no_path_count)
+
+        side_name = "left" if pref_side == self._module.Side.LEFT else \
+            ("right" if pref_side == self._module.Side.RIGHT else "forward")
         action = self._build_action(
             self.mode, guide, desired_yaw_world, True, 0.5,
-            "observe_%s" % side_name, observe_side=side)
+            "observe_%s" % side_name, observe_side=pref_side)
         action.observe_subtype = observe_subtype
         self._macro_decision_observable = False
         self._macro_decision_confidence = 0.5
@@ -714,6 +854,7 @@ class MacroExpert(object):
         self._observe_time_s = 0.0
         self._observe_yaw_delta = 0.0
         self._observe_reference_yaw_world = None
+        self._clear_observe_scan_state()
         pos_ctg = float(self._oracle.cost_to_go(pos)) \
             if self._oracle.built() else float("inf")
         self._side_best_cost = pos_ctg if math.isfinite(pos_ctg) else None
@@ -901,6 +1042,10 @@ class MacroExpert(object):
         self._side_last_progress_time = None
         self._side_last_pos = None
         self._side_path_progress = 0.0
+        # Fresh topology -> fresh active-observation scan state (section
+        # XLIII): old blocker scan exhaustion must never leak into the new
+        # obstacle.
+        self._clear_observe_scan_state()
 
     # ── Side failure memory (section VIII/XIV) ───────────────────────
     def _mark_side_failed(self, side, reason):
@@ -969,6 +1114,186 @@ class MacroExpert(object):
             return self._module.Side.RIGHT
         # Both sides failed -> NO_VALID_SIDE (never re-select a failed one).
         return None
+
+    # ── Active-observation scan lifecycle (sections XXI-XXXV) ───────
+    def _clear_observe_scan_state(self):
+        """Drop the whole active-observation scan session (called when
+        leaving OBSERVE / on a confirmed new blocker).  Scan exhaustion is
+        per-obstacle topology, never global."""
+        self._observe_scan_side = None
+        self._left_scan_exhausted = False
+        self._right_scan_exhausted = False
+        self._observe_stagnant_time = 0.0
+        self._observe_last_target_yaw = None
+        self._observe_last_move_guide = None
+        self._prev_observe_viewpoint = None
+
+    def _reset_observe_diagnostics(self):
+        """Zero the per-tick OBSERVE diagnostics (section XLVII-XLIX).  The
+        OBSERVE branch repopulates them; every other mode records zeros."""
+        self.observe_scan_side = 0
+        self.left_scan_exhausted = 0
+        self.right_scan_exhausted = 0
+        self.observe_rotation_exhausted = 0
+        self.observe_stagnant_rotate_time = 0.0
+        self.observe_raw_candidate_count = 0
+        self.observe_lattice_candidate_count = 0
+        self.observe_frontier_candidate_count = 0
+        self.observe_endpoint_known_free_count = 0
+        self.observe_local_full_count = 0
+        self.observe_reject_unknown = 0
+        self.observe_reject_endpoint_clearance = 0
+        self.observe_reject_min_distance = 0
+        self.observe_reject_max_distance = 0
+        self.observe_reject_partial = 0
+        self.observe_reject_no_path = 0
+        self.observe_reject_failed_side = 0
+        self.observe_left_valid_count = 0
+        self.observe_right_valid_count = 0
+        self.observe_center_valid_count = 0
+        self.observe_selected_source = ""
+        self.observe_selected_side = 0
+        self.observe_selected_distance = 0.0
+        self.observe_selected_path_length = 0.0
+        self.observe_selected_info_gain = 0.0
+        self.observe_selected_clearance = 0.0
+
+    def _reset_observe_scan(self, preferred_side, yaw, now_s):
+        """Initialise a fresh OBSERVE scan session (OBSERVE entry / new
+        blocker): the preferred side becomes the scan side, the sweep
+        reference is the current yaw, and both exhaustion flags are clear."""
+        self._clear_observe_scan_state()
+        self._observe_scan_side = preferred_side
+        self._observe_reference_yaw_world = yaw
+        self._observe_yaw_delta = 0.0
+        self._observe_last_target_yaw = yaw
+        self._observe_last_known = None
+        self._observe_last_edge_mask = None
+        self._observe_last_reachable_count = None
+        self._observe_last_info_time = now_s
+        self.observe_no_information_time = 0.0
+
+    def _scan_side_is_exhausted(self):
+        if self._observe_scan_side == self._module.Side.LEFT:
+            return self._left_scan_exhausted
+        if self._observe_scan_side == self._module.Side.RIGHT:
+            return self._right_scan_exhausted
+        return False
+
+    def _both_scans_exhausted(self):
+        return self._left_scan_exhausted and self._right_scan_exhausted
+
+    def _mark_current_scan_exhausted(self):
+        if self._observe_scan_side == self._module.Side.LEFT:
+            self._left_scan_exhausted = True
+        elif self._observe_scan_side == self._module.Side.RIGHT:
+            self._right_scan_exhausted = True
+
+    def _other_scan_side(self):
+        """The other non-failed, non-exhausted side, or None."""
+        if self._observe_scan_side == self._module.Side.LEFT:
+            if not self._right_scan_exhausted and self._failed_right is None:
+                return self._module.Side.RIGHT
+            return None
+        if self._observe_scan_side == self._module.Side.RIGHT:
+            if not self._left_scan_exhausted and self._failed_left is None:
+                return self._module.Side.LEFT
+            return None
+        # No scan side yet: first non-failed, non-exhausted side.
+        if not self._left_scan_exhausted and self._failed_left is None:
+            return self._module.Side.LEFT
+        if not self._right_scan_exhausted and self._failed_right is None:
+            return self._module.Side.RIGHT
+        return None
+
+    def _switch_scan_side(self, side, yaw, now_s):
+        """Start scanning the other side: re-baseline the sweep reference
+        at the CURRENT yaw and clear the info/stagnation windows."""
+        self._observe_scan_side = side
+        self._observe_reference_yaw_world = yaw
+        self._observe_yaw_delta = 0.0
+        self._observe_stagnant_time = 0.0
+        self._observe_last_target_yaw = yaw
+        self._observe_last_info_time = now_s
+        self.observe_no_information_time = 0.0
+
+    def _observe_rotate_action(self, pos, yaw, dt_s, fov_half_obs):
+        """OBSERVE_ROTATE: pure rotation about the current position toward
+        the sweep target of the CURRENT scan side (guide == position, zero
+        translation).  Returns (guide, desired_yaw_world, subtype)."""
+        scan_side = self._observe_scan_side
+        if scan_side is not None:
+            sign = 1.0 if scan_side == self._module.Side.LEFT else -1.0
+            sweep_step = self.cfg.get("observe_rotation_rate_rps", 1.5) * dt_s
+            self._observe_yaw_delta += sign * sweep_step
+            self._observe_yaw_delta = \
+                sign * min(abs(self._observe_yaw_delta), fov_half_obs)
+            desired_yaw_world = normalize_angle(
+                self._observe_reference_yaw_world + self._observe_yaw_delta)
+        else:
+            desired_yaw_world = yaw
+        return pos, desired_yaw_world, 0
+
+    def _update_observe_stagnation(self, target_yaw, rotating, info_gained,
+                                   dt_s):
+        """No-action deadlock detector (section XXXIII/XXXV): consecutive
+        macro ticks with a FIXED yaw target, no translation and no new
+        information accumulate `_observe_stagnant_time`; any change (target
+        moved, a move was issued, information arrived) resets it."""
+        fixed_yaw = (self._observe_last_target_yaw is not None and
+                     abs(normalize_angle(
+                         target_yaw - self._observe_last_target_yaw)) < 1e-3)
+        if rotating and not info_gained and fixed_yaw:
+            self._observe_stagnant_time += dt_s
+        else:
+            self._observe_stagnant_time = 0.0
+        self._observe_last_target_yaw = target_yaw
+
+    def _rank_observe_moves(self, cands, pos):
+        """Score FULL-reachable OBSERVE/GOAL_FRONTIER movement candidates:
+        information gain (primary) + goal progress + clearance - path cost,
+        plus a current-scan-side preference bonus and a hysteresis bonus for
+        the previously selected viewpoint (section XVII/XLI).  Returns the
+        candidates best-first."""
+        pref = self._observe_scan_side
+        hyst_m = self.cfg.get("observe_viewpoint_hysteresis_m", 0.8)
+        hyst_bonus = self.cfg.get("observe_viewpoint_hysteresis_bonus", 0.15)
+        lookahead = max(1.0, self.cfg.get("macro_lookahead_distance_m", 4.5))
+        scored = []
+        for c in cands:
+            cpos = np.asarray(c.position_world, dtype=np.float64)
+            score = float(c.unknown_information_gain)
+            score += 0.15 * float(c.goal_progress) / lookahead
+            score += 0.05 * max(0.0, float(c.minimum_clearance))
+            score -= 0.02 * float(c.observed_path_length)
+            if pref is not None and c.side == pref:
+                score += 0.10
+            if self._prev_observe_viewpoint is not None and \
+                    float(np.linalg.norm(
+                        cpos - self._prev_observe_viewpoint)) <= hyst_m:
+                score += hyst_bonus
+            scored.append((score, c))
+        scored.sort(key=lambda t: -t[0])
+        return [c for _, c in scored]
+
+    def _best_observe_move(self, move_cands, pos, prefer_side):
+        """Pick the best movement candidate with preference + fallback
+        (sections XVIII/XIX): preferred side first, then centre / neutral
+        frontier, then the other non-failed side.  Proven-failed sides are
+        already hard-excluded from `move_cands` (section XX)."""
+        if not move_cands:
+            return None
+        ranked = self._rank_observe_moves(move_cands, pos)
+        tier1 = [c for c in ranked if c.side == prefer_side]
+        tier2 = [c for c in ranked
+                 if c.side == self._module.Side.NONE]
+        tier3 = [c for c in ranked
+                 if c.side != prefer_side and
+                 c.side != self._module.Side.NONE]
+        for tier in (tier1, tier2, tier3):
+            if tier:
+                return tier[0]
+        return ranked[0] if ranked else None
 
     # ── SIDE selection (section VI/VIII) ─────────────────────────────
     def _select_side(self, viable):
@@ -1095,6 +1420,37 @@ class MacroExpert(object):
                 math.degrees(float(self._observe_yaw_delta)), 2),
             "observe_no_information_time": self._round_opt(
                 self.observe_no_information_time),
+            "observe_scan_side": int(self.observe_scan_side),
+            "left_scan_exhausted": bool(self.left_scan_exhausted),
+            "right_scan_exhausted": bool(self.right_scan_exhausted),
+            "observe_rotation_exhausted": bool(self.observe_rotation_exhausted),
+            "observe_stagnant_rotate_time": self._round_opt(
+                self.observe_stagnant_rotate_time),
+            "observe_raw_candidate_count": int(self.observe_raw_candidate_count),
+            "observe_lattice_candidate_count": int(
+                self.observe_lattice_candidate_count),
+            "observe_frontier_candidate_count": int(
+                self.observe_frontier_candidate_count),
+            "observe_local_full_count": int(self.observe_local_full_count),
+            "observe_reject_unknown": int(self.observe_reject_unknown),
+            "observe_reject_endpoint_clearance": int(
+                self.observe_reject_endpoint_clearance),
+            "observe_reject_partial": int(self.observe_reject_partial),
+            "observe_reject_no_path": int(self.observe_reject_no_path),
+            "observe_reject_failed_side": int(self.observe_reject_failed_side),
+            "observe_left_valid_count": int(self.observe_left_valid_count),
+            "observe_right_valid_count": int(self.observe_right_valid_count),
+            "observe_center_valid_count": int(self.observe_center_valid_count),
+            "observe_selected_source": str(self.observe_selected_source),
+            "observe_selected_side": int(self.observe_selected_side),
+            "observe_selected_distance": self._round_opt(
+                self.observe_selected_distance),
+            "observe_selected_path_length": self._round_opt(
+                self.observe_selected_path_length),
+            "observe_selected_info_gain": self._round_opt(
+                self.observe_selected_info_gain),
+            "observe_selected_clearance": self._round_opt(
+                self.observe_selected_clearance),
             "blocker_track_id": self.blocker_track_id,
             "blocker_matches_current": bool(self._blocker_matches_current),
             "rec_status": int(rec.status) if rec is not None else -1,

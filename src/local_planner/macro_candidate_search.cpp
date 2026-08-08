@@ -15,16 +15,22 @@ namespace {
 constexpr double kEpsilon = 1.0e-9;
 constexpr double kPi = 3.14159265358979323846;
 
-bool corridorIsKnownFree(const ObservedMap& map,
-                         const Eigen::Vector3d& start,
-                         const Eigen::Vector3d& end,
-                         double radius,
-                         double spacing,
-                         double min_clearance) {
+/// Straight known-and-clear segment check with a SINGLE required ESDF
+/// clearance.  The ESDF already subtracts the vehicle radius, so callers
+/// pass the extra margin they actually mean — never radius + margin again
+/// (that would double-inflate).  Used only where a straight segment is the
+/// right abstraction (side-corridor extent, DIRECT lookahead); OBSERVE and
+/// GOAL_FRONTIER movement candidates use the real observed LocalPathSearch
+/// instead (section XV).
+bool segmentKnownAndClear(const ObservedMap& map,
+                          const Eigen::Vector3d& start,
+                          const Eigen::Vector3d& end,
+                          double required_esdf_clearance) {
     const double length = (end - start).norm();
+    const double spacing = 0.10;
     if (length <= kEpsilon) {
         return map.isKnownFree(start.x(), start.y(), start.z(),
-                               radius + min_clearance);
+                               required_esdf_clearance);
     }
     const Eigen::Vector3d direction = (end - start) / length;
     const int samples =
@@ -33,7 +39,7 @@ bool corridorIsKnownFree(const ObservedMap& map,
         const Eigen::Vector3d point = start + direction *
                                                  (length * i / samples);
         if (!map.isKnownFree(point.x(), point.y(), point.z(),
-                             radius + min_clearance)) {
+                             required_esdf_clearance)) {
             return false;
         }
     }
@@ -280,15 +286,14 @@ GoalBlocker analyzeGoalBlocker(const ObservedMap& map,
                 *edge_world = probe;
                 *edge_visible = true;
                 *corridor_point = probe;
-                *corridor_known = corridorIsKnownFree(
+                *corridor_known = segmentKnownAndClear(
                     map, probe,
                     Eigen::Vector3d(probe.x() + goal_dir.x() *
                                                      config.side_corridor_length_m,
                                     probe.y() + goal_dir.y() *
                                                      config.side_corridor_length_m,
                                     z),
-                    corridor_clearance, config.corridor_check_spacing_m,
-                    config.min_candidate_clearance_m);
+                    corridor_clearance);
                 break;
             }
         }
@@ -303,41 +308,38 @@ void MacroCandidateSearch::scoreObserved(MacroCandidate* candidate,
     const Eigen::Vector3d delta = candidate->position_world - state.position;
     const double dist = delta.norm();
     candidate->position_flu = worldToFlu(delta, state.yaw);
-    candidate->observed_path_cost = dist;
 
-    // REAL observed-map path search for SIDE candidates (section XII):
-    // known_reachable means the search FULLY reached the candidate point.
-    // Other candidate types use the cheap straight-line corridor check.
+    // REAL observed-map reachability for every movement candidate (section
+    // XIII/XV): SIDE, OBSERVE and GOAL_FRONTIER all run the observed
+    // LocalPathSearch, and only FULL_GOAL_REACHED counts as reachable.  A
+    // blocked straight line from current->candidate is NOT a reason to
+    // reject an observation viewpoint — the 30 Hz planner can detour around
+    // known obstacles, so the macro candidate validator must reflect that
+    // real capability.  DIRECT and PREVIOUS_CONTINUATION keep the cheap
+    // segment check (they are not committed movement targets of this tick).
     if (candidate->type == CandidateType::SIDE) {
-        LocalPathSearch search;
-        const LocalSearchConfig search_config =
-            makeSearchConfig(config_, candidate->side);
-        const LocalPathResult path_result =
-            search.search(map, state, candidate->position_world,
-                          search_config);
-        candidate->full_goal_reached =
-            path_result.status == LocalPathResult::Status::FULL_GOAL_REACHED;
-        candidate->found_partial =
-            path_result.status != LocalPathResult::Status::NO_PATH;
-        candidate->known_reachable = candidate->full_goal_reached;
-        candidate->observed_path_cost = path_result.path_cost;
-        candidate->observed_path_length = path_result.path_cost;
-        candidate->minimum_clearance = path_result.minimum_clearance;
-        if (candidate->found_partial) {
-            candidate->position_world = path_result.terminal;
+        evaluateObservedReachability(candidate, map, state, true);
+    } else if (candidate->type == CandidateType::OBSERVE ||
+               candidate->type == CandidateType::GOAL_FRONTIER) {
+        evaluateObservedReachability(candidate, map, state, false);
+        if (candidate->full_goal_reached) {
+            ++observe_diag_.full_local_count;
+        } else if (candidate->found_partial) {
+            ++observe_diag_.partial_count;
+        } else {
+            ++observe_diag_.no_path_count;
         }
     } else {
-        candidate->known_reachable =
-            corridorIsKnownFree(map, state.position, candidate->position_world,
-                                config_.min_candidate_clearance_m,
-                                config_.corridor_check_spacing_m,
-                                config_.min_candidate_clearance_m);
+        candidate->known_reachable = segmentKnownAndClear(
+            map, state.position, candidate->position_world,
+            config_.min_candidate_clearance_m);
         candidate->full_goal_reached = candidate->known_reachable;
         candidate->found_partial = candidate->known_reachable;
-        // Minimum clearance along the candidate corridor.
-        double min_clearance = std::numeric_limits<double>::infinity();
+        candidate->observed_path_cost = dist;
+        candidate->minimum_clearance = 0.0;
         if (dist > kEpsilon) {
             const Eigen::Vector3d dir = delta / dist;
+            double min_clearance = std::numeric_limits<double>::infinity();
             const int n = std::max(
                 1, static_cast<int>(std::ceil(
                        dist / std::max(0.02, config_.corridor_check_spacing_m))));
@@ -347,9 +349,9 @@ void MacroCandidateSearch::scoreObserved(MacroCandidate* candidate,
                 const double c = map.esdfValue(point.x(), point.y(), point.z());
                 if (std::isfinite(c)) min_clearance = std::min(min_clearance, c);
             }
+            candidate->minimum_clearance =
+                std::isfinite(min_clearance) ? min_clearance : 0.0;
         }
-        candidate->minimum_clearance =
-            std::isfinite(min_clearance) ? min_clearance : 0.0;
     }
     // Goal progress: projection of the candidate offset onto the goal ray.
     const Eigen::Vector2d travel = goal_world.head<2>() - state.position.head<2>();
@@ -358,30 +360,65 @@ void MacroCandidateSearch::scoreObserved(MacroCandidate* candidate,
         candidate->goal_progress = delta.head<2>().dot(travel / travel_len);
     }
     // Information gain: unknown cells in a disk around the candidate.
+    candidate->unknown_information_gain =
+        estimateInfoGain(map, candidate->position_world);
+}
+
+void MacroCandidateSearch::evaluateObservedReachability(
+    MacroCandidate* candidate,
+    const ObservedMap& map,
+    const VehicleState& state,
+    bool adopt_partial) const {
+    LocalPathSearch search;
+    // OBSERVE / GOAL_FRONTIER use NO side bias: the reachability query must
+    // reflect the true 30 Hz planner capability, not a preference.
+    const Side bias_side =
+        candidate->type == CandidateType::SIDE ? candidate->side : Side::NONE;
+    const LocalSearchConfig search_config = makeSearchConfig(config_, bias_side);
+    const LocalPathResult path_result =
+        search.search(map, state, candidate->position_world, search_config);
+    candidate->full_goal_reached =
+        path_result.status == LocalPathResult::Status::FULL_GOAL_REACHED;
+    candidate->found_partial =
+        path_result.status != LocalPathResult::Status::NO_PATH;
+    candidate->known_reachable = candidate->full_goal_reached;
+    candidate->observed_path_cost = path_result.path_cost;
+    candidate->observed_path_length = path_result.path_cost;
+    candidate->minimum_clearance = path_result.minimum_clearance;
+    // A PARTIAL path is NEVER a reachable OBSERVE/GOAL_FRONTIER viewpoint
+    // (it is a real movement terminal); only SIDE adopts the partial
+    // terminal as its fallback position (existing behaviour).
+    if (adopt_partial && candidate->found_partial &&
+        !candidate->full_goal_reached) {
+        candidate->position_world = path_result.terminal;
+    }
+}
+
+double MacroCandidateSearch::estimateInfoGain(
+    const ObservedMap& map,
+    const Eigen::Vector3d& position) const {
+    const double radius = std::max(0.3, config_.observe_info_gain_radius_m);
     const int radius_cells = std::max(
-        2, static_cast<int>(std::ceil(0.8 / std::max(0.05, map.resolution()))));
+        2, static_cast<int>(std::ceil(radius / std::max(0.05, map.resolution()))));
     int unknown_count = 0;
     int total = 0;
-    const Eigen::Vector3i center = map.worldToGridInt(candidate->position_world);
+    const Eigen::Vector3i center = map.worldToGridInt(position);
     for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
         for (int dy = -radius_cells; dy <= radius_cells; ++dy) {
             const int ix = center.x() + dx;
             const int iy = center.y() + dy;
             if (ix < 0 || ix >= map.gx() || iy < 0 || iy >= map.gy()) continue;
-            const double wx = map.origin().x() + (static_cast<double>(ix) + 0.5) *
-                                                     map.resolution();
-            const double wy = map.origin().y() + (static_cast<double>(iy) + 0.5) *
-                                                     map.resolution();
-            if (std::hypot(wx - candidate->position_world.x(),
-                           wy - candidate->position_world.y()) > 0.8) {
+            const double wx =
+                map.origin().x() + (static_cast<double>(ix) + 0.5) * map.resolution();
+            const double wy =
+                map.origin().y() + (static_cast<double>(iy) + 0.5) * map.resolution();
+            if (std::hypot(wx - position.x(), wy - position.y()) > radius) {
                 continue;
             }
             ++total;
-            const Eigen::Vector3i g(ix, iy, center.z());
             const std::int64_t idx =
-                (static_cast<std::int64_t>(g.x()) * map.gy() + g.y()) *
-                    map.gz() +
-                g.z();
+                (static_cast<std::int64_t>(ix) * map.gy() + iy) * map.gz() +
+                center.z();
             if (idx >= 0 &&
                 idx < static_cast<std::int64_t>(map.occupancy().size()) &&
                 map.occupancy()[static_cast<size_t>(idx)] == UNKNOWN) {
@@ -389,12 +426,118 @@ void MacroCandidateSearch::scoreObserved(MacroCandidate* candidate,
             }
         }
     }
-    candidate->unknown_information_gain =
-        total > 0 ? static_cast<double>(unknown_count) / total : 0.0;
+    return total > 0 ? static_cast<double>(unknown_count) / total : 0.0;
 }
 
 MacroCandidateSearch::MacroCandidateSearch(const MacroCandidateConfig& config)
     : config_(config) {}
+
+std::vector<MacroCandidate> MacroCandidateSearch::makeObserveCandidates(
+    const ObservedMap& map,
+    const VehicleState& state,
+    const Eigen::Vector3d& goal_world,
+    int emit_budget) const {
+    std::vector<MacroCandidate> raw;
+    emit_budget = std::max(0, emit_budget);
+    const Eigen::Vector2d travel =
+        goal_world.head<2>() - state.position.head<2>();
+    const double travel_len = travel.norm();
+    if (travel_len <= kEpsilon) return raw;
+    const Eigen::Vector2d goal_dir = travel / travel_len;
+    const Eigen::Vector2d left_world(-goal_dir.y(), goal_dir.x());
+    const double z = state.position.z();
+
+    const auto& laterals = config_.observe_lateral_distances_m;
+    const auto& forwards = config_.observe_forward_distances_m;
+    if (laterals.empty()) return raw;
+    const double min_move = config_.min_observe_move_distance_m;
+    const double max_move = config_.max_observe_move_distance_m;
+    const double clear = config_.search_clearance_m;
+    // Lateral x forward x {LEFT, RIGHT}: a small local viewpoint lattice
+    // (section XV).  Forward 0 still yields near-side viewpoints at
+    // lateral offsets; every candidate is a real world position the drone
+    // may move to.
+    for (double fwd : forwards) {
+        for (double lat : laterals) {
+            for (int side_sign = -1; side_sign <= 1; side_sign += 2) {
+                const double lat_signed = side_sign * lat;
+                const Eigen::Vector3d pos(
+                    state.position.x() + goal_dir.x() * fwd +
+                        left_world.x() * lat_signed,
+                    state.position.y() + goal_dir.y() * fwd +
+                        left_world.y() * lat_signed,
+                    z);
+                const double move_dist = (pos - state.position).norm();
+                ++observe_diag_.raw_candidate_count;
+                // Cheap endpoint filter (section XII): distance bounds,
+                // known, free with the SAME clearance the 30 Hz planner
+                // uses (search_clearance_m — never a second inflation).
+                if (move_dist < min_move) {
+                    ++observe_diag_.reject_min_distance;
+                    continue;
+                }
+                if (move_dist > max_move) {
+                    ++observe_diag_.reject_max_distance;
+                    continue;
+                }
+                if (!map.isKnown(pos.x(), pos.y(), pos.z())) {
+                    ++observe_diag_.reject_unknown;
+                    continue;
+                }
+                if (!map.isKnownFree(pos.x(), pos.y(), pos.z(), clear)) {
+                    ++observe_diag_.reject_endpoint_clearance;
+                    continue;
+                }
+                ++observe_diag_.endpoint_known_free_count;
+                MacroCandidate c;
+                c.type = CandidateType::OBSERVE;
+                c.position_world = pos;
+                if (lat_signed > 1e-3) {
+                    c.side = Side::LEFT;
+                    c.source = "observe_left";
+                } else if (lat_signed < -1e-3) {
+                    c.side = Side::RIGHT;
+                    c.source = "observe_right";
+                } else {
+                    c.side = Side::NONE;
+                    c.source = "observe_center";
+                }
+                const double ec = map.esdfValue(pos.x(), pos.y(), pos.z());
+                c.minimum_clearance = std::isfinite(ec) ? ec : 0.0;
+                // Cheap information-gain estimate for ranking (the real
+                // value is recomputed after the FULL search).
+                c.unknown_information_gain = estimateInfoGain(map, pos);
+                raw.push_back(c);
+            }
+        }
+    }
+
+    // Cheap rank: information gain desc, endpoint clearance desc, distance
+    // asc.  Only the top candidates are kept; the FULL LocalPathSearch
+    // budget (max_viewpoint_searches_per_tick) limits how many of them
+    // actually get the A* in scoreObserved.
+    std::sort(raw.begin(), raw.end(),
+              [&](const MacroCandidate& a, const MacroCandidate& b) {
+                  const double ia = a.unknown_information_gain;
+                  const double ib = b.unknown_information_gain;
+                  if (std::abs(ia - ib) > 1e-6) return ia > ib;
+                  const double ca = a.minimum_clearance;
+                  const double cb = b.minimum_clearance;
+                  if (std::abs(ca - cb) > 1e-6) return ca > cb;
+                  const double da =
+                      (a.position_world - state.position).norm();
+                  const double db =
+                      (b.position_world - state.position).norm();
+                  return da < db;
+              });
+    const int pool_limit =
+        std::min(config_.max_viewpoint_candidates, static_cast<int>(raw.size()));
+    const int emit_limit =
+        std::min(emit_budget, pool_limit);
+    raw.resize(static_cast<size_t>(emit_limit));
+    observe_diag_.lattice_candidate_count = emit_limit;
+    return raw;
+}
 
 MacroCandidate MacroCandidateSearch::makeSideCandidate(
     const ObservedMap& map,
@@ -425,10 +568,8 @@ MacroCandidate MacroCandidateSearch::makeSideCandidate(
             const Eigen::Vector3d probe(
                 edge.x() + goal_dir.x() * d,
                 edge.y() + goal_dir.y() * d, z);
-            if (corridorIsKnownFree(map, edge, probe,
-                                    config_.side_corridor_radius_m,
-                                    config_.corridor_check_spacing_m,
-                                    config_.min_candidate_clearance_m)) {
+            if (segmentKnownAndClear(map, edge, probe,
+                                     config_.side_corridor_radius_m)) {
                 advance = probe;
             } else {
                 break;
@@ -448,8 +589,10 @@ MacroCandidate MacroCandidateSearch::makeSideCandidate(
 std::vector<MacroCandidate> MacroCandidateSearch::makeFrontierCandidates(
     const ObservedMap& map,
     const VehicleState& state,
-    const Eigen::Vector3d& goal_world) const {
+    const Eigen::Vector3d& goal_world,
+    int remaining_searches) const {
     std::vector<MacroCandidate> candidates;
+    if (remaining_searches <= 0) return candidates;
     const double res = map.resolution();
     const double z = state.position.z();
     const Eigen::Vector2d travel = goal_world.head<2>() - state.position.head<2>();
@@ -511,6 +654,7 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeFrontierCandidates(
                              config_.frontier_standoff_m});
         }
     }
+    observe_diag_.raw_candidate_count += static_cast<int>(cells.size());
     // Cluster by angular bin and keep the best cell per bin.
     const double bin_rad = 10.0 * kPi / 180.0;
     std::vector<std::pair<int, FrontierCell>> best_per_bin;
@@ -552,8 +696,10 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeFrontierCandidates(
         const Eigen::Vector3d pulled(
             cell.world.x() - dir.x() * cell.standoff,
             cell.world.y() - dir.y() * cell.standoff, z);
+        // Endpoint sits on the KNOWN-FREE side of the frontier with the
+        // same clearance the 30 Hz planner uses.
         if (!map.isKnownFree(pulled.x(), pulled.y(), pulled.z(),
-                             config_.min_candidate_clearance_m)) {
+                             config_.search_clearance_m)) {
             continue;
         }
         MacroCandidate candidate;
@@ -576,8 +722,23 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeFrontierCandidates(
         }
         candidate.position_world = pulled;
         candidate.source = "goal_frontier";
+        // Cheap information gain for ranking (recomputed after the FULL
+        // LocalPathSearch in scoreObserved).
+        candidate.unknown_information_gain = estimateInfoGain(map, pulled);
         candidates.push_back(candidate);
     }
+    // Honor the shared FULL-search budget: keep only the highest-gain
+    // frontiers that still fit within the remaining searches.
+    if (static_cast<int>(candidates.size()) > remaining_searches) {
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const MacroCandidate& a, const MacroCandidate& b) {
+                      return a.unknown_information_gain >
+                             b.unknown_information_gain;
+                  });
+        candidates.resize(static_cast<size_t>(remaining_searches));
+    }
+    observe_diag_.frontier_candidate_count =
+        static_cast<int>(candidates.size());
     return candidates;
 }
 
@@ -591,6 +752,8 @@ std::vector<MacroCandidate> MacroCandidateSearch::generateCandidates(
     const Eigen::Vector2d travel = goal_world.head<2>() - state.position.head<2>();
     const double travel_len = travel.norm();
     const double z = state.position.z();
+    // Per-tick observation diagnostics (mutable member, reset here).
+    observe_diag_ = ObserveDiagnostics();
     if (travel_len > kEpsilon) {
         const Eigen::Vector2d goal_dir = travel / travel_len;
 
@@ -625,36 +788,33 @@ std::vector<MacroCandidate> MacroCandidateSearch::generateCandidates(
             }
         }
 
-        // ── Observe candidates (ONLY non-zero known-safe probes) ────
-        // A zero-distance probe (current_position) must NEVER be emitted:
-        // it would be trivially FULL-reachable and masquerade as an
-        // OBSERVE_MOVE while executing nothing (sections V-VII, Case B).
-        // If the probe is unknown / occupied / too close, no MOVE
-        // candidate is generated — OBSERVE_ROTATE still covers pure yaw.
-        const Eigen::Vector2d perp(-goal_dir.y(), goal_dir.x());
-        for (int side_sign = -1; side_sign <= 1; side_sign += 2) {
-            const Side side = side_sign > 0 ? Side::LEFT : Side::RIGHT;
-            const Eigen::Vector3d probe(
-                state.position.x() + perp.x() * side_sign * config_.observe_step_m,
-                state.position.y() + perp.y() * side_sign * config_.observe_step_m,
-                z);
-            const double move_dist = (probe - state.position).norm();
-            if (move_dist < config_.min_observe_move_distance_m) continue;
-            if (!map.isKnownFree(probe.x(), probe.y(), probe.z(),
-                                 config_.min_candidate_clearance_m)) {
-                continue;
-            }
-            MacroCandidate observe;
-            observe.type = CandidateType::OBSERVE;
-            observe.side = side;
-            observe.position_world = probe;
-            observe.source = side == Side::LEFT ? "observe_left" : "observe_right";
-            candidates.push_back(observe);
-        }
+        // ── Active observation viewpoints (section XV) ──────────────
+        // A lateral x forward lattice on BOTH sides replaces the old two
+        // fixed ±observe_step_m probes.  The cheap endpoint filter runs
+        // first; only the top candidates (by information gain / clearance /
+        // distance) get the FULL observed LocalPathSearch in scoreObserved.
+        // A viewpoint never needs to be straight-line visible from here —
+        // the A* can detour around known obstacles exactly like the 30 Hz
+        // planner, and a blocked direct corridor is NOT a rejection.
+        const int frontier_reserve = std::min(
+            config_.max_frontier_candidates,
+            config_.min_frontier_searches_per_tick);
+        const int lattice_budget = std::max(
+            0, config_.max_viewpoint_searches_per_tick - frontier_reserve);
+        std::vector<MacroCandidate> observe_candidates =
+            makeObserveCandidates(map, state, goal_world, lattice_budget);
+        const int lattice_count =
+            static_cast<int>(observe_candidates.size());
+        candidates.insert(candidates.end(), observe_candidates.begin(),
+                          observe_candidates.end());
 
-        // ── Goal-directed frontiers ───────────────────────────────
+        // ── Goal-directed frontiers (known-free standoff) ──────────
+        const int remaining =
+            std::max(frontier_reserve,
+                     config_.max_viewpoint_searches_per_tick -
+                         lattice_count);
         std::vector<MacroCandidate> frontiers =
-            makeFrontierCandidates(map, state, goal_world);
+            makeFrontierCandidates(map, state, goal_world, remaining);
         candidates.insert(candidates.end(), frontiers.begin(), frontiers.end());
     }
 

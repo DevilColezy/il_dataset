@@ -90,6 +90,21 @@ DATA_SCHEMA_V22_FIELDS = [
     "plan_id", "plan_age_s", "plan_is_fresh", "plan_status", "plan_compute_ms",
     # episode
     "scene_id", "task_id", "episode_valid",
+    # active-observation diagnostics (pure diagnostics, never student
+    # input; held from the last 5 Hz macro tick)
+    "observe_scan_side", "left_scan_exhausted", "right_scan_exhausted",
+    "observe_rotation_exhausted", "observe_stagnant_rotate_time",
+    "observe_raw_candidate_count", "observe_lattice_candidate_count",
+    "observe_frontier_candidate_count", "observe_endpoint_known_free_count",
+    "observe_local_full_count", "observe_reject_unknown",
+    "observe_reject_endpoint_clearance", "observe_reject_min_distance",
+    "observe_reject_max_distance", "observe_reject_partial",
+    "observe_reject_no_path", "observe_reject_failed_side",
+    "observe_left_valid_count", "observe_right_valid_count",
+    "observe_center_valid_count",
+    "observe_selected_source", "observe_selected_side",
+    "observe_selected_distance", "observe_selected_path_length",
+    "observe_selected_info_gain", "observe_selected_clearance",
 ]
 
 _DEFAULT_ROW = {field: "" for field in DATA_SCHEMA_V22_FIELDS}

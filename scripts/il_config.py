@@ -195,6 +195,40 @@ def _validate_config(cfg):
     if mc.get("side_corridor_radius_m", 0.55) <= veh.get("radius_m", 0.30):
         errors.append(
             "macro_candidates.side_corridor_radius_m must exceed vehicle.radius_m")
+    # Active observation viewpoint search (section XV).
+    obs = mc.get("observation", {})
+    obs_lat = obs.get("lateral_distances_m", [0.4, 0.8, 1.2, 1.6])
+    obs_fwd = obs.get("forward_distances_m", [0.0, 0.4, 0.8, 1.2])
+    if not isinstance(obs_lat, list) or not obs_lat or \
+            any(float(v) <= 0 for v in obs_lat):
+        errors.append("macro_candidates.observation.lateral_distances_m "
+                      "must be a non-empty list of positive numbers")
+    if not isinstance(obs_fwd, list) or not obs_fwd or \
+            any(float(v) < 0 for v in obs_fwd):
+        errors.append("macro_candidates.observation.forward_distances_m "
+                      "must be a non-empty list of >= 0 numbers")
+    _positive(obs.get("max_viewpoint_candidates", 24),
+              "macro_candidates.observation.max_viewpoint_candidates", errors)
+    _positive(obs.get("max_viewpoint_searches_per_tick", 8),
+              "macro_candidates.observation.max_viewpoint_searches_per_tick",
+              errors)
+    _positive(obs.get("min_frontier_searches_per_tick", 2),
+              "macro_candidates.observation.min_frontier_searches_per_tick",
+              errors)
+    if int(obs.get("min_frontier_searches_per_tick", 2)) > \
+            int(obs.get("max_viewpoint_searches_per_tick", 8)):
+        errors.append("macro_candidates.observation."
+                      "min_frontier_searches_per_tick must be <= "
+                      "max_viewpoint_searches_per_tick")
+    _positive(obs.get("max_observe_move_distance_m", 6.0),
+              "macro_candidates.observation.max_observe_move_distance_m", errors)
+    _positive(obs.get("information_gain_radius_m", 1.2),
+              "macro_candidates.observation.information_gain_radius_m", errors)
+    if int(obs.get("max_viewpoint_searches_per_tick", 8)) > \
+            int(obs.get("max_viewpoint_candidates", 24)):
+        errors.append("macro_candidates.observation."
+                      "max_viewpoint_searches_per_tick must be <= "
+                      "max_viewpoint_candidates")
 
     # recoverability — unified LOCAL capability bounds (section II): the
     # privileged audit shares the SAME rejoin distance / duration / path
@@ -483,6 +517,22 @@ def build_macro_candidate_config(g, module):
     cfg.observe_step_m = float(mc.get("observe_step_m", 0.6))
     cfg.min_observe_move_distance_m = float(
         mc.get("min_observe_move_distance_m", 0.15))
+    # Active observation viewpoint search (section XV): lattice + FULL
+    # LocalPathSearch budget + info-gain radius.
+    obs = mc.get("observation", {})
+    cfg.observe_lateral_distances_m = [float(v) for v in
+        obs.get("lateral_distances_m", [0.4, 0.8, 1.2, 1.6])]
+    cfg.observe_forward_distances_m = [float(v) for v in
+        obs.get("forward_distances_m", [0.0, 0.4, 0.8, 1.2])]
+    cfg.max_viewpoint_candidates = int(obs.get("max_viewpoint_candidates", 24))
+    cfg.max_viewpoint_searches_per_tick = int(
+        obs.get("max_viewpoint_searches_per_tick", 8))
+    cfg.min_frontier_searches_per_tick = int(
+        obs.get("min_frontier_searches_per_tick", 2))
+    cfg.max_observe_move_distance_m = float(
+        obs.get("max_observe_move_distance_m", 6.0))
+    cfg.observe_info_gain_radius_m = float(
+        obs.get("information_gain_radius_m", 1.2))
     cfg.max_frontier_candidates = int(mc.get("max_frontier_candidates", 8))
     cfg.frontier_standoff_m = float(mc.get("frontier_standoff_m", 0.45))
     cfg.goal_frontier_cone_deg = float(mc.get("goal_frontier_cone_deg", 70.0))

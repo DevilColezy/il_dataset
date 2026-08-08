@@ -649,6 +649,20 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("observe_step_m", &MacroCandidateConfig::observe_step_m)
         .def_readwrite("min_observe_move_distance_m",
                        &MacroCandidateConfig::min_observe_move_distance_m)
+        .def_readwrite("observe_lateral_distances_m",
+                       &MacroCandidateConfig::observe_lateral_distances_m)
+        .def_readwrite("observe_forward_distances_m",
+                       &MacroCandidateConfig::observe_forward_distances_m)
+        .def_readwrite("max_viewpoint_candidates",
+                       &MacroCandidateConfig::max_viewpoint_candidates)
+        .def_readwrite("max_viewpoint_searches_per_tick",
+                       &MacroCandidateConfig::max_viewpoint_searches_per_tick)
+        .def_readwrite("min_frontier_searches_per_tick",
+                       &MacroCandidateConfig::min_frontier_searches_per_tick)
+        .def_readwrite("max_observe_move_distance_m",
+                       &MacroCandidateConfig::max_observe_move_distance_m)
+        .def_readwrite("observe_info_gain_radius_m",
+                       &MacroCandidateConfig::observe_info_gain_radius_m)
         .def_readwrite("max_frontier_candidates",
                        &MacroCandidateConfig::max_frontier_candidates)
         .def_readwrite("frontier_standoff_m",
@@ -693,7 +707,31 @@ PYBIND11_MODULE(_il_local_planner, m) {
                                                 blocker, prev_ptr);
              },
              py::arg("map"), py::arg("state"), py::arg("goal_world"),
-             py::arg("blocker"), py::arg("prev_candidate_world") = py::none());
+             py::arg("blocker"), py::arg("prev_candidate_world") = py::none())
+        .def("last_observe_diagnostics",
+             &MacroCandidateSearch::lastObserveDiagnostics);
+
+    py::class_<ObserveDiagnostics>(m, "ObserveDiagnostics")
+        .def(py::init<>())
+        .def_readonly("raw_candidate_count",
+                      &ObserveDiagnostics::raw_candidate_count)
+        .def_readonly("lattice_candidate_count",
+                      &ObserveDiagnostics::lattice_candidate_count)
+        .def_readonly("frontier_candidate_count",
+                      &ObserveDiagnostics::frontier_candidate_count)
+        .def_readonly("endpoint_known_free_count",
+                      &ObserveDiagnostics::endpoint_known_free_count)
+        .def_readonly("full_local_count",
+                      &ObserveDiagnostics::full_local_count)
+        .def_readonly("partial_count", &ObserveDiagnostics::partial_count)
+        .def_readonly("no_path_count", &ObserveDiagnostics::no_path_count)
+        .def_readonly("reject_unknown", &ObserveDiagnostics::reject_unknown)
+        .def_readonly("reject_endpoint_clearance",
+                      &ObserveDiagnostics::reject_endpoint_clearance)
+        .def_readonly("reject_min_distance",
+                      &ObserveDiagnostics::reject_min_distance)
+        .def_readonly("reject_max_distance",
+                      &ObserveDiagnostics::reject_max_distance);
 
     // ── PrivilegedOracle ────────────────────────────────────────────
     py::class_<PrivilegedOracleConfig::Scoring>(m, "PrivilegedOracleScoring")

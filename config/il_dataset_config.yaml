@@ -312,6 +312,13 @@ global:
     observe_rotation_rate_rps:  1.5
     # OBSERVE yaw sweep cap (half-FOV of the camera).
     observe_fov_half_deg:      45.0
+    # Active-observation scan lifecycle (sections XXI-XXXV): rotation-only
+    # stagnation cap, minimum info gain for a viewpoint to count as clearly
+    # better than continuing the sweep, and previous-viewpoint hysteresis.
+    max_stagnant_rotate_s:            2.0
+    observe_info_gain_move_threshold: 0.05
+    observe_viewpoint_hysteresis_m:   0.8
+    observe_viewpoint_hysteresis_bonus: 0.15
     # Episode-level final anti-deadlock guard (section XXII).
     macro_intervention_absolute_safety_timeout: 45.0
     # Fixed left preference for genuinely tied sides (never unconditional).
@@ -335,6 +342,24 @@ global:
     frontier_standoff_m:        0.45
     goal_frontier_cone_deg:     70.0
     corridor_check_spacing_m:   0.10
+    # ── Active observation viewpoint search (section XV) ───────────
+    # A small lateral x forward lattice around the current position on BOTH
+    # sides replaces the old two fixed ±observe_step_m probes.  Endpoints
+    # must be known-free with the SAME clearance as the 30 Hz local planner
+    # (local_path_search.search_clearance_m); reachability is verified with
+    # a real observed LocalPathSearch (FULL_GOAL_REACHED only, never a
+    # straight-corridor proxy).  All fields are diagnostic / expert-side;
+    # none enter the student input.
+    observation:
+      lateral_distances_m:       [0.4, 0.8, 1.2, 1.6]
+      forward_distances_m:       [0.0, 0.4, 0.8, 1.2]
+      max_viewpoint_candidates:  24
+      max_viewpoint_searches_per_tick: 8
+      # Minimum FULL searches reserved for GOAL_FRONTIER each tick (the
+      # lattice can never starve the frontier source).
+      min_frontier_searches_per_tick: 2
+      max_observe_move_distance_m: 6.0
+      information_gain_radius_m: 1.2
 
   # ── Local recoverability query (section VI) ────────────────────────
   # The search clearance is owned by local_path_search (single source).
