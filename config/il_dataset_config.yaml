@@ -35,6 +35,11 @@ global:
     drone_stable_timeout:    10.0
     trajectory_timeout:     120.0
     keep_alive_period:        3.0
+    # Keep AvoidBench's 5 s connection timeout from reloading the scene
+    # during the blocking map-build / task-generation phases.
+    block_keepalive_period:   2.0
+    # Wait for the first depth frame before recording a task (seconds).
+    depth_warmup_timeout:    30.0
 
   # ── Scene runtime / settle (section VIII) ─────────────────────────
   # `ready` is ONLY an initial AvoidBench handshake condition.  After a

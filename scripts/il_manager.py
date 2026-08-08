@@ -32,6 +32,7 @@ import math
 import os
 import shutil
 import sys
+import threading
 import time
 from enum import Enum
 
@@ -224,6 +225,8 @@ class ILManager(object):
         self._last_ply_size = -1
         self._ply_stable_since = None
         self._settle_last_keepalive = 0.0
+        self._scene_pose_msg = None
+        self._keepalive_thread = None
         self._generation_rng = None
 
         tg = self.g.get("task_generation", {})
@@ -464,6 +467,41 @@ class ILManager(object):
             drained += 1
         return drained
 
+    # ── Blocking-phase keep-alive ───────────────────────────────────
+    # AvoidBench restarts its whole scene if it receives NO message for
+    # `connection_timeout_seconds = 5` (CameraController.cs), which resets
+    # readyToRender and re-runs its 5-step initializeObjects state machine
+    # (one step per received Pose, no depth frames meanwhile).  The
+    # blocking map-build / task-generation phases send nothing for many
+    # seconds, tripping that timeout and burning the first ~6 depth
+    # requests of the scene (depth_frame_timeout).  A background thread
+    # re-sends the scene Pose every ~2 s so the silent gap never exceeds
+    # 5 s.  send_pose() is mutex-protected (UnityBridge._send_lock) and
+    # these phases never touch the bridge from the main thread, so the
+    # background send is safe.
+    def _start_keepalive(self):
+        period = float(self._fsm.get("block_keepalive_period", 2.0))
+        self._keepalive_stop = threading.Event()
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop, args=(period,), daemon=True)
+        self._keepalive_thread.start()
+
+    def _keepalive_loop(self, period):
+        while not self._keepalive_stop.wait(period):
+            try:
+                if self._scene_pose_msg is not None:
+                    self._bridge.send_pose(self._scene_pose_msg)
+            except Exception as exc:  # noqa: BLE001
+                rospy.logwarn("[Manager] keep-alive send failed: %s", exc)
+
+    def _stop_keepalive(self):
+        thread = self._keepalive_thread
+        if thread is not None:
+            self._keepalive_stop.set()
+            thread.join(timeout=float(
+                self._fsm.get("block_keepalive_period", 2.0)) + 1.0)
+            self._keepalive_thread = None
+
     def _build_scene_pose_message(self):
         """One unified scene Pose message shared by SEND_SCENE and the
         SETTLE_SCENE / WAIT_POINTCLOUD keep-alives (section XLVI).  Uses
@@ -631,6 +669,11 @@ class ILManager(object):
             return False
 
     def _st_build_privileged_map(self):
+        # This blocking phase (PLY load + grid/ESDF/Dijkstra) can take
+        # tens of seconds with no message on the wire; keep the scene Pose
+        # flowing so AvoidBench's 5 s connection timeout never reloads the
+        # scene (see _start_keepalive).
+        self._start_keepalive()
         try:
             points = load_ply(self._pc_path)
             # Grid bounds = the AvoidBench point-cloud sampling box, NOT the
@@ -660,10 +703,16 @@ class ILManager(object):
             self._error = "privileged_map_build_failed: %s" % exc
             self._enter_state(State.ERROR)
             return
+        finally:
+            self._stop_keepalive()
         self._enter_state(State.GENERATE_TASKS)
 
     def _st_generate_tasks(self):
         rng = self._generation_rng
+        # Same keep-alive reasoning as the map build: batch candidate
+        # evaluation is blocking and can exceed AvoidBench's 5 s
+        # connection timeout.
+        self._start_keepalive()
         try:
             tasks, note = self._task_generator.generate_tasks(
                 self._current_scene, self._oracle, self._quota, rng,
@@ -672,6 +721,8 @@ class ILManager(object):
             self._error = "task_generation_failed: %s" % exc
             self._enter_state(State.ERROR)
             return
+        finally:
+            self._stop_keepalive()
         if len(tasks) < self._min_tasks_per_scene:
             # This scene cannot produce enough valid tasks -> regenerate it
             # with a new seed (section XXXVIII/XLIX).  The generated tasks
@@ -872,6 +923,29 @@ class ILManager(object):
         # The macro action is held in the world frame for macro_interval
         # frames (section IX).
         held_action = None
+
+        # ── Depth warm-up ───────────────────────────────────────────
+        # AvoidBench's depth renderer may stay silent for several seconds
+        # right after a scene load / point-cloud export / connection-timeout
+        # scene reload: while readyToRender is false it feeds received
+        # Poses into its 5-step initializeObjects state machine and sends
+        # NO depth frame, so the first depth request of such a task would
+        # time out (2 s) and the episode would be rejected with 1 empty
+        # row.  Wait for the FIRST frame here (capped by
+        # fsm.depth_warmup_timeout) before the recorded loop.  Warm-up
+        # probes are discarded and must not count toward the sync gates,
+        # so the match counters are reset before recording starts.
+        warmup_timeout = float(self._fsm.get("depth_warmup_timeout", 30.0))
+        ds_warm = self._dynamics.get_state()
+        warm_pos = ds_warm.position_world
+        warm_quat = ds_warm.quaternion_world_body
+        warmup_start = time.monotonic()
+        while time.monotonic() - warmup_start < warmup_timeout \
+                and not rospy.is_shutdown():
+            if self._request_depth_frame(-1, warm_pos, warm_quat) is not None:
+                break
+        self._exact_matches = 0
+        self._unmatched_frames = 0
 
         while not rospy.is_shutdown():
             t_loop = time.monotonic()

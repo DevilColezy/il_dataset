@@ -1119,7 +1119,11 @@ class MacroExpert(object):
                  "source": str(c.source),
                  "score": round(float(c.privileged_score), 4),
                  "full": bool(c.full_goal_reached),
-                 "conn": bool(c.connected_to_goal)}
+                 "conn": bool(c.connected_to_goal),
+                 # World position for debug_viewer.py candidate overlay.
+                 "pos": [float(c.position_world[0]),
+                         float(c.position_world[1]),
+                         float(c.position_world[2])]}
                 for c in top
             ]
         trace["candidates"] = cands
