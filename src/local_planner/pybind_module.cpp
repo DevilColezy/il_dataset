@@ -162,6 +162,7 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .value("OBSERVE", MacroMode::OBSERVE)
         .value("GOAL_REACHED", MacroMode::GOAL_REACHED)
         .value("FAILED", MacroMode::FAILED)
+        .value("GOAL_APPROACH", MacroMode::GOAL_APPROACH)
         .export_values();
 
     py::enum_<Side>(m, "Side")
@@ -400,8 +401,8 @@ PYBIND11_MODULE(_il_local_planner, m) {
 
     py::class_<PrivilegedInterventionConfig>(m, "PrivilegedInterventionConfig")
         .def(py::init<>())
-        .def_readwrite("search_clearance_m",
-                       &PrivilegedInterventionConfig::search_clearance_m)
+        .def_readwrite("clearance_m",
+                       &PrivilegedInterventionConfig::clearance_m)
         .def_readwrite("search_max_time_ms",
                        &PrivilegedInterventionConfig::search_max_time_ms)
         .def_readwrite("rejoin_distance_m",
@@ -533,10 +534,11 @@ PYBIND11_MODULE(_il_local_planner, m) {
              })
         .def("is_known_free",
              [](const ObservedMap& self, const Eigen::Vector3d& p,
-                double min_clearance) {
-                 return self.isKnownFree(p.x(), p.y(), p.z(), min_clearance);
+                double required_clearance) {
+                 return self.isKnownFree(p.x(), p.y(), p.z(),
+                                         required_clearance);
              },
-             py::arg("point_world"), py::arg("min_clearance"))
+             py::arg("point_world"), py::arg("required_clearance"))
         .def("esdf_value",
              [](const ObservedMap& self, const Eigen::Vector3d& p) {
                  return self.esdfValue(p.x(), p.y(), p.z());
@@ -596,14 +598,14 @@ PYBIND11_MODULE(_il_local_planner, m) {
              py::arg("x"), py::arg("y"), py::arg("z"))
         .def("is_known_free", &ESDFGrid::isKnownFree,
              py::arg("x"), py::arg("y"), py::arg("z"),
-             py::arg("min_clearance"))
+             py::arg("required_clearance"))
         .def("initialized", &ESDFGrid::initialized);
 
     // ── LocalRecoverability ─────────────────────────────────────────
     py::class_<RecoverabilityConfig>(m, "RecoverabilityConfig")
         .def(py::init<>())
         .def_readwrite("rejoin_distance_m", &RecoverabilityConfig::rejoin_distance_m)
-        .def_readwrite("search_clearance_m", &RecoverabilityConfig::search_clearance_m)
+        .def_readwrite("clearance_m", &RecoverabilityConfig::clearance_m)
         .def_readwrite("max_duration_s", &RecoverabilityConfig::max_duration_s)
         .def_readwrite("max_path_length_m", &RecoverabilityConfig::max_path_length_m)
         .def_readwrite("min_goal_progress_m", &RecoverabilityConfig::min_goal_progress_m)
@@ -642,8 +644,8 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &MacroCandidateConfig::side_corridor_radius_m)
         .def_readwrite("edge_search_radius_m",
                        &MacroCandidateConfig::edge_search_radius_m)
-        .def_readwrite("min_candidate_clearance_m",
-                       &MacroCandidateConfig::min_candidate_clearance_m)
+        .def_readwrite("clearance_m",
+                       &MacroCandidateConfig::clearance_m)
         .def_readwrite("candidate_spacing_m",
                        &MacroCandidateConfig::candidate_spacing_m)
         .def_readwrite("observe_step_m", &MacroCandidateConfig::observe_step_m)
@@ -671,8 +673,6 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &MacroCandidateConfig::goal_frontier_cone_deg)
         .def_readwrite("corridor_check_spacing_m",
                        &MacroCandidateConfig::corridor_check_spacing_m)
-        .def_readwrite("search_clearance_m",
-                       &MacroCandidateConfig::search_clearance_m)
         .def_readwrite("search_max_time_ms",
                        &MacroCandidateConfig::search_max_time_ms)
         .def_readwrite("search_region_margin_m",
@@ -767,7 +767,7 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def(py::init<>())
         .def_readwrite("resolution", &PrivilegedOracleConfig::resolution)
         .def_readwrite("vehicle_radius_m", &PrivilegedOracleConfig::vehicle_radius_m)
-        .def_readwrite("inflation_m", &PrivilegedOracleConfig::inflation_m)
+        .def_readwrite("clearance_m", &PrivilegedOracleConfig::clearance_m)
         .def_readwrite("max_esdf_distance_m",
                        &PrivilegedOracleConfig::max_esdf_distance_m)
         .def_readwrite("map_margin_m", &PrivilegedOracleConfig::map_margin_m)
@@ -875,7 +875,7 @@ PYBIND11_MODULE(_il_local_planner, m) {
              })
         .def("score_candidates",
              [](const PrivilegedOracle& self,
-                std::vector<MacroCandidate>& candidates,
+                const std::vector<MacroCandidate>& candidates,
                 const VehicleState& state, const Eigen::Vector3d& goal,
                 Side committed_side,
                 const py::object& previous_guide_world) {
@@ -885,8 +885,12 @@ PYBIND11_MODULE(_il_local_planner, m) {
                      prev_val = previous_guide_world.cast<Eigen::Vector3d>();
                      prev_ptr = &prev_val;
                  }
-                 self.scoreCandidates(&candidates, state, goal,
-                                      committed_side, prev_ptr);
+                 py::gil_scoped_release release;
+                 // Returns a NEW list of scored candidates; the input list
+                 // is never mutated in place (see PrivilegedOracle::
+                 // scoreCandidates).  The caller MUST use the return value.
+                 return self.scoreCandidates(candidates, state, goal,
+                                             committed_side, prev_ptr);
              },
              py::arg("candidates"), py::arg("state"), py::arg("goal"),
              py::arg("committed_side"),
@@ -937,9 +941,7 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &TrajectoryOptimizationConfig::seed_trust_radius)
         .def_readwrite("horizontal_avoidance_only",
                        &TrajectoryOptimizationConfig::horizontal_avoidance_only)
-        .def_readwrite("min_clearance", &TrajectoryOptimizationConfig::min_clearance)
-        .def_readwrite("target_clearance",
-                       &TrajectoryOptimizationConfig::target_clearance)
+        .def_readwrite("clearance_m", &TrajectoryOptimizationConfig::clearance_m)
         .def_readwrite("collision_check_spacing",
                        &TrajectoryOptimizationConfig::collision_check_spacing)
         .def_readwrite("weight_path_length",
@@ -965,8 +967,6 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &TrajectoryOptimizationConfig::warm_start_max_age_s)
         .def_readwrite("warm_start_max_terminal_deviation_m",
                        &TrajectoryOptimizationConfig::warm_start_max_terminal_deviation_m)
-        .def_readwrite("search_clearance_m",
-                       &TrajectoryOptimizationConfig::search_clearance_m)
         .def_readwrite("search_max_time_ms",
                        &TrajectoryOptimizationConfig::search_max_time_ms)
         .def_readwrite("search_region_margin_m",
@@ -999,17 +999,16 @@ PYBIND11_MODULE(_il_local_planner, m) {
                 const std::vector<TrajectoryPoint>& trajectory,
                 double plan_start_time, double current_time,
                 const VehicleState& state,
-                double min_clearance, double max_position_error,
+                double max_position_error,
                 double max_velocity_error) {
                  py::gil_scoped_release release;
                  return self.validateTrajectorySuffix(
                      trajectory, plan_start_time, current_time, state,
-                     min_clearance, max_position_error, max_velocity_error);
+                     max_position_error, max_velocity_error);
              },
              py::arg("trajectory"), py::arg("plan_start_time"),
              py::arg("current_time"), py::arg("state"),
-             py::arg("min_clearance"), py::arg("max_position_error"),
-             py::arg("max_velocity_error"))
+             py::arg("max_position_error"), py::arg("max_velocity_error"))
         .def("current_plan_id", &LocalPlanner::currentPlanId);
 
     // ── TaskGenerationOracle (scene/task generation time only) ──────
@@ -1045,12 +1044,7 @@ PYBIND11_MODULE(_il_local_planner, m) {
 
     py::class_<TaskGenerationConfig>(m, "TaskGenerationConfig")
         .def(py::init<>())
-        .def_readwrite("start_clearance_m",
-                       &TaskGenerationConfig::start_clearance_m)
-        .def_readwrite("goal_clearance_m",
-                       &TaskGenerationConfig::goal_clearance_m)
-        .def_readwrite("direct_corridor_clearance_m",
-                       &TaskGenerationConfig::direct_corridor_clearance_m)
+        .def_readwrite("clearance_m", &TaskGenerationConfig::clearance_m)
         .def_readwrite("min_task_distance_m",
                        &TaskGenerationConfig::min_task_distance_m)
         .def_readwrite("max_task_distance_m",
@@ -1061,10 +1055,6 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &TaskGenerationConfig::lateral_probe_spacing_m)
         .def_readwrite("lateral_probe_count",
                        &TaskGenerationConfig::lateral_probe_count)
-        .def_readwrite("lateral_path_clearance_m",
-                       &TaskGenerationConfig::lateral_path_clearance_m)
-        .def_readwrite("search_clearance_m",
-                       &TaskGenerationConfig::search_clearance_m)
         .def_readwrite("search_max_time_ms",
                        &TaskGenerationConfig::search_max_time_ms)
         .def_readwrite("rejoin_distance_m",

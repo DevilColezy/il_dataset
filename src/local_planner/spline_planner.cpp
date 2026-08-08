@@ -380,11 +380,13 @@ struct SplineObjective {
                 static_cast<int>(std::ceil(
                     2.0 * polygon_length /
                     std::max(0.05, config.collision_check_spacing)))));
-        const double soft_band = std::max(
-            0.05, config.target_clearance - config.min_clearance);
+        // UNIFIED clearance (problem 4): the single effective safety
+        // boundary is `clearance_m` — both the optimizer's soft target and
+        // the hard validation floor, so the local trajectory is never more
+        // permissive than the global connectivity.
+        const double soft_band = std::max(0.05, config.clearance_m);
         const double resolution = std::max(0.02, esdf.resolution());
-        const double optimization_floor = std::min(
-            config.target_clearance, config.min_clearance + 0.05);
+        const double optimization_floor = config.clearance_m;
         for (int sample = 0; sample <= sample_count; ++sample) {
             const double parameter =
                 static_cast<double>(sample) / sample_count;
@@ -402,9 +404,9 @@ struct SplineObjective {
             const double normalization = 1.0 / (sample_count + 1);
             Eigen::Vector3d position_gradient = Eigen::Vector3d::Zero();
             if (std::isfinite(clearance) &&
-                clearance < config.target_clearance) {
+                clearance < config.clearance_m) {
                 const double residual =
-                    (config.target_clearance - clearance) / soft_band;
+                    (config.clearance_m - clearance) / soft_band;
                 cost += config.weight_obstacle *
                         residual * residual * normalization;
                 position_gradient +=
@@ -848,7 +850,7 @@ void LocalPlanner::setMap(const ObservedMap* map) { map_ = map; }
 ValidationResult LocalPlanner::validateTrajectorySegmentSpatially(
     const std::vector<TrajectoryPoint>& trajectory,
     double start_t,
-    double min_clearance) const {
+    double required_clearance) const {
     ValidationResult result;
     result.all_clear = true;
     if (trajectory.empty()) {
@@ -884,7 +886,7 @@ ValidationResult LocalPlanner::validateTrajectorySegmentSpatially(
             min_clear = std::min(min_clear, clearance);
         }
         if (!known || !std::isfinite(clearance) ||
-            clearance <= min_clearance) {
+            clearance <= required_clearance) {
             result.any_collision = true;
             result.all_clear = false;
             result.clearance_violation_count++;
@@ -942,7 +944,7 @@ ValidationResult LocalPlanner::validateTrajectory(
         return result;
     }
     return validateTrajectorySegmentSpatially(
-        trajectory, trajectory.front().t, config_.min_clearance);
+        trajectory, trajectory.front().t, config_.clearance_m);
 }
 
 ValidationResult LocalPlanner::validateTrajectorySuffix(
@@ -950,7 +952,6 @@ ValidationResult LocalPlanner::validateTrajectorySuffix(
     double plan_start_time,
     double current_time,
     const VehicleState& state,
-    double min_clearance,
     double max_position_error,
     double max_velocity_error) const {
     ValidationResult result;
@@ -1010,8 +1011,10 @@ ValidationResult LocalPlanner::validateTrajectorySuffix(
     }
 
     // Safety validation from the current age (section XX), with the SAME
-    // spatial interpolation strictness as the fresh trajectory.
-    return validateTrajectorySegmentSpatially(trajectory, age, min_clearance);
+    // spatial interpolation strictness and the SAME unified navigation
+    // clearance as the fresh trajectory (never an external override).
+    return validateTrajectorySegmentSpatially(trajectory, age,
+                                              config_.clearance_m);
 }
 
 LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
@@ -1048,7 +1051,7 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
 
     // ── 1. Observed-map A* seed path ──────────────────────────────
     LocalSearchConfig search_config;
-    search_config.search_clearance_m = config_.search_clearance_m;
+    search_config.clearance_m = config_.clearance_m;
     search_config.committed_side = request.committed_side;
     search_config.side_bias_gain = config_.search_side_bias_gain;
     search_config.max_time_ms = config_.search_max_time_ms;
@@ -1081,7 +1084,7 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
             if (point.t < request.previous_trajectory_age_s) continue;
             if (!map_->isKnownFree(point.position.x(), point.position.y(),
                                    point.position.z(),
-                                   config_.search_clearance_m)) {
+                                   config_.clearance_m)) {
                 suffix_valid = false;
                 break;
             }
@@ -1174,7 +1177,7 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
         (terminal - request.goal_world).head<2>().norm() <=
             config_.goal_stop_tolerance_m &&
         map_->isKnownFree(request.goal_world.x(), request.goal_world.y(),
-                          request.goal_world.z(), config_.min_clearance);
+                          request.goal_world.z(), config_.clearance_m);
     if (!stop_at_goal) {
         const double distance_ratio = clamp(
             distance / std::max(0.5, config_.lookahead_distance), 0.55, 1.0);

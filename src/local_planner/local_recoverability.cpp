@@ -74,7 +74,7 @@ RecoverabilityResult LocalRecoverability::test(
     result.rejoin_distance = rejoin_dist;
 
     LocalSearchConfig search_config;
-    search_config.search_clearance_m = config_.search_clearance_m;
+    search_config.clearance_m = config_.clearance_m;
     search_config.committed_side = Side::NONE;  // direct intent has no side
     search_config.forbid_unknown = true;
 
@@ -110,7 +110,17 @@ RecoverabilityResult LocalRecoverability::test(
                             config_.terminal_tangent_min_baseline, &tangent)) {
             result.terminal_guide_alignment = tangent.dot(goal_dir);
         }
-        if (result.goal_progress < config_.min_goal_progress_m) {
+        // Goal-progress gate (problem 2): the required progress is capped
+        // at the ACTUAL rejoin distance.  When the drone is already inside
+        // the goal tolerance the rejoin point is nearer than
+        // `min_goal_progress_m`, so demanding a full 0.30 m of forward
+        // progress would be physically impossible and would wrongly flip
+        // the terminal approach into PARTIAL_PROGRESS_ONLY (then OBSERVE).
+        // The gate still guarantees real forward motion whenever there is
+        // room for it.
+        const double required_progress =
+            std::min(config_.min_goal_progress_m, rejoin_dist);
+        if (result.goal_progress + 1.0e-3 < required_progress) {
             result.status = RecoverabilityStatus::PARTIAL_PROGRESS_ONLY;
             result.reason = "insufficient_goal_progress";
             result.feasible = false;
@@ -153,7 +163,7 @@ RecoverabilityResult LocalRecoverability::test(
     blocker_config.edge_search_radius_m = config_.edge_search_radius_m;
     blocker_config.side_corridor_length_m = config_.side_corridor_length_m;
     blocker_config.side_corridor_radius_m = config_.side_corridor_radius_m;
-    blocker_config.min_candidate_clearance_m = config_.search_clearance_m;
+    blocker_config.clearance_m = config_.clearance_m;
     const GoalBlocker blocker =
         analyzeGoalBlocker(map, state, direct_guide_world, blocker_config);
     result.blocker_signature = blocker.blocker_signature;

@@ -140,6 +140,13 @@ class ILManager(object):
         self._sync_cfg = self.g.get("sync", {})
         self._controller_cfg = self.g.get("trajectory_controller", {})
         self._safety_cfg = self.g.get("execution_safety", {})
+        # UNIFIED navigation clearance (problem 4): the single effective
+        # safety boundary shared by every C++ module.  The ESDFs already
+        # subtract the vehicle radius, so this is purely the additional
+        # margin.  The Python-side braking-risk and trajectory-suffix
+        # validation call sites pass this same value.
+        self._nav_clearance = float(
+            self.g.get("navigation", {}).get("clearance_m", 0.20))
         # Scene settle + point-cloud completion config (sections VIII/XXIV).
         self._scene_runtime = self.g.get("scene_runtime", {})
         _pc_cfg = self.g.get("pointcloud", {})
@@ -916,6 +923,14 @@ class ILManager(object):
         macro_interval = self._macro_interval
         goal = self._current_task["goal"]
         trajectory_timeout = self._fsm.get("trajectory_timeout", 120.0)
+        # Independent WALL-CLOCK task watchdog (section "time"): the sim
+        # trajectory timeout bounds SIMULATED flight time, but if the
+        # simulation time stalls (dynamics / depth / planning degradation)
+        # a task could occupy the process indefinitely.  This cap bounds
+        # the PROCESS time per task; it is deliberately well above the
+        # nominal wall duration and never affects navigation timing.
+        trajectory_wall_timeout = float(
+            self._fsm.get("trajectory_wall_timeout_s", 600.0))
         sample_index = 0
         last_plan_time = None
         last_trajectory = []
@@ -946,16 +961,29 @@ class ILManager(object):
                 break
         self._exact_matches = 0
         self._unmatched_frames = 0
+        # Simulation-time origin for this episode (section "time"): the
+        # dynamics backend advances `DynamicsState.simulation_time_s` by a
+        # fixed 1/record_hz per executed `step_velocity_command()` —
+        # regardless of the wall-clock rate.  ALL navigation / data time is
+        # measured on the SIMULATION axis; the wall clock is used only for
+        # pacing, communication timeouts and performance statistics.
+        recording_sim_start = self._dynamics.get_state().simulation_time_s
 
         while not rospy.is_shutdown():
             t_loop = time.monotonic()
-            elapsed = t_loop - self._recording_start_mono
-            if elapsed > trajectory_timeout:
-                self._exit_reason = "trajectory_timeout"
+            # Wall-clock elapsed since the episode start: ONLY for pacing /
+            # watchdog / performance statistics — never for navigation or
+            # data time (section "time").
+            wall_elapsed = t_loop - self._recording_start_mono
+            # Independent WALL-CLOCK watchdog: if the simulation time axis
+            # stalls or the loop degrades severely, never let one task
+            # occupy the process indefinitely.  Sim time stays authoritative
+            # for navigation; this only bounds the wall time per task.
+            if wall_elapsed > trajectory_wall_timeout:
+                self._exit_reason = "wall_clock_watchdog"
                 break
 
             frame_id = sample_index
-            timestamp = elapsed
 
             # ── 1. State ────────────────────────────────────────────
             ds = self._dynamics.get_state()
@@ -974,6 +1002,14 @@ class ILManager(object):
                 "yaw_rate": float(ds.angular_velocity_body[2]) if
                 len(ds.angular_velocity_body) > 2 else 0.0,
             }
+            # Simulation time is the SINGLE navigation/data time axis.
+            sim_elapsed = ds.simulation_time_s - recording_sim_start
+            # The trajectory timeout measures SIMULATED flight time (the
+            # wall clock may lag far behind the simulation).
+            if sim_elapsed > trajectory_timeout:
+                self._exit_reason = "trajectory_timeout"
+                break
+            timestamp = sim_elapsed
 
             # ── 2. Depth ────────────────────────────────────────────
             depth_frame = self._request_depth_frame(frame_id, pos, quat)
@@ -1009,7 +1045,7 @@ class ILManager(object):
                 self._macro_feedback_is_new = 1
                 held_action = self._macro_expert.update(
                     goal, state, self._observed_map, dt_s=dt_macro,
-                    interval_feedback=interval_feedback)
+                    now_s=sim_elapsed, interval_feedback=interval_feedback)
                 # Freeze the initial OBSERVED recoverability at the FIRST
                 # valid evaluation of this episode (sections XXX-XLII):
                 # only once the observed map actually holds integrated data
@@ -1033,7 +1069,7 @@ class ILManager(object):
                         "debug_trace", False):
                     trace = dict(self._macro_expert.last_trace or {})
                     trace["frame"] = sample_index
-                    trace["trajectory_time_s"] = round(elapsed, 4)
+                    trace["trajectory_time_s"] = round(sim_elapsed, 4)
                     self._writer.write_trace(trace)
                 if held_action.mode == module.MacroMode.GOAL_REACHED:
                     self._trajectory_reached_goal = True
@@ -1068,28 +1104,28 @@ class ILManager(object):
             req.committed_side = held_action.committed_side
             req.previous_trajectory = last_trajectory
             if last_plan_time is not None:
-                req.previous_trajectory_age_s = elapsed - last_plan_time
+                req.previous_trajectory_age_s = sim_elapsed - last_plan_time
             result = self._local_planner.plan(req)
             self._total_plans += 1
 
             # ── 6. Execution selection (section XIII) ───────────────
             execution_mode, trajectory, fresh_plan, cached_used, \
                 sample_offset = self._select_execution(
-                    result, last_trajectory, last_plan_time, elapsed,
+                    result, last_trajectory, last_plan_time, sim_elapsed,
                     held_action, state)
             if result.success:
                 self._successful_plans += 1
                 self._consecutive_plan_failures = 0
                 self._local_unrecoverable_pending = False
                 last_trajectory = result.trajectory
-                last_plan_time = elapsed
+                last_plan_time = sim_elapsed
 
             # Executed-plan semantics (sections XVII/XVIII): the training
             # labels and plan metadata must describe the ACTIVE executed
             # trajectory, not the failed planning attempt of this frame.
             if execution_mode == module.ExecutionMode.TRACK_FRESH:
                 self._active_result = result
-                self._active_plan_start_time = elapsed
+                self._active_plan_start_time = sim_elapsed
                 executed_result = result
             elif execution_mode == module.ExecutionMode.TRACK_CACHED and \
                     self._active_result is not None:
@@ -1156,9 +1192,9 @@ class ILManager(object):
             self._writer.write_sync(
                 frame_id, latency_ms, "frame_id_exact", False,
                 self._exact_matches, self._unmatched_frames)
-            plan_age_s = elapsed - self._active_plan_start_time \
+            plan_age_s = sim_elapsed - self._active_plan_start_time \
                 if self._active_plan_start_time is not None else 0.0
-            self._write_row(frame_id, sample_index, elapsed, state, ds,
+            self._write_row(frame_id, sample_index, sim_elapsed, state, ds,
                             depth_student, raw_finite_ratio, latency_ms,
                             held_action, executed_result, result,
                             execution_mode, fresh_plan, cached_used, cmd,
@@ -1167,11 +1203,11 @@ class ILManager(object):
 
             sample_index += 1
 
-            # Wall-clock pacing at record rate.
-            next_deadline = self._recording_start_mono + sample_index * dt
-            remaining = next_deadline - time.monotonic()
-            if remaining > 0:
-                time.sleep(remaining)
+            # Wall-clock pacing at record rate (wall clock ONLY — the loop
+            # may legitimately run below 30 Hz; sim time is authoritative
+            # for navigation / data).
+            if wall_elapsed < sample_index * dt:
+                time.sleep(sample_index * dt - wall_elapsed)
 
         self._writer.write_row({
             "episode_frame_index": sample_index,
@@ -1264,7 +1300,7 @@ class ILManager(object):
 
     # ── Execution selection (section XIII) ───────────────────────────
     def _select_execution(self, result, last_trajectory, last_plan_time,
-                          elapsed, held_action, state):
+                          sim_elapsed, held_action, state):
         safety = self._safety_cfg
         if result.success:
             return (module.ExecutionMode.TRACK_FRESH, result.trajectory,
@@ -1273,9 +1309,10 @@ class ILManager(object):
         # Cached trajectory: the C++ suffix validator re-checks the
         # remaining segment against the CURRENT observed map (section
         # VIII).  The controller samples it with an offset equal to the
-        # trajectory age (elapsed - plan_start_time).
+        # trajectory age (sim_elapsed - plan_start_time) — all on the
+        # SIMULATION time axis.
         if last_trajectory and last_plan_time is not None:
-            age = elapsed - last_plan_time
+            age = sim_elapsed - last_plan_time
             if age <= safety.get("max_plan_age_s", 0.20):
                 remaining = last_trajectory[-1].t - age
                 if remaining >= safety.get("min_remaining_trajectory_s", 0.10):
@@ -1286,9 +1323,7 @@ class ILManager(object):
                     vs.yaw = state["yaw"]
                     vs.yaw_rate = state["yaw_rate"]
                     valid = self._local_planner.validate_trajectory_suffix(
-                        last_trajectory, last_plan_time, elapsed, vs,
-                        self.g.get("trajectory_optimization", {}).get(
-                            "min_clearance", 0.02),
+                        last_trajectory, last_plan_time, sim_elapsed, vs,
                         safety.get("max_position_error_m", 0.50),
                         safety.get("max_velocity_error_mps", 1.00))
                     if valid.all_clear:
@@ -1335,7 +1370,7 @@ class ILManager(object):
             vs,
             self._safety_cfg.get("brake_reaction_delay_s", 0.10),
             self._safety_cfg.get("emergency_deceleration_mps2", 5.0),
-            self.g.get("vehicle", {}).get("safety_margin_m", 0.20),
+            self._nav_clearance,
             0.05)
         return bool(brake_result.risk)
 
@@ -1359,8 +1394,9 @@ class ILManager(object):
                               module.ExecutionMode.TRACK_CACHED):
             # Sample the trajectory at the velocity lookahead time.  For a
             # cached trajectory the sample is shifted by the trajectory age
-            # (elapsed - plan_start_time) so the drone re-executes the
-            # REMAINING segment, not from t=0 (section VIII).
+            # (sim_elapsed - plan_start_time, SIMULATION time) so the drone
+            # re-executes the REMAINING segment, not from t=0 (section
+            # VIII).
             lookahead = tc.get("velocity_lookahead_time_s", 0.08) + \
                 max(0.0, sample_offset)
             idx = 0
@@ -1477,7 +1513,10 @@ class ILManager(object):
         return out
 
     # ── Dataset row (section XIV) ────────────────────────────────────
-    def _write_row(self, frame_id, sample_index, elapsed, state, ds,
+    # `sim_elapsed` is the SIMULATION time axis (section "time"): recorded
+    # as trajectory_time_s and used for plan_age_s.  The wall clock is NOT
+    # written into any navigation time field.
+    def _write_row(self, frame_id, sample_index, sim_elapsed, state, ds,
                    depth_student, raw_finite_ratio, latency_ms, held_action,
                    executed_result, planning_attempt, execution_mode,
                    fresh_plan, cached_used, cmd, plan_age_s):
@@ -1662,7 +1701,7 @@ class ILManager(object):
             "frame_id": frame_id,
             "episode_frame_index": sample_index,
             "control_dt_s": self._dt,
-            "trajectory_time_s": elapsed,
+            "trajectory_time_s": sim_elapsed,
             "latency_ms": latency_ms,
             "match_method": "frame_id_exact",
             "frame_valid": 1,
@@ -1826,8 +1865,6 @@ class ILManager(object):
                 self._macro_expert.observe_reject_max_distance,
             "observe_reject_partial": self._macro_expert.observe_reject_partial,
             "observe_reject_no_path": self._macro_expert.observe_reject_no_path,
-            "observe_reject_failed_side":
-                self._macro_expert.observe_reject_failed_side,
             "observe_left_valid_count":
                 self._macro_expert.observe_left_valid_count,
             "observe_right_valid_count":

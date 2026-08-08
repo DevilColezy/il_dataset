@@ -11,20 +11,24 @@ namespace il_dataset {
 
 /// Configuration for the privileged global map (section VII).
 ///
-/// UNIFIED ESDF SEMANTICS (section XIV/XV): the global ESDF value is
+/// UNIFIED ESDF SEMANTICS (problem 4): the global ESDF value is
 ///     esdf = distance_to_obstacle_surface - vehicle_radius
 /// i.e. it represents clearance from the INFLATED vehicle body.  Free
 /// space everywhere uses
 ///     esdf > additional_safety_margin
-/// where the additional safety margin is `inflation_m` (connectivity,
+/// where the additional safety margin is `clearance_m` (connectivity,
 /// Dijkstra, candidate feasibility, privileged local recoverability).
 /// The vehicle radius is NEVER double counted.
 struct PrivilegedOracleConfig {
     double resolution = 0.10;
     double vehicle_radius_m = 0.30;
-    /// The single additional safety margin (m) on top of the vehicle
-    /// radius used for ALL global free-space definitions.
-    double inflation_m = 0.30;
+    /// The single UNIFIED navigation clearance (problem 4): the additional
+    /// safety margin (m) on top of the vehicle radius used for ALL global
+    /// free-space definitions (connectivity, cost-to-go, candidate
+    /// feasibility, privileged local recoverability).  The global ESDF
+    /// already subtracts the vehicle radius, so this value is never
+    /// re-subtracted anywhere.
+    double clearance_m = 0.20;
     double max_esdf_distance_m = 8.0;
     /// Margin added around the start-goal bounding box for the grid.
     double map_margin_m = 2.0;
@@ -53,7 +57,7 @@ struct PrivilegedOracleConfig {
 /// Privileged global map built once per task from the exported global
 /// point cloud: occupancy, global ESDF (distance - vehicle_radius), global
 /// connectivity and a goal-reversed cost-to-go.  Free space is everywhere
-///  esdf > inflation_m  (unified definition, section XIV).  Used ONLY for
+///  esdf > clearance_m  (unified definition, problem 4).  Used ONLY for
 /// macro candidate evaluation and dataset diagnostics — never for the
 /// 30 Hz observed-map planning or the student inputs.
 class PrivilegedOracle {
@@ -93,19 +97,25 @@ public:
     /// Unified global free-space test: in-bounds AND
     /// clearance(x,y,z) > required_clearance.  The vehicle radius is
     /// already inside the ESDF value, so `required_clearance` is an extra
-    /// safety margin (same definition as inflation_m).
+    /// safety margin (same definition as clearance_m).
     bool isFree(double x, double y, double z, double required_clearance) const;
     /// Goal-reversed cost-to-go at the drone's height slice (NaN when the
     /// cell is not free / outside the grid).
     double costToGo(double x, double y, double z) const;
     bool connectedToGoal(double x, double y, double z) const;
 
-    /// Fill the privileged fields + score of every candidate.
-    void scoreCandidates(std::vector<MacroCandidate>* candidates,
-                         const VehicleState& state,
-                         const Eigen::Vector3d& goal_world,
-                         Side committed_side,
-                         const Eigen::Vector3d* previous_guide_world) const;
+    /// Score every candidate and RETURN the scored candidates as a NEW
+    /// vector.  The privileged fields (connected_to_goal,
+    /// global_cost_to_go, global_clearance, global_path_length,
+    /// privileged_score) are written onto the returned objects only — the
+    /// input list is never mutated in place (a pybind list is converted to
+    /// a temporary vector, so in-place mutation would be silently lost).
+    std::vector<MacroCandidate> scoreCandidates(
+        const std::vector<MacroCandidate>& candidates,
+        const VehicleState& state,
+        const Eigen::Vector3d& goal_world,
+        Side committed_side,
+        const Eigen::Vector3d* previous_guide_world) const;
 
     /// Privileged best side between left/right side candidates.  Returns
     /// Side::NONE when neither is clearly better.

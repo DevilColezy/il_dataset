@@ -31,6 +31,7 @@ REQUIRED_MODULES = [
     "local_recoverability", "local_path_search", "trajectory_optimization",
     "yaw_planning", "trajectory_controller", "execution_safety",
     "dataset_logging", "sync", "commit", "privileged_intervention",
+    "navigation",
 ]
 
 
@@ -104,6 +105,12 @@ def _validate_config(cfg):
                       "sample rate is dynamics.control_hz, the record rate "
                       "is global.control.record_hz")
     _positive(record_hz, "global.control.record_hz", errors)
+
+    # Wall-clock task watchdog (section "time"): independent of the sim
+    # trajectory_timeout, bounds the PROCESS time of one episode so a
+    # stalled simulation / degraded loop cannot hang the collector.
+    _positive(g.get("fsm", {}).get("trajectory_wall_timeout_s", 600.0),
+              "global.fsm.trajectory_wall_timeout_s", errors)
 
     me_hz = me.get("update_hz", 5.0)
     _positive(me_hz, "global.macro_expert.update_hz", errors)
@@ -190,8 +197,6 @@ def _validate_config(cfg):
     # candidate geometry
     _positive(mc.get("side_corridor_radius_m", 0.55),
               "macro_candidates.side_corridor_radius_m", errors)
-    _positive(mc.get("min_candidate_clearance_m", 0.25),
-              "macro_candidates.min_candidate_clearance_m", errors)
     _positive(mc.get("min_observe_move_distance_m", 0.15),
               "macro_candidates.min_observe_move_distance_m", errors)
     if mc.get("side_corridor_radius_m", 0.55) <= veh.get("radius_m", 0.30):
@@ -255,8 +260,6 @@ def _validate_config(cfg):
             "macro_candidates.lookahead_distance_m")
 
     # local path search
-    _positive(lps.get("search_clearance_m", 0.25),
-              "local_path_search.search_clearance_m", errors)
     _positive(lps.get("max_time_ms", 20.0), "local_path_search.max_time_ms", errors)
 
     # trajectory optimization
@@ -272,10 +275,6 @@ def _validate_config(cfg):
         errors.append("trajectory_optimization.max_velocity must be >= nominal_speed")
     _positive(to.get("max_acceleration", 8.0),
               "trajectory_optimization.max_acceleration", errors)
-    _positive(to.get("min_clearance", 0.02),
-              "trajectory_optimization.min_clearance", errors, allow_zero=True)
-    if to.get("target_clearance", 0.20) < to.get("min_clearance", 0.02):
-        errors.append("target_clearance must be >= min_clearance")
     if to.get("optimizer", "auto") not in ("auto", "nlopt", "native"):
         errors.append("trajectory_optimization.optimizer must be auto|nlopt|native")
     _positive(to.get("goal_stop_tolerance_m", 0.4),
@@ -342,8 +341,6 @@ def _validate_config(cfg):
 
     # privileged intervention (privileged LOCAL-SCALE audit, section II)
     pi = g.get("privileged_intervention", {})
-    _positive(pi.get("search_clearance_m", 0.25),
-              "privileged_intervention.search_clearance_m", errors)
     _positive(pi.get("search_max_time_ms", 20.0),
               "privileged_intervention.search_max_time_ms", errors)
     # Capability bounds are shared with local_recoverability (single
@@ -371,7 +368,15 @@ def _validate_config(cfg):
     to_ = g.get("task_oracle", {})
     _positive(to_.get("map_resolution_m", 0.10),
               "task_oracle.map_resolution_m", errors)
-    _positive(to_.get("inflation_m", 0.30), "task_oracle.inflation_m", errors)
+
+    # ── UNIFIED navigation clearance (problem 4) ────────────────────
+    # `navigation.clearance_m` is the SINGLE effective safety boundary for
+    # every module (global connectivity/cost-to-go, local A*, recoverability,
+    # privileged intervention, trajectory optimisation/validation, goal
+    # stop, braking risk, start/goal/task generation).  The ESDFs already
+    # subtract the vehicle radius, so this is purely the additional margin.
+    nav = g.get("navigation", {})
+    _positive(nav.get("clearance_m", 0.20), "navigation.clearance_m", errors)
 
     # scene generation (section LXXV)
     sg = g.get("scene_generation", {})
@@ -481,10 +486,13 @@ def build_observed_map_config(g, module):
 
 def build_oracle_config(g, module):
     to_ = g.get("task_oracle", {})
+    nav = g.get("navigation", {})
     cfg = module.PrivilegedOracleConfig()
     cfg.resolution = float(to_.get("map_resolution_m", 0.10))
     cfg.vehicle_radius_m = float(g.get("vehicle", {}).get("radius_m", 0.30))
-    cfg.inflation_m = float(to_.get("inflation_m", 0.30))
+    # UNIFIED navigation clearance (problem 4): the single additional
+    # safety margin used by every module.
+    cfg.clearance_m = float(nav.get("clearance_m", 0.20))
     cfg.max_esdf_distance_m = float(to_.get("max_esdf_distance_m", 8.0))
     cfg.map_margin_m = float(to_.get("map_margin_m", 2.0))
     cfg.min_z_m = float(to_.get("min_z_m", 0.0))
@@ -509,12 +517,16 @@ def build_oracle_config(g, module):
 
 def build_macro_candidate_config(g, module):
     mc = g.get("macro_candidates", {})
+    nav = g.get("navigation", {})
     cfg = module.MacroCandidateConfig()
     cfg.lookahead_distance_m = float(mc.get("lookahead_distance_m", 4.5))
     cfg.side_corridor_length_m = float(mc.get("side_corridor_length_m", 4.0))
     cfg.side_corridor_radius_m = float(mc.get("side_corridor_radius_m", 0.55))
     cfg.edge_search_radius_m = float(mc.get("edge_search_radius_m", 5.0))
-    cfg.min_candidate_clearance_m = float(mc.get("min_candidate_clearance_m", 0.25))
+    # UNIFIED navigation clearance (problem 4): candidate known-free and
+    # observed LocalPathSearch reachability use the SAME additional margin
+    # as every other module.
+    cfg.clearance_m = float(nav.get("clearance_m", 0.20))
     cfg.candidate_spacing_m = float(mc.get("candidate_spacing_m", 0.5))
     cfg.observe_step_m = float(mc.get("observe_step_m", 0.6))
     cfg.min_observe_move_distance_m = float(
@@ -542,7 +554,6 @@ def build_macro_candidate_config(g, module):
     # Observed-map path-search parameters for REAL SIDE-candidate
     # reachability (section XII).  Taken from local_path_search.
     lps = g.get("local_path_search", {})
-    cfg.search_clearance_m = float(lps.get("search_clearance_m", 0.25))
     cfg.search_max_time_ms = float(lps.get("max_time_ms", 20.0))
     cfg.search_region_margin_m = float(lps.get("region_margin_m", 2.0))
     cfg.side_bias_gain = float(lps.get("side_bias_gain", 2.0))
@@ -554,8 +565,10 @@ def build_intervention_config(g, module):
     # the observed local recoverability (section II).
     lr = g.get("local_recoverability", {})
     pi = g.get("privileged_intervention", {})
+    nav = g.get("navigation", {})
     cfg = module.PrivilegedInterventionConfig()
-    cfg.search_clearance_m = float(pi.get("search_clearance_m", 0.25))
+    # UNIFIED navigation clearance (problem 4).
+    cfg.clearance_m = float(nav.get("clearance_m", 0.20))
     cfg.search_max_time_ms = float(pi.get("search_max_time_ms", 20.0))
     cfg.rejoin_distance_m = float(lr.get("rejoin_distance_m", 2.5))
     cfg.search_lateral_margin_m = float(lr.get("search_lateral_margin_m", 2.0))
@@ -580,10 +593,11 @@ def build_intervention_config(g, module):
 
 def build_recoverability_config(g, module):
     lr = g.get("local_recoverability", {})
-    lps = g.get("local_path_search", {})
+    nav = g.get("navigation", {})
     cfg = module.RecoverabilityConfig()
     cfg.rejoin_distance_m = float(lr.get("rejoin_distance_m", 2.5))
-    cfg.search_clearance_m = float(lps.get("search_clearance_m", 0.25))
+    # UNIFIED navigation clearance (problem 4).
+    cfg.clearance_m = float(nav.get("clearance_m", 0.20))
     cfg.max_duration_s = float(lr.get("max_duration_s", 2.5))
     cfg.max_path_length_m = float(lr.get("max_path_length_m", 6.0))
     cfg.min_goal_progress_m = float(lr.get("min_goal_progress_m", 0.30))
@@ -601,23 +615,20 @@ def build_recoverability_config(g, module):
 def build_task_generation_config(g, module):
     """Build the C++ TaskGenerationConfig (sections XXVIII/XXXIX).
 
-    The clearance uses the UNIFIED ESDF semantics: the global ESDF already
-    subtracts the vehicle radius, so `clearance_m` is an additional safety
-    margin (default = vehicle.safety_margin_m, section LVII).  The local
-    audit bounds come from local_recoverability / local_path_search so the
-    generated classes match the real behaviour scale.
+    The clearance is the single UNIFIED navigation clearance
+    (`navigation.clearance_m`, problem 4): the global ESDF already subtracts
+    the vehicle radius, so this is purely the additional safety margin used
+    for start/goal free tests, the direct corridor, the lateral probes AND
+    the local audit.  The capability bounds come from local_recoverability
+    / local_path_search so the generated classes match the real behaviour
+    scale.
     """
     tg = g.get("task_generation", {})
     lr = g.get("local_recoverability", {})
     lps = g.get("local_path_search", {})
-    veh = g.get("vehicle", {})
+    nav = g.get("navigation", {})
     cfg = module.TaskGenerationConfig()
-    base_clearance = float(
-        tg.get("clearance_m", veh.get("safety_margin_m", 0.20)))
-    cfg.start_clearance_m = base_clearance
-    cfg.goal_clearance_m = base_clearance
-    cfg.direct_corridor_clearance_m = base_clearance
-    cfg.lateral_path_clearance_m = base_clearance
+    cfg.clearance_m = float(nav.get("clearance_m", 0.20))
     bands = tg.get("distance_bands", {}) or {}
     mins = [float(b.get("min_m", 4.0)) for b in bands.values()]
     maxs = [float(b.get("max_m", 28.0)) for b in bands.values()]
@@ -629,8 +640,8 @@ def build_task_generation_config(g, module):
     cfg.lateral_probe_spacing_m = float(
         sampling.get("lateral_probe_spacing_m", 0.6))
     cfg.lateral_probe_count = int(sampling.get("lateral_probe_count", 4))
-    # Local-scale audit capability (same as local_recoverability).
-    cfg.search_clearance_m = float(lps.get("search_clearance_m", 0.25))
+    # Local-scale audit capability (same as local_recoverability).  The
+    # clearance is the SAME unified navigation clearance set above.
     cfg.search_max_time_ms = float(lps.get("max_time_ms", 20.0))
     cfg.rejoin_distance_m = float(lr.get("rejoin_distance_m", 2.5))
     cfg.max_duration_s = float(lr.get("max_duration_s", 2.5))
@@ -651,6 +662,7 @@ def build_planner_config(g, module):
     to = g.get("trajectory_optimization", {})
     lps = g.get("local_path_search", {})
     yp = g.get("yaw_planning", {})
+    nav = g.get("navigation", {})
     cfg = module.TrajectoryOptimizationConfig()
     cfg.planning_time_budget_ms = float(to.get("planning_time_budget_ms", 30.0))
     cfg.trajectory_dt = float(to.get("trajectory_dt", 0.04))
@@ -663,8 +675,10 @@ def build_planner_config(g, module):
     cfg.minimum_step_size = float(to.get("minimum_step_size", 1.0e-4))
     cfg.seed_trust_radius = float(to.get("seed_trust_radius", 0.35))
     cfg.horizontal_avoidance_only = bool(to.get("horizontal_avoidance_only", True))
-    cfg.min_clearance = float(to.get("min_clearance", 0.02))
-    cfg.target_clearance = float(to.get("target_clearance", 0.20))
+    # UNIFIED navigation clearance (problem 4): the single effective safety
+    # boundary — both the optimizer's soft target and the hard validation
+    # floor.  The observed ESDF already subtracts the vehicle radius.
+    cfg.clearance_m = float(nav.get("clearance_m", 0.20))
     cfg.collision_check_spacing = float(to.get("collision_check_spacing", 0.05))
     cfg.weight_path_length = float(to.get("weight_path_length", 0.05))
     cfg.weight_smooth = float(to.get("weight_smooth", 1.0))
@@ -682,7 +696,7 @@ def build_planner_config(g, module):
     cfg.warm_start_max_terminal_deviation_m = float(
         to.get("warm_start_max_terminal_deviation_m", 1.5))
     # Local A* search parameters come from the local_path_search module.
-    cfg.search_clearance_m = float(lps.get("search_clearance_m", 0.25))
+    # The clearance is the SAME unified navigation clearance set above.
     cfg.search_max_time_ms = float(lps.get("max_time_ms", 18.0))
     cfg.search_region_margin_m = float(lps.get("region_margin_m", 2.0))
     cfg.search_side_bias_gain = float(lps.get("side_bias_gain", 2.0))

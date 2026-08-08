@@ -50,7 +50,7 @@ bool segmentKnownAndClear(const ObservedMap& map,
 LocalSearchConfig makeSearchConfig(const MacroCandidateConfig& config,
                                    Side committed_side) {
     LocalSearchConfig search_config;
-    search_config.search_clearance_m = config.search_clearance_m;
+    search_config.clearance_m = config.clearance_m;
     search_config.max_time_ms = config.search_max_time_ms;
     search_config.region_margin_m = config.search_region_margin_m;
     search_config.side_bias_gain = config.side_bias_gain;
@@ -232,7 +232,7 @@ GoalBlocker analyzeGoalBlocker(const ObservedMap& map,
         std::max(8, static_cast<int>(std::ceil(config.edge_search_radius_m / res)));
     const BlockComponent comp =
         floodBlockedComponent(map, block_ix, block_iy, block_iz,
-                              config.min_candidate_clearance_m,
+                              config.clearance_m,
                               region_radius);
     if (comp.count > 0) {
         blocker.centroid = comp.centroid;
@@ -332,7 +332,7 @@ void MacroCandidateSearch::scoreObserved(MacroCandidate* candidate,
     } else {
         candidate->known_reachable = segmentKnownAndClear(
             map, state.position, candidate->position_world,
-            config_.min_candidate_clearance_m);
+            config_.clearance_m);
         candidate->full_goal_reached = candidate->known_reachable;
         candidate->found_partial = candidate->known_reachable;
         candidate->observed_path_cost = dist;
@@ -452,7 +452,7 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeObserveCandidates(
     if (laterals.empty()) return raw;
     const double min_move = config_.min_observe_move_distance_m;
     const double max_move = config_.max_observe_move_distance_m;
-    const double clear = config_.search_clearance_m;
+    const double clear = config_.clearance_m;
     // Lateral x forward x {LEFT, RIGHT}: a small local viewpoint lattice
     // (section XV).  Forward 0 still yields near-side viewpoints at
     // lateral offsets; every candidate is a real world position the drone
@@ -471,7 +471,7 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeObserveCandidates(
                 ++observe_diag_.raw_candidate_count;
                 // Cheap endpoint filter (section XII): distance bounds,
                 // known, free with the SAME clearance the 30 Hz planner
-                // uses (search_clearance_m — never a second inflation).
+                // uses (clearance_m — never a second inflation).
                 if (move_dist < min_move) {
                     ++observe_diag_.reject_min_distance;
                     continue;
@@ -699,7 +699,7 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeFrontierCandidates(
         // Endpoint sits on the KNOWN-FREE side of the frontier with the
         // same clearance the 30 Hz planner uses.
         if (!map.isKnownFree(pulled.x(), pulled.y(), pulled.z(),
-                             config_.search_clearance_m)) {
+                             config_.clearance_m)) {
             continue;
         }
         MacroCandidate candidate;

@@ -37,8 +37,11 @@ public:
     /// Known (observed) space check: all interpolation corners known.
     bool isKnown(double x, double y, double z) const;
 
-    /// Known AND clearance above `min_clearance`.
-    bool isKnownFree(double x, double y, double z, double min_clearance) const;
+    /// Known AND clearance above `required_clearance` (callers pass the
+    /// unified navigation clearance — the ESDF already subtracts the
+    /// vehicle radius, so this is purely the additional margin).
+    bool isKnownFree(double x, double y, double z,
+                     double required_clearance) const;
 
     bool initialized() const { return map_ != nullptr; }
     bool hasKnownMask() const { return map_ != nullptr; }

@@ -20,8 +20,12 @@ struct MacroCandidateConfig {
     double side_corridor_radius_m = 0.55;
     /// Radius around the blocker used to find its visible edges.
     double edge_search_radius_m = 5.0;
-    /// Required clearance for a candidate to count as known-reachable.
-    double min_candidate_clearance_m = 0.25;
+    /// The single UNIFIED navigation clearance (problem 4): required ESDF
+    /// clearance for a candidate to count as known-reachable AND for the
+    /// observed LocalPathSearch reachability queries.  The observed ESDF
+    /// already subtracts the vehicle radius, so this is the SAME additional
+    /// margin used by every other module — never a second inflation.
+    double clearance_m = 0.20;
     /// Spacing between consecutive SIDE candidates along the corridor.
     double candidate_spacing_m = 0.5;
     /// Forward step of OBSERVE candidates (kept very short / known-safe).
@@ -62,7 +66,6 @@ struct MacroCandidateConfig {
     double corridor_check_spacing_m = 0.10;
     // Observed-map path-search parameters used for REAL reachability of
     // SIDE candidates (section XII).
-    double search_clearance_m = 0.25;
     double search_max_time_ms = 20.0;
     double search_region_margin_m = 2.0;
     double side_bias_gain = 2.0;
@@ -136,8 +139,9 @@ private:
     /// movement terminal); for SIDE the partial terminal is adopted as
     /// before.  DIRECT / PREVIOUS_CONTINUATION keep the cheap straight
     /// segment check (they are not committed movement targets of this
-    /// tick).  The reachability query uses the SAME search clearance as
-    /// the 30 Hz planner (search_clearance_m) — never a second inflation.
+    /// tick).  The reachability query uses the SAME unified navigation
+    /// clearance as the 30 Hz planner (clearance_m) — never a second
+    /// inflation.
     void scoreObserved(MacroCandidate* candidate,
                        const ObservedMap& map,
                        const VehicleState& state,
@@ -155,10 +159,10 @@ private:
 
     /// Small local viewpoint lattice around the current position (section
     /// XV): forward x lateral offsets on BOTH sides, cheap endpoint filter
-    /// (in map, known, free with search_clearance_m, distance bounds),
-    /// then cheap information-gain / clearance / distance rank.  Returns
-    /// at most `max_viewpoint_candidates` candidates; only the top
-    /// `emit_budget` are emitted (the ones that will get the FULL
+    /// (in map, known, free with the unified clearance_m, distance
+    /// bounds), then cheap information-gain / clearance / distance rank.
+    /// Returns at most `max_viewpoint_candidates` candidates; only the
+    /// top `emit_budget` are emitted (the ones that will get the FULL
     /// LocalPathSearch in scoreObserved).
     std::vector<MacroCandidate> makeObserveCandidates(
         const ObservedMap& map,

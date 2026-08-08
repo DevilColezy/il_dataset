@@ -119,7 +119,7 @@ LocalPathResult LocalPathSearch::search(const ObservedMap& map,
     const bool goal_valid =
         goal_in_bounds &&
         map.isKnownFree(goal_world.x(), goal_world.y(), goal_world.z(),
-                        config.search_clearance_m);
+                        config.clearance_m);
     const int goal_ix = std::max(min_ix, std::min(max_ix, static_cast<int>(
                                                              std::floor(goal_g.x()))));
     const int goal_iy = std::max(min_iy, std::min(max_iy, static_cast<int>(
@@ -196,7 +196,7 @@ LocalPathResult LocalPathSearch::search(const ObservedMap& map,
             if (config.forbid_unknown) {
                 const Eigen::Vector3d w = worldPoint(ix, iy);
                 if (!map.isKnownFree(w.x(), w.y(), w.z(),
-                                     config.search_clearance_m)) {
+                                     config.clearance_m)) {
                     return false;
                 }
             }
@@ -268,8 +268,8 @@ LocalPathResult LocalPathSearch::search(const ObservedMap& map,
         size_t verified_end = 0;
         for (size_t i = 0; i + 1 < path->size(); ++i) {
             if (segmentClear(map, (*path)[i], (*path)[i + 1],
-                             config.search_clearance_m,
-                             0.5 * config.search_clearance_m)) {
+                             config.clearance_m,
+                             0.5 * config.clearance_m)) {
                 verified_end = i + 1;
             } else {
                 break;
@@ -294,8 +294,8 @@ LocalPathResult LocalPathSearch::search(const ObservedMap& map,
         // goal.  Only then is the terminal the exact goal.
         const bool final_clear =
             segmentClear(map, goal_cell_center, goal_world,
-                         config.search_clearance_m,
-                         0.5 * config.search_clearance_m);
+                         config.clearance_m,
+                         0.5 * config.clearance_m);
         const bool all_edges_ok = verified_end + 1 == original_size;
         if (final_clear && all_edges_ok) {
             path.back() = goal_world;

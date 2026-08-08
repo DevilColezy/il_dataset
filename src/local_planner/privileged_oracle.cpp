@@ -166,11 +166,11 @@ bool PrivilegedOracle::buildScene(
     };
     for (const Eigen::Vector3d& p : points) voxelize(p.x(), p.y(), p.z());
 
-    // Global ESDF.  UNIFIED SEMANTICS (section XIV/XV): the ESDF value is
+    // Global ESDF.  UNIFIED SEMANTICS (problem 4): the ESDF value is
     //   esdf = distance_to_obstacle_surface - vehicle_radius
     // i.e. clearance from the INFLATED vehicle body.  Free space is
-    // everywhere defined by  esdf > inflation_m  (never re-subtracting the
-    // vehicle radius).
+    // everywhere defined by  esdf > clearance_m  (never re-subtracting the
+    // vehicle radius — it is subtracted EXACTLY ONCE here).
     const std::vector<double> dist2 =
         squaredEdt3d(occupancy_, gx_, gy_, gz_);
     esdf_.resize(total);
@@ -301,9 +301,10 @@ void PrivilegedOracle::buildConnectivityAndCostToGo(
     cost_to_go_.assign(slice, std::numeric_limits<float>::infinity());
     connected_.assign(slice, 0);
 
-    // UNIFIED free-space definition (section XIV): free = not occupied AND
-    // esdf > inflation_m  (ESDF already subtracts the vehicle radius).
-    const double free_threshold = config_.inflation_m;
+    // UNIFIED free-space definition (problem 4): free = not occupied AND
+    // esdf > clearance_m  (ESDF already subtracts the vehicle radius; the
+    // clearance is the SAME additional margin used by every module).
+    const double free_threshold = config_.clearance_m;
     auto cell_free = [&](int ix, int iy) {
         if (ix < 0 || ix >= gx_ || iy < 0 || iy >= gy_) return false;
         const size_t index = (static_cast<size_t>(ix) * gy_ + iy) * gz_ + z;
@@ -439,16 +440,19 @@ double PrivilegedOracle::directionCostToGo(
     return costToGo(point.x(), point.y(), point.z());
 }
 
-void PrivilegedOracle::scoreCandidates(
-    std::vector<MacroCandidate>* candidates,
+std::vector<MacroCandidate> PrivilegedOracle::scoreCandidates(
+    const std::vector<MacroCandidate>& candidates,
     const VehicleState& state,
     const Eigen::Vector3d& goal_world,
     Side committed_side,
     const Eigen::Vector3d* previous_guide_world) const {
-    if (candidates == nullptr || !built_) return;
+    std::vector<MacroCandidate> scored;
+    if (!built_) return scored;
+    scored.reserve(candidates.size());
     const double cap = config_.cost_to_go_cap_m;
     const double clearance_target = config_.scoring.clearance_target_m;
-    for (MacroCandidate& candidate : *candidates) {
+    for (const MacroCandidate& source : candidates) {
+        MacroCandidate candidate = source;
         const Eigen::Vector3d& p = candidate.position_world;
         const double c = clearance(p.x(), p.y(), p.z());
         const double ctg = costToGo(p.x(), p.y(), p.z());
@@ -524,7 +528,9 @@ void PrivilegedOracle::scoreCandidates(
         // Approximate long-term path length (observed + remaining).
         candidate.global_path_length =
             candidate.observed_path_cost + candidate.global_cost_to_go;
+        scored.push_back(std::move(candidate));
     }
+    return scored;
 }
 
 Side PrivilegedOracle::privilegedBestSide(

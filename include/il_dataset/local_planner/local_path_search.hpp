@@ -12,9 +12,12 @@ class ObservedMap;
 
 /// Configuration for the 30 Hz observed-map A* / JPS-style search.
 struct LocalSearchConfig {
-    /// Extra margin added on top of the vehicle radius when deciding node
-    /// safety (the ESDF already subtracts the vehicle radius).
-    double search_clearance_m = 0.25;
+    /// The single UNIFIED navigation clearance (problem 4): the extra
+    /// margin on top of the vehicle radius required for a node to be safe.
+    /// The observed ESDF already subtracts the vehicle radius, so this is
+    /// the SAME additional margin used by the global connectivity and every
+    /// other module — never a second, more permissive boundary.
+    double clearance_m = 0.20;
     /// Lateral bias toward the committed side: per-metre path-cost penalty
     /// for nodes on the opposite side of the goal ray (0 disables).
     double side_bias_gain = 2.0;

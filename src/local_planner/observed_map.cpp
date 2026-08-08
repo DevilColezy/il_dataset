@@ -544,10 +544,10 @@ double ObservedMap::esdfValue(double x, double y, double z) const {
 }
 
 bool ObservedMap::isKnownFree(double x, double y, double z,
-                              double min_clearance) const {
+                              double required_clearance) const {
     if (!isKnown(x, y, z)) return false;
     const double value = esdfValue(x, y, z);
-    return std::isfinite(value) && value > min_clearance;
+    return std::isfinite(value) && value > required_clearance;
 }
 
 int ObservedMap::knownCount() const {

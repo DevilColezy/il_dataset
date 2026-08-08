@@ -129,9 +129,9 @@ TaskCandidateResult TaskGenerationOracle::evaluate(
         return r;
     }
     r.start_free = oracle.isFree(start.x(), start.y(), start.z(),
-                                 config_.start_clearance_m);
+                                 config_.clearance_m);
     r.goal_free = oracle.isFree(goal.x(), goal.y(), goal.z(),
-                                config_.goal_clearance_m);
+                                config_.clearance_m);
     r.straight_distance = (goal - start).norm();
     if (!r.start_free || !r.goal_free) {
         r.reason = "endpoint_not_free";
@@ -163,7 +163,7 @@ TaskCandidateResult TaskGenerationOracle::evaluate(
         const double px = start.x() + dir.x() * d;
         const double py = start.y() + dir.y() * d;
         const bool free =
-            oracle.isFree(px, py, z_walk, config_.direct_corridor_clearance_m);
+            oracle.isFree(px, py, z_walk, config_.clearance_m);
         if (!free) {
             if (!in_block) {
                 ++r.direct_blocker_count;
@@ -181,7 +181,7 @@ TaskCandidateResult TaskGenerationOracle::evaluate(
     // Global connectivity + cost-to-go from this candidate's goal (local
     // copy; the oracle's persistent task state is left untouched).
     const SliceSearch s = runSliceSearch(oracle, start, goal,
-                                         config_.lateral_path_clearance_m);
+                                         config_.clearance_m);
     if (!s.built) {
         r.reason = "endpoint_not_in_grid";
         return r;
@@ -234,7 +234,7 @@ TaskCandidateResult TaskGenerationOracle::evaluate(
                 perp * (static_cast<double>(side_sign) *
                         config_.lateral_probe_offset_m);
             if (!oracle.isFree(probe.x(), probe.y(), s.z_world,
-                               config_.lateral_path_clearance_m)) {
+                               config_.clearance_m)) {
                 continue;
             }
             const int pix = static_cast<int>(std::floor(
@@ -260,7 +260,7 @@ TaskCandidateResult TaskGenerationOracle::evaluate(
     // Privileged local-scale audit on the FULL map: short-range rejoin
     // search from the start toward the goal ray, allowing local bypass.
     PrivilegedInterventionConfig lic;
-    lic.search_clearance_m = config_.search_clearance_m;
+    lic.clearance_m = config_.clearance_m;
     lic.search_max_time_ms = config_.search_max_time_ms;
     lic.rejoin_distance_m = config_.rejoin_distance_m;
     lic.max_duration_s = config_.max_duration_s;

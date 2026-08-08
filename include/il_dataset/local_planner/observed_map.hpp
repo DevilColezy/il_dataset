@@ -83,7 +83,8 @@ public:
 
     // ── Queries ─────────────────────────────────────────────────────
     bool isKnown(double x, double y, double z) const;
-    bool isKnownFree(double x, double y, double z, double min_clearance) const;
+    bool isKnownFree(double x, double y, double z,
+                     double required_clearance) const;
     /// Signed clearance at a point (trilinear).  Returns NaN when outside
     /// the grid; unknown cells report 0.0 (never free).
     double esdfValue(double x, double y, double z) const;

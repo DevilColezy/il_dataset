@@ -48,9 +48,9 @@ bool ESDFGrid::isKnown(double x, double y, double z) const {
 }
 
 bool ESDFGrid::isKnownFree(double x, double y, double z,
-                           double min_clearance) const {
+                           double required_clearance) const {
     if (map_ == nullptr) return false;
-    return map_->isKnownFree(x, y, z, min_clearance);
+    return map_->isKnownFree(x, y, z, required_clearance);
 }
 
 }  // namespace il_dataset

@@ -30,9 +30,13 @@ struct TrajectoryOptimizationConfig {
     double seed_trust_radius = 0.35;
     bool horizontal_avoidance_only = true;
 
-    // Clearance
-    double min_clearance = 0.02;
-    double target_clearance = 0.20;
+    // Clearance — the single UNIFIED navigation clearance (problem 4).
+    // The observed ESDF already subtracts the vehicle radius, so this is
+    // the same additional margin used by the global connectivity and every
+    // other module.  It is BOTH the trajectory optimizer's soft target AND
+    // the hard validation floor: the local trajectory / goal-stop /
+    // braking checks are never more permissive than global connectivity.
+    double clearance_m = 0.20;
     double collision_check_spacing = 0.05;
 
     // Cost weights
@@ -59,7 +63,8 @@ struct TrajectoryOptimizationConfig {
     double warm_start_max_terminal_deviation_m = 1.5;
 
     // Local A* seed (populated from the local_path_search config module).
-    double search_clearance_m = 0.25;
+    // Uses the SAME unified clearance_m (never a second, more permissive
+    // boundary).
     double search_max_time_ms = 18.0;
     double search_region_margin_m = 2.0;
     double search_side_bias_gain = 2.0;
@@ -96,9 +101,10 @@ public:
     LocalPlanResult plan(const LocalPlanRequest& request) const;
 
     /// Strict validation: every point must be known AND clearance above
-    /// `min_clearance`, plus finite state and dynamics feasibility.
-    /// Spatially interpolates so the max collision-check spacing along the
-    /// trajectory is <= collision_check_spacing (section XVI).
+    /// the unified `config_.clearance_m`, plus finite state and dynamics
+    /// feasibility.  Spatially interpolates so the max collision-check
+    /// spacing along the trajectory is <= collision_check_spacing (section
+    /// XVI).
     ValidationResult validateTrajectory(
         const std::vector<TrajectoryPoint>& trajectory) const;
 
@@ -106,9 +112,11 @@ public:
     /// re-executed from the cache (section VIII/X).  The current state is
     /// compared against the trajectory INTERPOLATED at the current age
     /// (position_at_age, velocity_at_age) — never against trajectory[0].
-    /// Safety validation starts AT the current age and uses the SAME
-    /// spatial interpolation (collision_check_spacing) as the fresh final
-    /// validation (sections XIX/XX).
+    /// Safety validation starts AT the current age, uses the SAME unified
+    /// `config_.clearance_m` and the SAME spatial interpolation
+    /// (collision_check_spacing) as the fresh final validation (sections
+    /// XIX/XX).  No external clearance is accepted: the unified
+    /// navigation clearance is the ONLY effective safety boundary.
     ///  - plan_start_time: wall time when the trajectory was planned (s).
     ///  - current_time:    wall time now (s).
     /// Returns a ValidationResult.
@@ -117,7 +125,6 @@ public:
         double plan_start_time,
         double current_time,
         const VehicleState& state,
-        double min_clearance,
         double max_position_error,
         double max_velocity_error) const;
 
@@ -129,11 +136,12 @@ private:
     /// validation and the cached suffix validation.  Checks every sample
     /// with t >= start_t and spatially interpolates so the maximum gap is
     /// <= collision_check_spacing.  Every interpolated point is checked for
-    /// known + clearance.
+    /// known + clearance.  `clearance` is the effective safety boundary
+    /// (callers always pass the unified config_.clearance_m).
     ValidationResult validateTrajectorySegmentSpatially(
         const std::vector<TrajectoryPoint>& trajectory,
         double start_t,
-        double min_clearance) const;
+        double clearance) const;
 
     TrajectoryOptimizationConfig config_;
     const ObservedMap* map_ = nullptr;

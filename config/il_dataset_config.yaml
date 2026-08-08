@@ -34,6 +34,11 @@ global:
     pc_export_timeout:      600.0
     drone_stable_timeout:    10.0
     trajectory_timeout:     120.0
+    # Independent WALL-CLOCK cap per task (section "time"): the sim-based
+    # trajectory_timeout alone cannot bound a stalled simulation or a
+    # severely degraded loop.  Generous, so it only fires on pathological
+    # stalls; never affects navigation timing.
+    trajectory_wall_timeout_s: 600.0
     keep_alive_period:        3.0
     # Keep AvoidBench's 5 s connection timeout from reloading the scene
     # during the blocking map-build / task-generation phases.
@@ -78,7 +83,21 @@ global:
   # ── Vehicle geometry ───────────────────────────────────────────────
   vehicle:
     radius_m:        0.30
+    # Scene-generation-only geometry spacing margin.  It is NOT a
+    # navigation clearance: the unified navigation safety boundary is
+    # `navigation.clearance_m` below.
     safety_margin_m: 0.20
+
+  # ── UNIFIED navigation clearance (problem 4) ───────────────────────
+  # The SINGLE effective safety boundary for EVERY navigation module
+  # (global connectivity / cost-to-go, observed-map A*, local
+  # recoverability, privileged intervention, trajectory optimisation /
+  # validation, goal-stop, braking risk and start/goal/task generation).
+  # Both ESDFs (observed and privileged) already subtract the vehicle
+  # radius, so this is purely the additional margin on top of the inflated
+  # vehicle body.  No module may use a different, more permissive value.
+  navigation:
+    clearance_m: 0.20
 
   # ── Procedural scene generation (section XXII/XXXII-XXXVI) ─────────
   scene_generation:
@@ -146,7 +165,6 @@ global:
     enabled: true
     # VERIFIED 'fixed' flight height: 1.8-2.2 m inside the factory z[0,8].
     flight_height_m: 2.0
-    clearance_m: 0.20            # extra margin on top of vehicle radius (ESDF)
     task_seed_base: 999983
     # Factory drivable box covering all verified start/goal sampling
     # regions (starts y~-1 / x~-8 / x~11.5; goals y~31 / x~-8 / x~11.5).
@@ -220,17 +238,15 @@ global:
       initial_angular_velocity_noise_std_rps: [0.0, 0.0, 0.0]
 
   # ── Privileged global map (section VII) ────────────────────────────
-  # UNIFIED ESDF semantics (section XIV/XV): the global ESDF value is
-  #   esdf = distance_to_obstacle_surface - vehicle_radius
-  # Free space is everywhere  esdf > inflation_m  (never re-subtracting the
-  # vehicle radius).
+  # The global ESDF value is  esdf = distance_to_obstacle_surface -
+  # vehicle_radius.  Free space is everywhere  esdf > navigation.clearance_m
+  # (never re-subtracting the vehicle radius).
   task_oracle:
     # Global privileged map config.  Tasks are now generated ONLINE per
     # scene (scene_generation / task_generation); no external manifests
     # are required as inputs (section VI).
     map_resolution_m:      0.10
     map_margin_m:          2.0
-    inflation_m:           0.30
     max_esdf_distance_m:   8.0
     min_z_m:              -5.0
     max_z_m:               8.0
@@ -338,7 +354,6 @@ global:
     side_corridor_length_m:     4.0
     side_corridor_radius_m:     0.55
     edge_search_radius_m:       5.0
-    min_candidate_clearance_m:  0.25
     candidate_spacing_m:        0.5
     observe_step_m:             0.6
     # Minimum candidate->current distance for an OBSERVE candidate to be
@@ -351,11 +366,11 @@ global:
     # ── Active observation viewpoint search (section XV) ───────────
     # A small lateral x forward lattice around the current position on BOTH
     # sides replaces the old two fixed ±observe_step_m probes.  Endpoints
-    # must be known-free with the SAME clearance as the 30 Hz local planner
-    # (local_path_search.search_clearance_m); reachability is verified with
-    # a real observed LocalPathSearch (FULL_GOAL_REACHED only, never a
-    # straight-corridor proxy).  All fields are diagnostic / expert-side;
-    # none enter the student input.
+    # must be known-free with the unified navigation clearance
+    # (`navigation.clearance_m`); reachability is verified with a real
+    # observed LocalPathSearch (FULL_GOAL_REACHED only, never a straight-
+    # corridor proxy).  All fields are diagnostic / expert-side; none enter
+    # the student input.
     observation:
       lateral_distances_m:       [0.4, 0.8, 1.2, 1.6]
       forward_distances_m:       [0.0, 0.4, 0.8, 1.2]
@@ -368,7 +383,7 @@ global:
       information_gain_radius_m: 1.2
 
   # ── Local recoverability query (section VI) ────────────────────────
-  # The search clearance is owned by local_path_search (single source).
+  # The clearance is the unified `navigation.clearance_m` (single source).
   # These bounds define the LOCAL capability and are shared with the
   # privileged local-scale audit (section II): observed and privileged use
   # the SAME rejoin distance, duration, path-length and detour limits.
@@ -390,8 +405,8 @@ global:
     edge_search_radius_m:        5.0
 
   # ── Observed-map A* (section X.2) ──────────────────────────────────
+  # The unified navigation clearance lives in `navigation.clearance_m`.
   local_path_search:
-    search_clearance_m: 0.25
     side_bias_gain:     2.0
     max_expansions: 200000
     max_time_ms:        20.0
@@ -403,9 +418,9 @@ global:
   # observed local recoverability (same rejoin distance and capability
   # bounds from local_recoverability); ALLOWS local bypass.  Its result is
   # an auxiliary label / audit — it never directly changes the main macro
-  # mode without causal evidence.
+  # mode without causal evidence.  The clearance is the unified
+  # `navigation.clearance_m`.
   privileged_intervention:
-    search_clearance_m:     0.25
     search_max_time_ms:    20.0
     # Loop detection (section IX).
     loop_ignore_recent_s:   2.5
@@ -419,8 +434,10 @@ global:
     cost_margin_m:          2.0
 
   # ── B-spline trajectory optimization (section X.4) ─────────────────
-  # The A* search and yaw parameters live in local_path_search and
-  # yaw_planning respectively (single source per concern).
+  # The clearance is the unified `navigation.clearance_m` (both the soft
+  # optimisation target and the hard validation floor).  The A* search and
+  # yaw parameters live in local_path_search and yaw_planning respectively
+  # (single source per concern).
   trajectory_optimization:
     planning_time_budget_ms: 30.0
     trajectory_dt:           0.04
@@ -433,8 +450,6 @@ global:
     minimum_step_size:        1.0e-4
     seed_trust_radius:        0.35
     horizontal_avoidance_only: true
-    min_clearance:            0.02
-    target_clearance:         0.20
     collision_check_spacing:  0.05
     weight_path_length:       0.05
     weight_smooth:            1.0

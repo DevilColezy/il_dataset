@@ -53,6 +53,14 @@ enum class MacroMode : int {
     OBSERVE = 2,
     GOAL_REACHED = 3,
     FAILED = 4,
+    /// Explicit terminal approach / deceleration (problem 2): the drone is
+    /// within the goal position tolerance but still above the goal speed
+    /// tolerance.  The macro keeps the guide pinned at the goal and NEVER
+    /// enters OBSERVE / runs recoverability / emits OBSERVE_MOVE; the
+    /// 30 Hz local planner + executor produce the real zero-velocity stop
+    /// (C++ stop_at_goal / goal_stop_tolerance).  GOAL_REACHED still
+    /// requires BOTH the position AND the speed condition.
+    GOAL_APPROACH = 5,
 };
 
 /// Committed horizontal bypass side. FLU: +y is left.
@@ -178,21 +186,19 @@ struct TaskCandidateResult {
 /// / privileged_intervention so generated classes match the real scale
 /// definition (behaviour scale, not obstacle size).
 struct TaskGenerationConfig {
-    /// Extra clearance for start/goal free tests (unified ESDF semantics:
-    /// vehicle radius already subtracted, so this is an additional margin).
-    double start_clearance_m = 0.45;
-    double goal_clearance_m = 0.45;
-    /// Extra clearance for the direct-corridor ray walk.
-    double direct_corridor_clearance_m = 0.45;
+    /// The single UNIFIED navigation clearance (problem 4): the global ESDF
+    /// already subtracts the vehicle radius, so this is the one additional
+    /// safety margin used for start/goal free tests, the direct-corridor
+    /// ray walk, the lateral probes AND the local-scale audit search.  No
+    /// module may use a different effective safety boundary.
+    double clearance_m = 0.20;
     double min_task_distance_m = 3.0;
     double max_task_distance_m = 30.0;
     /// Lateral probe geometry for left/right global feasibility.
     double lateral_probe_offset_m = 1.2;
     double lateral_probe_spacing_m = 0.6;
     int lateral_probe_count = 4;
-    double lateral_path_clearance_m = 0.45;
     // ── Local-scale audit capability bounds (same as local_recoverability).
-    double search_clearance_m = 0.25;
     double search_max_time_ms = 20.0;
     double rejoin_distance_m = 2.5;
     double max_duration_s = 2.5;

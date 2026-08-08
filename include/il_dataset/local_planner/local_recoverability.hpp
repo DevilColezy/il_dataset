@@ -13,8 +13,11 @@ class ObservedMap;
 struct RecoverabilityConfig {
     /// Direct-guide lookahead used to define the rejoin point.
     double rejoin_distance_m = 2.5;
-    /// Clearance required along the local path.
-    double search_clearance_m = 0.25;
+    /// The single UNIFIED navigation clearance (problem 4): clearance
+    /// required along the local path.  The observed ESDF already subtracts
+    /// the vehicle radius, so this is the SAME additional margin used by
+    /// every other navigation module.
+    double clearance_m = 0.20;
     /// Fixed local planning horizon: the path must be executable within it.
     double max_duration_s = 2.5;
     /// Max allowed local path length (m).

@@ -18,10 +18,11 @@ class PrivilegedOracle;
 /// ray to be collision free.  It uses the SAME rejoin target distance and
 /// the SAME capability bounds as the observed local recoverability.
 struct PrivilegedInterventionConfig {
-    /// Additional clearance (m) required for the privileged search; the
-    /// global ESDF already subtracts the vehicle radius, so this is the
-    /// same "extra safety margin" used by every global module.
-    double search_clearance_m = 0.25;
+    /// The single UNIFIED navigation clearance (problem 4): additional
+    /// clearance (m) required for the privileged search.  The global ESDF
+    /// already subtracts the vehicle radius, so this is the SAME "extra
+    /// safety margin" used by every global module.
+    double clearance_m = 0.20;
     double search_max_time_ms = 20.0;
     /// Rejoin target distance (m) — SAME as local_recoverability.
     double rejoin_distance_m = 2.5;

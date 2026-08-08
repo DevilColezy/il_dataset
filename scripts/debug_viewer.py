@@ -39,7 +39,7 @@ except ImportError:
 
 # Stable enum names (mirror types.hpp / il_macro_expert.SideFailure).
 _MODE_NAMES = {0: "DIRECT_GUIDE", 1: "SIDE_GUIDE", 2: "OBSERVE",
-               3: "GOAL_REACHED", 4: "FAILED"}
+               3: "GOAL_REACHED", 4: "FAILED", 5: "GOAL_APPROACH"}
 _SIDE_NAMES = {0: "NONE", 1: "LEFT", -1: "RIGHT"}
 _REC_STATUS_NAMES = {0: "DIRECT_REJOIN_SUCCESS", 1: "PARTIAL_PROGRESS_ONLY",
                      2: "BLOCKED_BY_KNOWN", 3: "BLOCKED_BY_UNKNOWN",
@@ -47,7 +47,7 @@ _REC_STATUS_NAMES = {0: "DIRECT_REJOIN_SUCCESS", 1: "PARTIAL_PROGRESS_ONLY",
 _CAND_TYPE_NAMES = {0: "DIRECT", 1: "SIDE", 2: "OBSERVE",
                     3: "GOAL_FRONTIER", 4: "PREVIOUS_CONT"}
 _MODE_COLORS = {0: "#1f77b4", 1: "#ff7f0e", 2: "#2ca02c",
-                3: "#d62728", 4: "#9467bd"}
+                3: "#d62728", 4: "#9467bd", 5: "#8c564b"}
 _CAND_COLORS = {0: "#1f77b4", 1: "#ff7f0e", 2: "#2ca02c",
                 3: "#d62728", 4: "#9467bd"}
 

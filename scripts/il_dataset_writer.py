@@ -99,7 +99,7 @@ DATA_SCHEMA_V22_FIELDS = [
     "observe_local_full_count", "observe_reject_unknown",
     "observe_reject_endpoint_clearance", "observe_reject_min_distance",
     "observe_reject_max_distance", "observe_reject_partial",
-    "observe_reject_no_path", "observe_reject_failed_side",
+    "observe_reject_no_path",
     "observe_left_valid_count", "observe_right_valid_count",
     "observe_center_valid_count",
     "observe_selected_source", "observe_selected_side",

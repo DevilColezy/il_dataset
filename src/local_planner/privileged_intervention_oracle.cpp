@@ -163,7 +163,7 @@ PrivilegedInterventionResult PrivilegedInterventionOracle::evaluate(
     auto cell_free = [&](int ix, int iy) {
         if (ix < 0 || ix >= gx || iy < 0 || iy >= gy) return false;
         const Eigen::Vector3d p = world_point(ix, iy);
-        return oracle.isFree(p.x(), p.y(), p.z(), config_.search_clearance_m);
+        return oracle.isFree(p.x(), p.y(), p.z(), config_.clearance_m);
     };
 
     // Unify the rejoin target with the OBSERVED recoverability (section II):
@@ -238,7 +238,7 @@ PrivilegedInterventionResult PrivilegedInterventionOracle::evaluate(
 
     // The start must be free under the unified global definition.
     if (!oracle.isFree(state.position.x(), state.position.y(), z,
-                       config_.search_clearance_m)) {
+                       config_.clearance_m)) {
         result.privileged_local_recoverable = false;
         result.privileged_future_intervention_required = true;
         result.failure_reason = PrivilegedRecoverabilityFailure::NO_REJOIN_PATH;
@@ -333,13 +333,13 @@ PrivilegedInterventionResult PrivilegedInterventionOracle::evaluate(
         bool edges_clear = true;
         for (size_t i = 0; i + 1 < path.size() && edges_clear; ++i) {
             edges_clear = segmentFree(oracle, path[i], path[i + 1],
-                                      config_.search_clearance_m, res);
+                                      config_.clearance_m, res);
         }
         // Final continuous segment from the goal cell centre to the exact
         // rejoin point.
         const bool final_clear =
             segmentFree(oracle, goal_cell, rejoin_point,
-                        config_.search_clearance_m, res);
+                        config_.clearance_m, res);
         if (!edges_clear || !final_clear) {
             goal_reached = false;
             path.clear();
@@ -392,12 +392,18 @@ PrivilegedInterventionResult PrivilegedInterventionOracle::evaluate(
     const bool detour_ok =
         straight_rejoin <= 1.0e-3 ||
         result.privileged_detour_ratio <= config_.max_detour_ratio + 1.0e-3;
+    // Progress gate capped at the ACTUAL rejoin distance (problem 2): when
+    // the drone is inside the goal tolerance the rejoin point is nearer
+    // than `min_goal_progress_m`, and demanding full progress would
+    // wrongly report the terminal approach as globally unrecoverable.
+    const double required_progress =
+        std::min(config_.min_goal_progress_m, rejoin_dist);
     const bool progress_ok =
-        goal_progress >= config_.min_goal_progress_m;
+        goal_progress + 1.0e-3 >= required_progress;
     const bool alignment_ok =
         terminal_alignment >= config_.min_terminal_alignment;
     const bool clearance_ok =
-        result.privileged_min_clearance >= config_.search_clearance_m;
+        result.privileged_min_clearance >= config_.clearance_m;
 
     result.privileged_rejoin_reached =
         goal_reached && within_budget && detour_ok && progress_ok &&
