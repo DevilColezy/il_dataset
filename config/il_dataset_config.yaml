@@ -319,6 +319,12 @@ global:
     observe_info_gain_move_threshold: 0.05
     observe_viewpoint_hysteresis_m:   0.8
     observe_viewpoint_hysteresis_bonus: 0.15
+    # Distance a real OBSERVE_MOVE must travel before the current
+    # observation anchor is considered "new" (sections XXI-XXIV): beyond
+    # this, scan exhaustion / yaw reference / stagnation / info baselines
+    # are re-based at the new viewpoint.  Small drifts never reset scan
+    # state (section XLIII).
+    viewpoint_reset_distance_m:      0.35
     # Episode-level final anti-deadlock guard (section XXII).
     macro_intervention_absolute_safety_timeout: 45.0
     # Fixed left preference for genuinely tied sides (never unconditional).

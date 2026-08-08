@@ -164,6 +164,8 @@ def _validate_config(cfg):
               "macro_expert.side_no_progress_seconds", errors)
     _positive(me.get("observe_no_information_timeout", 4.0),
               "macro_expert.observe_no_information_timeout", errors)
+    _positive(me.get("viewpoint_reset_distance_m", 0.35),
+              "macro_expert.viewpoint_reset_distance_m", errors)
     _positive(me.get("local_path_fail_threshold", 2),
               "macro_expert.local_path_fail_threshold", errors)
     _positive(me.get("blocker_rebind_ticks", 2),

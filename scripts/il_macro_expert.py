@@ -101,9 +101,16 @@ class MacroExpert(object):
         self._observe_time_s = 0.0
         self._observe_yaw_delta = 0.0
         self._observe_reference_yaw_world = None
-        self._observe_last_known = None
+        # OBSERVE information baselines (sections XVI-XVIII): monotonic
+        # bests for known cells and per-category FULL-reachable movement
+        # counts (SIDE / OBSERVE / GOAL_FRONTIER), state-change for edge
+        # visibility.  A fresh session writes the CURRENT values — never
+        # None — so no tick can ever hit `int > None`.
+        self._observe_best_known = None
         self._observe_last_edge_mask = None
-        self._observe_last_reachable_count = None
+        self._observe_best_side_count = None
+        self._observe_best_observe_count = None
+        self._observe_best_frontier_count = None
         self._observe_last_info_time = None
         self._prev_guide_world = None
         # Active-observation scan lifecycle (sections XXI-XXXV): per-side
@@ -117,6 +124,10 @@ class MacroExpert(object):
         self._observe_last_target_yaw = None
         self._observe_last_move_guide = None
         self._prev_observe_viewpoint = None
+        # World anchor of the current observation viewpoint (sections
+        # XXI-XXIV): a real OBSERVE_MOVE beyond viewpoint_reset_distance_m
+        # re-bases the whole scan session at the new position.
+        self._observe_anchor_position_world = None
         # Per-tick OBSERVE diagnostics (pure diagnostics, never student
         # input).  Held between 5 Hz ticks so the 30 Hz recorder sees them.
         self.observe_scan_side = 0
@@ -145,6 +156,11 @@ class MacroExpert(object):
         self.observe_selected_path_length = 0.0
         self.observe_selected_info_gain = 0.0
         self.observe_selected_clearance = 0.0
+        # OBSERVE session diagnostics (sections XXXV-XXXVI): whether a
+        # session baseline has been established this tick and how far the
+        # drone is from its observation anchor.
+        self.observe_session_initialized = 0
+        self.observe_anchor_distance = 0.0
         # DIRECT session (section XXV): history is initialised ONLY when
         # entering DIRECT from another mode; a DIRECT->DIRECT tick only
         # UPDATES the history so causal evidence accumulates across 5 Hz
@@ -480,10 +496,11 @@ class MacroExpert(object):
             # keeps the accumulated history — evidence is never cleared on
             # a plain DIRECT tick.
             if self.mode == self._module.MacroMode.OBSERVE:
+                # Leaving OBSERVE (section X): the whole session — yaw
+                # reference, baselines, scan exhaustion, stagnation,
+                # anchor — is cleared so a later re-entry starts fresh.
                 self._observe_time_s = 0.0
-                self._observe_yaw_delta = 0.0
-                self._observe_reference_yaw_world = None
-                self._clear_observe_scan_state()
+                self._clear_observe_session()
             self._enter_direct_session(goal_dist, now_s)
         self.mode = self._module.MacroMode.DIRECT_GUIDE
         yaw_world = math.atan2(goal_dir_world[1], goal_dir_world[0]) - \
@@ -597,33 +614,63 @@ class MacroExpert(object):
             else self._module.Side.NONE
         pref_side = side
 
-        # Rolling OBSERVE information-gain window (section XVI/XLII):
-        # known cells, edge visibility, SIDE-candidate availability and a
-        # newly FULL-reachable movement candidate all count as progress.
+        # Rolling OBSERVE information-gain window (sections XVI-XVIII):
+        # known cells (monotonic best), edge visibility (state change) and
+        # newly FULL-reachable movement candidates count as progress.  The
+        # movement counts include SIDE + OBSERVE + GOAL_FRONTIER FULL
+        # reachability — an OBSERVE/FRONTIER viewpoint becoming reachable
+        # is itself decision information (sections XII-XIV/XXXIX).
+        # Per-category BEST baselines are monotonic so candidate-count
+        # jitter (2 -> 1 -> 2) never produces repeated false progress
+        # (sections XVII/XLIV), while a fresh session always writes the
+        # CURRENT observed values as baselines — never None (sections
+        # II-III/XIX/XXXVII).
         known = int(observed_map.known_count())
         edge_mask = (int(blocker.left_edge_visible),
                      int(blocker.right_edge_visible))
-        reachable = len([c for c in candidates
+        side_full = len([c for c in candidates
                          if c.type == self._module.CandidateType.SIDE and
                          c.full_goal_reached])
+        observe_full = len([c for c in candidates
+                            if c.type ==
+                            self._module.CandidateType.OBSERVE and
+                            c.full_goal_reached])
+        frontier_full = len([c for c in candidates
+                             if c.type ==
+                             self._module.CandidateType.GOAL_FRONTIER and
+                             c.full_goal_reached])
+        # A real OBSERVE_MOVE that travelled beyond the viewpoint reset
+        # distance establishes a NEW observation anchor: scan exhaustion,
+        # yaw reference, stagnation and info baselines are all re-based at
+        # the current position (sections XXI-XXIV/XLII).  Small drifts
+        # never reset scan state (section XLIII).
+        anchor_moved = (
+            self._observe_anchor_position_world is not None and
+            float(np.linalg.norm(
+                pos - self._observe_anchor_position_world)) >=
+            float(self.cfg.get("viewpoint_reset_distance_m", 0.35)))
         info_gained = False
         if self.mode != self._module.MacroMode.OBSERVE or \
-                self._observe_reference_yaw_world is None:
-            # Entering OBSERVE: initialise a fresh scan session and close
-            # the DIRECT / SIDE sessions (sections XXIV-XXV).
+                self._observe_reference_yaw_world is None or anchor_moved:
+            # Entering OBSERVE (fresh session) or the drone reached a new
+            # observation viewpoint: start a fresh session whose baselines
+            # are the CURRENT observed values (never None, so the next
+            # tick's comparison can never hit `int > None`).  First entry
+            # keeps the "session start" semantics of info_gained = True.
             self._exit_direct_session()
             self._side_session_active = False
-            self._reset_observe_scan(pref_side, yaw, now_s)
+            self._start_observe_session(
+                pref_side, yaw, now_s,
+                known_count=known, edge_mask=edge_mask,
+                side_full_count=side_full,
+                observe_full_count=observe_full,
+                frontier_full_count=frontier_full,
+                pos=pos)
             info_gained = True
         else:
-            if known > self._observe_last_known or \
-                    edge_mask != self._observe_last_edge_mask or \
-                    reachable > self._observe_last_reachable_count:
-                self._observe_last_known = known
-                self._observe_last_edge_mask = edge_mask
-                self._observe_last_reachable_count = reachable
-                self._observe_last_info_time = now_s
-                info_gained = True
+            info_gained = self._observe_information_progress(
+                known, edge_mask, side_full, observe_full, frontier_full,
+                now_s)
         if self._observe_last_info_time is not None:
             self.observe_no_information_time = \
                 now_s - self._observe_last_info_time
@@ -754,7 +801,7 @@ class MacroExpert(object):
                     self._mark_current_scan_exhausted()
                 other = self._other_scan_side()
                 if other is not None:
-                    self._switch_scan_side(other, yaw, now_s)
+                    self._switch_observe_scan_side(other, yaw, now_s)
                     guide, desired_yaw_world, observe_subtype = \
                         self._observe_rotate_action(pos, yaw, dt_s,
                                                     fov_half_obs)
@@ -818,6 +865,9 @@ class MacroExpert(object):
         self.observe_rotation_exhausted = int(rotation_exhausted)
         self.observe_stagnant_rotate_time = round(
             self._observe_stagnant_time, 3)
+        self.observe_anchor_distance = round(float(
+            np.linalg.norm(pos - self._observe_anchor_position_world)), 3) \
+            if self._observe_anchor_position_world is not None else 0.0
         diag = self._candidate_search.last_observe_diagnostics()
         self.observe_raw_candidate_count = int(diag.raw_candidate_count)
         self.observe_lattice_candidate_count = int(diag.lattice_candidate_count)
@@ -851,10 +901,10 @@ class MacroExpert(object):
         SIDE->SIDE tick, so no-progress accumulation is preserved."""
         self._side_session_active = True
         self._exit_direct_session()
+        # Leaving OBSERVE (section X): full session clear so a later
+        # re-entry starts fresh.
         self._observe_time_s = 0.0
-        self._observe_yaw_delta = 0.0
-        self._observe_reference_yaw_world = None
-        self._clear_observe_scan_state()
+        self._clear_observe_session()
         pos_ctg = float(self._oracle.cost_to_go(pos)) \
             if self._oracle.built() else float("inf")
         self._side_best_cost = pos_ctg if math.isfinite(pos_ctg) else None
@@ -1016,15 +1066,9 @@ class MacroExpert(object):
         self._blocker_switch_ticks = 0
         self._blocker_matches_current = False
         self._direct_stable_ticks = 0
-        # Observe side / reference state (section XII).
+        # Observe session (section XII): fresh absolute budget; the full
+        # session clear runs inside _reset_side_memory (new topology).
         self._observe_time_s = 0.0
-        self._observe_yaw_delta = 0.0
-        self._observe_reference_yaw_world = None
-        self._observe_last_known = None
-        self._observe_last_edge_mask = None
-        self._observe_last_reachable_count = None
-        self._observe_last_info_time = None
-        self.observe_no_information_time = 0.0
         self._reset_side_memory()
 
     def _reset_side_memory(self):
@@ -1042,10 +1086,10 @@ class MacroExpert(object):
         self._side_last_progress_time = None
         self._side_last_pos = None
         self._side_path_progress = 0.0
-        # Fresh topology -> fresh active-observation scan state (section
-        # XLIII): old blocker scan exhaustion must never leak into the new
-        # obstacle.
-        self._clear_observe_scan_state()
+        # Fresh topology -> fresh active-observation session (section
+        # XXVIII/XL): old blocker yaw reference, scan exhaustion, info
+        # baselines and anchor must never leak into the new obstacle.
+        self._clear_observe_session()
 
     # ── Side failure memory (section VIII/XIV) ───────────────────────
     def _mark_side_failed(self, side, reason):
@@ -1116,17 +1160,35 @@ class MacroExpert(object):
         return None
 
     # ── Active-observation scan lifecycle (sections XXI-XXXV) ───────
-    def _clear_observe_scan_state(self):
-        """Drop the whole active-observation scan session (called when
-        leaving OBSERVE / on a confirmed new blocker).  Scan exhaustion is
-        per-obstacle topology, never global."""
+    def _clear_observe_session(self):
+        """Drop the ENTIRE active-observation session (leave OBSERVE /
+        confirmed new blocker / episode reset).  Scan exhaustion, sweep
+        reference, info baselines, stagnation and the observation anchor
+        are all per-obstacle topology — never global — so a new blocker or
+        a later re-entry into OBSERVE must start fully fresh (sections
+        VII-XI/XL).  The absolute OBSERVE time budget `_observe_time_s` is
+        deliberately NOT part of this clear: it is the final anti-deadlock
+        guard and is reset only when the mode leaves OBSERVE or the blocker
+        is released (section XLV)."""
         self._observe_scan_side = None
         self._left_scan_exhausted = False
         self._right_scan_exhausted = False
+        self._observe_reference_yaw_world = None
+        self._observe_yaw_delta = 0.0
+        self._observe_best_known = None
+        self._observe_last_edge_mask = None
+        self._observe_best_side_count = None
+        self._observe_best_observe_count = None
+        self._observe_best_frontier_count = None
+        self._observe_last_info_time = None
+        self.observe_no_information_time = 0.0
         self._observe_stagnant_time = 0.0
         self._observe_last_target_yaw = None
         self._observe_last_move_guide = None
         self._prev_observe_viewpoint = None
+        self._observe_anchor_position_world = None
+        self.observe_session_initialized = 0
+        self.observe_anchor_distance = 0.0
 
     def _reset_observe_diagnostics(self):
         """Zero the per-tick OBSERVE diagnostics (section XLVII-XLIX).  The
@@ -1157,21 +1219,86 @@ class MacroExpert(object):
         self.observe_selected_path_length = 0.0
         self.observe_selected_info_gain = 0.0
         self.observe_selected_clearance = 0.0
+        self.observe_session_initialized = 0
+        self.observe_anchor_distance = 0.0
 
-    def _reset_observe_scan(self, preferred_side, yaw, now_s):
-        """Initialise a fresh OBSERVE scan session (OBSERVE entry / new
-        blocker): the preferred side becomes the scan side, the sweep
-        reference is the current yaw, and both exhaustion flags are clear."""
-        self._clear_observe_scan_state()
+    def _start_observe_session(self, preferred_side, yaw_world, now_s,
+                               known_count, edge_mask, side_full_count,
+                               observe_full_count, frontier_full_count, pos):
+        """Establish a fresh OBSERVE session (OBSERVE entry / new blocker /
+        confirmed OBSERVE_MOVE to a new observation anchor).  The session's
+        baselines are the CURRENT observed values — never None — so the
+        next tick's information comparison can never crash with
+        `int > None` and a fresh session never reports fake progress
+        (sections II-III/XIX/XXXVII-XXXVIII).  The preferred side becomes
+        the scan side and the sweep reference is the current yaw."""
+        self._clear_observe_session()
         self._observe_scan_side = preferred_side
-        self._observe_reference_yaw_world = yaw
+        self._observe_reference_yaw_world = yaw_world
         self._observe_yaw_delta = 0.0
-        self._observe_last_target_yaw = yaw
-        self._observe_last_known = None
-        self._observe_last_edge_mask = None
-        self._observe_last_reachable_count = None
+        self._observe_anchor_position_world = np.asarray(pos,
+                                                         dtype=np.float64)
+        self._observe_best_known = int(known_count)
+        self._observe_last_edge_mask = edge_mask
+        self._observe_best_side_count = int(side_full_count)
+        self._observe_best_observe_count = int(observe_full_count)
+        self._observe_best_frontier_count = int(frontier_full_count)
         self._observe_last_info_time = now_s
         self.observe_no_information_time = 0.0
+        self._observe_stagnant_time = 0.0
+        self._observe_last_target_yaw = None
+        self._observe_last_move_guide = None
+        self._prev_observe_viewpoint = None
+        self.observe_session_initialized = 1
+        self.observe_anchor_distance = 0.0
+
+    def _observe_information_progress(self, known_count, edge_mask,
+                                      side_full_count, observe_full_count,
+                                      frontier_full_count, now_s):
+        """Compare the CURRENT observed state against the session baseline
+        and report genuine information progress (sections XVI-XVIII):
+          - known cells: monotonic best (session-local; a fresh session
+            re-bases it, so viewpoint changes never leave a stale best),
+          - edge visibility: state change,
+          - FULL-reachable movement counts: monotonic per-category best
+            for SIDE + OBSERVE + GOAL_FRONTIER, so a newly reachable
+            observation viewpoint counts as progress (section XXXIX) while
+            candidate-count jitter never does (section XLIV).
+        Defensive fallback (section V): a half-initialised session — which
+        should be impossible after `_start_observe_session` — is healed by
+        adopting the current values instead of raising `int > None`."""
+        if self._observe_best_known is None:
+            self._observe_best_known = int(known_count)
+        if self._observe_last_edge_mask is None:
+            self._observe_last_edge_mask = edge_mask
+        if self._observe_best_side_count is None:
+            self._observe_best_side_count = int(side_full_count)
+        if self._observe_best_observe_count is None:
+            self._observe_best_observe_count = int(observe_full_count)
+        if self._observe_best_frontier_count is None:
+            self._observe_best_frontier_count = int(frontier_full_count)
+        if self._observe_last_info_time is None:
+            self._observe_last_info_time = now_s
+
+        progress = (
+            int(known_count) > self._observe_best_known
+            or edge_mask != self._observe_last_edge_mask
+            or int(side_full_count) > self._observe_best_side_count
+            or int(observe_full_count) > self._observe_best_observe_count
+            or int(frontier_full_count) > self._observe_best_frontier_count
+        )
+        if progress:
+            self._observe_best_known = max(
+                self._observe_best_known, int(known_count))
+            self._observe_last_edge_mask = edge_mask
+            self._observe_best_side_count = max(
+                self._observe_best_side_count, int(side_full_count))
+            self._observe_best_observe_count = max(
+                self._observe_best_observe_count, int(observe_full_count))
+            self._observe_best_frontier_count = max(
+                self._observe_best_frontier_count, int(frontier_full_count))
+            self._observe_last_info_time = now_s
+        return progress
 
     def _scan_side_is_exhausted(self):
         if self._observe_scan_side == self._module.Side.LEFT:
@@ -1206,9 +1333,11 @@ class MacroExpert(object):
             return self._module.Side.RIGHT
         return None
 
-    def _switch_scan_side(self, side, yaw, now_s):
-        """Start scanning the other side: re-baseline the sweep reference
-        at the CURRENT yaw and clear the info/stagnation windows."""
+    def _switch_observe_scan_side(self, side, yaw, now_s):
+        """Switch the scan side LEFT <-> RIGHT within an ACTIVE OBSERVE
+        session (section XXVI): only the sweep reference (current yaw),
+        yaw delta, info timer and stagnation window are re-based.  The
+        session baselines, blocker and failed-side memory are untouched."""
         self._observe_scan_side = side
         self._observe_reference_yaw_world = yaw
         self._observe_yaw_delta = 0.0
@@ -1451,6 +1580,13 @@ class MacroExpert(object):
                 self.observe_selected_info_gain),
             "observe_selected_clearance": self._round_opt(
                 self.observe_selected_clearance),
+            "observe_session_initialized": int(self.observe_session_initialized),
+            "observe_anchor_distance": self._round_opt(
+                self.observe_anchor_distance),
+            "observe_best_known": self._observe_best_known,
+            "observe_best_side_count": self._observe_best_side_count,
+            "observe_best_observe_count": self._observe_best_observe_count,
+            "observe_best_frontier_count": self._observe_best_frontier_count,
             "blocker_track_id": self.blocker_track_id,
             "blocker_matches_current": bool(self._blocker_matches_current),
             "rec_status": int(rec.status) if rec is not None else -1,
