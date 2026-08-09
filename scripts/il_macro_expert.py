@@ -131,6 +131,7 @@ class MacroExpert(object):
         # XXI-XXIV): a real OBSERVE_MOVE beyond viewpoint_reset_distance_m
         # re-bases the whole scan session at the new position.
         self._observe_anchor_position_world = None
+        self._observe_virtual_frontier_issued = False
         # Per-tick OBSERVE diagnostics (pure diagnostics, never student
         # input).  Held between 5 Hz ticks so the 30 Hz recorder sees them.
         self.observe_scan_side = 0
@@ -163,6 +164,12 @@ class MacroExpert(object):
         # drone is from its observation anchor.
         self.observe_session_initialized = 0
         self.observe_anchor_distance = 0.0
+        # Round 5 termination: consecutive OBSERVE ticks (rotation, retreat
+        # AND frontier) without REAL information progress.  Only real
+        # progress (known cells / edge visibility / new FULL candidate) or a
+        # true session entry resets it; an anchor re-base alone does not, so
+        # cycling between viewpoints without new information is bounded too.
+        self._observe_no_progress_ticks = 0
         # DIRECT session (section XXV): history is initialised ONLY when
         # entering DIRECT from another mode; a DIRECT->DIRECT tick only
         # UPDATES the history so causal evidence accumulates across 5 Hz
@@ -176,16 +183,50 @@ class MacroExpert(object):
         self._direct_brake_ticks = 0
         self.causal_intervention_evidence = False
         self.observe_no_information_time = 0.0
-        # SIDE session (sections XVI/XVII): strategic progress uses ONLY
-        # global cost-to-go (or committed-candidate distance as fallback).
-        # Travelled distance is a diagnostic, never strategic progress.
+        # SIDE session (sections XVI/XVII): strategic progress is measured
+        # from observed displacement toward the committed guide.
         self._side_session_active = False
-        self._side_best_cost = None
         self._side_target_world = None
         self._side_best_target_dist = None
         self._side_last_progress_time = None
         self._side_last_pos = None
         self._side_path_progress = 0.0
+        # P2/P4 side-commitment consistency (problem: committed side kept
+        # while unsafe / dead-end / oscillating):
+        #   _side_entered_time      sim time the current SIDE session began
+        #                           (min-hold before a side switch)
+        #   _side_release_tick      sim time each side was last RELEASED by
+        #                           _release_side_commit (cooldown before it
+        #                           may be re-picked)
+        #   _side_release_reason    diagnostic: why the last side was
+        #                           released ("" when none)
+        #   _side_goal_regress_ticks consecutive ticks the goal distance
+        #                           regressed beyond side_goal_regress_m
+        #   _side_last_goal_dist    goal distance of the previous SIDE tick
+        self._side_entered_time = None
+        self._side_release_tick = {
+            self._module.Side.LEFT: -1.0e9,
+            self._module.Side.RIGHT: -1.0e9,
+        }
+        self._side_release_reason = ""
+        self._side_goal_regress_ticks = 0
+        self._side_last_goal_dist = None
+        # P2 diagnostics (pure diagnostics, never student input): the side
+        # chosen for SIDE_GUIDE this tick, the last release reason, and
+        # per-side FULL / connected candidate counts.
+        self.macro_chosen_side = 0
+        self.side_rejection_reason = ""
+        self.side_candidate_full_left = 0
+        self.side_candidate_full_right = 0
+        self.side_candidate_connected_left = 0
+        self.side_candidate_connected_right = 0
+        # P3 recovery diagnostics (pure diagnostics, never student input):
+        # forward vs retreat FULL viewpoint counts and whether the active
+        # OBSERVE move is a known-free retreat.
+        self.observe_forward_full_count = 0
+        self.observe_retreat_full_count = 0
+        self.observe_retreat_candidate_count = 0
+        self.observe_recovery_active = 0
         # Side memory (section VIII/X): bound to the ACTIVE blocker TRACK
         # (stable world-geometry association).  Side memory is reset only
         # when a CONFIRMED new blocker appears or the old blocker is
@@ -491,25 +532,15 @@ class MacroExpert(object):
 
     # ── SIDE rolling strategic progress (sections VII/XV/XVIII) ──────
     def _update_side_progress(self, now_s, state):
-        """Strategic progress = monotonic improvement of a strategic metric
-        ONLY: global cost-to-go decrease (metric A, preferred) or committed-
-        candidate distance decrease (metric B, fallback when no CTG).
-        Ordinary travelled distance is recorded as a diagnostic but NEVER
-        counts as progress, so left/right oscillation (Case F) cannot keep
-        a side alive."""
+        """Strategic progress is causal decrease of the held SIDE target.
+
+        Global cost-to-go remains an offline diagnostic only.  Letting it
+        keep a side alive would teach an action criterion the student cannot
+        recover from its depth/state history.
+        """
         pos = np.asarray(state["position"], dtype=np.float64)
         made_progress = False
-        ctg = float(self._oracle.cost_to_go(pos)) \
-            if self._oracle.built() else float("inf")
-        if math.isfinite(ctg):
-            if self._side_best_cost is None or \
-                    ctg < self._side_best_cost - \
-                    self.cfg.get("progress_cost_epsilon_m", 0.10):
-                self._side_best_cost = ctg
-                made_progress = True
-        elif self._side_target_world is not None:
-            # No global CTG available: fall back to the distance to the
-            # committed world candidate (metric B).
+        if self._side_target_world is not None:
             d = float(np.linalg.norm(self._side_target_world - pos))
             if self._side_best_target_dist is None or \
                     d < self._side_best_target_dist - \
@@ -585,18 +616,17 @@ class MacroExpert(object):
             prev_ptr = self._prev_guide_world
         candidates = self._candidate_search.generate_candidates(
             observed_map, vs, goal, blocker, prev_ptr)
-        # The oracle RETURNS a NEW list with the privileged fields scored
-        # (pybind cannot write the C++ results back into a Python list, so
-        # the return value is the only source of truth).  All downstream
-        # filters / best-side / trace read THIS scored list.
+        # Privileged fields are attached only for offline audit / auxiliary
+        # labels.  Online action selection below uses observed reachability
+        # and observed_score, never hidden connectivity or cost-to-go.
         candidates = self._oracle.score_candidates(
             candidates, vs, goal, self.committed_side, prev_ptr)
         self._last_candidates = candidates
 
         # ── Candidate filters (section IV/V) ─────────────────────────
-        # 1) observed FULL reachability (never PARTIAL), 2) privileged
-        # global connectivity (a side that is observed-path-able but a
-        # global dead-end is EXCLUDED).
+        # SIDE actions use causal evidence only.  A global-map tie-break
+        # would create an unlearnable LEFT/RIGHT label in an observationally
+        # ambiguous depth state.
         viable = {self._module.Side.LEFT: [],
                   self._module.Side.RIGHT: []}
         for candidate in candidates:
@@ -604,16 +634,44 @@ class MacroExpert(object):
                 continue
             if not candidate.full_goal_reached:
                 continue
-            if not candidate.connected_to_goal:
-                continue
             if candidate.side in viable:
                 viable[candidate.side].append(candidate)
 
         # ── Side failure memory (section VIII/XIV) ───────────────────
         self._update_side_failures(viable, now_s)
 
+        # ── P2 committed-side consistency ────────────────────────────
+        # A committed side is kept ONLY while it is safe, reachable and
+        # progressing: lost FULL/connected viability, an unsafe clearance
+        # trend (drone global clearance or committed-candidate path
+        # clearance entering the danger band) or sustained goal regression
+        # all release the side IMMEDIATELY — never keep it by hysteresis
+        # while steering toward an obstacle.
+        goal_dist_for_check = float(np.linalg.norm(goal - pos))
+        self._check_committed_side_safety(pos, vs, viable,
+                                          goal_dist_for_check, now_s)
+
+        # P2 diagnostics (pure diagnostics, never student input): per-side
+        # candidate FULL / connected counts from the CURRENT scored list,
+        # and the side actually chosen below.
+        self.side_candidate_full_left = len([c for c in self._last_candidates
+            if c.type == self._module.CandidateType.SIDE and
+            c.side == self._module.Side.LEFT and c.full_goal_reached])
+        self.side_candidate_full_right = len([c for c in self._last_candidates
+            if c.type == self._module.CandidateType.SIDE and
+            c.side == self._module.Side.RIGHT and c.full_goal_reached])
+        self.side_candidate_connected_left = len([c for c in
+            self._last_candidates
+            if c.type == self._module.CandidateType.SIDE and
+            c.side == self._module.Side.LEFT and c.connected_to_goal])
+        self.side_candidate_connected_right = len([c for c in
+            self._last_candidates
+            if c.type == self._module.CandidateType.SIDE and
+            c.side == self._module.Side.RIGHT and c.connected_to_goal])
+
         # ── SIDE selection (section VI) ──────────────────────────────
-        side = self._select_side(viable)
+        side = self._select_side(viable, now_s)
+        self.macro_chosen_side = int(side) if side is not None else 0
 
         if side is not None:
             candidate = self._best_candidate_for_side(viable[side], side)
@@ -691,9 +749,11 @@ class MacroExpert(object):
             float(np.linalg.norm(
                 pos - self._observe_anchor_position_world)) >=
             float(self.cfg.get("viewpoint_reset_distance_m", 0.35)))
+        fresh_session = self.mode != self._module.MacroMode.OBSERVE or \
+            self._observe_reference_yaw_world is None
         info_gained = False
-        if self.mode != self._module.MacroMode.OBSERVE or \
-                self._observe_reference_yaw_world is None or anchor_moved:
+        real_progress = False
+        if fresh_session or anchor_moved:
             # Entering OBSERVE (fresh session) or the drone reached a new
             # observation viewpoint: start a fresh session whose baselines
             # are the CURRENT observed values (never None, so the next
@@ -709,15 +769,45 @@ class MacroExpert(object):
                 frontier_full_count=frontier_full,
                 pos=pos)
             info_gained = True
+            # Round 5 termination: a TRUE session entry (from another mode
+            # or a new blocker) is a new situation and resets the no-
+            # progress budget; an anchor re-base is NOT real information by
+            # itself (moving between viewpoints without growing known space
+            # must still count toward the bound).
+            real_progress = fresh_session
+            if fresh_session:
+                self._observe_no_progress_ticks = 0
         else:
-            info_gained = self._observe_information_progress(
+            real_progress = self._observe_information_progress(
                 known, edge_mask, side_full, observe_full, frontier_full,
                 now_s)
+            info_gained = real_progress
+        if real_progress:
+            self._observe_no_progress_ticks = 0
+        else:
+            self._observe_no_progress_ticks += 1
         if self._observe_last_info_time is not None:
             self.observe_no_information_time = \
                 now_s - self._observe_last_info_time
         else:
             self.observe_no_information_time = 0.0
+
+        # Round 5 termination (requirement 5): if rotation, retreat AND
+        # frontier have provided NO new information for
+        # `observe_no_progress_fail_ticks` consecutive OBSERVE ticks, exit
+        # with a DISTINCT failure reason instead of continuing meaningless
+        # rotation / viewpoint cycling.  Only real information progress
+        # (known cells / edge visibility / new FULL candidate) or a true
+        # session entry resets the counter.
+        if self._observe_no_progress_ticks >= int(
+                self.cfg.get("observe_no_progress_fail_ticks", 35)):
+            self.mode = self._module.MacroMode.FAILED
+            self._failed_reason = "observe_no_recovery_path"
+            self._macro_decision_observable = False
+            self._macro_decision_confidence = 0.0
+            return self._build_action(
+                self.mode, pos, None, False, 0.0,
+                "observe_no_recovery_path")
 
         self.mode = self._module.MacroMode.OBSERVE
 
@@ -740,6 +830,7 @@ class MacroExpert(object):
         # always allowed and `_best_observe_move` keeps preferring the
         # non-failed side.
         min_move = self.cfg.get("min_observe_move_distance_m", 0.15)
+        min_visible_gain = self.cfg.get("observe_min_visible_gain", 0.05)
         move_cands = []
         for c in candidates:
             if c.type not in (self._module.CandidateType.OBSERVE,
@@ -751,6 +842,13 @@ class MacroExpert(object):
             # displacement observation "move" (C++ already filters).
             if float(np.linalg.norm(
                     np.asarray(c.position_world) - pos)) < min_move:
+                continue
+            # A move is an active observation action only when the C++ FOV
+            # raycast predicts that it exposes unknown space.  Do not drive
+            # to a merely reachable endpoint that cannot reveal anything;
+            # RETREAT remains available as a separate safety recovery.
+            if (getattr(c, "source", "") != "observe_retreat" and
+                    float(c.unknown_information_gain) < min_visible_gain):
                 continue
             # Side FAILURE memory does NOT block safe proactive observation
             # (problem 3): a failed side topology is never re-committed as
@@ -805,7 +903,7 @@ class MacroExpert(object):
         # (SIDE_GUIDE); safe OBSERVE / GOAL_FRONTIER viewpoints are never
         # hard-excluded.  Once both scans are exhausted this is exactly the
         # expanded search over every viewpoint (sections XXX-XXXI).
-        best_move = self._best_observe_move(move_cands, pos, pref_side)
+        best_move = self._best_observe_move(move_cands, pos)
         clearly_better = (best_move is not None and
                           float(best_move.unknown_information_gain) >=
                           self.cfg.get("observe_info_gain_move_threshold",
@@ -814,15 +912,19 @@ class MacroExpert(object):
             self.cfg.get("max_stagnant_rotate_s", 2.0)
 
         if not self._both_scans_exhausted() and not stagnant and \
-                ((not no_new_info) or (not rotation_exhausted)):
-            # Rotation still yields information (or is still sweeping): keep
-            # OBSERVE_ROTATE unless a clearly better viewpoint exists
-            # (sections LXVIII/LXIX).
+                (not no_new_info) and (not rotation_exhausted):
+            # Rotation is ONLY for active information gain (P3): keep
+            # OBSERVE_ROTATE while information is genuinely fresh AND the
+            # sweep has not hit its FOV cap, unless a clearly better FULL
+            # viewpoint exists.  The moment no new information arrives (or
+            # the sweep reaches the cap) the drone MUST move to a recovery
+            # viewpoint instead of continuing to wait in place — the
+            # `elif best_move` branch below handles that (forward viewpoint
+            # or, if none, a known-free retreat).
             if clearly_better:
                 guide = np.asarray(best_move.position_world)
                 desired_yaw_world = normalize_angle(
-                    math.atan2(guide[1] - pos[1], guide[0] - pos[0]) -
-                    0.5 * math.pi)
+                    float(best_move.observation_yaw_world))
                 observe_subtype = 1
             else:
                 guide, desired_yaw_world, observe_subtype = \
@@ -832,8 +934,7 @@ class MacroExpert(object):
             # other non-failed side (expanded search included).
             guide = np.asarray(best_move.position_world)
             desired_yaw_world = normalize_angle(
-                math.atan2(guide[1] - pos[1], guide[0] - pos[0]) -
-                0.5 * math.pi)
+                float(best_move.observation_yaw_world))
             observe_subtype = 1
         elif not self._both_scans_exhausted():
             # No movement candidate: advance the per-side scan lifecycle
@@ -842,7 +943,9 @@ class MacroExpert(object):
             # non-exhausted side with a fresh sweep reference.  (Side
             # failure memory does not restrict scanning — only SIDE_GUIDE
             # topology re-commit.)
-            if rotation_exhausted or no_new_info or stagnant:
+            if (rotation_exhausted or no_new_info or stagnant) and \
+                    (self.cfg.get("observe_virtual_frontier_distance_m", 0.0) <= 0.0 or
+                     self._observe_virtual_frontier_issued):
                 if not self._scan_side_is_exhausted():
                     self._mark_current_scan_exhausted()
                 other = self._other_scan_side()
@@ -862,18 +965,37 @@ class MacroExpert(object):
                     guide, desired_yaw_world, observe_subtype = \
                         self._observe_rotate_action(pos, yaw, dt_s,
                                                     fov_half_obs)
+            elif rotation_exhausted or no_new_info or stagnant:
+                _, desired_yaw_world, _ = self._observe_rotate_action(
+                    pos, yaw, dt_s, fov_half_obs)
+                guide = self._observe_virtual_frontier_guide(
+                    pos, desired_yaw_world)
+                self._observe_virtual_frontier_issued = True
+                observe_subtype = 2
             else:
                 guide, desired_yaw_world, observe_subtype = \
                     self._observe_rotate_action(pos, yaw, dt_s, fov_half_obs)
         else:
             # BOTH scans exhausted and no FULL-reachable viewpoint anywhere
-            # (section XXIX/XXXII): keep the STATE-FUL alternating sweep
-            # running — never re-base the sweep reference / delta per tick
-            # (problem 2).  The yaw target keeps moving while the observed
-            # map can grow, any newly FULL-reachable viewpoint is picked up
-            # by `best_move` on the next tick, and the episode-level
-            # absolute OBSERVE timeout remains the final anti-deadlock
-            # guard.
+            # (section XXIX/XXXII).  Rotation is ONLY for active
+            # information gain (P3): while information is still arriving we
+            # keep the STATE-FUL alternating sweep running — never re-base
+            # the sweep reference / delta per tick (problem 2) — so any
+            # newly FULL-reachable viewpoint (including a retreat) is
+            # picked up by `best_move` on the next tick.  But once no new
+            # information arrives (no known growth, no edge change, no FULL
+            # candidate) AND no recovery viewpoint exists anywhere, endless
+            # ROTATE_ONLY is pointless: this is a bounded terminal with a
+            # DISTINCT failure reason, not a silent spin until the large
+            # absolute OBSERVE timeout.
+            if no_new_info or stagnant:
+                self.mode = self._module.MacroMode.FAILED
+                self._failed_reason = "observe_no_recovery_path"
+                self._macro_decision_observable = False
+                self._macro_decision_confidence = 0.0
+                return self._build_action(
+                    self.mode, pos, None, False, 0.0,
+                    "observe_no_recovery_path")
             guide, desired_yaw_world, observe_subtype = \
                 self._observe_rotate_action(pos, yaw, dt_s, fov_half_obs)
 
@@ -882,7 +1004,11 @@ class MacroExpert(object):
         self._update_observe_stagnation(
             desired_yaw_world, observe_subtype == 0, info_gained, dt_s)
 
-        # Selected-viewpoint diagnostics (section XLIX).
+        # Selected-viewpoint diagnostics (section XLIX).  P3: a selected
+        # move whose source is "observe_retreat" is a known-free RECOVERY
+        # move (negative goal progress allowed) — flagged separately so the
+        # recorded macro label stays OBSERVE (never mistaken for a DIRECT /
+        # normal goal advance) while the recovery behaviour is auditable.
         if observe_subtype == 1 and best_move is not None:
             self._prev_observe_viewpoint = np.asarray(guide)
             self.observe_selected_source = best_move.source
@@ -895,6 +1021,8 @@ class MacroExpert(object):
                 float(best_move.unknown_information_gain), 4)
             self.observe_selected_clearance = round(
                 float(best_move.minimum_clearance), 3)
+            self.observe_recovery_active = int(
+                best_move.source == "observe_retreat")
         else:
             self._prev_observe_viewpoint = None
             self.observe_selected_source = ""
@@ -903,6 +1031,7 @@ class MacroExpert(object):
             self.observe_selected_path_length = 0.0
             self.observe_selected_info_gain = 0.0
             self.observe_selected_clearance = 0.0
+            self.observe_recovery_active = 0
 
         # ── OBSERVE per-tick diagnostics (section XLVII/XLVIII) ──────
         self.observe_scan_side = int(self._observe_scan_side) \
@@ -919,9 +1048,17 @@ class MacroExpert(object):
         self.observe_raw_candidate_count = int(diag.raw_candidate_count)
         self.observe_lattice_candidate_count = int(diag.lattice_candidate_count)
         self.observe_frontier_candidate_count = int(diag.frontier_candidate_count)
+        self.observe_retreat_candidate_count = int(
+            diag.retreat_candidate_count)
         self.observe_endpoint_known_free_count = int(
             diag.endpoint_known_free_count)
         self.observe_local_full_count = int(diag.full_local_count)
+        # P3: separate the forward (lattice/frontier) FULL count from the
+        # known-free retreat FULL count — "no forward FULL viewpoint but a
+        # safe retreat exists" is exactly the observe_deadlock trigger.
+        self.observe_retreat_full_count = int(diag.retreat_full_count)
+        self.observe_forward_full_count = max(
+            0, int(diag.full_local_count) - int(diag.retreat_full_count))
         self.observe_reject_unknown = int(diag.reject_unknown)
         self.observe_reject_endpoint_clearance = int(
             diag.reject_endpoint_clearance)
@@ -930,11 +1067,17 @@ class MacroExpert(object):
         self.observe_reject_partial = int(diag.partial_count)
         self.observe_reject_no_path = int(diag.no_path_count)
 
-        side_name = "left" if pref_side == self._module.Side.LEFT else \
-            ("right" if pref_side == self._module.Side.RIGHT else "forward")
+        action_observe_side = (
+            best_move.side if observe_subtype == 1 and best_move is not None
+            else pref_side)
+        side_name = "left" if action_observe_side == self._module.Side.LEFT else \
+            ("right" if action_observe_side == self._module.Side.RIGHT
+             else "forward")
+        reason_prefix = "observe_frontier" if observe_subtype == 2 else "observe"
         action = self._build_action(
             self.mode, guide, desired_yaw_world, True, 0.5,
-            "observe_%s" % side_name, observe_side=pref_side)
+            "%s_%s" % (reason_prefix, side_name),
+            observe_side=action_observe_side)
         action.observe_subtype = observe_subtype
         self._macro_decision_observable = False
         self._macro_decision_confidence = 0.5
@@ -952,14 +1095,89 @@ class MacroExpert(object):
         # re-entry starts fresh.
         self._observe_time_s = 0.0
         self._clear_observe_session()
-        pos_ctg = float(self._oracle.cost_to_go(pos)) \
-            if self._oracle.built() else float("inf")
-        self._side_best_cost = pos_ctg if math.isfinite(pos_ctg) else None
         self._side_best_target_dist = None
         self._side_last_progress_time = now_s
         self._side_last_pos = pos
         self._side_path_progress = 0.0
         self._side_target_world = None
+        # P4: record when this SIDE session started (sim time) so a
+        # side-switch cannot happen inside the min-hold window; and start a
+        # fresh goal-regression baseline for the new commitment.
+        self._side_entered_time = now_s
+        self._side_goal_regress_ticks = 0
+        self._side_last_goal_dist = None
+
+    # ── P2/P4 committed-side release ─────────────────────────────────
+    def _release_side_commit(self, side, reason, now_s):
+        """Release the committed side IMMEDIATELY (P2/P4): the side is no
+        longer viable (lost FULL/connected), unsafe (clearance trend) or
+        progressing (goal regression).  Clears the SIDE session and the
+        committed side so the next tick re-selects from scratch — never
+        kept by hysteresis while steering toward an obstacle.  The side is
+        NOT marked permanently failed: after `side_release_cooldown_s` a
+        genuinely better candidate may legitimately re-commit it."""
+        self.side_rejection_reason = reason
+        self._side_release_tick[side] = now_s
+        self._side_entered_time = None
+        self.committed_side = self._module.Side.NONE
+        self._side_session_active = False
+        self._side_target_world = None
+        self._side_best_target_dist = None
+        self._side_last_progress_time = None
+        self._side_last_pos = None
+        self._side_path_progress = 0.0
+        self._side_goal_regress_ticks = 0
+        self._side_last_goal_dist = None
+
+    def _check_committed_side_safety(self, pos, vs, viable, goal_dist,
+                                     now_s):
+        """P2/P4: while SIDE_GUIDE, verify the committed side is still
+         (1) observed-FULL, (2) at a safe observed-path clearance above
+         clearance_m + side_unsafe_clearance_margin_m,
+         and (3) actually progressing (goal distance not regressing beyond
+         side_goal_regress_m for side_goal_regress_ticks).  Any violation
+         releases the side immediately.  Returns True when released.
+
+        A side is kept only while causal observations still support a safe,
+        reachable and progressing guide.
+        """
+        committed = self.committed_side
+        if not self._side_session_active or \
+                committed not in (self._module.Side.LEFT,
+                                  self._module.Side.RIGHT):
+            return False
+        # 1) Lost causal viability: no FULL observed candidate remains.
+        if not viable.get(committed):
+            self._release_side_commit(committed, "side_lost_viability",
+                                      now_s)
+            return True
+        # 2) Unsafe observed-path clearance.  The global ESDF is not an
+        #    online action criterion.
+        base = float(self._candidate_cfg.clearance_m)
+        danger = base + float(self.cfg.get(
+            "side_unsafe_clearance_margin_m", 0.05))
+        cand = self._best_candidate_for_side(viable[committed], committed)
+        if cand is not None and cand.minimum_clearance > 0.0 and \
+                float(cand.minimum_clearance) < danger:
+            self._release_side_commit(committed, "side_clearance_unsafe",
+                                      now_s)
+            return True
+        # 3) Goal regression: the side is a dead end / leading away from
+        #    the goal.  Requires a few consecutive ticks (hysteresis) so a
+        #    single noisy frame never flaps the commitment.
+        if self._side_last_goal_dist is not None:
+            if goal_dist > self._side_last_goal_dist + \
+                    float(self.cfg.get("side_goal_regress_m", 0.35)):
+                self._side_goal_regress_ticks += 1
+                if self._side_goal_regress_ticks >= int(self.cfg.get(
+                        "side_goal_regress_ticks", 3)):
+                    self._release_side_commit(committed, "side_goal_regress",
+                                              now_s)
+                    return True
+            else:
+                self._side_goal_regress_ticks = 0
+        self._side_last_goal_dist = goal_dist
+        return False
 
     def _set_side_target(self, guide, pos):
         """Rebaseline the committed world candidate used by metric B."""
@@ -1136,12 +1354,25 @@ class MacroExpert(object):
             self._module.Side.RIGHT: 0,
         }
         self._side_session_active = False
-        self._side_best_cost = None
         self._side_target_world = None
         self._side_best_target_dist = None
         self._side_last_progress_time = None
         self._side_last_pos = None
         self._side_path_progress = 0.0
+        self._side_entered_time = None
+        self._side_release_tick = {
+            self._module.Side.LEFT: -1.0e9,
+            self._module.Side.RIGHT: -1.0e9,
+        }
+        self._side_release_reason = ""
+        self._side_goal_regress_ticks = 0
+        self._side_last_goal_dist = None
+        self.macro_chosen_side = 0
+        self.side_rejection_reason = ""
+        self.side_candidate_full_left = 0
+        self.side_candidate_full_right = 0
+        self.side_candidate_connected_left = 0
+        self.side_candidate_connected_right = 0
         # Fresh topology -> fresh active-observation session (section
         # XXVIII/XL): old blocker yaw reference, scan exhaustion, info
         # baselines and anchor must never leak into the new obstacle.
@@ -1244,6 +1475,7 @@ class MacroExpert(object):
         self._observe_last_move_guide = None
         self._prev_observe_viewpoint = None
         self._observe_anchor_position_world = None
+        self._observe_virtual_frontier_issued = False
         self.observe_session_initialized = 0
         self.observe_anchor_distance = 0.0
 
@@ -1258,8 +1490,12 @@ class MacroExpert(object):
         self.observe_raw_candidate_count = 0
         self.observe_lattice_candidate_count = 0
         self.observe_frontier_candidate_count = 0
+        self.observe_retreat_candidate_count = 0
         self.observe_endpoint_known_free_count = 0
         self.observe_local_full_count = 0
+        self.observe_forward_full_count = 0
+        self.observe_retreat_full_count = 0
+        self.observe_recovery_active = 0
         self.observe_reject_unknown = 0
         self.observe_reject_endpoint_clearance = 0
         self.observe_reject_min_distance = 0
@@ -1428,6 +1664,7 @@ class MacroExpert(object):
         self._observe_last_target_yaw = yaw
         self._observe_last_info_time = now_s
         self.observe_no_information_time = 0.0
+        self._observe_virtual_frontier_issued = False
 
     def _observe_rotate_action(self, pos, yaw, dt_s, fov_half_obs):
         """OBSERVE_ROTATE: pure rotation about the current position
@@ -1469,6 +1706,19 @@ class MacroExpert(object):
             self._observe_reference_yaw_world + self._observe_yaw_delta)
         return pos, desired_yaw_world, 0
 
+    def _observe_virtual_frontier_guide(self, pos, yaw_world):
+        """Return an unknown-space exploration *intent*, not a flight
+        terminal.  The 30 Hz C++ planner receives this guide but keeps
+        `forbid_unknown_space=True`, so it can execute only the verified
+        known-free partial path toward the frontier.
+        """
+        distance = float(self.cfg.get(
+            "observe_virtual_frontier_distance_m", 2.0))
+        direction = np.array(
+            [-math.sin(yaw_world), math.cos(yaw_world), 0.0],
+            dtype=np.float64)
+        return np.asarray(pos, dtype=np.float64) + distance * direction
+
     def _update_observe_stagnation(self, target_yaw, rotating, info_gained,
                                    dt_s):
         """No-action deadlock detector (section XXXIII/XXXV): consecutive
@@ -1489,13 +1739,25 @@ class MacroExpert(object):
         information gain (primary) + goal progress + clearance - path cost,
         plus a current-scan-side preference bonus and a hysteresis bonus for
         the previously selected viewpoint (section XVII/XLI).  Returns the
-        candidates best-first."""
+        candidates best-first.
+
+        P3: known-free retreat candidates (source "observe_retreat") are
+        EXCLUDED whenever ANY forward FULL viewpoint exists — a retreat is
+        only the recovery path for the observe_deadlock case (rotation
+        yields no forward FULL candidate).  When no forward viewpoint is
+        reachable, retreats are ranked normally (info gain / clearance /
+        path cost) so the drone moves to a safe known-free anchor instead
+        of rotating forever."""
         pref = self._observe_scan_side
         hyst_m = self.cfg.get("observe_viewpoint_hysteresis_m", 0.8)
         hyst_bonus = self.cfg.get("observe_viewpoint_hysteresis_bonus", 0.15)
         lookahead = max(1.0, self.cfg.get("macro_lookahead_distance_m", 4.5))
+        has_forward_full = any(
+            c.source != "observe_retreat" for c in cands)
         scored = []
         for c in cands:
+            if has_forward_full and c.source == "observe_retreat":
+                continue
             cpos = np.asarray(c.position_world, dtype=np.float64)
             score = float(c.unknown_information_gain)
             score += 0.15 * float(c.goal_progress) / lookahead
@@ -1511,7 +1773,7 @@ class MacroExpert(object):
         scored.sort(key=lambda t: -t[0])
         return [c for _, c in scored]
 
-    def _best_observe_move(self, move_cands, pos, prefer_side):
+    def _best_observe_move(self, move_cands, pos):
         """Pick the best movement candidate with preference + fallback
         (sections XVIII/XIX): preferred side first, then centre / neutral
         frontier, then the other side.  Side FAILURE memory never
@@ -1522,28 +1784,51 @@ class MacroExpert(object):
         if not move_cands:
             return None
         ranked = self._rank_observe_moves(move_cands, pos)
-        tier1 = [c for c in ranked if c.side == prefer_side]
-        tier2 = [c for c in ranked
-                 if c.side == self._module.Side.NONE]
-        tier3 = [c for c in ranked
-                 if c.side != prefer_side and
-                 c.side != self._module.Side.NONE]
-        for tier in (tier1, tier2, tier3):
-            if tier:
-                return tier[0]
         return ranked[0] if ranked else None
 
     # ── SIDE selection (section VI/VIII) ─────────────────────────────
-    def _select_side(self, viable):
-        """Choose the side to commit among observed-FULL + global-connected
-        candidates.  Failed sides are MASKED FIRST (section VIII): a failed
+    def _select_side(self, viable, now_s):
+        """Choose a SIDE only when observed evidence separates it.
+
+        Failed sides are MASKED FIRST (section VIII): a failed
         LEFT/RIGHT can never be re-selected, so LEFT NO_PROGRESS cannot be
-        followed by a LEFT re-commit.  Keep the committed side if still
-        valid; never switch on small cost fluctuations; fixed LEFT tie."""
+        followed by a LEFT re-commit.  P2/P4 additions:
+
+         - Post-release cooldown: a side that was just RELEASED by
+           `_release_side_commit` (lost viability / unsafe clearance /
+           goal regression) is not re-picked for `side_release_cooldown_s`
+           unless it is the only option — this stops release-then-immediate-
+           re-pick flapping.
+         - Min-hold: while SIDE_GUIDE, the committed side is kept for at
+           least `side_min_hold_s` whenever it is still viable, so a small
+           cost fluctuation never switches sides inside the hold window.
+
+        Keep the committed side if still valid; never switch on small cost
+        fluctuations; visually ambiguous sides defer to OBSERVE."""
         left = list(viable[self._module.Side.LEFT]) \
             if self._failed_left is None else []
         right = list(viable[self._module.Side.RIGHT]) \
             if self._failed_right is None else []
+        cooldown = float(self.cfg.get("side_release_cooldown_s", 1.5))
+        # Post-release cooldown is UNCONDITIONAL: a just-released side must
+        # not be re-picked on the same tick even when it is the only viable
+        # one (that would re-commit an unsafe/dead-end side instantly and
+        # flap at 5 Hz).  When both sides are cooling down, _select_side
+        # returns None and the macro falls back to OBSERVE (safe).
+        if now_s - self._side_release_tick[self._module.Side.LEFT] < cooldown:
+            left = []
+        if now_s - self._side_release_tick[self._module.Side.RIGHT] < cooldown:
+            right = []
+        if self._side_session_active and \
+                self.committed_side in (self._module.Side.LEFT,
+                                        self._module.Side.RIGHT):
+            committed = self.committed_side
+            committed_viable = left if committed == self._module.Side.LEFT \
+                else right
+            if committed_viable and self._side_entered_time is not None and \
+                    now_s - self._side_entered_time < \
+                    float(self.cfg.get("side_min_hold_s", 1.5)):
+                return committed
         if self.committed_side == self._module.Side.LEFT and left:
             return self._module.Side.LEFT
         if self.committed_side == self._module.Side.RIGHT and right:
@@ -1553,16 +1838,16 @@ class MacroExpert(object):
         if right and not left:
             return self._module.Side.RIGHT
         if left and right:
-            left_cost = min(float(c.global_cost_to_go) for c in left)
-            right_cost = min(float(c.global_cost_to_go) for c in right)
-            margin = abs(left_cost - right_cost)
-            cost_margin = self.cfg.get("cost_margin_m", 2.0)
-            if margin >= cost_margin:
-                return self._module.Side.LEFT \
-                    if left_cost < right_cost else self._module.Side.RIGHT
-            if self.cfg.get("left_preferred_on_tie", True):
-                return self._module.Side.LEFT
-            return self._module.Side.RIGHT
+            left_score = max(float(c.observed_score) for c in left)
+            right_score = max(float(c.observed_score) for c in right)
+            margin = abs(left_score - right_score)
+            required = float(self.cfg.get("observed_side_score_margin", 0.15))
+            if margin < required:
+                # Global topology cannot resolve a visual tie for the
+                # student.  OBSERVE until the depth history distinguishes it.
+                return None
+            return self._module.Side.LEFT \
+                if left_score > right_score else self._module.Side.RIGHT
         return None
 
     def _best_candidate_for_side(self, candidates, side):
@@ -1573,7 +1858,7 @@ class MacroExpert(object):
             if candidate.type != self._module.CandidateType.SIDE:
                 continue
             if best is None or \
-                    candidate.privileged_score < best.privileged_score:
+                    candidate.observed_score > best.observed_score:
                 best = candidate
         return best
 
@@ -1651,13 +1936,23 @@ class MacroExpert(object):
             "failed_right": _SIDE_FAILURE_NAMES.get(
                 self._failed_right.value, "NONE") if self._failed_right is not None
             else "NONE",
-            "side_best_cost": self._round_opt(self._side_best_cost),
             "side_path_progress": self._round_opt(self._side_path_progress),
+            "macro_chosen_side": _SIDE_NAMES.get(
+                int(self.macro_chosen_side), "?"),
+            "side_rejection_reason": str(self.side_rejection_reason),
+            "side_candidate_full_left": int(self.side_candidate_full_left),
+            "side_candidate_full_right": int(self.side_candidate_full_right),
+            "side_candidate_connected_left": int(
+                self.side_candidate_connected_left),
+            "side_candidate_connected_right": int(
+                self.side_candidate_connected_right),
             "observe_time_s": self._round_opt(self._observe_time_s),
             "observe_yaw_delta_deg": self._round_opt(
                 math.degrees(float(self._observe_yaw_delta)), 2),
             "observe_no_information_time": self._round_opt(
                 self.observe_no_information_time),
+            "observe_no_progress_ticks": int(
+                self._observe_no_progress_ticks),
             "observe_scan_side": int(self.observe_scan_side),
             "left_scan_exhausted": bool(self.left_scan_exhausted),
             "right_scan_exhausted": bool(self.right_scan_exhausted),
@@ -1670,6 +1965,11 @@ class MacroExpert(object):
             "observe_frontier_candidate_count": int(
                 self.observe_frontier_candidate_count),
             "observe_local_full_count": int(self.observe_local_full_count),
+            "observe_forward_full_count": int(self.observe_forward_full_count),
+            "observe_retreat_full_count": int(self.observe_retreat_full_count),
+            "observe_retreat_candidate_count": int(
+                self.observe_retreat_candidate_count),
+            "observe_recovery_active": int(self.observe_recovery_active),
             "observe_reject_unknown": int(self.observe_reject_unknown),
             "observe_reject_endpoint_clearance": int(
                 self.observe_reject_endpoint_clearance),
@@ -1713,11 +2013,11 @@ class MacroExpert(object):
         cands = []
         if self._last_candidates:
             top = sorted(self._last_candidates,
-                         key=lambda c: float(c.privileged_score))[:5]
+                         key=lambda c: float(c.observed_score), reverse=True)[:5]
             cands = [
                 {"type": int(c.type), "side": _SIDE_NAMES.get(int(c.side), "?"),
                  "source": str(c.source),
-                 "score": round(float(c.privileged_score), 4),
+                 "score": round(float(c.observed_score), 4),
                  "full": bool(c.full_goal_reached),
                  "conn": bool(c.connected_to_goal),
                  # World position for debug_viewer.py candidate overlay.

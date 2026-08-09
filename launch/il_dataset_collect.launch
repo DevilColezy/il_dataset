@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <!-- ===================================================================
   Automatic multi-scale IL dataset collection (two-level navigation
-  expert, schema v22).
+  expert, schema v23).
 
   Wire contract (verified topics): scene + runtime messages use the
   `Pose` topic; point cloud export uses the `PointCloud` topic.  The

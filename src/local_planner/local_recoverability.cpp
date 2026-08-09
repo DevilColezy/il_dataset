@@ -73,8 +73,18 @@ RecoverabilityResult LocalRecoverability::test(
     result.rejoin_point = rejoin_point;
     result.rejoin_distance = rejoin_dist;
 
+    // Round 6: the rejoin search uses the SAME dynamic effective clearance
+    // as the 30 Hz LocalPlanner (evaluated at the current state speed), so
+    // DIRECT_REJOIN_SUCCESS is never more permissive than what plan() can
+    // actually execute.  Single shared C++ formula — no second copy.
+    const DynamicClearanceConfig clearance_cfg{
+        config_.clearance_m, config_.clearance_margin_tracking_m,
+        config_.clearance_margin_latency_s, config_.clearance_margin_max_m};
+    const double effective_clearance =
+        effectiveClearanceForSpeed(clearance_cfg, state.velocity.norm());
+
     LocalSearchConfig search_config;
-    search_config.clearance_m = config_.clearance_m;
+    search_config.clearance_m = effective_clearance;
     search_config.committed_side = Side::NONE;  // direct intent has no side
     search_config.forbid_unknown = true;
 
@@ -159,11 +169,15 @@ RecoverabilityResult LocalRecoverability::test(
 
     // ── Not fully recoverable: classify the blocker ─────────────────
     result.feasible = false;
+    // Round 6: the blocker analysis inside the recoverability query also
+    // uses the dynamic effective clearance (not a looser fixed base), so
+    // edge / corridor visibility reflects what the local layer can actually
+    // execute.
     MacroCandidateConfig blocker_config;
     blocker_config.edge_search_radius_m = config_.edge_search_radius_m;
     blocker_config.side_corridor_length_m = config_.side_corridor_length_m;
     blocker_config.side_corridor_radius_m = config_.side_corridor_radius_m;
-    blocker_config.clearance_m = config_.clearance_m;
+    blocker_config.clearance_m = effective_clearance;
     const GoalBlocker blocker =
         analyzeGoalBlocker(map, state, direct_guide_world, blocker_config);
     result.blocker_signature = blocker.blocker_signature;

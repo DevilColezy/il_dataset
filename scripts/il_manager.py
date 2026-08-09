@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 il_manager.py  —  IL dataset collection manager (two-level navigation
-expert, schema v22).
+expert, schema v23).
 
 Automatic unattended lifecycle (section I/XX/XXIV-XXVIII):
     connect AvoidBench (10253/10254)
@@ -65,6 +65,7 @@ from il_common import (
     UnityBridge,
     make_depth_vehicle,
     world_vector_to_body_flu_quat,
+    body_flu_vector_to_world_quat,
     normalize_angle,
     quantize_bounded_vector,
     load_ply,
@@ -140,13 +141,12 @@ class ILManager(object):
         self._sync_cfg = self.g.get("sync", {})
         self._controller_cfg = self.g.get("trajectory_controller", {})
         self._safety_cfg = self.g.get("execution_safety", {})
-        # UNIFIED navigation clearance (problem 4): the single effective
-        # safety boundary shared by every C++ module.  The ESDFs already
-        # subtract the vehicle radius, so this is purely the additional
-        # margin.  The Python-side braking-risk and trajectory-suffix
-        # validation call sites pass this same value.
-        self._nav_clearance = float(
-            self.g.get("navigation", {}).get("clearance_m", 0.20))
+        # Round 5: the UNIFIED navigation clearance and its speed-dependent
+        # dynamic margin are computed by the C++ LocalPlanner — Python calls
+        # `_local_planner.effective_clearance_for(state)` (e.g. the braking
+        # check) instead of re-deriving the formula, so the boundary always
+        # matches the planner's exactly (no duplicated, drifting Python
+        # formula, no stale base-clearance field).
         # Scene settle + point-cloud completion config (sections VIII/XXIV).
         self._scene_runtime = self.g.get("scene_runtime", {})
         _pc_cfg = self.g.get("pointcloud", {})
@@ -860,6 +860,12 @@ class ILManager(object):
         self._intervention_oracle.reset()
         self._trajectory_reached_goal = False
         self._exit_reason = ""
+        # P1/P5 per-episode safety + failure-taxonomy bookkeeping.
+        self._last_plan_failure_status = None
+        self._critical_plan_failure_occurred = False
+        self._stale_plan_invalidations = 0
+        self._committed_side_at_failure = int(self._macro_expert.committed_side)
+        self._failure_taxonomy = ""
         self._consecutive_plan_failures = 0
         self._local_unrecoverable_pending = False
         self._brake_hold_time = 0.0
@@ -931,6 +937,21 @@ class ILManager(object):
         # nominal wall duration and never affects navigation timing.
         trajectory_wall_timeout = float(
             self._fsm.get("trajectory_wall_timeout_s", 600.0))
+        # P1 stale-plan invalidation: a fresh-plan failure with one of
+        # these statuses means the ENVIRONMENT changed around the drone
+        # (new collision / unknown / dead-end / invalid terminal).  After
+        # such a failure the OLD cached trajectory may steer toward the
+        # very region that just invalidated the fresh plan, so the cache is
+        # dropped immediately and the episode falls through to brake /
+        # emergency instead of re-executing the stale suffix.
+        _critical_plan_failures = (
+            module.PlannerStatus.COLLISION,
+            module.PlannerStatus.UNKNOWN_SPACE,
+            module.PlannerStatus.SEARCH_FAILED,
+            module.PlannerStatus.LOCAL_TERMINAL_INVALID,
+            module.PlannerStatus.DYNAMICS_VIOLATION,
+            module.PlannerStatus.INVALID_INPUT,
+        )
         sample_index = 0
         last_plan_time = None
         last_trajectory = []
@@ -1108,6 +1129,18 @@ class ILManager(object):
             result = self._local_planner.plan(req)
             self._total_plans += 1
 
+            # ── P1 stale cached-plan invalidation ───────────────────
+            # A safety-critical fresh-plan failure invalidates the cached
+            # trajectory: the old suffix describes a world state that just
+            # became invalid (collision / unknown / dead-end).  Re-executing
+            # it afterwards could approach the very obstacle that caused the
+            # failure, so the cache is cleared and the active plan is marked
+            # void BEFORE execution selection — the episode can only brake,
+            # hold or stop, never steer with a stale plan.
+            if result.status in _critical_plan_failures:
+                self._last_plan_failure_status = int(result.status)
+                self._critical_plan_failure_occurred = True
+
             # ── 6. Execution selection (section XIII) ───────────────
             execution_mode, trajectory, fresh_plan, cached_used, \
                 sample_offset = self._select_execution(
@@ -1148,6 +1181,17 @@ class ILManager(object):
             else:
                 self._brake_hold_time = 0.0
             if execution_mode == module.ExecutionMode.EMERGENCY_STOP:
+                # Round 5 (requirement 4): an emergency stop VOIDS the
+                # executed trajectory.  The cached suffix and the active
+                # plan must never be re-selected on a later frame to resume
+                # forward motion while the drone is still decelerating —
+                # dynamic braking keeps commanding deceleration from the
+                # CURRENT velocity, and with the cache cleared every
+                # subsequent frame can only hold/stop, never TRACK_CACHED.
+                last_trajectory = []
+                last_plan_time = None
+                self._active_result = None
+                self._active_plan_start_time = None
                 self._emergency_stop_time += dt
                 if self._emergency_stop_time > \
                         self._safety_cfg.get("max_emergency_stop_seconds", 2.0):
@@ -1160,7 +1204,8 @@ class ILManager(object):
             # not just the last frame before its tick.
             fb = self._macro_feedback
             fb["interval_frame_count"] += 1
-            if not result.success:
+            if not result.success and \
+                    execution_mode != module.ExecutionMode.TRACK_CACHED:
                 fb["planning_failure_count"] += 1
             if execution_mode == module.ExecutionMode.TRACK_FRESH:
                 fb["fresh_frame_count"] += 1
@@ -1176,7 +1221,7 @@ class ILManager(object):
             # ── 7. Trajectory controller ────────────────────────────
             cmd = self._compute_command(
                 trajectory, state, ds, execution_mode, held_action,
-                sample_offset)
+                goal[2], sample_offset)
             if cmd is None:
                 self._exit_reason = "controller_invalid"
                 break
@@ -1209,13 +1254,87 @@ class ILManager(object):
             if wall_elapsed < sample_index * dt:
                 time.sleep(sample_index * dt - wall_elapsed)
 
+        self._trajectory_exit_reason = self._exit_reason
+        # The committed side at the moment the loop stopped (for the
+        # side_selection_error / unsafe_approach taxonomy).
+        self._committed_side_at_failure = int(
+            self._macro_expert.committed_side)
+        # Classify BEFORE the final row is written so the recorded
+        # failure_taxonomy reflects the actual exit (pure diagnostic).
+        self._classify_failure()
         self._writer.write_row({
             "episode_frame_index": sample_index,
             "frame_valid": 0,
             "frame_invalid_reason": self._exit_reason,
+            "failure_taxonomy": self._failure_taxonomy,
         })
-        self._trajectory_exit_reason = self._exit_reason
         self._enter_state(State.FINISH_TASK)
+
+    # ── P5 failure taxonomy (pure diagnostics, never student input) ──
+    def _classify_failure(self):
+        """Map the episode exit to one of the documented failure
+        categories (diagnostic only — never a student input and never a
+        mode hint):
+
+          - goal_reached            terminal success (position + speed).
+          - unsafe_approach         the drone had to emergency-stop /
+                                    controller-invalidate while moving;
+                                    no committed side was the cause.
+          - stale_plan_after_failure a safety-critical fresh-plan failure
+                                    occurred earlier and the episode then
+                                    ended in an emergency/controller stop —
+                                    the P1 cache invalidation is what keeps
+                                    this from executing a stale plan.
+          - side_selection_error    the episode failed while a LEFT/RIGHT
+                                    side was committed (SIDE_GUIDE) or right
+                                    after a critical plan failure under a
+                                    committed side — the side led into an
+                                    unsafe / dead-end approach.
+          - observe_deadlock        OBSERVE could not resolve within its
+                                    absolute budget / no valid side.
+          - local_unknown_block     exit was caused by unknown-space /
+                                    depth availability rather than a
+                                    committed-side error.
+          - trajectory_timeout      simulated flight-time budget exceeded.
+        """
+        r = self._trajectory_exit_reason or ""
+        side = self._committed_side_at_failure
+        side_committed = side in (int(module.Side.LEFT),
+                                  int(module.Side.RIGHT))
+        if self._trajectory_reached_goal:
+            self._failure_taxonomy = "goal_reached"
+            return
+        if r == "emergency_stop_timeout":
+            if self._critical_plan_failure_occurred:
+                self._failure_taxonomy = "stale_plan_after_failure"
+            elif side_committed:
+                self._failure_taxonomy = "side_selection_error"
+            else:
+                self._failure_taxonomy = "unsafe_approach"
+            return
+        if r in ("controller_invalid", "dynamics_step_failed"):
+            self._failure_taxonomy = "unsafe_approach"
+            return
+        if "observe" in r or r == "no_valid_side_no_route":
+            self._failure_taxonomy = "observe_deadlock"
+            return
+        if r.startswith("macro_"):
+            self._failure_taxonomy = ("side_selection_error"
+                                      if side_committed else "macro_failed")
+            return
+        if r == "depth_frame_timeout":
+            # No depth -> the observed map cannot grow -> unknown blocks.
+            self._failure_taxonomy = "local_unknown_block"
+            return
+        if r == "trajectory_timeout":
+            self._failure_taxonomy = "trajectory_timeout"
+            return
+        if self._critical_plan_failure_occurred:
+            self._failure_taxonomy = ("side_selection_error"
+                                      if side_committed
+                                      else "local_unknown_block")
+            return
+        self._failure_taxonomy = "unknown"
 
     # ── Macro-interval feedback (sections XX-XXIII) ──────────────────
     def _new_macro_feedback(self):
@@ -1351,15 +1470,23 @@ class ILManager(object):
         return (module.ExecutionMode.BRAKE_HOLD, [], False, False, 0.0)
 
     def _collision_risk(self, state):
-        """Swept-volume braking check computed in C++ (section XVIII): the
+        """Swept-volume braking + current-pose safety check computed in
+        C++ (sections XVIII / round 5-6).
+
+        ALWAYS evaluates the current pose, the current velocity and the
         predicted braking trajectory (reaction delay at constant velocity,
-        then deceleration to stop) is sampled continuously; UNKNOWN space
-        counts as unsafe."""
-        if not self._observed_map.esdf_built():
-            return False
-        speed = float(np.linalg.norm(state["velocity"]))
-        if speed < 0.3:
-            return False
+        then deceleration to rest).  Low speed ONLY shortens the predicted
+        braking distance inside the C++ `swept_brake_risk` — it NEVER
+        disables collision detection (the old `speed < 0.3` early-return is
+        gone).  There is NO Python-side early-return either: when the ESDF
+        is not built / the map is uninitialised / the state is invalid, the
+        C++ `swept_brake_risk` itself returns risk=true (round 6), so
+        unknown space is never silently treated as safe and the episode
+        cannot enter BRAKE_HOLD and wait without a risk diagnosis.
+
+        The effective boundary is the SINGLE C++ computation
+        (`_local_planner.effective_clearance_for`), identical to what the
+        planner validates trajectories with — no Python-side formula."""
         vs = module.VehicleState()
         vs.position = state["position"]
         vs.velocity = state["velocity"]
@@ -1370,13 +1497,13 @@ class ILManager(object):
             vs,
             self._safety_cfg.get("brake_reaction_delay_s", 0.10),
             self._safety_cfg.get("emergency_deceleration_mps2", 5.0),
-            self._nav_clearance,
+            self._local_planner.effective_clearance_for(vs),
             0.05)
         return bool(brake_result.risk)
 
     # ── Trajectory controller (section XII) ──────────────────────────
     def _compute_command(self, trajectory, state, ds, execution_mode,
-                         held_action, sample_offset=0.0):
+                         held_action, altitude_target_z, sample_offset=0.0):
         tc = self._controller_cfg
         out = {"velocity_flu": np.zeros(3), "yaw_rate": 0.0}
         max_yaw_rate = tc.get("max_yaw_rate_rps", 2.0)
@@ -1501,6 +1628,28 @@ class ILManager(object):
             self._last_velocity_world = np.zeros(3)
             self._last_acceleration_world = np.zeros(3)
             self._last_yaw_rate = 0.0
+
+        # The local search is intentionally planar at the task flight
+        # slice.  Preserve that slice in every execution mode so a small
+        # simulator drift during rotate/brake cannot become a permanent
+        # lower planning height.
+        altitude_cfg = tc.get("altitude_hold", {})
+        if altitude_cfg.get("enabled", True):
+            error = float(altitude_target_z - state["position"][2])
+            if abs(error) <= float(altitude_cfg.get("deadband_m", 0.02)):
+                error = 0.0
+            max_vertical_speed = float(
+                altitude_cfg.get("max_speed_mps", 0.6))
+            vertical_world = float(np.clip(
+                float(altitude_cfg.get("kp", 1.5)) * error -
+                float(altitude_cfg.get("kd", 0.6)) *
+                    float(state["velocity"][2]),
+                -max_vertical_speed, max_vertical_speed))
+            commanded_world = body_flu_vector_to_world_quat(
+                out["velocity_flu"], quat)
+            commanded_world[2] = vertical_world
+            out["velocity_flu"] = world_vector_to_body_flu_quat(
+                commanded_world, quat)
 
         # Final command clamp.
         speed = float(np.linalg.norm(out["velocity_flu"]))
@@ -1734,6 +1883,21 @@ class ILManager(object):
             "macro_is_new_tick": int(held_action.is_new_tick),
             "macro_mode": int(held_action.mode),
             "macro_committed_side": int(held_action.committed_side),
+            # P2 side-selection consistency diagnostics (pure diagnostics,
+            # never student input): chosen vs committed vs privileged-best
+            # side, per-side candidate FULL/connected counts and the last
+            # side release reason.
+            "macro_chosen_side": self._macro_expert.macro_chosen_side,
+            "side_rejection_reason":
+                self._macro_expert.side_rejection_reason,
+            "side_candidate_full_left":
+                self._macro_expert.side_candidate_full_left,
+            "side_candidate_full_right":
+                self._macro_expert.side_candidate_full_right,
+            "side_candidate_connected_left":
+                self._macro_expert.side_candidate_connected_left,
+            "side_candidate_connected_right":
+                self._macro_expert.side_candidate_connected_right,
             "macro_observe_side": int(
                 getattr(held_action, "observe_side", 0)),
             "macro_confidence": held_action.confidence,
@@ -1836,6 +2000,13 @@ class ILManager(object):
             "scene_id": self._dataset_scene_key,
             "task_id": self._current_task_id,
             "episode_valid": 1,
+            # P5 failure taxonomy + P1 stale-plan diagnostics (pure
+            # diagnostics, never student input): the documented episode
+            # failure category, the last safety-critical plan failure
+            # status and how many times a stale cached plan was invalidated.
+            "failure_taxonomy": self._failure_taxonomy,
+            "critical_plan_failure_status": self._last_plan_failure_status,
+            "stale_plan_invalidations": self._stale_plan_invalidations,
             # Active-observation diagnostics (section XLVII-XLIX): pure
             # diagnostics, never part of any student input.  Held from the
             # last 5 Hz macro tick.
@@ -1856,6 +2027,17 @@ class ILManager(object):
                 self._macro_expert.observe_endpoint_known_free_count,
             "observe_local_full_count":
                 self._macro_expert.observe_local_full_count,
+            # P3 recovery diagnostics (pure diagnostics, never student
+            # input): forward vs known-free-retreat FULL viewpoint counts
+            # and whether the active OBSERVE move is a retreat.
+            "observe_forward_full_count":
+                self._macro_expert.observe_forward_full_count,
+            "observe_retreat_full_count":
+                self._macro_expert.observe_retreat_full_count,
+            "observe_retreat_candidate_count":
+                self._macro_expert.observe_retreat_candidate_count,
+            "observe_recovery_active":
+                self._macro_expert.observe_recovery_active,
             "observe_reject_unknown": self._macro_expert.observe_reject_unknown,
             "observe_reject_endpoint_clearance":
                 self._macro_expert.observe_reject_endpoint_clearance,
@@ -1929,6 +2111,9 @@ class ILManager(object):
         extra = {
             "exit_reason": self._trajectory_exit_reason,
             "reject_reason": reject_reason,
+            "failure_taxonomy": self._failure_taxonomy,
+            "critical_plan_failure_status": self._last_plan_failure_status,
+            "stale_plan_invalidations": self._stale_plan_invalidations,
             "total_plans": self._total_plans,
             "successful_plans": self._successful_plans,
             "reached_goal": self._trajectory_reached_goal,
@@ -1964,6 +2149,7 @@ class ILManager(object):
             "episode_result": "success" if committed else "failed",
             "exit_reason": self._trajectory_exit_reason,
             "reject_reason": reject_reason,
+            "failure_taxonomy": self._failure_taxonomy,
             "dataset_write_ok": write_ok,
         }
         runtime_cls = None
@@ -2010,6 +2196,7 @@ class ILManager(object):
                 "scene_key": self._dataset_scene_key,
                 "exit_reason": self._trajectory_exit_reason,
                 "reject_reason": reject_reason,
+                "failure_taxonomy": self._failure_taxonomy,
                 "dataset_write_ok": write_ok,
             })
 

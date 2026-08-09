@@ -26,6 +26,18 @@ struct MacroCandidateConfig {
     /// already subtracts the vehicle radius, so this is the SAME additional
     /// margin used by every other module — never a second inflation.
     double clearance_m = 0.20;
+    // ── Round 5: shared dynamic-executability margin ─────────────────
+    // The SAME three parameters the 30 Hz LocalPlanner uses
+    // (TrajectoryOptimizationConfig::clearance_margin_*), so candidate
+    // endpoint filters AND the observed FULL-reachable A* are evaluated at
+    // a clearance NEVER below what the 30 Hz planner will validate with at
+    // the macro tick.  A candidate the macro marks FULL is therefore not
+    // immediately rejected by the local planner over an inconsistent
+    // safety margin.  The computation lives in the shared C++
+    // effectiveClearanceForSpeed() (types.hpp).
+    double clearance_margin_tracking_m = 0.05;
+    double clearance_margin_latency_s = 0.10;
+    double clearance_margin_max_m = 0.25;
     /// Spacing between consecutive SIDE candidates along the corridor.
     double candidate_spacing_m = 0.5;
     /// Forward step of OBSERVE candidates (kept very short / known-safe).
@@ -51,11 +63,28 @@ struct MacroCandidateConfig {
     int max_viewpoint_searches_per_tick = 8;
     /// Minimum FULL searches reserved for GOAL_FRONTIER candidates each
     /// tick (so the lattice can never starve the frontier source).
-    int min_frontier_searches_per_tick = 2;
-    /// Max current->viewpoint distance for a valid OBSERVE_MOVE.
+    int min_frontier_searches_per_tick = 2;    // ── P3 known-free recovery (retreat) viewpoints ─────────────────
+    /// Dedicated FULL-search budget for recovery viewpoints behind the
+    /// drone (negative goal progress allowed).  When rotation yields no
+    /// FULL forward viewpoint, the macro can still move to a known-free
+    /// retreat instead of rotating forever (observe_deadlock fix).  These
+    /// are OBSERVE candidates with source "observe_retreat", verified by
+    /// the real observed LocalPathSearch like every other viewpoint.
+    int retreat_searches_per_tick = 3;
+    /// Backward distances (m) behind the drone (opposite the goal ray)
+    /// sampled for recovery viewpoints.
+    std::vector<double> retreat_distances_m{0.5, 1.0, 1.5};
+    /// Perpendicular (lateral) offset of a retreat viewpoint; 0 samples
+    /// the pure backward direction, +/- this samples backward-side.
+    double retreat_lateral_m = 0.6;    /// Max current->viewpoint distance for a valid OBSERVE_MOVE.
     double max_observe_move_distance_m = 6.0;
-    /// Radius around a viewpoint used to estimate unknown information gain.
-    double observe_info_gain_radius_m = 1.2;
+    /// FOV-aware expected-visibility proxy.  Rays start at a known-free
+    /// candidate, stop at known occupied geometry and receive gain only at
+    /// their first visible UNKNOWN frontier; nearby UNKNOWN behind a known
+    /// wall therefore cannot falsely score as useful information.
+    double observe_visibility_fov_deg = 90.0;
+    int observe_visibility_ray_count = 31;
+    double observe_visibility_range_m = 4.0;
     /// Max number of goal-directed frontier candidates.
     int max_frontier_candidates = 8;
     /// Pull-back of frontier candidates into known space.
@@ -90,6 +119,10 @@ struct ObserveDiagnostics {
     int lattice_candidate_count = 0;
     /// GOAL_FRONTIER candidates emitted after the cheap filter.
     int frontier_candidate_count = 0;
+    /// P3 retreat/recovery candidates emitted (source "observe_retreat").
+    int retreat_candidate_count = 0;
+    /// P3 retreat/recovery candidates verified FULL_GOAL_REACHED.
+    int retreat_full_count = 0;
     /// Candidates whose endpoint passed the cheap known-free + clearance
     /// filter (these get ranked and possibly the FULL LocalPathSearch).
     int endpoint_known_free_count = 0;
@@ -185,11 +218,26 @@ private:
         const Eigen::Vector3d& goal_world,
         int remaining_searches) const;
 
-    /// Fraction of unknown cells in a disk of
-    /// `observe_info_gain_radius_m` around `position` (used for cheap
-    /// viewpoint ranking and the final candidate score).
-    double estimateInfoGain(const ObservedMap& map,
-                            const Eigen::Vector3d& position) const;
+    /// P3 known-free recovery (retreat) viewpoints: points BEHIND the
+    /// drone (negative goal progress) inside known free space, sampled at
+    /// `retreat_distances_m` x {-retreat_lateral_m, 0, +retreat_lateral_m}.
+    /// Same cheap endpoint filter (known + unified clearance) as the
+    /// forward lattice; reachability is verified by the real observed
+    /// LocalPathSearch in scoreObserved (FULL only).  Emitted as OBSERVE
+    /// candidates with source "observe_retreat" so the Python macro can
+    /// prefer them exactly when no forward FULL viewpoint exists.
+    std::vector<MacroCandidate> makeRetreatCandidates(
+        const ObservedMap& map,
+        const VehicleState& state,
+        const Eigen::Vector3d& goal_world,
+        int budget) const;
+
+    /// FOV- and known-occlusion-aware expected visibility of the first
+    /// UNKNOWN frontier along each camera ray.  It is a causal proxy for
+    /// active-perception value, not a privileged look-through-wall score.
+    double estimateVisibleUnknownGain(const ObservedMap& map,
+                                      const Eigen::Vector3d& position,
+                                      double yaw_world) const;
 
     MacroCandidateConfig config_;
     /// Per-tick observation diagnostics (mutable: updated inside the const

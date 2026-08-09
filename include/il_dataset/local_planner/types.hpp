@@ -2,6 +2,8 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -18,6 +20,37 @@ struct VehicleState {
     double yaw = 0.0;
     double yaw_rate = 0.0;
 };
+
+/// Unified dynamic-executability clearance parameters (round 5): the
+/// SINGLE source for the speed-dependent safety margin shared by the
+/// 30 Hz LocalPlanner and the 5 Hz macro candidate search.  The effective
+/// boundary is `clearance_m + min(margin_max_m, margin_tracking_m +
+/// margin_latency_s * speed)`.
+///
+/// This formula lives in ONE C++ place (`effectiveClearanceForSpeed`); the
+/// planner and the candidate search both funnel their flat config fields
+/// into it and Python never re-derives it (it calls the C++ interface).
+struct DynamicClearanceConfig {
+    /// Unified base clearance (extra margin on top of the ESDF, which
+    /// already subtracts the vehicle radius).
+    double clearance_m = 0.20;
+    /// Constant tracking-error floor of the margin.
+    double margin_tracking_m = 0.05;
+    /// Control-latency coefficient: distance travelled during the command
+    /// latency (margin_latency_s * speed).
+    double margin_latency_s = 0.10;
+    /// Hard cap on the speed-dependent part of the margin.
+    double margin_max_m = 0.25;
+};
+
+/// The core effective-clearance computation (shared, never duplicated):
+/// effective = clearance_m + min(margin_max_m, tracking + latency*speed).
+inline double effectiveClearanceForSpeed(const DynamicClearanceConfig& cfg,
+                                         double speed_mps) {
+    const double margin =
+        cfg.margin_tracking_m + cfg.margin_latency_s * speed_mps;
+    return cfg.clearance_m + std::min(cfg.margin_max_m, margin);
+}
 
 /// A single point on a dense time-sampled trajectory.
 struct TrajectoryPoint {
@@ -138,8 +171,16 @@ struct MacroCandidate {
     double observed_path_length = 0.0;
     double minimum_clearance = 0.0;
     double goal_progress = 0.0;
+    /// Camera yaw to use after reaching an active-observation candidate.
+    /// It is derived solely from the observable task goal / candidate pose,
+    /// never from privileged topology.
+    double observation_yaw_world = 0.0;
     bool left_edge_visible = false;
     bool right_edge_visible = false;
+    /// Causal candidate utility assembled from observed reachability,
+    /// clearance, goal progress and FOV-aware expected visibility.  This is
+    /// the online ranking quantity; privileged_score is diagnostics only.
+    double observed_score = 0.0;
     double unknown_information_gain = 0.0;
     // Privileged fields (filled only by the PrivilegedOracle).
     bool connected_to_goal = false;
@@ -192,6 +233,13 @@ struct TaskGenerationConfig {
     /// ray walk, the lateral probes AND the local-scale audit search.  No
     /// module may use a different effective safety boundary.
     double clearance_m = 0.20;
+    /// Task validity uses the same dynamic-clearance formula as execution.
+    /// A stationary default enforces the non-zero tracking floor without
+    /// rejecting every corridor that a slow controller can execute.
+    double clearance_margin_tracking_m = 0.05;
+    double clearance_margin_latency_s = 0.10;
+    double clearance_margin_max_m = 0.25;
+    double validation_speed_mps = 0.0;
     double min_task_distance_m = 3.0;
     double max_task_distance_m = 30.0;
     /// Lateral probe geometry for left/right global feasibility.
@@ -310,6 +358,11 @@ struct LocalPlanResult {
     double planning_time_ms = 0.0;
     uint64_t plan_id = 0;
     int search_status = 0;  // 0 = full path, 1 = partial, 2 = no path
+    /// Effective local clearance used to PLAN + VALIDATE this trajectory:
+    /// the unified `clearance_m` plus the speed-dependent executability
+    /// margin (P1).  Pure diagnostic — the effective boundary is never a
+    /// second configurable safety value.
+    double effective_clearance_m = 0.0;
 };
 
 /// Final 30 Hz controller command (section XII).

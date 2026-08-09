@@ -1,5 +1,5 @@
 # ============================================================================
-#  Imitation Learning Dataset Collection — Two-Level Navigation Expert (schema v22)
+#  Imitation Learning Dataset Collection — Two-Level Navigation Expert (schema v23)
 # ============================================================================
 #
 #  Architecture:
@@ -98,6 +98,18 @@ global:
   # vehicle body.  No module may use a different, more permissive value.
   navigation:
     clearance_m: 0.20
+    # ── P1 dynamic executability margin ────────────────────────────
+    # The LOCAL 30 Hz layer plans/validates its executable trajectory with
+    # `clearance_m + min(margin_max_m, margin_tracking_m +
+    # margin_latency_s * speed)` so a fast drone gets a wider effective
+    # safety boundary than a hovering one (control latency + tracking
+    # error).  These three parameters are the SINGLE source for both the
+    # C++ LocalPlanner and the Python swept-braking check; the unified
+    # clearance_m above remains the module-consistency boundary for every
+    # other module.
+    margin_tracking_m:  0.05
+    margin_latency_s:   0.10
+    margin_max_m:       0.25
 
   # ── Procedural scene generation (section XXII/XXXII-XXXVI) ─────────
   scene_generation:
@@ -163,6 +175,10 @@ global:
   # never student inputs and never forced onto the macro expert mode.
   task_generation:
     enabled: true
+    # Validate against the nominal executed speed, not a stationary vehicle.
+    # This rejects corridors that are globally connected but cannot satisfy
+    # the local planner's dynamic clearance while flying.
+    validation_speed_mps: 1.8
     # VERIFIED 'fixed' flight height: 1.8-2.2 m inside the factory z[0,8].
     flight_height_m: 2.0
     task_seed_base: 999983
@@ -304,6 +320,13 @@ global:
     # Rolling SIDE / OBSERVE progress thresholds (section VII/XVI).
     side_no_progress_seconds:   6.0
     observe_no_information_timeout: 4.0
+    # Round 5 termination: after this many consecutive OBSERVE ticks with
+    # NO real information progress (rotation, retreat AND frontier all
+    # fruitless), the macro fails with observe_no_recovery_path instead of
+    # continuing meaningless rotation / viewpoint cycling.  A true session
+    # entry (new mode / new blocker) or real progress resets the counter;
+    # an anchor re-base alone does not.
+    observe_no_progress_fail_ticks: 35
     progress_cost_epsilon_m:    0.10
     local_path_fail_threshold:  2
     # Blocker tracking (sections VII/X): world-geometry association of the
@@ -333,6 +356,15 @@ global:
     # better than continuing the sweep, and previous-viewpoint hysteresis.
     max_stagnant_rotate_s:            2.0
     observe_info_gain_move_threshold: 0.05
+    # An OBSERVE movement endpoint must causally expose at least this much
+    # unknown space in its predicted camera FOV; reachable-but-blind points
+    # are excluded (RETREAT is a separate safety recovery action).
+    observe_min_visible_gain:         0.05
+    # A virtual target may lie beyond the observed frontier, but the C++
+    # local planner still executes only its verified known-free partial path.
+    # This prevents active perception from degrading into rotate-only when
+    # no fully reachable viewpoint has been observed yet.
+    observe_virtual_frontier_distance_m: 2.0
     observe_viewpoint_hysteresis_m:   0.8
     observe_viewpoint_hysteresis_bonus: 0.15
     # Distance a real OBSERVE_MOVE must travel before the current
@@ -343,8 +375,27 @@ global:
     viewpoint_reset_distance_m:      0.35
     # Episode-level final anti-deadlock guard (section XXII).
     macro_intervention_absolute_safety_timeout: 45.0
-    # Fixed left preference for genuinely tied sides (never unconditional).
-    left_preferred_on_tie:      true
+    # ── P2/P4 side-commitment consistency and anti-oscillation ─────
+    # Minimum time a committed SIDE is held even if the other side looks
+    # cheaper (SIDE<->SIDE / DIRECT<->SIDE thrash suppression).
+    side_min_hold_s:            1.5
+    # After a committed side is released (lost viability / unsafe
+    # clearance / goal regression) it is not re-picked for this long,
+    # unless it is the only option.
+    side_release_cooldown_s:    1.5
+    # Extra margin (m) above clearance_m used to judge the drone's global
+    # clearance / committed-candidate path clearance as "unsafe" -> the
+    # side is released immediately instead of approaching the obstacle.
+    side_unsafe_clearance_margin_m: 0.05
+    # Both observed sides being FULL-reachable is not enough to force a
+    # strategic LEFT/RIGHT label.  When their causal utilities are this
+    # close, enter OBSERVE instead of using hidden global topology to break
+    # the tie; this keeps labels learnable from depth history.
+    observed_side_score_margin:   0.15
+    # Goal distance may regress by at most this much before the committed
+    # side is considered a dead end (released after the tick count below).
+    side_goal_regress_m:        0.35
+    side_goal_regress_ticks:    3
     # Confidence gate: below this the macro marks labels ambiguous.
     confidence_gate:            0.5
 
@@ -375,12 +426,27 @@ global:
       lateral_distances_m:       [0.4, 0.8, 1.2, 1.6]
       forward_distances_m:       [0.0, 0.4, 0.8, 1.2]
       max_viewpoint_candidates:  24
-      max_viewpoint_searches_per_tick: 8
+      max_viewpoint_searches_per_tick: 11
       # Minimum FULL searches reserved for GOAL_FRONTIER each tick (the
       # lattice can never starve the frontier source).
       min_frontier_searches_per_tick: 2
       max_observe_move_distance_m: 6.0
-      information_gain_radius_m: 1.2
+      # Candidate value is the expected first UNKNOWN frontier visible from
+      # its predicted yaw, using this FOV and known-obstacle ray occlusion.
+      # It is not a disk count of UNKNOWN cells behind walls.
+      visibility_fov_deg:         90.0
+      visibility_ray_count:       31
+      visibility_range_m:          4.0
+      # ── P3 known-free recovery (retreat) viewpoints ──────────────
+      # Dedicated FULL-search budget + geometry for recovery points BEHIND
+      # the drone (negative goal progress allowed).  When rotation produces
+      # no FULL forward viewpoint the macro moves to a safe known-free
+      # retreat instead of ROTATE_ONLY forever; reachability is verified
+      # by the real observed LocalPathSearch.  Never lets the drone cross
+      # unknown space (endpoints must be known-free with clearance_m).
+      retreat_searches_per_tick: 3
+      retreat_distances_m:       [0.5, 1.0, 1.5]
+      retreat_lateral_m:         0.6
 
   # ── Local recoverability query (section VI) ────────────────────────
   # The clearance is the unified `navigation.clearance_m` (single source).
@@ -487,6 +553,14 @@ global:
     max_yaw_accel_rps2:         8.0
     emergency_brake_distance_m: 0.8
     brake_deceleration_mps2:    3.0
+    # Keep the fixed task flight slice through rotate/brake and replanning
+    # degradation; the 2-D local search must not follow simulator z drift.
+    altitude_hold:
+      enabled: true
+      kp: 1.5
+      kd: 0.6
+      deadband_m: 0.02
+      max_speed_mps: 0.6
 
   # ── Execution safety / degradation (section XIII) ──────────────────
   execution_safety:
@@ -501,7 +575,7 @@ global:
 
   # ── Dataset logging (section XIV) ──────────────────────────────────
   dataset_logging:
-    schema_version: 22
+    schema_version: 23
     depth_in_memory: true
     write_local_plan_points: true
     collect_privileged_diagnostics: true

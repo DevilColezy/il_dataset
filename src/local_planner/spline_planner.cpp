@@ -847,6 +847,17 @@ LocalPlanner::LocalPlanner(const TrajectoryOptimizationConfig& config)
 
 void LocalPlanner::setMap(const ObservedMap* map) { map_ = map; }
 
+double LocalPlanner::effectiveClearance(const VehicleState& state) const {
+    // Round 5: the single shared C++ formula (effectiveClearanceForSpeed).
+    // Every other module (macro candidate search, Python braking check via
+    // the pybind interface) uses the exact same computation — there is no
+    // second formula to drift.
+    const DynamicClearanceConfig cfg{
+        config_.clearance_m, config_.clearance_margin_tracking_m,
+        config_.clearance_margin_latency_s, config_.clearance_margin_max_m};
+    return effectiveClearanceForSpeed(cfg, state.velocity.norm());
+}
+
 ValidationResult LocalPlanner::validateTrajectorySegmentSpatially(
     const std::vector<TrajectoryPoint>& trajectory,
     double start_t,
@@ -936,15 +947,21 @@ ValidationResult LocalPlanner::validateTrajectorySegmentSpatially(
 }
 
 ValidationResult LocalPlanner::validateTrajectory(
-    const std::vector<TrajectoryPoint>& trajectory) const {
+    const std::vector<TrajectoryPoint>& trajectory,
+    const VehicleState& state) const {
     if (trajectory.empty()) {
         ValidationResult result;
         result.all_clear = false;
         result.any_collision = true;
         return result;
     }
+    // Round 6: the public validator uses the SAME speed-dependent
+    // effective clearance as plan() / validateTrajectorySuffix() (derived
+    // from the state at the START of the trajectory).  A base-clearance-only
+    // validation path no longer exists, so the public interface can never
+    // approve a trajectory the planner would reject as too tight.
     return validateTrajectorySegmentSpatially(
-        trajectory, trajectory.front().t, config_.clearance_m);
+        trajectory, trajectory.front().t, effectiveClearance(state));
 }
 
 ValidationResult LocalPlanner::validateTrajectorySuffix(
@@ -970,6 +987,12 @@ ValidationResult LocalPlanner::validateTrajectorySuffix(
     }
     const double elapsed = current_time - plan_start_time;
     const double age = std::max(0.0, elapsed);
+
+    // P1: the cached suffix is validated with the SAME speed-dependent
+    // effective clearance the fresh plan used — a drone that has sped up
+    // since the plan was made gets no narrower a safety floor than the
+    // planner used when it built the trajectory.
+    const double effective_clearance = effectiveClearance(state);
 
     // Interpolate the reference position / velocity AT the current age
     // (section X) — the drone is re-executing the REMAINING segment, so
@@ -1011,10 +1034,11 @@ ValidationResult LocalPlanner::validateTrajectorySuffix(
     }
 
     // Safety validation from the current age (section XX), with the SAME
-    // spatial interpolation strictness and the SAME unified navigation
-    // clearance as the fresh trajectory (never an external override).
+    // spatial interpolation strictness and the SAME effective clearance as
+    // the fresh trajectory (never an external override, never narrower
+    // than the unified base).
     return validateTrajectorySegmentSpatially(trajectory, age,
-                                              config_.clearance_m);
+                                              effective_clearance);
 }
 
 LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
@@ -1049,9 +1073,23 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
         return finish();
     }
 
+    // ── P1 dynamic executability margin ────────────────────────────
+    // The whole local pipeline (A* seed, warm start, goal stop, optimizer
+    // soft target / floor, fresh validation) uses the speed-dependent
+    // effective clearance so a fast drone is planned and validated with a
+    // wider safety buffer than a hovering one.  The unified base
+    // `config_.clearance_m` remains the module-consistency boundary for
+    // every OTHER module; this only widens the executable 30 Hz layer.
+    const double effective_clearance = effectiveClearance(state);
+    result.effective_clearance_m = effective_clearance;
+    // Optimizer config copy: everything identical except the clearance
+    // soft target / hard floor, which rise to the effective boundary.
+    TrajectoryOptimizationConfig opt_config = config_;
+    opt_config.clearance_m = effective_clearance;
+
     // ── 1. Observed-map A* seed path ──────────────────────────────
     LocalSearchConfig search_config;
-    search_config.clearance_m = config_.clearance_m;
+    search_config.clearance_m = effective_clearance;
     search_config.committed_side = request.committed_side;
     search_config.side_bias_gain = config_.search_side_bias_gain;
     search_config.max_time_ms = config_.search_max_time_ms;
@@ -1084,7 +1122,7 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
             if (point.t < request.previous_trajectory_age_s) continue;
             if (!map_->isKnownFree(point.position.x(), point.position.y(),
                                    point.position.z(),
-                                   config_.clearance_m)) {
+                                   effective_clearance)) {
                 suffix_valid = false;
                 break;
             }
@@ -1177,7 +1215,7 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
         (terminal - request.goal_world).head<2>().norm() <=
             config_.goal_stop_tolerance_m &&
         map_->isKnownFree(request.goal_world.x(), request.goal_world.y(),
-                          request.goal_world.z(), config_.clearance_m);
+                          request.goal_world.z(), effective_clearance);
     if (!stop_at_goal) {
         const double distance_ratio = clamp(
             distance / std::max(0.5, config_.lookahead_distance), 0.55, 1.0);
@@ -1250,7 +1288,7 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
     esdf.setMap(map_);
 
     bool optimized = optimizeSpline(
-        &control_points, knots, duration, esdf, config_,
+        &control_points, knots, duration, esdf, opt_config,
         seed_control_points, corridor_min, corridor_max,
         planning_deadline - std::chrono::milliseconds(3));
     imposeBoundaryState(&control_points, knots, duration, state.position,
@@ -1315,7 +1353,7 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
         imposeBoundaryState(&control_points, knots, duration, state.position,
                             state.velocity, start_acceleration, terminal,
                             terminal_velocity);
-        optimizeSpline(&control_points, knots, duration, esdf, config_,
+        optimizeSpline(&control_points, knots, duration, esdf, opt_config,
                        seed_control_points, corridor_min, corridor_max,
                        planning_deadline - std::chrono::milliseconds(1));
         imposeBoundaryState(&control_points, knots, duration, state.position,
@@ -1323,9 +1361,10 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
                             terminal_velocity);
         trajectory = sampleTrajectory(control_points, duration);
         const ValidationResult time_validation =
-            validateTrajectory(trajectory);
+            validateTrajectorySegmentSpatially(
+                trajectory, trajectory.front().t, effective_clearance);
         if (time_validation.any_collision) {
-            optimizeSpline(&control_points, knots, duration, esdf, config_,
+            optimizeSpline(&control_points, knots, duration, esdf, opt_config,
                            seed_control_points, corridor_min, corridor_max,
                            planning_deadline - std::chrono::milliseconds(1));
             imposeBoundaryState(&control_points, knots, duration,
@@ -1333,7 +1372,11 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
                                 start_acceleration, terminal,
                                 terminal_velocity);
             trajectory = sampleTrajectory(control_points, duration);
-            if (validateTrajectory(trajectory).any_collision) break;
+            if (validateTrajectorySegmentSpatially(
+                    trajectory, trajectory.front().t, effective_clearance)
+                    .any_collision) {
+                break;
+            }
         }
         dynamics = measureDynamics(trajectory);
     }
@@ -1349,8 +1392,11 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
     yaw_planner.planYaw(&trajectory, state.yaw, planned_target_yaw,
                         has_macro_yaw);
 
-    // ── Strict validation ─────────────────────────────────────────
-    const ValidationResult validation = validateTrajectory(trajectory);
+    // ── Strict validation (P1: effective boundary, never the bare 0.20
+    //    floor) ──────────────────────────────────────────────────────
+    const ValidationResult validation =
+        validateTrajectorySegmentSpatially(
+            trajectory, trajectory.front().t, effective_clearance);
     result.min_clearance = validation.min_clearance;
     result.duration_s = duration;
     if (validation.any_unknown || validation.any_collision) {

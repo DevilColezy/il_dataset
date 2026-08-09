@@ -18,6 +18,16 @@ struct RecoverabilityConfig {
     /// the vehicle radius, so this is the SAME additional margin used by
     /// every other navigation module.
     double clearance_m = 0.20;
+    // ── Round 6: shared dynamic-executability margin ─────────────────
+    // The SAME three parameters the 30 Hz LocalPlanner and the macro
+    // candidate search use, so the recoverability query's rejoin search and
+    // blocker analysis are evaluated at the SAME effective clearance as
+    // actual local planning — DIRECT_REJOIN_SUCCESS can never be more
+    // permissive than what plan() can execute.  The formula is the shared
+    // C++ effectiveClearanceForSpeed() (types.hpp), never reimplemented.
+    double clearance_margin_tracking_m = 0.05;
+    double clearance_margin_latency_s = 0.10;
+    double clearance_margin_max_m = 0.25;
     /// Fixed local planning horizon: the path must be executable within it.
     double max_duration_s = 2.5;
     /// Max allowed local path length (m).

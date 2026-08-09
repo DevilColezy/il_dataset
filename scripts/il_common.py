@@ -167,6 +167,14 @@ def world_vector_to_body_flu_quat(vector_world, quaternion_xyzw):
     return np.array([body[1], -body[0], body[2]], dtype=np.float64)
 
 
+def body_flu_vector_to_world_quat(vector_flu, quaternion_xyzw):
+    """Inverse of :func:`world_vector_to_body_flu_quat`."""
+    v = np.asarray(vector_flu, dtype=np.float64)
+    r = quaternion_xyzw_to_rotation(quaternion_xyzw)
+    body = np.array([-v[1], v[0], v[2]], dtype=np.float64)
+    return r.dot(body)
+
+
 def body_flu_to_flightlib_body(vector_flu):
     """FLU [forward, left, up] -> Flightlib body [right, forward, up]."""
     v = np.asarray(vector_flu, dtype=np.float64)

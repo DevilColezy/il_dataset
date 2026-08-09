@@ -37,6 +37,22 @@ struct TrajectoryOptimizationConfig {
     // the hard validation floor: the local trajectory / goal-stop /
     // braking checks are never more permissive than global connectivity.
     double clearance_m = 0.20;
+    // ── Dynamic executability margin (P1) ───────────────────────────
+    // The LOCAL layer adds a speed-dependent buffer ON TOP of the unified
+    // clearance so accepted trajectories never hug the 0.20 m floor: it
+    // composes the control latency (margin_latency_s * speed, the distance
+    // travelled before the command takes effect) and a constant tracking-
+    // error floor, capped by margin_max_m.  The effective boundary is
+    // `clearance_m + min(margin_max_m, tracking + latency*speed)` and is
+    // applied consistently to the A* seed, the optimizer cost/floor, the
+    // fresh validation AND the cached-suffix validation of the LOCAL
+    // layer.  All OTHER modules (recoverability, candidates, privileged
+    // audit, global connectivity) keep the unified base `clearance_m` so
+    // the decision boundary stays module-consistent; only the executable
+    // 30 Hz trajectory is planned/validated with the extra buffer.
+    double clearance_margin_tracking_m = 0.05;
+    double clearance_margin_latency_s = 0.10;
+    double clearance_margin_max_m = 0.25;
     double collision_check_spacing = 0.05;
 
     // Cost weights
@@ -100,13 +116,20 @@ public:
     /// Plan a 30 Hz local trajectory.
     LocalPlanResult plan(const LocalPlanRequest& request) const;
 
-    /// Strict validation: every point must be known AND clearance above
-    /// the unified `config_.clearance_m`, plus finite state and dynamics
+    /// Strict validation of a complete trajectory (section XVI): every
+    /// point must be known AND clearance above the SPEED-DEPENDENT
+    /// effective clearance (round 6), plus finite state and dynamics
     /// feasibility.  Spatially interpolates so the max collision-check
-    /// spacing along the trajectory is <= collision_check_spacing (section
-    /// XVI).
+    /// spacing along the trajectory is <= collision_check_spacing.
+    ///
+    /// `state` is the vehicle state at the START of the trajectory: it
+    /// provides the speed at which the unified dynamic-executability margin
+    /// is evaluated, so the public validator is never more permissive than
+    /// what `plan()` actually validates its executable trajectories with
+    /// (no base-clearance-only validation path remains).
     ValidationResult validateTrajectory(
-        const std::vector<TrajectoryPoint>& trajectory) const;
+        const std::vector<TrajectoryPoint>& trajectory,
+        const VehicleState& state) const;
 
     /// Validate the SUFFIX of a previously planned trajectory that is being
     /// re-executed from the cache (section VIII/X).  The current state is
@@ -128,6 +151,14 @@ public:
         double max_position_error,
         double max_velocity_error) const;
 
+    /// The SINGLE C++ dynamic effective-clearance computation (round 5/6):
+    /// `clearance_m + min(margin_max_m, margin_tracking_m +
+    /// margin_latency_s * speed)`, evaluated at the current state speed.
+    /// PUBLIC so the pybind interface (`effective_clearance_for`) and any
+    /// other module can call it directly — there is exactly one formula in
+    /// `effectiveClearanceForSpeed()` (types.hpp) and no second copy.
+    double effectiveClearance(const VehicleState& state) const;
+
     uint64_t currentPlanId() const { return plan_id_counter_; }
     const TrajectoryOptimizationConfig& config() const { return config_; }
 
@@ -137,7 +168,9 @@ private:
     /// with t >= start_t and spatially interpolates so the maximum gap is
     /// <= collision_check_spacing.  Every interpolated point is checked for
     /// known + clearance.  `clearance` is the effective safety boundary
-    /// (callers always pass the unified config_.clearance_m).
+    /// (always the speed-dependent effective clearance; the public
+    /// `validateTrajectory`, `plan()` and the cached-suffix validation all
+    /// pass it — never a bare base clearance).
     ValidationResult validateTrajectorySegmentSpatially(
         const std::vector<TrajectoryPoint>& trajectory,
         double start_t,

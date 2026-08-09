@@ -18,12 +18,12 @@ import time
 
 import numpy as np
 
-# ── Schema (v22) ──────────────────────────────────────────────────────
+# ── Schema (v23) ──────────────────────────────────────────────────────
 # Order matters: this is the CSV header.  All fields are written on every
 # row; missing keys are filled with defaults by write_row().
 # NO depth-valid-mask fields: the student input is a single depth channel
 # (section XII).  raw_depth_finite_ratio is a PURE diagnostic.
-DATA_SCHEMA_V22_FIELDS = [
+DATA_SCHEMA_V23_FIELDS = [
     # time / matching
     "timestamp_ns", "receive_timestamp_ns", "episode_id", "frame_id",
     "episode_frame_index", "control_dt_s", "trajectory_time_s",
@@ -42,6 +42,10 @@ DATA_SCHEMA_V22_FIELDS = [
     # macro labels (5 Hz; held between ticks, macro_is_new_tick flags)
     "macro_is_new_tick", "macro_mode", "macro_committed_side",
     "macro_observe_side",
+    # P2 side-selection consistency diagnostics (never student input)
+    "macro_chosen_side", "side_rejection_reason",
+    "side_candidate_full_left", "side_candidate_full_right",
+    "side_candidate_connected_left", "side_candidate_connected_right",
     "macro_confidence", "macro_decision_reason",
     "macro_decision_observable", "macro_decision_confidence",
     "macro_decision_margin",
@@ -90,13 +94,19 @@ DATA_SCHEMA_V22_FIELDS = [
     "plan_id", "plan_age_s", "plan_is_fresh", "plan_status", "plan_compute_ms",
     # episode
     "scene_id", "task_id", "episode_valid",
+    # P5 failure taxonomy + P1 stale-plan diagnostics (never student input)
+    "failure_taxonomy", "critical_plan_failure_status",
+    "stale_plan_invalidations",
     # active-observation diagnostics (pure diagnostics, never student
     # input; held from the last 5 Hz macro tick)
     "observe_scan_side", "left_scan_exhausted", "right_scan_exhausted",
     "observe_rotation_exhausted", "observe_stagnant_rotate_time",
     "observe_raw_candidate_count", "observe_lattice_candidate_count",
     "observe_frontier_candidate_count", "observe_endpoint_known_free_count",
-    "observe_local_full_count", "observe_reject_unknown",
+    "observe_local_full_count",
+    "observe_forward_full_count", "observe_retreat_full_count",
+    "observe_retreat_candidate_count", "observe_recovery_active",
+    "observe_reject_unknown",
     "observe_reject_endpoint_clearance", "observe_reject_min_distance",
     "observe_reject_max_distance", "observe_reject_partial",
     "observe_reject_no_path",
@@ -107,7 +117,7 @@ DATA_SCHEMA_V22_FIELDS = [
     "observe_selected_info_gain", "observe_selected_clearance",
 ]
 
-_DEFAULT_ROW = {field: "" for field in DATA_SCHEMA_V22_FIELDS}
+_DEFAULT_ROW = {field: "" for field in DATA_SCHEMA_V23_FIELDS}
 
 
 class DatasetWriter(object):
@@ -149,7 +159,7 @@ class DatasetWriter(object):
 
         self._data_csv = open(self._data_file, "w", newline="")
         self._data_writer = csv.DictWriter(
-            self._data_csv, fieldnames=DATA_SCHEMA_V22_FIELDS)
+            self._data_csv, fieldnames=DATA_SCHEMA_V23_FIELDS)
         self._data_writer.writeheader()
 
         self._sync_csv = open(self._sync_file, "w", newline="")
@@ -187,7 +197,7 @@ class DatasetWriter(object):
             "start_world": start_world,
             "goal_world": goal_world,
             "initial_yaw": initial_yaw,
-            "schema_version": int(cfg.get("schema_version", 22)),
+            "schema_version": int(cfg.get("schema_version", 23)),
             "status": "inprogress",
             "created_at_ns": time.time_ns(),
         }

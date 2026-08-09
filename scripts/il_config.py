@@ -171,6 +171,8 @@ def _validate_config(cfg):
               "macro_expert.side_no_progress_seconds", errors)
     _positive(me.get("observe_no_information_timeout", 4.0),
               "macro_expert.observe_no_information_timeout", errors)
+    _positive(me.get("observe_no_progress_fail_ticks", 35),
+              "macro_expert.observe_no_progress_fail_ticks", errors)
     _positive(me.get("viewpoint_reset_distance_m", 0.35),
               "macro_expert.viewpoint_reset_distance_m", errors)
     _positive(me.get("local_path_fail_threshold", 2),
@@ -193,6 +195,27 @@ def _validate_config(cfg):
         errors.append(
             "macro_expert.macro_intervention_absolute_safety_timeout must "
             "be well above observe_no_information_timeout")
+    # P2/P4 side-commitment consistency and anti-oscillation.
+    _positive(me.get("side_min_hold_s", 1.5),
+              "macro_expert.side_min_hold_s", errors, allow_zero=True)
+    _positive(me.get("side_release_cooldown_s", 1.5),
+              "macro_expert.side_release_cooldown_s", errors, allow_zero=True)
+    _positive(me.get("side_unsafe_clearance_margin_m", 0.05),
+              "macro_expert.side_unsafe_clearance_margin_m", errors,
+              allow_zero=True)
+    _positive(me.get("observed_side_score_margin", 0.15),
+              "macro_expert.observed_side_score_margin", errors,
+              allow_zero=True)
+    _positive(me.get("observe_min_visible_gain", 0.05),
+              "macro_expert.observe_min_visible_gain", errors,
+              allow_zero=True)
+    _positive(me.get("observe_virtual_frontier_distance_m", 2.0),
+              "macro_expert.observe_virtual_frontier_distance_m", errors)
+    _positive(me.get("side_goal_regress_m", 0.35),
+              "macro_expert.side_goal_regress_m", errors, allow_zero=True)
+    _positive(me.get("side_goal_regress_ticks", 3),
+              "macro_expert.side_goal_regress_ticks", errors,
+              allow_zero=True)
 
     # candidate geometry
     _positive(mc.get("side_corridor_radius_m", 0.55),
@@ -229,13 +252,39 @@ def _validate_config(cfg):
                       "max_viewpoint_searches_per_tick")
     _positive(obs.get("max_observe_move_distance_m", 6.0),
               "macro_candidates.observation.max_observe_move_distance_m", errors)
-    _positive(obs.get("information_gain_radius_m", 1.2),
-              "macro_candidates.observation.information_gain_radius_m", errors)
+    _positive(obs.get("visibility_fov_deg", 90.0),
+              "macro_candidates.observation.visibility_fov_deg", errors)
+    if float(obs.get("visibility_fov_deg", 90.0)) > 180.0:
+        errors.append("macro_candidates.observation.visibility_fov_deg "
+                      "must be <= 180")
+    _positive(obs.get("visibility_ray_count", 31),
+              "macro_candidates.observation.visibility_ray_count", errors)
+    _positive(obs.get("visibility_range_m", 4.0),
+              "macro_candidates.observation.visibility_range_m", errors)
     if int(obs.get("max_viewpoint_searches_per_tick", 8)) > \
             int(obs.get("max_viewpoint_candidates", 24)):
         errors.append("macro_candidates.observation."
                       "max_viewpoint_searches_per_tick must be <= "
                       "max_viewpoint_candidates")
+    # P3 known-free recovery (retreat) viewpoints.
+    _positive(obs.get("retreat_searches_per_tick", 3),
+              "macro_candidates.observation.retreat_searches_per_tick",
+              errors, allow_zero=True)
+    ret_dist = obs.get("retreat_distances_m", [0.5, 1.0, 1.5])
+    if not isinstance(ret_dist, list) or not ret_dist or \
+            any(float(v) <= 0 for v in ret_dist):
+        errors.append("macro_candidates.observation.retreat_distances_m "
+                      "must be a non-empty list of positive numbers")
+    _positive(obs.get("retreat_lateral_m", 0.6),
+              "macro_candidates.observation.retreat_lateral_m", errors,
+              allow_zero=True)
+    if int(obs.get("min_frontier_searches_per_tick", 2)) + \
+            int(obs.get("retreat_searches_per_tick", 3)) > \
+            int(obs.get("max_viewpoint_searches_per_tick", 8)):
+        errors.append("macro_candidates.observation."
+                      "min_frontier_searches_per_tick + "
+                      "retreat_searches_per_tick must be <= "
+                      "max_viewpoint_searches_per_tick")
 
     # recoverability — unified LOCAL capability bounds (section II): the
     # privileged audit shares the SAME rejoin distance / duration / path
@@ -297,6 +346,20 @@ def _validate_config(cfg):
               "trajectory_controller.max_acceleration_mps2", errors)
     _positive(tc.get("max_yaw_rate_rps", 2.0),
               "trajectory_controller.max_yaw_rate_rps", errors)
+    ah = tc.get("altitude_hold", {})
+    if not isinstance(ah, dict):
+        errors.append("trajectory_controller.altitude_hold must be a mapping")
+    else:
+        _positive(ah.get("kp", 1.5),
+                  "trajectory_controller.altitude_hold.kp", errors)
+        _positive(ah.get("kd", 0.6),
+                  "trajectory_controller.altitude_hold.kd", errors,
+                  allow_zero=True)
+        _positive(ah.get("deadband_m", 0.02),
+                  "trajectory_controller.altitude_hold.deadband_m", errors,
+                  allow_zero=True)
+        _positive(ah.get("max_speed_mps", 0.6),
+                  "trajectory_controller.altitude_hold.max_speed_mps", errors)
     _positive(tc.get("max_yaw_accel_rps2", 8.0),
               "trajectory_controller.max_yaw_accel_rps2", errors)
     _positive(tc.get("emergency_brake_distance_m", 0.8),
@@ -328,10 +391,10 @@ def _validate_config(cfg):
               "execution_safety.max_emergency_stop_seconds", errors)
 
     # dataset logging
-    _positive(ds.get("schema_version", 22),
+    _positive(ds.get("schema_version", 23),
               "dataset_logging.schema_version", errors)
-    if ds.get("schema_version", 22) != 22:
-        errors.append("dataset_logging.schema_version must be 22")
+    if ds.get("schema_version", 23) != 23:
+        errors.append("dataset_logging.schema_version must be 23")
     _positive(ds.get("perception_range_m", 5.0),
               "dataset_logging.perception_range_m", errors)
     _positive(ds.get("flush_interval_rows", 64),
@@ -377,6 +440,14 @@ def _validate_config(cfg):
     # subtract the vehicle radius, so this is purely the additional margin.
     nav = g.get("navigation", {})
     _positive(nav.get("clearance_m", 0.20), "navigation.clearance_m", errors)
+    # P1 dynamic executability margin: speed-dependent extra buffer for the
+    # LOCAL layer only (planner + braking).  Never a second clearance value.
+    _positive(nav.get("margin_tracking_m", 0.05),
+              "navigation.margin_tracking_m", errors, allow_zero=True)
+    _positive(nav.get("margin_latency_s", 0.10),
+              "navigation.margin_latency_s", errors, allow_zero=True)
+    _positive(nav.get("margin_max_m", 0.25),
+              "navigation.margin_max_m", errors, allow_zero=True)
 
     # scene generation (section LXXV)
     sg = g.get("scene_generation", {})
@@ -398,6 +469,9 @@ def _validate_config(cfg):
     # task generation (section LXXV)
     tg = g.get("task_generation", {})
     if tg.get("enabled", True):
+        _positive(tg.get("validation_speed_mps", 0.0),
+                  "task_generation.validation_speed_mps", errors,
+                  allow_zero=True)
         _positive(tg.get("candidate_batch_size", 64),
                   "task_generation.candidate_batch_size", errors)
         _positive(tg.get("maximum_batches_per_scene", 6),
@@ -527,12 +601,21 @@ def build_macro_candidate_config(g, module):
     # observed LocalPathSearch reachability use the SAME additional margin
     # as every other module.
     cfg.clearance_m = float(nav.get("clearance_m", 0.20))
+    # Round 5: the SAME dynamic-executability margin parameters the 30 Hz
+    # LocalPlanner uses (single source = navigation), so candidate endpoint
+    # filters and FULL-reachable A* are evaluated at a clearance never
+    # below what the planner validates with.
+    cfg.clearance_margin_tracking_m = float(
+        nav.get("margin_tracking_m", 0.05))
+    cfg.clearance_margin_latency_s = float(
+        nav.get("margin_latency_s", 0.10))
+    cfg.clearance_margin_max_m = float(nav.get("margin_max_m", 0.25))
     cfg.candidate_spacing_m = float(mc.get("candidate_spacing_m", 0.5))
     cfg.observe_step_m = float(mc.get("observe_step_m", 0.6))
     cfg.min_observe_move_distance_m = float(
         mc.get("min_observe_move_distance_m", 0.15))
-    # Active observation viewpoint search (section XV): lattice + FULL
-    # LocalPathSearch budget + info-gain radius.
+    # Active observation viewpoint search: lattice + FULL LocalPathSearch
+    # budget + FOV/known-occlusion-aware expected visibility.
     obs = mc.get("observation", {})
     cfg.observe_lateral_distances_m = [float(v) for v in
         obs.get("lateral_distances_m", [0.4, 0.8, 1.2, 1.6])]
@@ -543,10 +626,20 @@ def build_macro_candidate_config(g, module):
         obs.get("max_viewpoint_searches_per_tick", 8))
     cfg.min_frontier_searches_per_tick = int(
         obs.get("min_frontier_searches_per_tick", 2))
+    # P3 known-free recovery (retreat) viewpoints.
+    cfg.retreat_searches_per_tick = int(
+        obs.get("retreat_searches_per_tick", 3))
+    cfg.retreat_distances_m = [float(v) for v in
+        obs.get("retreat_distances_m", [0.5, 1.0, 1.5])]
+    cfg.retreat_lateral_m = float(obs.get("retreat_lateral_m", 0.6))
     cfg.max_observe_move_distance_m = float(
         obs.get("max_observe_move_distance_m", 6.0))
-    cfg.observe_info_gain_radius_m = float(
-        obs.get("information_gain_radius_m", 1.2))
+    cfg.observe_visibility_fov_deg = float(
+        obs.get("visibility_fov_deg", 90.0))
+    cfg.observe_visibility_ray_count = int(
+        obs.get("visibility_ray_count", 31))
+    cfg.observe_visibility_range_m = float(
+        obs.get("visibility_range_m", 4.0))
     cfg.max_frontier_candidates = int(mc.get("max_frontier_candidates", 8))
     cfg.frontier_standoff_m = float(mc.get("frontier_standoff_m", 0.45))
     cfg.goal_frontier_cone_deg = float(mc.get("goal_frontier_cone_deg", 70.0))
@@ -598,6 +691,15 @@ def build_recoverability_config(g, module):
     cfg.rejoin_distance_m = float(lr.get("rejoin_distance_m", 2.5))
     # UNIFIED navigation clearance (problem 4).
     cfg.clearance_m = float(nav.get("clearance_m", 0.20))
+    # Round 6: the SAME dynamic-executability margin parameters the 30 Hz
+    # LocalPlanner and the macro candidate search use (single source =
+    # navigation), so the recoverability query is never more permissive
+    # than actual local planning.
+    cfg.clearance_margin_tracking_m = float(
+        nav.get("margin_tracking_m", 0.05))
+    cfg.clearance_margin_latency_s = float(
+        nav.get("margin_latency_s", 0.10))
+    cfg.clearance_margin_max_m = float(nav.get("margin_max_m", 0.25))
     cfg.max_duration_s = float(lr.get("max_duration_s", 2.5))
     cfg.max_path_length_m = float(lr.get("max_path_length_m", 6.0))
     cfg.min_goal_progress_m = float(lr.get("min_goal_progress_m", 0.30))
@@ -629,6 +731,15 @@ def build_task_generation_config(g, module):
     nav = g.get("navigation", {})
     cfg = module.TaskGenerationConfig()
     cfg.clearance_m = float(nav.get("clearance_m", 0.20))
+    cfg.clearance_margin_tracking_m = float(
+        nav.get("margin_tracking_m", 0.05))
+    cfg.clearance_margin_latency_s = float(
+        nav.get("margin_latency_s", 0.10))
+    cfg.clearance_margin_max_m = float(nav.get("margin_max_m", 0.25))
+    # Stationary validation includes the non-zero tracking floor.  Increasing
+    # this optional speed makes task generation stricter for faster expected
+    # execution without creating another clearance definition.
+    cfg.validation_speed_mps = float(tg.get("validation_speed_mps", 0.0))
     bands = tg.get("distance_bands", {}) or {}
     mins = [float(b.get("min_m", 4.0)) for b in bands.values()]
     maxs = [float(b.get("max_m", 28.0)) for b in bands.values()]
@@ -679,6 +790,13 @@ def build_planner_config(g, module):
     # boundary — both the optimizer's soft target and the hard validation
     # floor.  The observed ESDF already subtracts the vehicle radius.
     cfg.clearance_m = float(nav.get("clearance_m", 0.20))
+    # P1 dynamic executability margin (single source with the Python
+    # braking check): speed-dependent extra buffer for the LOCAL layer.
+    cfg.clearance_margin_tracking_m = float(
+        nav.get("margin_tracking_m", 0.05))
+    cfg.clearance_margin_latency_s = float(
+        nav.get("margin_latency_s", 0.10))
+    cfg.clearance_margin_max_m = float(nav.get("margin_max_m", 0.25))
     cfg.collision_check_spacing = float(to.get("collision_check_spacing", 0.05))
     cfg.weight_path_length = float(to.get("weight_path_length", 0.05))
     cfg.weight_smooth = float(to.get("weight_smooth", 1.0))

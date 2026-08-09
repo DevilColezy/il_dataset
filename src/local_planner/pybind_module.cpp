@@ -264,8 +264,11 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("observed_path_length", &MacroCandidate::observed_path_length)
         .def_readwrite("minimum_clearance", &MacroCandidate::minimum_clearance)
         .def_readwrite("goal_progress", &MacroCandidate::goal_progress)
+        .def_readwrite("observation_yaw_world",
+                       &MacroCandidate::observation_yaw_world)
         .def_readwrite("left_edge_visible", &MacroCandidate::left_edge_visible)
         .def_readwrite("right_edge_visible", &MacroCandidate::right_edge_visible)
+        .def_readwrite("observed_score", &MacroCandidate::observed_score)
         .def_readwrite("unknown_information_gain",
                        &MacroCandidate::unknown_information_gain)
         .def_readwrite("connected_to_goal", &MacroCandidate::connected_to_goal)
@@ -320,7 +323,9 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("duration_s", &LocalPlanResult::duration_s)
         .def_readwrite("planning_time_ms", &LocalPlanResult::planning_time_ms)
         .def_readwrite("plan_id", &LocalPlanResult::plan_id)
-        .def_readwrite("search_status", &LocalPlanResult::search_status);
+        .def_readwrite("search_status", &LocalPlanResult::search_status)
+        .def_readwrite("effective_clearance_m",
+                       &LocalPlanResult::effective_clearance_m);
 
     py::class_<ControllerCommand>(m, "ControllerCommand")
         .def(py::init<>())
@@ -606,6 +611,12 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def(py::init<>())
         .def_readwrite("rejoin_distance_m", &RecoverabilityConfig::rejoin_distance_m)
         .def_readwrite("clearance_m", &RecoverabilityConfig::clearance_m)
+        .def_readwrite("clearance_margin_tracking_m",
+                       &RecoverabilityConfig::clearance_margin_tracking_m)
+        .def_readwrite("clearance_margin_latency_s",
+                       &RecoverabilityConfig::clearance_margin_latency_s)
+        .def_readwrite("clearance_margin_max_m",
+                       &RecoverabilityConfig::clearance_margin_max_m)
         .def_readwrite("max_duration_s", &RecoverabilityConfig::max_duration_s)
         .def_readwrite("max_path_length_m", &RecoverabilityConfig::max_path_length_m)
         .def_readwrite("min_goal_progress_m", &RecoverabilityConfig::min_goal_progress_m)
@@ -646,6 +657,12 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &MacroCandidateConfig::edge_search_radius_m)
         .def_readwrite("clearance_m",
                        &MacroCandidateConfig::clearance_m)
+        .def_readwrite("clearance_margin_tracking_m",
+                       &MacroCandidateConfig::clearance_margin_tracking_m)
+        .def_readwrite("clearance_margin_latency_s",
+                       &MacroCandidateConfig::clearance_margin_latency_s)
+        .def_readwrite("clearance_margin_max_m",
+                       &MacroCandidateConfig::clearance_margin_max_m)
         .def_readwrite("candidate_spacing_m",
                        &MacroCandidateConfig::candidate_spacing_m)
         .def_readwrite("observe_step_m", &MacroCandidateConfig::observe_step_m)
@@ -661,10 +678,20 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &MacroCandidateConfig::max_viewpoint_searches_per_tick)
         .def_readwrite("min_frontier_searches_per_tick",
                        &MacroCandidateConfig::min_frontier_searches_per_tick)
+        .def_readwrite("retreat_searches_per_tick",
+                       &MacroCandidateConfig::retreat_searches_per_tick)
+        .def_readwrite("retreat_distances_m",
+                       &MacroCandidateConfig::retreat_distances_m)
+        .def_readwrite("retreat_lateral_m",
+                       &MacroCandidateConfig::retreat_lateral_m)
         .def_readwrite("max_observe_move_distance_m",
                        &MacroCandidateConfig::max_observe_move_distance_m)
-        .def_readwrite("observe_info_gain_radius_m",
-                       &MacroCandidateConfig::observe_info_gain_radius_m)
+        .def_readwrite("observe_visibility_fov_deg",
+                       &MacroCandidateConfig::observe_visibility_fov_deg)
+        .def_readwrite("observe_visibility_ray_count",
+                       &MacroCandidateConfig::observe_visibility_ray_count)
+        .def_readwrite("observe_visibility_range_m",
+                       &MacroCandidateConfig::observe_visibility_range_m)
         .def_readwrite("max_frontier_candidates",
                        &MacroCandidateConfig::max_frontier_candidates)
         .def_readwrite("frontier_standoff_m",
@@ -719,6 +746,10 @@ PYBIND11_MODULE(_il_local_planner, m) {
                       &ObserveDiagnostics::lattice_candidate_count)
         .def_readonly("frontier_candidate_count",
                       &ObserveDiagnostics::frontier_candidate_count)
+        .def_readonly("retreat_candidate_count",
+                      &ObserveDiagnostics::retreat_candidate_count)
+        .def_readonly("retreat_full_count",
+                      &ObserveDiagnostics::retreat_full_count)
         .def_readonly("endpoint_known_free_count",
                       &ObserveDiagnostics::endpoint_known_free_count)
         .def_readonly("full_local_count",
@@ -942,6 +973,12 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("horizontal_avoidance_only",
                        &TrajectoryOptimizationConfig::horizontal_avoidance_only)
         .def_readwrite("clearance_m", &TrajectoryOptimizationConfig::clearance_m)
+        .def_readwrite("clearance_margin_tracking_m",
+                       &TrajectoryOptimizationConfig::clearance_margin_tracking_m)
+        .def_readwrite("clearance_margin_latency_s",
+                       &TrajectoryOptimizationConfig::clearance_margin_latency_s)
+        .def_readwrite("clearance_margin_max_m",
+                       &TrajectoryOptimizationConfig::clearance_margin_max_m)
         .def_readwrite("collision_check_spacing",
                        &TrajectoryOptimizationConfig::collision_check_spacing)
         .def_readwrite("weight_path_length",
@@ -993,7 +1030,10 @@ PYBIND11_MODULE(_il_local_planner, m) {
              py::arg("request"),
              "Plan a 30 Hz local trajectory. Releases the GIL.")
         .def("validate_trajectory", &LocalPlanner::validateTrajectory,
-             py::arg("trajectory"))
+             py::arg("trajectory"), py::arg("state"),
+             "Validate a complete trajectory with the speed-dependent "
+             "effective clearance evaluated at `state` (the trajectory "
+             "start state).  Never more permissive than plan().")
         .def("validate_trajectory_suffix",
              [](const LocalPlanner& self,
                 const std::vector<TrajectoryPoint>& trajectory,
@@ -1009,6 +1049,15 @@ PYBIND11_MODULE(_il_local_planner, m) {
              py::arg("trajectory"), py::arg("plan_start_time"),
              py::arg("current_time"), py::arg("state"),
              py::arg("max_position_error"), py::arg("max_velocity_error"))
+        .def("effective_clearance_for",
+             [](const LocalPlanner& self, const VehicleState& state) {
+                 return self.effectiveClearance(state);
+             },
+             py::arg("state"),
+             "Round 5: the SINGLE C++ effective-clearance computation "
+             "(unified dynamic margin).  Python calls this instead of "
+             "re-deriving the formula, so the braking check always uses "
+             "exactly the boundary the planner validates with.")
         .def("current_plan_id", &LocalPlanner::currentPlanId);
 
     // ── TaskGenerationOracle (scene/task generation time only) ──────
@@ -1045,6 +1094,14 @@ PYBIND11_MODULE(_il_local_planner, m) {
     py::class_<TaskGenerationConfig>(m, "TaskGenerationConfig")
         .def(py::init<>())
         .def_readwrite("clearance_m", &TaskGenerationConfig::clearance_m)
+        .def_readwrite("clearance_margin_tracking_m",
+                       &TaskGenerationConfig::clearance_margin_tracking_m)
+        .def_readwrite("clearance_margin_latency_s",
+                       &TaskGenerationConfig::clearance_margin_latency_s)
+        .def_readwrite("clearance_margin_max_m",
+                       &TaskGenerationConfig::clearance_margin_max_m)
+        .def_readwrite("validation_speed_mps",
+                       &TaskGenerationConfig::validation_speed_mps)
         .def_readwrite("min_task_distance_m",
                        &TaskGenerationConfig::min_task_distance_m)
         .def_readwrite("max_task_distance_m",
