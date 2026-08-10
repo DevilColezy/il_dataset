@@ -33,6 +33,7 @@
 
 #include "il_dataset/local_planner/types.hpp"
 #include "il_dataset/local_planner/observed_map.hpp"
+#include "il_dataset/local_planner/goal_capture_controller.hpp"
 #include "il_dataset/local_planner/esdf_grid.hpp"
 #include "il_dataset/local_planner/local_path_search.hpp"
 #include "il_dataset/local_planner/local_recoverability.hpp"
@@ -193,6 +194,7 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .value("ROTATE_ONLY", ExecutionMode::ROTATE_ONLY)
         .value("BRAKE_HOLD", ExecutionMode::BRAKE_HOLD)
         .value("EMERGENCY_STOP", ExecutionMode::EMERGENCY_STOP)
+        .value("GOAL_CAPTURE", ExecutionMode::GOAL_CAPTURE)
         .export_values();
 
     // ── Data structures ─────────────────────────────────────────────
@@ -332,6 +334,38 @@ PYBIND11_MODULE(_il_local_planner, m) {
         .def_readwrite("velocity_flu", &ControllerCommand::velocity_flu)
         .def_readwrite("yaw_rate", &ControllerCommand::yaw_rate)
         .def_readwrite("valid", &ControllerCommand::valid);
+
+    py::class_<GoalCaptureConfig>(m, "GoalCaptureConfig")
+        .def(py::init<>())
+        .def_readwrite("position_tolerance_m",
+                       &GoalCaptureConfig::position_tolerance_m)
+        .def_readwrite("speed_tolerance_mps",
+                       &GoalCaptureConfig::speed_tolerance_mps)
+        .def_readwrite("approach_deceleration_mps2",
+                       &GoalCaptureConfig::approach_deceleration_mps2)
+        .def_readwrite("max_approach_speed_mps",
+                       &GoalCaptureConfig::max_approach_speed_mps)
+        .def_readwrite("return_speed_mps",
+                       &GoalCaptureConfig::return_speed_mps)
+        .def_readwrite("position_gain", &GoalCaptureConfig::position_gain)
+        .def_readwrite("max_acceleration_mps2",
+                       &GoalCaptureConfig::max_acceleration_mps2)
+        .def_readwrite("max_jerk_mps3",
+                       &GoalCaptureConfig::max_jerk_mps3);
+
+    py::class_<GoalCaptureCommand>(m, "GoalCaptureCommand")
+        .def(py::init<>())
+        .def_readwrite("velocity_world",
+                       &GoalCaptureCommand::velocity_world)
+        .def_readwrite("valid", &GoalCaptureCommand::valid)
+        .def_readwrite("braking", &GoalCaptureCommand::braking);
+
+    py::class_<GoalCaptureController>(m, "GoalCaptureController")
+        .def(py::init<const GoalCaptureConfig&>(), py::arg("config"))
+        .def("reset", &GoalCaptureController::reset)
+        .def("compute", &GoalCaptureController::compute,
+             py::arg("state"), py::arg("goal_world"),
+             py::arg("capture_latched"), py::arg("dt_s"));
 
     py::class_<ValidationResult>(m, "ValidationResult")
         .def(py::init<>())
@@ -544,6 +578,11 @@ PYBIND11_MODULE(_il_local_planner, m) {
                                          required_clearance);
              },
              py::arg("point_world"), py::arg("required_clearance"))
+        .def("segment_known_and_clear",
+             &ObservedMap::segmentKnownAndClear,
+             py::arg("start_world"), py::arg("end_world"),
+             py::arg("required_clearance"),
+             py::arg("sample_spacing_m"))
         .def("esdf_value",
              [](const ObservedMap& self, const Eigen::Vector3d& p) {
                  return self.esdfValue(p.x(), p.y(), p.z());
@@ -617,6 +656,8 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &RecoverabilityConfig::clearance_margin_latency_s)
         .def_readwrite("clearance_margin_max_m",
                        &RecoverabilityConfig::clearance_margin_max_m)
+        .def_readwrite("planning_clearance_margin_m",
+                       &RecoverabilityConfig::planning_clearance_margin_m)
         .def_readwrite("max_duration_s", &RecoverabilityConfig::max_duration_s)
         .def_readwrite("max_path_length_m", &RecoverabilityConfig::max_path_length_m)
         .def_readwrite("min_goal_progress_m", &RecoverabilityConfig::min_goal_progress_m)
@@ -663,6 +704,10 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &MacroCandidateConfig::clearance_margin_latency_s)
         .def_readwrite("clearance_margin_max_m",
                        &MacroCandidateConfig::clearance_margin_max_m)
+        .def_readwrite("planning_clearance_margin_m",
+                       &MacroCandidateConfig::planning_clearance_margin_m)
+        .def_readwrite("nominal_speed_mps",
+                       &MacroCandidateConfig::nominal_speed_mps)
         .def_readwrite("candidate_spacing_m",
                        &MacroCandidateConfig::candidate_spacing_m)
         .def_readwrite("observe_step_m", &MacroCandidateConfig::observe_step_m)
@@ -696,6 +741,8 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &MacroCandidateConfig::max_frontier_candidates)
         .def_readwrite("frontier_standoff_m",
                        &MacroCandidateConfig::frontier_standoff_m)
+        .def_readwrite("frontier_prefix_horizon_m",
+                       &MacroCandidateConfig::frontier_prefix_horizon_m)
         .def_readwrite("goal_frontier_cone_deg",
                        &MacroCandidateConfig::goal_frontier_cone_deg)
         .def_readwrite("corridor_check_spacing_m",
@@ -736,7 +783,9 @@ PYBIND11_MODULE(_il_local_planner, m) {
              py::arg("map"), py::arg("state"), py::arg("goal_world"),
              py::arg("blocker"), py::arg("prev_candidate_world") = py::none())
         .def("last_observe_diagnostics",
-             &MacroCandidateSearch::lastObserveDiagnostics);
+             &MacroCandidateSearch::lastObserveDiagnostics)
+        .def("required_clearance_m",
+             &MacroCandidateSearch::requiredClearance);
 
     py::class_<ObserveDiagnostics>(m, "ObserveDiagnostics")
         .def(py::init<>())
@@ -979,6 +1028,8 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &TrajectoryOptimizationConfig::clearance_margin_latency_s)
         .def_readwrite("clearance_margin_max_m",
                        &TrajectoryOptimizationConfig::clearance_margin_max_m)
+        .def_readwrite("planning_clearance_margin_m",
+                       &TrajectoryOptimizationConfig::planning_clearance_margin_m)
         .def_readwrite("collision_check_spacing",
                        &TrajectoryOptimizationConfig::collision_check_spacing)
         .def_readwrite("weight_path_length",
@@ -1100,6 +1151,10 @@ PYBIND11_MODULE(_il_local_planner, m) {
                        &TaskGenerationConfig::clearance_margin_latency_s)
         .def_readwrite("clearance_margin_max_m",
                        &TaskGenerationConfig::clearance_margin_max_m)
+        .def_readwrite("planning_clearance_margin_m",
+                       &TaskGenerationConfig::planning_clearance_margin_m)
+        .def_readwrite("task_robustness_margin_m",
+                       &TaskGenerationConfig::task_robustness_margin_m)
         .def_readwrite("validation_speed_mps",
                        &TaskGenerationConfig::validation_speed_mps)
         .def_readwrite("min_task_distance_m",

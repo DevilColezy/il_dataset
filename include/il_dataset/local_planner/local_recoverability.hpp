@@ -28,6 +28,8 @@ struct RecoverabilityConfig {
     double clearance_margin_tracking_m = 0.05;
     double clearance_margin_latency_s = 0.10;
     double clearance_margin_max_m = 0.25;
+    /// Additional quality band used by every fresh local plan.
+    double planning_clearance_margin_m = 0.10;
     /// Fixed local planning horizon: the path must be executable within it.
     double max_duration_s = 2.5;
     /// Max allowed local path length (m).

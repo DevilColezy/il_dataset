@@ -44,15 +44,17 @@ struct TrajectoryOptimizationConfig {
     // travelled before the command takes effect) and a constant tracking-
     // error floor, capped by margin_max_m.  The effective boundary is
     // `clearance_m + min(margin_max_m, tracking + latency*speed)` and is
-    // applied consistently to the A* seed, the optimizer cost/floor, the
-    // fresh validation AND the cached-suffix validation of the LOCAL
-    // layer.  All OTHER modules (recoverability, candidates, privileged
-    // audit, global connectivity) keep the unified base `clearance_m` so
-    // the decision boundary stays module-consistent; only the executable
-    // 30 Hz trajectory is planned/validated with the extra buffer.
+    // forms the hard safety floor for every local validation. Fresh A*,
+    // optimization and fresh validation add `planning_clearance_margin_m`
+    // below; cached suffixes intentionally retain this hard floor so a
+    // newly observed cell cannot make an already safe braking manoeuvre
+    // disappear solely for quality reasons.
     double clearance_margin_tracking_m = 0.05;
     double clearance_margin_latency_s = 0.10;
     double clearance_margin_max_m = 0.25;
+    /// Extra quality margin used only when constructing a fresh trajectory.
+    /// The hard dynamic boundary remains the cache/braking safety floor.
+    double planning_clearance_margin_m = 0.10;
     double collision_check_spacing = 0.05;
 
     // Cost weights

@@ -48,21 +48,21 @@ bool segmentKnownAndClear(const ObservedMap& map,
 
 /// Build the search config for a candidate's reachability query.
 ///
-/// Round 5: the observed FULL-reachable A* uses the SAME dynamic effective
-/// clearance as the 30 Hz LocalPlanner (evaluated at the current vehicle
-/// speed), so a candidate the macro marks FULL is never immediately
+/// Round 5: the observed FULL-reachable A* uses the SAME nominal planning
+/// clearance as the 30 Hz LocalPlanner, so a candidate marked FULL is never
+/// immediately
 /// rejected by the local planner over an inconsistent safety margin.  The
 /// formula is the shared C++ effectiveClearanceForSpeed() — never a local
 /// copy.
 LocalSearchConfig makeSearchConfig(const MacroCandidateConfig& config,
-                                   Side committed_side,
-                                   double speed_mps) {
+                                   Side committed_side) {
     LocalSearchConfig search_config;
     const DynamicClearanceConfig clearance{
         config.clearance_m, config.clearance_margin_tracking_m,
         config.clearance_margin_latency_s, config.clearance_margin_max_m};
-    search_config.clearance_m = effectiveClearanceForSpeed(clearance,
-                                                           speed_mps);
+    search_config.clearance_m = planningClearanceForSpeed(
+        clearance, config.nominal_speed_mps,
+        config.planning_clearance_margin_m);
     search_config.max_time_ms = config.search_max_time_ms;
     search_config.region_margin_m = config.search_region_margin_m;
     search_config.side_bias_gain = config.side_bias_gain;
@@ -72,12 +72,12 @@ LocalSearchConfig makeSearchConfig(const MacroCandidateConfig& config,
 }
 
 /// Round 5: the candidate-search view of the shared dynamic clearance.
-double effectiveCandidateClearance(const MacroCandidateConfig& config,
-                                   double speed_mps) {
+double effectiveCandidateClearance(const MacroCandidateConfig& config) {
     const DynamicClearanceConfig clearance{
         config.clearance_m, config.clearance_margin_tracking_m,
         config.clearance_margin_latency_s, config.clearance_margin_max_m};
-    return effectiveClearanceForSpeed(clearance, speed_mps);
+    return planningClearanceForSpeed(clearance, config.nominal_speed_mps,
+                                     config.planning_clearance_margin_m);
 }
 
 /// World delta -> FLU using yaw only (level body).  UNIFIED FLU convention
@@ -135,26 +135,33 @@ BlockComponent floodBlockedComponent(const ObservedMap& map,
     const double res = map.resolution();
     const Eigen::Vector3d origin = map.origin();
     const double z_world = origin.z() + (static_cast<double>(z_index) + 0.5) * res;
-    auto occupancy_at = [&](int ix, int iy) -> std::uint8_t {
-        if (ix < 0 || ix >= gx || iy < 0 || iy >= gy || z_index < 0 ||
-            z_index >= map.gz()) {
-            return UNKNOWN;
-        }
-        const std::int64_t idx =
-            (static_cast<std::int64_t>(ix) * gy + iy) * map.gz() + z_index;
-        return map.occupancy()[static_cast<size_t>(idx)];
-    };
-    auto known_free_at = [&](int ix, int iy) {
+    const double seed_wx =
+        origin.x() + (static_cast<double>(seed_ix) + 0.5) * res;
+    const double seed_wy =
+        origin.y() + (static_cast<double>(seed_iy) + 0.5) * res;
+    const bool seed_known = map.isKnown(seed_wx, seed_wy, z_world);
+    const double seed_clearance = map.esdfValue(seed_wx, seed_wy, z_world);
+    // A FREE voxel inside the ESDF safety band is blocked by known geometry,
+    // not by missing information.  Treating only raw OCCUPIED seeds as known
+    // sent grazing corridors into an OBSERVE scan loop.
+    comp.blocked_by_known =
+        seed_known && std::isfinite(seed_clearance) &&
+        seed_clearance <= block_clearance;
+    auto blocked_at = [&](int ix, int iy) {
         if (std::abs(ix - seed_ix) > region_radius_cells ||
             std::abs(iy - seed_iy) > region_radius_cells) {
-            return true;  // treat far cells as free to bound the region
+            return false;
         }
-        const double wx = origin.x() + (static_cast<double>(ix) + 0.5) * res;
-        const double wy = origin.y() + (static_cast<double>(iy) + 0.5) * res;
-        return map.isKnownFree(wx, wy, z_world, block_clearance);
+        const double wx =
+            origin.x() + (static_cast<double>(ix) + 0.5) * res;
+        const double wy =
+            origin.y() + (static_cast<double>(iy) + 0.5) * res;
+        const bool known = map.isKnown(wx, wy, z_world);
+        if (!comp.blocked_by_known) return !known;
+        const double clearance = map.esdfValue(wx, wy, z_world);
+        return known && std::isfinite(clearance) &&
+               clearance <= block_clearance;
     };
-    const std::uint8_t seed_state = occupancy_at(seed_ix, seed_iy);
-    comp.blocked_by_known = (seed_state == OCCUPIED);
 
     std::vector<int> queue;
     queue.reserve(4096);
@@ -182,14 +189,14 @@ BlockComponent floodBlockedComponent(const ObservedMap& map,
         comp.max_ix = std::max(comp.max_ix, ix);
         comp.min_iy = std::min(comp.min_iy, iy);
         comp.max_iy = std::max(comp.max_iy, iy);
-        if (known_free_at(ix, iy)) continue;
+        if (!blocked_at(ix, iy)) continue;
         for (int n = 0; n < 8; ++n) {
             const int nxi = ix + di[n];
             const int nyi = iy + dj[n];
             if (nxi < 0 || nxi >= gx || nyi < 0 || nyi >= gy) continue;
             const int nindex = nyi * gx + nxi;
             if (visited[static_cast<size_t>(nindex)] != 0) continue;
-            if (!known_free_at(nxi, nyi)) {
+            if (blocked_at(nxi, nyi)) {
                 visited[static_cast<size_t>(nindex)] = 1;
                 queue.push_back(nindex);
             }
@@ -234,6 +241,8 @@ GoalBlocker analyzeGoalBlocker(const ObservedMap& map,
     const Eigen::Vector2d goal_dir = travel / travel_len;
 
     const double z = state.position.z();
+    const double effective_clearance =
+        effectiveCandidateClearance(config);
     const double max_walk = std::min(travel_len, config.edge_search_radius_m);
     Eigen::Vector3d block_point{Eigen::Vector3d::Zero()};
     bool found = false;
@@ -247,7 +256,8 @@ GoalBlocker analyzeGoalBlocker(const ObservedMap& map,
         const Eigen::Vector3d point(
             state.position.x() + goal_dir.x() * d,
             state.position.y() + goal_dir.y() * d, z);
-        if (!map.isKnownFree(point.x(), point.y(), point.z(), 0.0)) {
+        if (!map.isKnownFree(point.x(), point.y(), point.z(),
+                             effective_clearance)) {
             block_point = point;
             found = true;
             blocking_ray_depth = d;
@@ -266,7 +276,7 @@ GoalBlocker analyzeGoalBlocker(const ObservedMap& map,
         std::max(8, static_cast<int>(std::ceil(config.edge_search_radius_m / res)));
     const BlockComponent comp =
         floodBlockedComponent(map, block_ix, block_iy, block_iz,
-                              config.clearance_m,
+                              effective_clearance,
                               region_radius);
     if (comp.count > 0) {
         blocker.centroid = comp.centroid;
@@ -298,7 +308,8 @@ GoalBlocker analyzeGoalBlocker(const ObservedMap& map,
 
     // ── Edge visibility + known corridor on each side ──────────────
     const Eigen::Vector2d perp(-goal_dir.y(), goal_dir.x());  // + = left
-    const double corridor_clearance = config.side_corridor_radius_m;
+    const double corridor_clearance =
+        std::max(config.side_corridor_radius_m, effective_clearance);
     const int max_edge_cells =
         static_cast<int>(std::ceil(config.edge_search_radius_m / res));
     for (int side_sign = -1; side_sign <= 1; side_sign += 2) {
@@ -333,6 +344,10 @@ GoalBlocker analyzeGoalBlocker(const ObservedMap& map,
         }
     }
     return blocker;
+}
+
+double MacroCandidateSearch::requiredClearance() const {
+    return effectiveCandidateClearance(config_);
 }
 
 void MacroCandidateSearch::scoreObserved(MacroCandidate* candidate,
@@ -372,7 +387,7 @@ void MacroCandidateSearch::scoreObserved(MacroCandidate* candidate,
         // planner uses (round 5): a continuation point that would not be
         // executable locally is not reported as reachable either.
         const double effective_clearance =
-            effectiveCandidateClearance(config_, state.velocity.norm());
+            effectiveCandidateClearance(config_);
         candidate->known_reachable = segmentKnownAndClear(
             map, state.position, candidate->position_world,
             effective_clearance);
@@ -437,7 +452,7 @@ void MacroCandidateSearch::evaluateObservedReachability(
     // fixed-clearance FULL (macro) vs dynamic-clearance execution (local)
     // mismatch.
     const LocalSearchConfig search_config =
-        makeSearchConfig(config_, bias_side, state.velocity.norm());
+        makeSearchConfig(config_, bias_side);
     const LocalPathResult path_result =
         search.search(map, state, candidate->position_world, search_config);
     candidate->full_goal_reached =
@@ -518,6 +533,7 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeObserveCandidates(
     int emit_budget) const {
     std::vector<MacroCandidate> raw;
     emit_budget = std::max(0, emit_budget);
+    if (emit_budget == 0) return raw;
     const Eigen::Vector2d travel =
         goal_world.head<2>() - state.position.head<2>();
     const double travel_len = travel.norm();
@@ -534,8 +550,7 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeObserveCandidates(
     // Round 5: the lattice endpoint must be known-free with the SAME
     // dynamic effective clearance the 30 Hz planner validates with, never
     // the fixed base clearance.
-    const double clear = effectiveCandidateClearance(
-        config_, state.velocity.norm());
+    const double clear = effectiveCandidateClearance(config_);
     // Lateral x forward x {LEFT, RIGHT}: a small local viewpoint lattice
     // (section XV).  Forward 0 still yields near-side viewpoints at
     // lateral offsets; every candidate is a real world position the drone
@@ -653,8 +668,10 @@ MacroCandidate MacroCandidateSearch::makeSideCandidate(
             const Eigen::Vector3d probe(
                 edge.x() + goal_dir.x() * d,
                 edge.y() + goal_dir.y() * d, z);
-            if (segmentKnownAndClear(map, edge, probe,
-                                     config_.side_corridor_radius_m)) {
+            if (segmentKnownAndClear(
+                    map, edge, probe,
+                    std::max(config_.side_corridor_radius_m,
+                             requiredClearance()))) {
                 advance = probe;
             } else {
                 break;
@@ -690,12 +707,35 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeFrontierCandidates(
     struct FrontierCell {
         Eigen::Vector3d world;
         double standoff;
+        bool is_safe_prefix = false;
     };
     std::vector<FrontierCell> cells;
     cells.reserve(512);
     const Eigen::Vector3d origin = map.origin();
     const int iz = static_cast<int>(std::floor(
         (z - origin.z()) / res));
+    // First emit the farthest short segment on the goal ray that is fully
+    // observed and clear at the execution clearance.  Unlike a grid A*
+    // terminal at the distant map frontier, this is a straight, conservative
+    // prefix that the spline planner can execute without cutting a corner.
+    const double clear = effectiveCandidateClearance(config_);
+    const double prefix_horizon = std::min(
+        std::min(travel_len, config_.edge_search_radius_m),
+        config_.frontier_prefix_horizon_m);
+    Eigen::Vector3d safe_prefix = state.position;
+    const double prefix_step = std::max(res, 0.10);
+    for (double d = config_.min_observe_move_distance_m;
+         d <= prefix_horizon + 1.0e-6; d += prefix_step) {
+        const Eigen::Vector3d point(
+            state.position.x() + goal_dir.x() * d,
+            state.position.y() + goal_dir.y() * d, z);
+        if (!segmentKnownAndClear(map, state.position, point, clear)) break;
+        safe_prefix = point;
+    }
+    if ((safe_prefix - state.position).norm() >=
+        config_.min_observe_move_distance_m) {
+        cells.push_back({safe_prefix, 0.0, true});
+    }
     for (int ix = 0; ix < map.gx(); ++ix) {
         for (int iy = 0; iy < map.gy(); ++iy) {
             const std::int64_t idx =
@@ -709,7 +749,10 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeFrontierCandidates(
             const Eigen::Vector2d offset(wx - state.position.x(),
                                          wy - state.position.y());
             const double dist = offset.norm();
-            if (dist <= 1.0 || dist > config_.edge_search_radius_m) continue;
+            if (dist <= config_.min_observe_move_distance_m ||
+                dist > config_.edge_search_radius_m) {
+                continue;
+            }
             if (dist > kEpsilon) {
                 const double cos_angle = offset.dot(goal_dir) / dist;
                 if (cos_angle < cos_cone) continue;
@@ -736,7 +779,7 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeFrontierCandidates(
             }
             if (!adjacent_unknown) continue;
             cells.push_back({Eigen::Vector3d(wx, wy, z),
-                             config_.frontier_standoff_m});
+                             config_.frontier_standoff_m, false});
         }
     }
     observe_diag_.raw_candidate_count += static_cast<int>(cells.size());
@@ -754,7 +797,12 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeFrontierCandidates(
         bool inserted = false;
         for (auto& entry : best_per_bin) {
             if (entry.first == bin) {
-                if (score > entry.second.world.head<2>().dot(goal_dir)) {
+                const double old_score =
+                    entry.second.world.head<2>().dot(goal_dir);
+                if ((cell.is_safe_prefix && !entry.second.is_safe_prefix) ||
+                    (cell.is_safe_prefix == entry.second.is_safe_prefix &&
+                     ((cell.is_safe_prefix && score < old_score) ||
+                      (!cell.is_safe_prefix && score > old_score)))) {
                     entry.second = cell;
                 }
                 inserted = true;
@@ -766,8 +814,12 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeFrontierCandidates(
     std::sort(best_per_bin.begin(), best_per_bin.end(),
               [&](const std::pair<int, FrontierCell>& a,
                   const std::pair<int, FrontierCell>& b) {
-                  return a.second.world.head<2>().dot(goal_dir) >
-                         b.second.world.head<2>().dot(goal_dir);
+                   if (a.second.is_safe_prefix != b.second.is_safe_prefix) {
+                       return a.second.is_safe_prefix;
+                   }
+                   const double pa = a.second.world.head<2>().dot(goal_dir);
+                   const double pb = b.second.world.head<2>().dot(goal_dir);
+                   return pa > pb;
               });
     const int limit =
         std::min(config_.max_frontier_candidates,
@@ -778,15 +830,21 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeFrontierCandidates(
         const Eigen::Vector2d dir = (cell.world.head<2>() -
                                      state.position.head<2>())
                                         .normalized();
+        // A freshly integrated map can expose a frontier only a few cells
+        // ahead.  Preserve a nonzero forward prefix instead of pulling that
+        // endpoint back to (or behind) the vehicle.
+        const double standoff = std::min(
+            cell.standoff,
+            std::max(0.0, (cell.world - state.position).norm() -
+                              config_.min_observe_move_distance_m));
         const Eigen::Vector3d pulled(
-            cell.world.x() - dir.x() * cell.standoff,
-            cell.world.y() - dir.y() * cell.standoff, z);
+            cell.world.x() - dir.x() * standoff,
+            cell.world.y() - dir.y() * standoff, z);
         // Endpoint sits on the KNOWN-FREE side of the frontier with the
         // SAME dynamic effective clearance the 30 Hz planner uses (round
         // 5) — never a narrower fixed boundary.
         if (!map.isKnownFree(pulled.x(), pulled.y(), pulled.z(),
-                             effectiveCandidateClearance(
-                                 config_, state.velocity.norm()))) {
+                             effectiveCandidateClearance(config_))) {
             continue;
         }
         MacroCandidate candidate;
@@ -808,21 +866,30 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeFrontierCandidates(
             candidate.side = Side::NONE;
         }
         candidate.position_world = pulled;
-        candidate.source = "goal_frontier";
+        candidate.source = cell.is_safe_prefix ? "goal_safe_prefix"
+                                                : "goal_frontier";
         candidate.observation_yaw_world = observationYawTowardGoal(
             pulled, goal_world, state.yaw);
         candidate.unknown_information_gain = estimateVisibleUnknownGain(
             map, pulled, candidate.observation_yaw_world);
         candidates.push_back(candidate);
     }
-    // Honor the shared FULL-search budget: keep only the highest-gain
-    // frontiers that still fit within the remaining searches.
+    // Preserve the short executable prefix before optional distant frontier
+    // candidates when applying the bounded FULL-search budget.
     if (static_cast<int>(candidates.size()) > remaining_searches) {
         std::sort(candidates.begin(), candidates.end(),
-                  [](const MacroCandidate& a, const MacroCandidate& b) {
-                      return a.unknown_information_gain >
-                             b.unknown_information_gain;
-                  });
+                  [&](const MacroCandidate& a, const MacroCandidate& b) {
+                       const bool a_prefix = a.source == "goal_safe_prefix";
+                       const bool b_prefix = b.source == "goal_safe_prefix";
+                       if (a_prefix != b_prefix) return a_prefix;
+                       const double da =
+                           (a.position_world - state.position).norm();
+                       const double db =
+                           (b.position_world - state.position).norm();
+                       if (a_prefix) return da > db;
+                       return a.unknown_information_gain >
+                              b.unknown_information_gain;
+                   });
         candidates.resize(static_cast<size_t>(remaining_searches));
     }
     observe_diag_.frontier_candidate_count =
@@ -851,8 +918,7 @@ std::vector<MacroCandidate> MacroCandidateSearch::makeRetreatCandidates(
     // Round 5: the retreat endpoint must be known-free with the SAME
     // dynamic effective clearance as the 30 Hz planner (and FULL-verified
     // by the observed A* in scoreObserved).  Unknown is never traversable.
-    const double clear = effectiveCandidateClearance(
-        config_, state.velocity.norm());
+    const double clear = effectiveCandidateClearance(config_);
     const double lateral = config_.retreat_lateral_m;
     // Backward x {-lateral, 0, +lateral}: known-free points BEHIND the
     // drone.  Moderate negative goal progress is allowed — the whole point
@@ -976,6 +1042,7 @@ std::vector<MacroCandidate> MacroCandidateSearch::generateCandidates(
         // A viewpoint never needs to be straight-line visible from here —
         // the A* can detour around known obstacles exactly like the 30 Hz
         // planner, and a blocked direct corridor is NOT a rejection.
+        if (config_.max_viewpoint_searches_per_tick > 0) {
         const int frontier_reserve = std::min(
             config_.max_frontier_candidates,
             config_.min_frontier_searches_per_tick);
@@ -1004,6 +1071,7 @@ std::vector<MacroCandidate> MacroCandidateSearch::generateCandidates(
         std::vector<MacroCandidate> retreats =
             makeRetreatCandidates(map, state, goal_world, retreat_budget);
         candidates.insert(candidates.end(), retreats.begin(), retreats.end());
+        }
     }
 
     // ── Previous strategic continuation ────────────────────────────

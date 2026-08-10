@@ -38,6 +38,13 @@ struct MacroCandidateConfig {
     double clearance_margin_tracking_m = 0.05;
     double clearance_margin_latency_s = 0.10;
     double clearance_margin_max_m = 0.25;
+    /// Match LocalPlanner's fresh-planning quality margin so macro
+    /// candidates do not target routes the local planner intentionally
+    /// rejects as too close to obstacles.
+    double planning_clearance_margin_m = 0.10;
+    /// Fixed speed used for all macro-candidate clearance tests.  This must
+    /// equal the local planner's nominal execution speed.
+    double nominal_speed_mps = 1.8;
     /// Spacing between consecutive SIDE candidates along the corridor.
     double candidate_spacing_m = 0.5;
     /// Forward step of OBSERVE candidates (kept very short / known-safe).
@@ -45,7 +52,7 @@ struct MacroCandidateConfig {
     /// Minimum candidate->current distance for an OBSERVE candidate to be
     /// emitted at all.  A zero-distance probe must never be generated: it
     /// would be trivially FULL-reachable and masquerade as an OBSERVE_MOVE.
-    double min_observe_move_distance_m = 0.15;
+    double min_observe_move_distance_m = 0.50;
     // ── Active observation viewpoint search (section XV) ───────────────
     /// Lattice of lateral (perpendicular to the goal ray) and forward
     /// offsets around the current position.  Every (forward, lateral)
@@ -60,7 +67,7 @@ struct MacroCandidateConfig {
     /// GOAL_FRONTIER movement candidates per tick.  The cheap endpoint
     /// filter and the information-gain / clearance / distance rank run
     /// first; only the top candidates get the full search.
-    int max_viewpoint_searches_per_tick = 8;
+    int max_viewpoint_searches_per_tick = 0;
     /// Minimum FULL searches reserved for GOAL_FRONTIER candidates each
     /// tick (so the lattice can never starve the frontier source).
     int min_frontier_searches_per_tick = 2;    // ── P3 known-free recovery (retreat) viewpoints ─────────────────
@@ -89,6 +96,10 @@ struct MacroCandidateConfig {
     int max_frontier_candidates = 8;
     /// Pull-back of frontier candidates into known space.
     double frontier_standoff_m = 0.45;
+    /// Maximum forward distance of the conservative known-free prefix used
+    /// before any UNKNOWN frontier.  This is deliberately short: it is an
+    /// executable observation advance, not a long-horizon macro waypoint.
+    double frontier_prefix_horizon_m = 1.20;
     /// Half-cone (deg) around the goal direction for frontier extraction.
     double goal_frontier_cone_deg = 70.0;
     /// Straight-line corridor check spacing.
@@ -162,6 +173,10 @@ public:
     const ObserveDiagnostics& lastObserveDiagnostics() const {
         return observe_diag_;
     }
+
+    /// Exact safety clearance shared by candidate endpoints, blocker rays
+    /// and observed-map path searches.
+    double requiredClearance() const;
 
 private:
     /// REAL observed-map reachability for movement candidates (section

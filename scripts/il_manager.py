@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 il_manager.py  —  IL dataset collection manager (two-level navigation
-expert, schema v23).
+expert, schema v24).
 
 Automatic unattended lifecycle (section I/XX/XXIV-XXVIII):
     connect AvoidBench (10253/10254)
@@ -73,6 +73,7 @@ from il_common import (
 from il_config import (
     load_config,
     build_observed_map_config,
+    build_goal_capture_config,
     build_oracle_config,
     build_macro_candidate_config,
     build_recoverability_config,
@@ -144,9 +145,8 @@ class ILManager(object):
         # Round 5: the UNIFIED navigation clearance and its speed-dependent
         # dynamic margin are computed by the C++ LocalPlanner — Python calls
         # `_local_planner.effective_clearance_for(state)` (e.g. the braking
-        # check) instead of re-deriving the formula, so the boundary always
-        # matches the planner's exactly (no duplicated, drifting Python
-        # formula, no stale base-clearance field).
+        # check and cached-suffix safety) instead of re-deriving the hard
+        # boundary in Python. Fresh plans add their C++ quality margin.
         # Scene settle + point-cloud completion config (sections VIII/XXIV).
         self._scene_runtime = self.g.get("scene_runtime", {})
         _pc_cfg = self.g.get("pointcloud", {})
@@ -171,6 +171,8 @@ class ILManager(object):
         self._observed_map = module.ObservedMap(build_observed_map_config(self.g, module))
         self._local_planner = module.LocalPlanner(build_planner_config(self.g, module))
         self._local_planner.set_map(self._observed_map)
+        self._goal_capture_controller = module.GoalCaptureController(
+            build_goal_capture_config(self.g, module))
         self._recoverability = module.LocalRecoverability(
             build_recoverability_config(self.g, module))
         self._candidate_config = build_macro_candidate_config(self.g, module)
@@ -184,11 +186,12 @@ class ILManager(object):
         # Macro expert
         macro_cfg = dict(self.g.get("macro_expert", {}))
         macro_cfg.update(self.g.get("macro_candidates", {}))
-        macro_cfg.update(self.g.get("privileged_intervention", {}))
+        goal_capture_cfg = self._controller_cfg.get("goal_capture", {})
+        macro_cfg["goal_approach_deceleration_mps2"] = float(
+            goal_capture_cfg.get("approach_deceleration_mps2", 2.5))
         self._macro_expert = MacroExpert(
             macro_cfg, module, self._recoverability,
-            self._candidate_search, self._oracle,
-            self._intervention_oracle, self._candidate_config)
+            self._candidate_search, self._candidate_config)
 
         # Dynamics
         self._dynamics = create_dynamics_backend(cfg)
@@ -859,6 +862,10 @@ class ILManager(object):
         self._macro_expert.reset()
         self._intervention_oracle.reset()
         self._trajectory_reached_goal = False
+        # A fast vehicle can pass through the goal tolerance disc between
+        # 5 Hz macro ticks. This latch requests terminal recovery but is not
+        # itself a success declaration.
+        self._goal_capture_latched = False
         self._exit_reason = ""
         # P1/P5 per-episode safety + failure-taxonomy bookkeeping.
         self._last_plan_failure_status = None
@@ -872,6 +879,7 @@ class ILManager(object):
         self._emergency_stop_time = 0.0
         self._active_result = None
         self._active_plan_start_time = None
+        self._active_plan_action = None
         self._total_plans = 0
         self._successful_plans = 0
         self._frame_latencies = []
@@ -881,6 +889,8 @@ class ILManager(object):
         self._last_velocity_world = None
         self._last_acceleration_world = None
         self._last_yaw_rate = 0.0
+        self._last_execution_mode = None
+        self._goal_capture_controller.reset()
         # 30 Hz -> 5 Hz macro-interval feedback accumulator (section XX).
         self._macro_feedback = self._new_macro_feedback()
         self._macro_feedback_log = None
@@ -1031,6 +1041,10 @@ class ILManager(object):
                 self._exit_reason = "trajectory_timeout"
                 break
             timestamp = sim_elapsed
+            if np.linalg.norm(np.asarray(pos, dtype=np.float64) - goal) <= \
+                    float(self.g.get("macro_expert", {}).get(
+                        "goal_tolerance_m", 0.30)):
+                self._goal_capture_latched = True
 
             # ── 2. Depth ────────────────────────────────────────────
             depth_frame = self._request_depth_frame(frame_id, pos, quat)
@@ -1062,6 +1076,8 @@ class ILManager(object):
             if is_macro_tick:
                 dt_macro = macro_interval * dt
                 interval_feedback = self._consume_macro_interval_feedback()
+                interval_feedback["goal_capture_latched"] = int(
+                    self._goal_capture_latched)
                 self._macro_feedback_log = interval_feedback
                 self._macro_feedback_is_new = 1
                 held_action = self._macro_expert.update(
@@ -1129,29 +1145,34 @@ class ILManager(object):
             result = self._local_planner.plan(req)
             self._total_plans += 1
 
-            # ── P1 stale cached-plan invalidation ───────────────────
-            # A safety-critical fresh-plan failure invalidates the cached
-            # trajectory: the old suffix describes a world state that just
-            # became invalid (collision / unknown / dead-end).  Re-executing
-            # it afterwards could approach the very obstacle that caused the
-            # failure, so the cache is cleared and the active plan is marked
-            # void BEFORE execution selection — the episode can only brake,
-            # hold or stop, never steer with a stale plan.
-            if result.status in _critical_plan_failures:
-                self._last_plan_failure_status = int(result.status)
-                self._critical_plan_failure_occurred = True
-
+            # Classify a planning failure only after execution selection.
+            # A cached suffix has its own current-map validation; camera
+            # rotation and goal capture do not execute this spline result.
             # ── 6. Execution selection (section XIII) ───────────────
             execution_mode, trajectory, fresh_plan, cached_used, \
                 sample_offset = self._select_execution(
                     result, last_trajectory, last_plan_time, sim_elapsed,
-                    held_action, state)
-            if result.success:
+                    held_action, state, goal)
+            planning_failure_executed = execution_mode in (
+                module.ExecutionMode.BRAKE_HOLD,
+                module.ExecutionMode.EMERGENCY_STOP)
+            if planning_failure_executed and \
+                    result.status in _critical_plan_failures:
+                self._last_plan_failure_status = int(result.status)
+                self._critical_plan_failure_occurred = True
+            # A successful replan is a candidate replacement, not an order to
+            # restart execution at trajectory t=0.  Only the trajectory that
+            # is actually selected for execution becomes the active cache.
+            if execution_mode == module.ExecutionMode.TRACK_FRESH:
                 self._successful_plans += 1
                 self._consecutive_plan_failures = 0
                 self._local_unrecoverable_pending = False
                 last_trajectory = result.trajectory
                 last_plan_time = sim_elapsed
+            elif result.success:
+                self._successful_plans += 1
+                self._consecutive_plan_failures = 0
+                self._local_unrecoverable_pending = False
 
             # Executed-plan semantics (sections XVII/XVIII): the training
             # labels and plan metadata must describe the ACTIVE executed
@@ -1159,6 +1180,7 @@ class ILManager(object):
             if execution_mode == module.ExecutionMode.TRACK_FRESH:
                 self._active_result = result
                 self._active_plan_start_time = sim_elapsed
+                self._active_plan_action = self._action_signature(held_action)
                 executed_result = result
             elif execution_mode == module.ExecutionMode.TRACK_CACHED and \
                     self._active_result is not None:
@@ -1166,11 +1188,17 @@ class ILManager(object):
             else:
                 executed_result = result
             if execution_mode == module.ExecutionMode.TRACK_CACHED:
-                # Cached execution: the planner failed but the previous
-                # trajectory suffix is still safe (no episode abort).
+                # Cached execution: a per-frame validated active suffix
+                # remains selected, whether the replacement replan succeeded
+                # or failed.  The controller therefore advances in simulated
+                # trajectory time instead of restarting at t=0.
                 pass
-            elif execution_mode not in (
-                    module.ExecutionMode.TRACK_FRESH,):
+            elif execution_mode in (
+                    module.ExecutionMode.ROTATE_ONLY,
+                    module.ExecutionMode.GOAL_CAPTURE):
+                self._consecutive_plan_failures = 0
+                self._local_unrecoverable_pending = False
+            elif execution_mode != module.ExecutionMode.TRACK_FRESH:
                 self._consecutive_plan_failures += 1
                 self._local_unrecoverable_pending = \
                     self._consecutive_plan_failures >= 2
@@ -1192,6 +1220,7 @@ class ILManager(object):
                 last_plan_time = None
                 self._active_result = None
                 self._active_plan_start_time = None
+                self._active_plan_action = None
                 self._emergency_stop_time += dt
                 if self._emergency_stop_time > \
                         self._safety_cfg.get("max_emergency_stop_seconds", 2.0):
@@ -1204,8 +1233,7 @@ class ILManager(object):
             # not just the last frame before its tick.
             fb = self._macro_feedback
             fb["interval_frame_count"] += 1
-            if not result.success and \
-                    execution_mode != module.ExecutionMode.TRACK_CACHED:
+            if not result.success and planning_failure_executed:
                 fb["planning_failure_count"] += 1
             if execution_mode == module.ExecutionMode.TRACK_FRESH:
                 fb["fresh_frame_count"] += 1
@@ -1221,7 +1249,7 @@ class ILManager(object):
             # ── 7. Trajectory controller ────────────────────────────
             cmd = self._compute_command(
                 trajectory, state, ds, execution_mode, held_action,
-                goal[2], sample_offset)
+                goal, goal[2], sample_offset)
             if cmd is None:
                 self._exit_reason = "controller_invalid"
                 break
@@ -1418,21 +1446,74 @@ class ILManager(object):
         return None
 
     # ── Execution selection (section XIII) ───────────────────────────
+    @staticmethod
+    def _action_signature(action):
+        if action is None:
+            return None
+        return {
+            "mode": int(action.mode),
+            "guide": np.asarray(action.guide_world, dtype=np.float64).copy(),
+            "has_yaw": bool(action.has_desired_yaw),
+            "yaw": float(action.desired_yaw_world),
+            "side": int(action.committed_side),
+            "observe_subtype": int(getattr(action, "observe_subtype", 0)),
+        }
+
+    def _active_plan_matches_action(self, held_action):
+        active = self._active_plan_action
+        if active is None or held_action is None:
+            return False
+        current = self._action_signature(held_action)
+        if (active["mode"] != current["mode"] or
+                active["side"] != current["side"] or
+                active["observe_subtype"] != current["observe_subtype"] or
+                active["has_yaw"] != current["has_yaw"]):
+            return False
+        if np.linalg.norm(active["guide"] - current["guide"]) > \
+                float(self._safety_cfg.get(
+                    "active_guide_replan_distance_m", 0.50)):
+            return False
+        if active["has_yaw"] and abs(normalize_angle(
+                active["yaw"] - current["yaw"])) > float(
+                    self._safety_cfg.get("active_yaw_replan_delta_rad", 0.20)):
+            return False
+        return True
+
     def _select_execution(self, result, last_trajectory, last_plan_time,
-                          sim_elapsed, held_action, state):
+                          sim_elapsed, held_action, state, goal_world):
         safety = self._safety_cfg
-        if result.success:
-            return (module.ExecutionMode.TRACK_FRESH, result.trajectory,
-                    True, False, 0.0)
+        # The terminal controller is allowed only over a complete segment
+        # that is already known-free in the causal observed map.  The
+        # ignored spline result therefore cannot leak hidden geometry.
+        if held_action is not None and \
+                held_action.mode == module.MacroMode.GOAL_APPROACH:
+            vs = module.VehicleState()
+            vs.position = state["position"]
+            vs.velocity = state["velocity"]
+            vs.acceleration = state["acceleration"]
+            vs.yaw = state["yaw"]
+            vs.yaw_rate = state["yaw_rate"]
+            if self._observed_map.segment_known_and_clear(
+                    state["position"], goal_world,
+                    self._local_planner.effective_clearance_for(vs), 0.05):
+                return (module.ExecutionMode.GOAL_CAPTURE, [],
+                        False, False, 0.0)
+
+        # A camera-only macro action preempts any old forward trajectory.
+        if held_action is not None and \
+                held_action.mode == module.MacroMode.OBSERVE and \
+                getattr(held_action, "observe_subtype", 0) == 0:
+            return (module.ExecutionMode.ROTATE_ONLY, [], False, False, 0.0)
 
         # Cached trajectory: the C++ suffix validator re-checks the
         # remaining segment against the CURRENT observed map (section
         # VIII).  The controller samples it with an offset equal to the
         # trajectory age (sim_elapsed - plan_start_time) — all on the
         # SIMULATION time axis.
-        if last_trajectory and last_plan_time is not None:
+        if (last_trajectory and last_plan_time is not None and
+                self._active_plan_matches_action(held_action)):
             age = sim_elapsed - last_plan_time
-            if age <= safety.get("max_plan_age_s", 0.20):
+            if age <= safety.get("max_plan_age_s", 0.70):
                 remaining = last_trajectory[-1].t - age
                 if remaining >= safety.get("min_remaining_trajectory_s", 0.10):
                     vs = module.VehicleState()
@@ -1449,13 +1530,9 @@ class ILManager(object):
                         return (module.ExecutionMode.TRACK_CACHED,
                                 last_trajectory, False, True, age)
 
-        # Macro OBSERVE_ROTATE -> rotate only (pure rotation, zero
-        # velocity).  OBSERVE_MOVE (observe_subtype == 1) has a forward
-        # observation-probe goal, so it falls through to normal planning.
-        if held_action is not None and \
-                held_action.mode == module.MacroMode.OBSERVE and \
-                getattr(held_action, "observe_subtype", 0) == 0:
-            return (module.ExecutionMode.ROTATE_ONLY, [], False, False, 0.0)
+        if result.success:
+            return (module.ExecutionMode.TRACK_FRESH, result.trajectory,
+                    True, False, 0.0)
 
         # Emergency brake when the swept braking volume collides (C++).
         if self._collision_risk(state):
@@ -1484,9 +1561,10 @@ class ILManager(object):
         unknown space is never silently treated as safe and the episode
         cannot enter BRAKE_HOLD and wait without a risk diagnosis.
 
-        The effective boundary is the SINGLE C++ computation
-        (`_local_planner.effective_clearance_for`), identical to what the
-        planner validates trajectories with — no Python-side formula."""
+        The hard boundary is the SINGLE C++ computation
+        (`_local_planner.effective_clearance_for`), shared with cached
+        suffix validation. Fresh planning adds its C++ quality margin; no
+        Python-side safety formula is duplicated here."""
         vs = module.VehicleState()
         vs.position = state["position"]
         vs.velocity = state["velocity"]
@@ -1503,7 +1581,8 @@ class ILManager(object):
 
     # ── Trajectory controller (section XII) ──────────────────────────
     def _compute_command(self, trajectory, state, ds, execution_mode,
-                         held_action, altitude_target_z, sample_offset=0.0):
+                         held_action, goal_world, altitude_target_z,
+                         sample_offset=0.0):
         tc = self._controller_cfg
         out = {"velocity_flu": np.zeros(3), "yaw_rate": 0.0}
         max_yaw_rate = tc.get("max_yaw_rate_rps", 2.0)
@@ -1516,6 +1595,10 @@ class ILManager(object):
         yaw_gain = tc.get("yaw_gain", 2.0)
         yaw = float(state["yaw"])
         quat = ds.quaternion_world_body
+
+        if execution_mode == module.ExecutionMode.GOAL_CAPTURE and \
+                self._last_execution_mode != module.ExecutionMode.GOAL_CAPTURE:
+            self._goal_capture_controller.reset()
 
         if execution_mode in (module.ExecutionMode.TRACK_FRESH,
                               module.ExecutionMode.TRACK_CACHED):
@@ -1551,6 +1634,17 @@ class ILManager(object):
                 vel_world = vel_world * (max_vel / speed)
             prev = getattr(self, "_last_velocity_world", None)
             prev_accel = getattr(self, "_last_acceleration_world", None)
+            if self._last_execution_mode not in (
+                    module.ExecutionMode.TRACK_FRESH,
+                    module.ExecutionMode.TRACK_CACHED):
+                # A fresh trajectory is initialized from the measured
+                # physical state after rotate/brake/emergency, not from the
+                # previous mode's zero/hold command.  This prevents the first
+                # recovered plan from commanding near-zero velocity while the
+                # vehicle is still moving.
+                prev = np.asarray(state["velocity"], dtype=np.float64)
+                prev_accel = np.asarray(state["acceleration"],
+                                        dtype=np.float64)
             if prev is not None:
                 delta = vel_world - prev
                 delta_norm = float(np.linalg.norm(delta))
@@ -1564,11 +1658,6 @@ class ILManager(object):
                     desired_accel = prev_accel + \
                         accel_change * (jerk_limit / change_norm)
                     vel_world = prev + desired_accel * self._dt
-            self._last_velocity_world = vel_world
-            if prev is not None:
-                self._last_acceleration_world = (vel_world - prev) / self._dt
-            else:
-                self._last_acceleration_world = np.zeros(3)
             vel_flu = world_vector_to_body_flu_quat(vel_world, quat)
             out["velocity_flu"] = vel_flu
 
@@ -1580,6 +1669,32 @@ class ILManager(object):
             yr = max(-max_yaw_rate, min(max_yaw_rate, yr))
             prev_yr = getattr(self, "_last_yaw_rate", 0.0)
             yr = max(prev_yr - max_yaw_accel, min(prev_yr + max_yaw_accel, yr))
+            self._last_yaw_rate = yr
+            out["yaw_rate"] = yr
+        elif execution_mode == module.ExecutionMode.GOAL_CAPTURE:
+            vs = module.VehicleState()
+            vs.position = state["position"]
+            vs.velocity = state["velocity"]
+            vs.acceleration = state["acceleration"]
+            vs.yaw = state["yaw"]
+            vs.yaw_rate = state["yaw_rate"]
+            capture = self._goal_capture_controller.compute(
+                vs, goal_world, self._goal_capture_latched, self._dt)
+            if not capture.valid:
+                return None
+            vel_world = np.asarray(capture.velocity_world,
+                                   dtype=np.float64)
+            out["velocity_flu"] = world_vector_to_body_flu_quat(
+                vel_world, quat)
+            yaw_target = yaw
+            if held_action is not None and held_action.has_desired_yaw:
+                yaw_target = held_action.desired_yaw_world
+            yaw_err = normalize_angle(yaw_target - yaw)
+            yr = max(-max_yaw_rate, min(max_yaw_rate,
+                                        yaw_gain * yaw_err))
+            prev_yr = getattr(self, "_last_yaw_rate", 0.0)
+            yr = max(prev_yr - max_yaw_accel,
+                     min(prev_yr + max_yaw_accel, yr))
             self._last_yaw_rate = yr
             out["yaw_rate"] = yr
         elif execution_mode == module.ExecutionMode.ROTATE_ONLY:
@@ -1597,8 +1712,6 @@ class ILManager(object):
             self._last_yaw_rate = yr
             out["yaw_rate"] = yr
             out["velocity_flu"] = np.zeros(3)
-            self._last_velocity_world = np.zeros(3)
-            self._last_acceleration_world = np.zeros(3)
         elif execution_mode == module.ExecutionMode.BRAKE_HOLD:
             # Decelerate to hover.
             vel_flu = world_vector_to_body_flu_quat(state["velocity"], quat)
@@ -1610,8 +1723,6 @@ class ILManager(object):
                 vel_flu = np.zeros(3)
             out["velocity_flu"] = vel_flu
             out["yaw_rate"] = 0.0
-            self._last_velocity_world = np.zeros(3)
-            self._last_acceleration_world = np.zeros(3)
             self._last_yaw_rate = 0.0
         else:  # EMERGENCY_STOP
             # Emergency deceleration toward hover (stronger than brake).
@@ -1625,8 +1736,6 @@ class ILManager(object):
                 vel_flu = np.zeros(3)
             out["velocity_flu"] = vel_flu
             out["yaw_rate"] = 0.0
-            self._last_velocity_world = np.zeros(3)
-            self._last_acceleration_world = np.zeros(3)
             self._last_yaw_rate = 0.0
 
         # The local search is intentionally planar at the task flight
@@ -1659,6 +1768,22 @@ class ILManager(object):
             out["velocity_flu"], max_vel)
         out["yaw_rate"] = float(np.clip(out["yaw_rate"], -max_yaw_rate,
                                         max_yaw_rate))
+        final_velocity_world = body_flu_vector_to_world_quat(
+            out["velocity_flu"], quat)
+        previous_velocity_world = getattr(
+            self, "_last_velocity_world", None)
+        if execution_mode in (module.ExecutionMode.TRACK_FRESH,
+                              module.ExecutionMode.TRACK_CACHED) and \
+                self._last_execution_mode not in (
+                    module.ExecutionMode.TRACK_FRESH,
+                    module.ExecutionMode.TRACK_CACHED):
+            previous_velocity_world = np.asarray(
+                state["velocity"], dtype=np.float64)
+        self._last_velocity_world = final_velocity_world
+        self._last_acceleration_world = (
+            np.zeros(3) if previous_velocity_world is None else
+            (final_velocity_world - previous_velocity_world) / self._dt)
+        self._last_execution_mode = execution_mode
         return out
 
     # ── Dataset row (section XIV) ────────────────────────────────────
@@ -1694,7 +1819,10 @@ class ILManager(object):
         # minimum_clearance, plan age and plan status all describe the
         # ACTIVE executed trajectory (fresh or cached), while the fresh
         # planning attempt status is kept as a pure diagnostic.
-        executed_ok = executed_result.success and \
+        executed_tracking = execution_mode in (
+            module.ExecutionMode.TRACK_FRESH,
+            module.ExecutionMode.TRACK_CACHED)
+        executed_ok = executed_tracking and executed_result.success and \
             len(executed_result.trajectory) > 0
         local_terminal_flu = np.zeros(3)
         if executed_ok:
@@ -1924,6 +2052,7 @@ class ILManager(object):
             "desired_yaw_sin": math.sin(desired_yaw_delta),
             "desired_yaw_cos": math.cos(desired_yaw_delta),
             # local labels — EXECUTED plan semantics (section XVIII)
+            "local_terminal_valid": int(executed_ok),
             "local_terminal_world_x": executed_result.trajectory_terminal[0]
             if executed_ok else 0.0,
             "local_terminal_world_y": executed_result.trajectory_terminal[1]
@@ -1942,9 +2071,12 @@ class ILManager(object):
             "cached_plan_used": int(cached_used),
             "active_plan_is_fresh": int(fresh_plan),
             "active_plan_is_cached": int(cached_used),
-            "planning_status": int(executed_result.status),
-            "minimum_clearance": executed_result.min_clearance,
-            "trajectory_duration_s": executed_result.duration_s,
+            "planning_status": int(executed_result.status)
+            if executed_tracking else -1,
+            "minimum_clearance": executed_result.min_clearance
+            if executed_tracking else -1.0,
+            "trajectory_duration_s": executed_result.duration_s
+            if executed_tracking else -1.0,
             "fresh_planning_status": int(planning_attempt.status),
             # privileged diagnostics
             "local_recoverable": local_recoverable,
@@ -1992,11 +2124,13 @@ class ILManager(object):
             # goal / plan bookkeeping — executed-plan semantics (XVII)
             "goal_world_x": goal[0], "goal_world_y": goal[1], "goal_world_z": goal[2],
             "distance_to_final_goal": goal_dist,
-            "plan_id": executed_result.plan_id,
-            "plan_age_s": plan_age_s,
+            "plan_id": executed_result.plan_id if executed_tracking else -1,
+            "plan_age_s": plan_age_s if executed_tracking else -1.0,
             "plan_is_fresh": int(fresh_plan),
-            "plan_status": int(executed_result.status),
-            "plan_compute_ms": executed_result.planning_time_ms,
+            "plan_status": int(executed_result.status)
+            if executed_tracking else -1,
+            "plan_compute_ms": executed_result.planning_time_ms
+            if executed_tracking else -1.0,
             "scene_id": self._dataset_scene_key,
             "task_id": self._current_task_id,
             "episode_valid": 1,

@@ -140,31 +140,46 @@ def _validate_config(cfg):
     if lookahead > 0.9 * min(half_x, half_y):
         errors.append("macro_lookahead_distance_m must fit the observed map")
 
-    # causal_feedback (sections XXV/XXVI): 30 Hz -> 5 Hz interval
-    # thresholds for DIRECT causal evidence.
-    cf = me.get("causal_feedback", {})
-    _positive(cf.get("interval_failure_threshold", 2),
-              "macro_expert.causal_feedback.interval_failure_threshold",
-              errors, allow_zero=True)
-    _positive(cf.get("local_failure_macro_ticks", 2),
-              "macro_expert.causal_feedback.local_failure_macro_ticks",
-              errors, allow_zero=True)
-    _bounded(cf.get("cached_ratio_threshold", 0.5),
-             "macro_expert.causal_feedback.cached_ratio_threshold",
-             0.0, 1.0, errors)
-    _positive(cf.get("cached_macro_ticks", 2),
-              "macro_expert.causal_feedback.cached_macro_ticks",
-              errors, allow_zero=True)
-    _bounded(cf.get("brake_ratio_threshold", 0.5),
-             "macro_expert.causal_feedback.brake_ratio_threshold",
-             0.0, 1.0, errors)
-    _positive(cf.get("brake_macro_ticks", 2),
-              "macro_expert.causal_feedback.brake_macro_ticks",
-              errors, allow_zero=True)
-    _positive(cf.get("emergency_macro_ticks", 1),
-              "macro_expert.causal_feedback.emergency_macro_ticks",
-              errors, allow_zero=True)
+    _bounded(me.get("local_bend_max_deg", 25.0),
+             "macro_expert.local_bend_max_deg", 1.0, 89.0, errors)
+    _bounded(me.get("local_lateral_ratio_max", 0.30),
+             "macro_expert.local_lateral_ratio_max", 0.01, 2.0, errors)
+    _positive(me.get("local_failure_count_for_observe", 4),
+              "macro_expert.local_failure_count_for_observe", errors)
+    _positive(me.get("observe_target_failure_ticks", 2),
+              "macro_expert.observe_target_failure_ticks", errors)
+    _positive(me.get("observe_target_retire_max_speed_mps", 0.30),
+              "macro_expert.observe_target_retire_max_speed_mps", errors,
+              allow_zero=True)
+    _positive(me.get("initial_map_warmup_s", 1.0),
+              "macro_expert.initial_map_warmup_s", errors, allow_zero=True)
+    _bounded(me.get("initial_goal_alignment_tolerance_deg", 8.0),
+             "macro_expert.initial_goal_alignment_tolerance_deg",
+             1.0, 45.0, errors)
+    _positive(me.get("initial_goal_alignment_min_duration_s", 0.20),
+              "macro_expert.initial_goal_alignment_min_duration_s", errors,
+              allow_zero=True)
+    _bounded(me.get("observe_scan_half_angle_deg", 35.0),
+             "macro_expert.observe_scan_half_angle_deg", 5.0, 80.0,
+             errors)
+    _positive(me.get("observe_scan_hold_s", 0.20),
+              "macro_expert.observe_scan_hold_s", errors,
+              allow_zero=True)
+    _bounded(me.get("observe_scan_yaw_tolerance_deg", 6.0),
+             "macro_expert.observe_scan_yaw_tolerance_deg", 1.0, 20.0,
+             errors)
+    _positive(me.get("side_release_clear_ticks", 2),
+              "macro_expert.side_release_clear_ticks", errors)
+
     _positive(me.get("goal_tolerance_m", 0.30), "macro_expert.goal_tolerance_m", errors)
+    _positive(me.get("goal_speed_tolerance_mps", 0.20),
+              "macro_expert.goal_speed_tolerance_mps", errors)
+    _positive(me.get("goal_approach_radius_m", 0.80),
+              "macro_expert.goal_approach_radius_m", errors)
+    if me.get("goal_approach_radius_m", 0.80) < \
+            me.get("goal_tolerance_m", 0.30):
+        errors.append("macro_expert.goal_approach_radius_m must be >= "
+                      "goal_tolerance_m")
     _positive(me.get("direct_intervention_timeout", 5.0),
               "macro_expert.direct_intervention_timeout", errors)
     _positive(me.get("side_no_progress_seconds", 6.0),
@@ -220,8 +235,14 @@ def _validate_config(cfg):
     # candidate geometry
     _positive(mc.get("side_corridor_radius_m", 0.55),
               "macro_candidates.side_corridor_radius_m", errors)
-    _positive(mc.get("min_observe_move_distance_m", 0.15),
+    _positive(mc.get("min_observe_move_distance_m", 0.50),
               "macro_candidates.min_observe_move_distance_m", errors)
+    _positive(mc.get("frontier_prefix_horizon_m", 1.20),
+              "macro_candidates.frontier_prefix_horizon_m", errors)
+    if mc.get("frontier_prefix_horizon_m", 1.20) < \
+            mc.get("min_observe_move_distance_m", 0.50):
+        errors.append("macro_candidates.frontier_prefix_horizon_m must be >= "
+                      "min_observe_move_distance_m")
     if mc.get("side_corridor_radius_m", 0.55) <= veh.get("radius_m", 0.30):
         errors.append(
             "macro_candidates.side_corridor_radius_m must exceed vehicle.radius_m")
@@ -370,6 +391,22 @@ def _validate_config(cfg):
             "removed; use max_jerk_mps3 + max_acceleration_mps2 instead")
     _positive(tc.get("max_jerk_mps3", 25.0),
               "trajectory_controller.max_jerk_mps3", errors)
+    gc = tc.get("goal_capture", {})
+    if not isinstance(gc, dict):
+        errors.append("trajectory_controller.goal_capture must be a mapping")
+    else:
+        _positive(gc.get("approach_deceleration_mps2", 2.5),
+                  "trajectory_controller.goal_capture."
+                  "approach_deceleration_mps2", errors)
+        _positive(gc.get("max_approach_speed_mps", 0.8),
+                  "trajectory_controller.goal_capture."
+                  "max_approach_speed_mps", errors)
+        _positive(gc.get("return_speed_mps", 0.25),
+                  "trajectory_controller.goal_capture.return_speed_mps",
+                  errors)
+        _positive(gc.get("position_gain", 1.0),
+                  "trajectory_controller.goal_capture.position_gain",
+                  errors)
 
     # execution safety
     es = g.get("execution_safety", {})
@@ -377,6 +414,10 @@ def _validate_config(cfg):
               "execution_safety.max_plan_age_s", errors)
     _positive(es.get("min_remaining_trajectory_s", 0.25),
               "execution_safety.min_remaining_trajectory_s", errors)
+    _positive(es.get("active_guide_replan_distance_m", 0.50),
+              "execution_safety.active_guide_replan_distance_m", errors)
+    _positive(es.get("active_yaw_replan_delta_rad", 0.20),
+              "execution_safety.active_yaw_replan_delta_rad", errors)
     _positive(es.get("max_position_error_m", 0.6),
               "execution_safety.max_position_error_m", errors)
     _positive(es.get("max_velocity_error_mps", 1.0),
@@ -391,10 +432,10 @@ def _validate_config(cfg):
               "execution_safety.max_emergency_stop_seconds", errors)
 
     # dataset logging
-    _positive(ds.get("schema_version", 23),
+    _positive(ds.get("schema_version", 24),
               "dataset_logging.schema_version", errors)
-    if ds.get("schema_version", 23) != 23:
-        errors.append("dataset_logging.schema_version must be 23")
+    if ds.get("schema_version", 24) != 24:
+        errors.append("dataset_logging.schema_version must be 24")
     _positive(ds.get("perception_range_m", 5.0),
               "dataset_logging.perception_range_m", errors)
     _positive(ds.get("flush_interval_rows", 64),
@@ -448,6 +489,9 @@ def _validate_config(cfg):
               "navigation.margin_latency_s", errors, allow_zero=True)
     _positive(nav.get("margin_max_m", 0.25),
               "navigation.margin_max_m", errors, allow_zero=True)
+    _positive(nav.get("planning_quality_margin_m", 0.10),
+              "navigation.planning_quality_margin_m", errors,
+              allow_zero=True)
 
     # scene generation (section LXXV)
     sg = g.get("scene_generation", {})
@@ -469,6 +513,9 @@ def _validate_config(cfg):
     # task generation (section LXXV)
     tg = g.get("task_generation", {})
     if tg.get("enabled", True):
+        _positive(tg.get("robustness_margin_m", 0.10),
+                  "task_generation.robustness_margin_m", errors,
+                  allow_zero=True)
         _positive(tg.get("validation_speed_mps", 0.0),
                   "task_generation.validation_speed_mps", errors,
                   allow_zero=True)
@@ -558,6 +605,27 @@ def build_observed_map_config(g, module):
     return cfg
 
 
+def build_goal_capture_config(g, module):
+    macro = g.get("macro_expert", {})
+    controller = g.get("trajectory_controller", {})
+    capture = controller.get("goal_capture", {})
+    cfg = module.GoalCaptureConfig()
+    cfg.position_tolerance_m = float(
+        macro.get("goal_tolerance_m", 0.30))
+    cfg.speed_tolerance_mps = float(
+        macro.get("goal_speed_tolerance_mps", 0.20))
+    cfg.approach_deceleration_mps2 = float(
+        capture.get("approach_deceleration_mps2", 2.5))
+    cfg.max_approach_speed_mps = float(
+        capture.get("max_approach_speed_mps", 0.80))
+    cfg.return_speed_mps = float(capture.get("return_speed_mps", 0.25))
+    cfg.position_gain = float(capture.get("position_gain", 1.0))
+    cfg.max_acceleration_mps2 = float(
+        controller.get("max_acceleration_mps2", 3.5))
+    cfg.max_jerk_mps3 = float(controller.get("max_jerk_mps3", 25.0))
+    return cfg
+
+
 def build_oracle_config(g, module):
     to_ = g.get("task_oracle", {})
     nav = g.get("navigation", {})
@@ -610,10 +678,14 @@ def build_macro_candidate_config(g, module):
     cfg.clearance_margin_latency_s = float(
         nav.get("margin_latency_s", 0.10))
     cfg.clearance_margin_max_m = float(nav.get("margin_max_m", 0.25))
+    cfg.planning_clearance_margin_m = float(
+        nav.get("planning_quality_margin_m", 0.10))
+    cfg.nominal_speed_mps = float(
+        g.get("trajectory_optimization", {}).get("nominal_speed", 1.8))
     cfg.candidate_spacing_m = float(mc.get("candidate_spacing_m", 0.5))
     cfg.observe_step_m = float(mc.get("observe_step_m", 0.6))
     cfg.min_observe_move_distance_m = float(
-        mc.get("min_observe_move_distance_m", 0.15))
+        mc.get("min_observe_move_distance_m", 0.50))
     # Active observation viewpoint search: lattice + FULL LocalPathSearch
     # budget + FOV/known-occlusion-aware expected visibility.
     obs = mc.get("observation", {})
@@ -622,13 +694,15 @@ def build_macro_candidate_config(g, module):
     cfg.observe_forward_distances_m = [float(v) for v in
         obs.get("forward_distances_m", [0.0, 0.4, 0.8, 1.2])]
     cfg.max_viewpoint_candidates = int(obs.get("max_viewpoint_candidates", 24))
-    cfg.max_viewpoint_searches_per_tick = int(
-        obs.get("max_viewpoint_searches_per_tick", 8))
+    # Reserve the C++ candidate search exclusively for known-free,
+    # goal-directed frontier prefixes.  With the lattice and retreat budgets
+    # disabled below, this is also the exact FULL-path validation budget.
+    cfg.max_viewpoint_searches_per_tick = max(
+        1, int(obs.get("min_frontier_searches_per_tick", 2)))
     cfg.min_frontier_searches_per_tick = int(
         obs.get("min_frontier_searches_per_tick", 2))
     # P3 known-free recovery (retreat) viewpoints.
-    cfg.retreat_searches_per_tick = int(
-        obs.get("retreat_searches_per_tick", 3))
+    cfg.retreat_searches_per_tick = 0
     cfg.retreat_distances_m = [float(v) for v in
         obs.get("retreat_distances_m", [0.5, 1.0, 1.5])]
     cfg.retreat_lateral_m = float(obs.get("retreat_lateral_m", 0.6))
@@ -642,6 +716,8 @@ def build_macro_candidate_config(g, module):
         obs.get("visibility_range_m", 4.0))
     cfg.max_frontier_candidates = int(mc.get("max_frontier_candidates", 8))
     cfg.frontier_standoff_m = float(mc.get("frontier_standoff_m", 0.45))
+    cfg.frontier_prefix_horizon_m = float(
+        mc.get("frontier_prefix_horizon_m", 1.20))
     cfg.goal_frontier_cone_deg = float(mc.get("goal_frontier_cone_deg", 70.0))
     cfg.corridor_check_spacing_m = float(mc.get("corridor_check_spacing_m", 0.10))
     # Observed-map path-search parameters for REAL SIDE-candidate
@@ -669,7 +745,8 @@ def build_intervention_config(g, module):
         lr.get("search_longitudinal_margin_m", 2.0))
     cfg.max_duration_s = float(lr.get("max_duration_s", 2.5))
     cfg.max_path_length_m = float(lr.get("max_path_length_m", 6.0))
-    cfg.nominal_speed_mps = float(lr.get("nominal_speed_mps", 1.8))
+    cfg.nominal_speed_mps = float(
+        g.get("trajectory_optimization", {}).get("nominal_speed", 1.8))
     cfg.max_detour_ratio = float(lr.get("max_detour_ratio", 1.6))
     cfg.min_goal_progress_m = float(lr.get("min_goal_progress_m", 0.30))
     cfg.min_terminal_alignment = float(lr.get("min_terminal_alignment", 0.5))
@@ -700,12 +777,15 @@ def build_recoverability_config(g, module):
     cfg.clearance_margin_latency_s = float(
         nav.get("margin_latency_s", 0.10))
     cfg.clearance_margin_max_m = float(nav.get("margin_max_m", 0.25))
+    cfg.planning_clearance_margin_m = float(
+        nav.get("planning_quality_margin_m", 0.10))
     cfg.max_duration_s = float(lr.get("max_duration_s", 2.5))
     cfg.max_path_length_m = float(lr.get("max_path_length_m", 6.0))
     cfg.min_goal_progress_m = float(lr.get("min_goal_progress_m", 0.30))
     cfg.min_terminal_alignment = float(lr.get("min_terminal_alignment", 0.5))
     cfg.max_detour_ratio = float(lr.get("max_detour_ratio", 1.6))
-    cfg.nominal_speed_mps = float(lr.get("nominal_speed_mps", 1.8))
+    cfg.nominal_speed_mps = float(
+        g.get("trajectory_optimization", {}).get("nominal_speed", 1.8))
     cfg.terminal_tangent_min_baseline = float(
         lr.get("terminal_tangent_min_baseline", 0.3))
     cfg.side_corridor_length_m = float(lr.get("side_corridor_length_m", 4.0))
@@ -736,10 +816,15 @@ def build_task_generation_config(g, module):
     cfg.clearance_margin_latency_s = float(
         nav.get("margin_latency_s", 0.10))
     cfg.clearance_margin_max_m = float(nav.get("margin_max_m", 0.25))
-    # Stationary validation includes the non-zero tracking floor.  Increasing
-    # this optional speed makes task generation stricter for faster expected
-    # execution without creating another clearance definition.
-    cfg.validation_speed_mps = float(tg.get("validation_speed_mps", 0.0))
+    cfg.planning_clearance_margin_m = float(
+        nav.get("planning_quality_margin_m", 0.10))
+    cfg.task_robustness_margin_m = float(
+        tg.get("robustness_margin_m", 0.10))
+    cfg.nominal_speed_mps = float(
+        g.get("trajectory_optimization", {}).get("nominal_speed", 1.8))
+    # Task validity and all online modules use the same fixed nominal speed.
+    cfg.validation_speed_mps = float(
+        g.get("trajectory_optimization", {}).get("nominal_speed", 1.8))
     bands = tg.get("distance_bands", {}) or {}
     mins = [float(b.get("min_m", 4.0)) for b in bands.values()]
     maxs = [float(b.get("max_m", 28.0)) for b in bands.values()]
@@ -757,7 +842,8 @@ def build_task_generation_config(g, module):
     cfg.rejoin_distance_m = float(lr.get("rejoin_distance_m", 2.5))
     cfg.max_duration_s = float(lr.get("max_duration_s", 2.5))
     cfg.max_path_length_m = float(lr.get("max_path_length_m", 6.0))
-    cfg.nominal_speed_mps = float(lr.get("nominal_speed_mps", 1.8))
+    cfg.nominal_speed_mps = float(
+        g.get("trajectory_optimization", {}).get("nominal_speed", 1.8))
     cfg.max_detour_ratio = float(lr.get("max_detour_ratio", 1.6))
     cfg.min_goal_progress_m = float(lr.get("min_goal_progress_m", 0.30))
     cfg.min_terminal_alignment = float(lr.get("min_terminal_alignment", 0.5))
@@ -797,6 +883,8 @@ def build_planner_config(g, module):
     cfg.clearance_margin_latency_s = float(
         nav.get("margin_latency_s", 0.10))
     cfg.clearance_margin_max_m = float(nav.get("margin_max_m", 0.25))
+    cfg.planning_clearance_margin_m = float(
+        nav.get("planning_quality_margin_m", 0.10))
     cfg.collision_check_spacing = float(to.get("collision_check_spacing", 0.05))
     cfg.weight_path_length = float(to.get("weight_path_length", 0.05))
     cfg.weight_smooth = float(to.get("weight_smooth", 1.0))

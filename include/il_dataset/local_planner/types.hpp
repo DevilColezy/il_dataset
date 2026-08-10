@@ -52,6 +52,17 @@ inline double effectiveClearanceForSpeed(const DynamicClearanceConfig& cfg,
     return cfg.clearance_m + std::min(cfg.margin_max_m, margin);
 }
 
+/// Clearance used when creating a NEW path.  This deliberately adds a
+/// quality buffer after the hard dynamic safety boundary: fresh plans avoid
+/// grazing the boundary, while braking and cached-suffix safety checks may
+/// still use `effectiveClearanceForSpeed()` as their non-negotiable floor.
+inline double planningClearanceForSpeed(const DynamicClearanceConfig& cfg,
+                                        double speed_mps,
+                                        double quality_margin_m) {
+    return effectiveClearanceForSpeed(cfg, speed_mps) +
+           std::max(0.0, quality_margin_m);
+}
+
 /// A single point on a dense time-sampled trajectory.
 struct TrajectoryPoint {
     double t = 0.0;
@@ -239,6 +250,14 @@ struct TaskGenerationConfig {
     double clearance_margin_tracking_m = 0.05;
     double clearance_margin_latency_s = 0.10;
     double clearance_margin_max_m = 0.25;
+    /// Extra clearance required for generated tasks to be comfortably,
+    /// rather than merely barely, executable by online fresh planning.
+    double planning_clearance_margin_m = 0.10;
+    /// Dataset-only robustness reserve.  Online planning keeps the unified
+    /// safety boundary above; generated tasks must additionally have this
+    /// much geometric slack so they are not concentrated exactly on the
+    /// planner's feasibility boundary.
+    double task_robustness_margin_m = 0.10;
     double validation_speed_mps = 0.0;
     double min_task_distance_m = 3.0;
     double max_task_distance_m = 30.0;
@@ -320,6 +339,10 @@ enum class ExecutionMode : int {
     ROTATE_ONLY = 2,
     BRAKE_HOLD = 3,
     EMERGENCY_STOP = 4,
+    /// Dedicated final-goal capture controller.  It is selected only when
+    /// the complete current-to-goal segment is known and clear in the
+    /// observed map, and is independent of an ignored spline-plan result.
+    GOAL_CAPTURE = 5,
 };
 
 /// 30 Hz local planning request (section XVII).

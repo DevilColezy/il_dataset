@@ -544,10 +544,36 @@ double ObservedMap::esdfValue(double x, double y, double z) const {
 }
 
 bool ObservedMap::isKnownFree(double x, double y, double z,
-                              double required_clearance) const {
+                             double required_clearance) const {
     if (!isKnown(x, y, z)) return false;
     const double value = esdfValue(x, y, z);
     return std::isfinite(value) && value > required_clearance;
+}
+
+bool ObservedMap::segmentKnownAndClear(
+    const Eigen::Vector3d& start_world,
+    const Eigen::Vector3d& end_world,
+    double required_clearance,
+    double sample_spacing_m) const {
+    if (!esdf_built_ || !start_world.allFinite() || !end_world.allFinite() ||
+        !std::isfinite(required_clearance) ||
+        !std::isfinite(sample_spacing_m) || sample_spacing_m <= 0.0) {
+        return false;
+    }
+    const Eigen::Vector3d delta = end_world - start_world;
+    const double length = delta.norm();
+    const int samples = std::max(
+        1, static_cast<int>(std::ceil(length / sample_spacing_m)));
+    for (int i = 0; i <= samples; ++i) {
+        const double alpha = static_cast<double>(i) /
+                             static_cast<double>(samples);
+        const Eigen::Vector3d point = start_world + alpha * delta;
+        if (!isKnownFree(point.x(), point.y(), point.z(),
+                         required_clearance)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 int ObservedMap::knownCount() const {

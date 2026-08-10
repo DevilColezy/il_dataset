@@ -1,5 +1,5 @@
 # ============================================================================
-#  Imitation Learning Dataset Collection — Two-Level Navigation Expert (schema v23)
+#  Imitation Learning Dataset Collection — Two-Level Navigation Expert (schema v24)
 # ============================================================================
 #
 #  Architecture:
@@ -110,6 +110,10 @@ global:
     margin_tracking_m:  0.05
     margin_latency_s:   0.10
     margin_max_m:       0.25
+    # Fresh plans and generated tasks require this extra quality gap beyond
+    # the hard dynamic safety boundary. Cached-suffix and braking checks
+    # continue to use the hard boundary itself.
+    planning_quality_margin_m: 0.10
 
   # ── Procedural scene generation (section XXII/XXXII-XXXVI) ─────────
   scene_generation:
@@ -175,6 +179,9 @@ global:
   # never student inputs and never forced onto the macro expert mode.
   task_generation:
     enabled: true
+    # Keep generated tasks away from the exact online feasibility boundary.
+    # This is dataset qualification slack, not a second runtime clearance.
+    robustness_margin_m: 0.10
     # Validate against the nominal executed speed, not a stationary vehicle.
     # This rejects corridors that are globally connected but cannot satisfy
     # the local planner's dynamic clearance while flying.
@@ -299,24 +306,45 @@ global:
   # ── 5 Hz macro expert (section IV) ─────────────────────────────────
   macro_expert:
     update_hz:               5.0
-    # Direct-guide lookahead (min(goal_distance, this)).
+    # Observed reference-path horizon (min(goal_distance, this)).
     macro_lookahead_distance_m: 4.5
+    # A known occupied blocker remains a local DIRECT problem only while its
+    # observed detour has both small turn and small lateral deviation.
+    local_bend_max_deg:        25.0
+    local_lateral_ratio_max:    0.30
+    # Let initial depth frames establish a nonzero known-free prefix before
+    # local failures can trigger frontier observation.
+    initial_map_warmup_s: 1.0
+    # Before any motion, point the depth FOV at the goal ray and wait for a
+    # goal-facing map update.  This is a one-shot initialization action.
+    initial_goal_alignment_tolerance_deg: 8.0
+    initial_goal_alignment_min_duration_s: 0.20
+    # Last-resort deterministic goal-relative camera sweep.  It is used
+    # only when no known-free executable motion prefix exists.
+    observe_scan_half_angle_deg: 35.0
+    observe_scan_hold_s: 0.20
+    observe_scan_yaw_tolerance_deg: 6.0
+    # UNKNOWN is a continuation frontier, never an obstacle.  After this
+    # many 30 Hz failures, advance to a known-free frontier prefix; rotate
+    # only when no such prefix exists.
+    local_failure_count_for_observe: 4
+    # Retire an OBSERVE movement target only after persistent intervals with
+    # no fresh/cached execution, and only once the vehicle is nearly stopped.
+    # This prevents a single failed replan from producing a new macro target
+    # while the previous target's velocity is still being executed.
+    observe_target_failure_ticks: 2
+    observe_target_retire_max_speed_mps: 0.30
+    # A frontier guide rejected by the executing local planner is excluded
+    # until the vehicle has moved this far; never retry it for the timeout.
+    frontier_rejection_radius_m: 0.40
+    frontier_rejection_reset_distance_m: 0.50
+    # Release a SIDE commitment only after this many clear goal-ray ticks.
+    side_release_clear_ticks:  2
+    goal_progress_epsilon_m:   0.05
     # DIRECT long no-progress (goal distance not decreasing for this long)
     # is ALSO causal evidence -> macro intervention, never an immediate
     # episode FAILED (section XI/XII).
     direct_intervention_timeout: 5.0
-    # 30 Hz -> 5 Hz interval feedback thresholds for DIRECT causal evidence
-    # (sections XXV/XXVI): counters accumulate per MACRO TICK with decay,
-    # so a single occasional bad frame never intervenes while consecutive
-    # unstable intervals do.
-    causal_feedback:
-      interval_failure_threshold:  2      # planning failures within one interval
-      local_failure_macro_ticks:   2      # consecutive bad intervals -> evidence
-      cached_ratio_threshold:      0.5    # cached_frames / interval_frames
-      cached_macro_ticks:          2
-      brake_ratio_threshold:       0.5
-      brake_macro_ticks:           2
-      emergency_macro_ticks:       1      # any emergency interval -> strong evidence
     # Rolling SIDE / OBSERVE progress thresholds (section VII/XVI).
     side_no_progress_seconds:   6.0
     observe_no_information_timeout: 4.0
@@ -344,6 +372,10 @@ global:
     # Goal reached condition (distance + speed).
     goal_tolerance_m:           0.30
     goal_speed_tolerance_mps:   0.20
+    # Start terminal deceleration before the goal. The 30 Hz capture latch
+    # preserves it if the vehicle crosses the tolerance disc between 5 Hz
+    # macro ticks.
+    goal_approach_radius_m:     0.80
     # OBSERVE rotate sweep speed and cap.  OBSERVE never FAILs on a short
     # fixed duration: it runs while it keeps gaining information (section
     # XIX/XX).  The absolute safety limit below is only a large final
@@ -409,9 +441,10 @@ global:
     observe_step_m:             0.6
     # Minimum candidate->current distance for an OBSERVE candidate to be
     # emitted.  Zero-distance probes are never generated (no fake MOVE).
-    min_observe_move_distance_m: 0.15
+    min_observe_move_distance_m: 0.50
     max_frontier_candidates:    8
     frontier_standoff_m:        0.45
+    frontier_prefix_horizon_m:  1.20
     goal_frontier_cone_deg:     70.0
     corridor_check_spacing_m:   0.10
     # ── Active observation viewpoint search (section XV) ───────────
@@ -553,6 +586,11 @@ global:
     max_yaw_accel_rps2:         8.0
     emergency_brake_distance_m: 0.8
     brake_deceleration_mps2:    3.0
+    goal_capture:
+      approach_deceleration_mps2: 2.5
+      max_approach_speed_mps:      0.8
+      return_speed_mps:            0.25
+      position_gain:               1.0
     # Keep the fixed task flight slice through rotate/brake and replanning
     # degradation; the 2-D local search must not follow simulator z drift.
     altitude_hold:
@@ -564,8 +602,12 @@ global:
 
   # ── Execution safety / degradation (section XIII) ──────────────────
   execution_safety:
-    max_plan_age_s:          0.20
+    # Replanning stays at 30 Hz, while an active suffix executes on its own
+    # simulation-time axis after every per-frame safety validation.
+    max_plan_age_s:          0.70
     min_remaining_trajectory_s: 0.10
+    active_guide_replan_distance_m: 0.50
+    active_yaw_replan_delta_rad: 0.20
     max_position_error_m:    0.50
     max_velocity_error_mps:  1.00
     emergency_deceleration_mps2: 5.0
@@ -575,7 +617,7 @@ global:
 
   # ── Dataset logging (section XIV) ──────────────────────────────────
   dataset_logging:
-    schema_version: 23
+    schema_version: 24
     depth_in_memory: true
     write_local_plan_points: true
     collect_privileged_diagnostics: true

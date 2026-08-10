@@ -85,6 +85,12 @@ public:
     bool isKnown(double x, double y, double z) const;
     bool isKnownFree(double x, double y, double z,
                      double required_clearance) const;
+    /// True only when every sample of the complete segment is observed
+    /// known-free at the requested clearance.  UNKNOWN is always unsafe.
+    bool segmentKnownAndClear(const Eigen::Vector3d& start_world,
+                              const Eigen::Vector3d& end_world,
+                              double required_clearance,
+                              double sample_spacing_m) const;
     /// Signed clearance at a point (trilinear).  Returns NaN when outside
     /// the grid; unknown cells report 0.0 (never free).
     double esdfValue(double x, double y, double z) const;

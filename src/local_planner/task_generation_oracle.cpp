@@ -131,8 +131,10 @@ TaskCandidateResult TaskGenerationOracle::evaluate(
     const DynamicClearanceConfig dynamic_clearance{
         config_.clearance_m, config_.clearance_margin_tracking_m,
         config_.clearance_margin_latency_s, config_.clearance_margin_max_m};
-    const double executable_clearance = effectiveClearanceForSpeed(
-        dynamic_clearance, std::max(0.0, config_.validation_speed_mps));
+    const double executable_clearance = planningClearanceForSpeed(
+        dynamic_clearance, std::max(0.0, config_.validation_speed_mps),
+        config_.planning_clearance_margin_m) +
+        std::max(0.0, config_.task_robustness_margin_m);
     r.start_free = oracle.isFree(start.x(), start.y(), start.z(),
                                  executable_clearance);
     r.goal_free = oracle.isFree(goal.x(), goal.y(), goal.z(),

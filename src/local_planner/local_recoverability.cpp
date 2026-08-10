@@ -73,15 +73,16 @@ RecoverabilityResult LocalRecoverability::test(
     result.rejoin_point = rejoin_point;
     result.rejoin_distance = rejoin_dist;
 
-    // Round 6: the rejoin search uses the SAME dynamic effective clearance
-    // as the 30 Hz LocalPlanner (evaluated at the current state speed), so
+    // Round 6: the rejoin search uses the SAME nominal fresh-planning
+    // clearance as the 30 Hz LocalPlanner, so
     // DIRECT_REJOIN_SUCCESS is never more permissive than what plan() can
     // actually execute.  Single shared C++ formula — no second copy.
     const DynamicClearanceConfig clearance_cfg{
         config_.clearance_m, config_.clearance_margin_tracking_m,
         config_.clearance_margin_latency_s, config_.clearance_margin_max_m};
-    const double effective_clearance =
-        effectiveClearanceForSpeed(clearance_cfg, state.velocity.norm());
+    const double effective_clearance = planningClearanceForSpeed(
+        clearance_cfg, config_.nominal_speed_mps,
+        config_.planning_clearance_margin_m);
 
     LocalSearchConfig search_config;
     search_config.clearance_m = effective_clearance;
@@ -177,7 +178,15 @@ RecoverabilityResult LocalRecoverability::test(
     blocker_config.edge_search_radius_m = config_.edge_search_radius_m;
     blocker_config.side_corridor_length_m = config_.side_corridor_length_m;
     blocker_config.side_corridor_radius_m = config_.side_corridor_radius_m;
-    blocker_config.clearance_m = effective_clearance;
+    blocker_config.clearance_m = config_.clearance_m;
+    blocker_config.clearance_margin_tracking_m =
+        config_.clearance_margin_tracking_m;
+    blocker_config.clearance_margin_latency_s =
+        config_.clearance_margin_latency_s;
+    blocker_config.clearance_margin_max_m = config_.clearance_margin_max_m;
+    blocker_config.planning_clearance_margin_m =
+        config_.planning_clearance_margin_m;
+    blocker_config.nominal_speed_mps = config_.nominal_speed_mps;
     const GoalBlocker blocker =
         analyzeGoalBlocker(map, state, direct_guide_world, blocker_config);
     result.blocker_signature = blocker.blocker_signature;
@@ -189,12 +198,15 @@ RecoverabilityResult LocalRecoverability::test(
     if (!search_result.found_partial) {
         // No safe motion at all.  Classify whether the immediate blockage
         // is known or unknown.
-        const std::uint8_t state_at = map.occupancyAt(
+        const bool current_known = map.isKnown(
             state.position.x(), state.position.y(), state.position.z());
-        if (state_at == OCCUPIED) {
+        const double current_clearance = map.esdfValue(
+            state.position.x(), state.position.y(), state.position.z());
+        if (current_known && std::isfinite(current_clearance) &&
+            current_clearance <= effective_clearance) {
             result.status = RecoverabilityStatus::BLOCKED_BY_KNOWN;
             result.reason = "no_safe_motion_blocked_by_known";
-        } else if (state_at == UNKNOWN) {
+        } else if (!current_known) {
             result.status = RecoverabilityStatus::BLOCKED_BY_UNKNOWN;
             result.reason = "no_safe_motion_blocked_by_unknown";
         } else {

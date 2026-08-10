@@ -53,7 +53,7 @@ _CAND_COLORS = {0: "#1f77b4", 1: "#ff7f0e", 2: "#2ca02c",
 
 # Map legend rows: (swatch color, label) — what is drawn on the map.
 _LEGEND_ITEMS = [
-    ("#b0b0b0", "Global map (scene PLY)"),
+    ("#606060", "Scene obstacles (flight-height PLY slice)"),
     ("#4db3ff", "Local observation - free"),
     ("#e63826", "Local observation - obstacle"),
     ("#7f7f7f", "Flight trajectory"),
@@ -222,21 +222,30 @@ def _load_ply_points(path):
         return None
 
 
-def _build_occupancy(pts, res=0.2):
-    """Bin world XY points into a 2D occupancy grid.
+def _build_occupancy(pts, z_center, res=0.10, z_half_width=0.20):
+    """Project obstacle surfaces near one flight-height slice into XY.
+
+    A scene PLY includes floor and ceiling points.  Projecting every point
+    makes the floor occupy nearly every XY cell, which hides the actual
+    cylinders/walls.  Keeping only points near the vehicle's current height
+    retains vertical obstacle surfaces and intentionally drops the floor.
 
     Returns (grid (ny, nx) uint8, extent [minx, maxx, miny, maxy]) or
     (None, None) when there is nothing to draw.
     """
     if pts is None or len(pts) == 0:
         return None, None
+    z_center = float(z_center)
+    slice_pts = pts[np.abs(pts[:, 2] - z_center) <= float(z_half_width)]
+    if len(slice_pts) == 0:
+        return None, None
     minx, miny = float(pts[:, 0].min()), float(pts[:, 1].min())
     maxx, maxy = float(pts[:, 0].max()), float(pts[:, 1].max())
     nx = int(math.floor((maxx - minx) / res)) + 1
     ny = int(math.floor((maxy - miny) / res)) + 1
     grid = np.zeros((ny, nx), dtype=np.uint8)
-    ix = np.floor((pts[:, 0] - minx) / res).astype(np.int64)
-    iy = np.floor((pts[:, 1] - miny) / res).astype(np.int64)
+    ix = np.floor((slice_pts[:, 0] - minx) / res).astype(np.int64)
+    iy = np.floor((slice_pts[:, 1] - miny) / res).astype(np.int64)
     m = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
     np.add.at(grid, (iy[m], ix[m]), 1)
     return grid, [minx, maxx, miny, maxy]
@@ -337,7 +346,7 @@ class LocalMapBuilder(object):
 
 
 # ── Episode ───────────────────────────────────────────────────────────
-_SCENE_MAP_CACHE = {}
+_SCENE_POINT_CACHE = {}
 
 
 class Episode(object):
@@ -359,7 +368,7 @@ class Episode(object):
         self._trace = None
         self._plan_points = None
         self._tick_for_frame = None
-        self._scene_map = None
+        self._scene_maps = {}
 
     def rows(self):
         if self._rows is None:
@@ -393,18 +402,20 @@ class Episode(object):
             self._tick_for_frame = out
         return self._tick_for_frame
 
-    def scene_map(self):
-        """Global 2D occupancy grid from maps/<scene_key>.ply (cached)."""
-        if self._scene_map is None:
-            ply = os.path.join(self.root, "maps",
-                               str(self.scene_id) + ".ply")
-            if ply in _SCENE_MAP_CACHE:
-                self._scene_map = _SCENE_MAP_CACHE[ply]
-            else:
-                grid, extent = _build_occupancy(_load_ply_points(ply))
-                self._scene_map = (grid, extent)
-                _SCENE_MAP_CACHE[ply] = self._scene_map
-        return self._scene_map
+    def scene_map(self, flight_z):
+        """Obstacle-only XY grid at the requested flight-height slice."""
+        # Height changes caused by altitude hold are small; quarter-metre
+        # buckets keep rendering stable and avoid rebuilding every frame.
+        z_key = round(float(flight_z) * 4.0) / 4.0
+        cached = self._scene_maps.get(z_key)
+        if cached is not None:
+            return cached
+        ply = os.path.join(self.root, "maps", str(self.scene_id) + ".ply")
+        if ply not in _SCENE_POINT_CACHE:
+            _SCENE_POINT_CACHE[ply] = _load_ply_points(ply)
+        grid, extent = _build_occupancy(_SCENE_POINT_CACHE[ply], z_key)
+        self._scene_maps[z_key] = (grid, extent)
+        return self._scene_maps[z_key]
 
 
 # ── Dataset scan ──────────────────────────────────────────────────────
@@ -801,7 +812,7 @@ class ViewerApp(object):
 
         # Global static map (scene PLY) as the 2D plane background.
         if self.show["global_map"]:
-            self._draw_global_map(ax, ep)
+            self._draw_global_map(ax, ep, _f(row.get("z")))
 
         ax.plot(xs, ys, color="0.7", lw=1.2, zorder=3, label="Flight trajectory")
 
@@ -844,7 +855,7 @@ class ViewerApp(object):
                         label="Local trajectory")
                 ax.plot([px[-1]], [py[-1]], marker="^", color="#e377c2",
                         ms=10, zorder=8, label="Local terminal")
-            elif row.get("local_terminal_world_x") not in ("", None):
+            elif _i(row.get("local_terminal_valid"), 0) == 1:
                 tx, ty = _f(row.get("local_terminal_world_x")), \
                     _f(row.get("local_terminal_world_y"))
                 ax.plot([tx], [ty], marker="^", color="#e377c2",
@@ -874,12 +885,12 @@ class ViewerApp(object):
         else:
             ax.autoscale(enable=True, axis="both", tight=True)
 
-    def _draw_global_map(self, ax, ep):
-        grid, extent = ep.scene_map()
+    def _draw_global_map(self, ax, ep, flight_z):
+        grid, extent = ep.scene_map(flight_z)
         if grid is None or extent is None:
             return
         ax.imshow((grid > 0).astype(np.float32), extent=extent,
-                  origin="lower", cmap="Greys", vmin=0, vmax=1, alpha=0.5,
+                  origin="lower", cmap="Greys", vmin=0, vmax=1, alpha=0.65,
                   interpolation="nearest", zorder=0)
 
     def _draw_local_map(self, ax, ep, row, x, y, yaw):

@@ -18,12 +18,12 @@ import time
 
 import numpy as np
 
-# ── Schema (v23) ──────────────────────────────────────────────────────
+# ── Schema (v24) ──────────────────────────────────────────────────────
 # Order matters: this is the CSV header.  All fields are written on every
 # row; missing keys are filled with defaults by write_row().
 # NO depth-valid-mask fields: the student input is a single depth channel
 # (section XII).  raw_depth_finite_ratio is a PURE diagnostic.
-DATA_SCHEMA_V23_FIELDS = [
+DATA_SCHEMA_V24_FIELDS = [
     # time / matching
     "timestamp_ns", "receive_timestamp_ns", "episode_id", "frame_id",
     "episode_frame_index", "control_dt_s", "trajectory_time_s",
@@ -57,6 +57,7 @@ DATA_SCHEMA_V23_FIELDS = [
     "desired_yaw_world", "desired_yaw_delta",
     "desired_yaw_sin", "desired_yaw_cos",
     # local labels (30 Hz) — EXECUTED plan semantics (section XVIII)
+    "local_terminal_valid",
     "local_terminal_world_x", "local_terminal_world_y", "local_terminal_world_z",
     "local_terminal_flu_x", "local_terminal_flu_y", "local_terminal_flu_z",
     "execution_mode",
@@ -117,7 +118,7 @@ DATA_SCHEMA_V23_FIELDS = [
     "observe_selected_info_gain", "observe_selected_clearance",
 ]
 
-_DEFAULT_ROW = {field: "" for field in DATA_SCHEMA_V23_FIELDS}
+_DEFAULT_ROW = {field: "" for field in DATA_SCHEMA_V24_FIELDS}
 
 
 class DatasetWriter(object):
@@ -159,7 +160,7 @@ class DatasetWriter(object):
 
         self._data_csv = open(self._data_file, "w", newline="")
         self._data_writer = csv.DictWriter(
-            self._data_csv, fieldnames=DATA_SCHEMA_V23_FIELDS)
+            self._data_csv, fieldnames=DATA_SCHEMA_V24_FIELDS)
         self._data_writer.writeheader()
 
         self._sync_csv = open(self._sync_file, "w", newline="")
@@ -197,7 +198,7 @@ class DatasetWriter(object):
             "start_world": start_world,
             "goal_world": goal_world,
             "initial_yaw": initial_yaw,
-            "schema_version": int(cfg.get("schema_version", 23)),
+            "schema_version": int(cfg.get("schema_version", 24)),
             "status": "inprogress",
             "created_at_ns": time.time_ns(),
         }

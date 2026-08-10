@@ -848,6 +848,7 @@ LocalPlanner::LocalPlanner(const TrajectoryOptimizationConfig& config)
 void LocalPlanner::setMap(const ObservedMap* map) { map_ = map; }
 
 double LocalPlanner::effectiveClearance(const VehicleState& state) const {
+    (void)state;
     // Round 5: the single shared C++ formula (effectiveClearanceForSpeed).
     // Every other module (macro candidate search, Python braking check via
     // the pybind interface) uses the exact same computation — there is no
@@ -855,7 +856,7 @@ double LocalPlanner::effectiveClearance(const VehicleState& state) const {
     const DynamicClearanceConfig cfg{
         config_.clearance_m, config_.clearance_margin_tracking_m,
         config_.clearance_margin_latency_s, config_.clearance_margin_max_m};
-    return effectiveClearanceForSpeed(cfg, state.velocity.norm());
+    return effectiveClearanceForSpeed(cfg, config_.nominal_speed);
 }
 
 ValidationResult LocalPlanner::validateTrajectorySegmentSpatially(
@@ -955,13 +956,16 @@ ValidationResult LocalPlanner::validateTrajectory(
         result.any_collision = true;
         return result;
     }
-    // Round 6: the public validator uses the SAME speed-dependent
-    // effective clearance as plan() / validateTrajectorySuffix() (derived
-    // from the state at the START of the trajectory).  A base-clearance-only
-    // validation path no longer exists, so the public interface can never
-    // approve a trajectory the planner would reject as too tight.
+    // The public fresh-trajectory validator follows plan(): it includes the
+    // planning quality margin. Cached-suffix validation below deliberately
+    // uses only the hard dynamic safety floor.
+    const DynamicClearanceConfig dynamic_clearance{
+        config_.clearance_m, config_.clearance_margin_tracking_m,
+        config_.clearance_margin_latency_s, config_.clearance_margin_max_m};
     return validateTrajectorySegmentSpatially(
-        trajectory, trajectory.front().t, effectiveClearance(state));
+        trajectory, trajectory.front().t, planningClearanceForSpeed(
+            dynamic_clearance, config_.nominal_speed,
+            config_.planning_clearance_margin_m));
 }
 
 ValidationResult LocalPlanner::validateTrajectorySuffix(
@@ -1078,9 +1082,15 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
     // soft target / floor, fresh validation) uses the speed-dependent
     // effective clearance so a fast drone is planned and validated with a
     // wider safety buffer than a hovering one.  The unified base
-    // `config_.clearance_m` remains the module-consistency boundary for
-    // every OTHER module; this only widens the executable 30 Hz layer.
-    const double effective_clearance = effectiveClearance(state);
+    // `effectiveClearance()` is the non-negotiable dynamic safety floor.
+    // Fresh A*, warm starts and optimization additionally use a quality
+    // margin, so a plan does not intentionally graze that hard boundary.
+    const DynamicClearanceConfig dynamic_clearance{
+        config_.clearance_m, config_.clearance_margin_tracking_m,
+        config_.clearance_margin_latency_s, config_.clearance_margin_max_m};
+    const double effective_clearance = planningClearanceForSpeed(
+        dynamic_clearance, config_.nominal_speed,
+        config_.planning_clearance_margin_m);
     result.effective_clearance_m = effective_clearance;
     // Optimizer config copy: everything identical except the clearance
     // soft target / hard floor, which rise to the effective boundary.
@@ -1392,8 +1402,7 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanRequest& request) const {
     yaw_planner.planYaw(&trajectory, state.yaw, planned_target_yaw,
                         has_macro_yaw);
 
-    // ── Strict validation (P1: effective boundary, never the bare 0.20
-    //    floor) ──────────────────────────────────────────────────────
+    // ── Strict fresh-plan validation (hard boundary + quality margin) ──
     const ValidationResult validation =
         validateTrajectorySegmentSpatially(
             trajectory, trajectory.front().t, effective_clearance);

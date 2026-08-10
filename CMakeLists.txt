@@ -107,6 +107,7 @@ include_directories(
 # ── C++ local planner static library ────────────────────────────
 set(LOCAL_PLANNER_SOURCES
   src/local_planner/observed_map.cpp
+  src/local_planner/goal_capture_controller.cpp
   src/local_planner/esdf_grid.cpp
   src/local_planner/local_path_search.cpp
   src/local_planner/local_recoverability.cpp
