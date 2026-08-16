@@ -67,6 +67,7 @@ void TaskRouteQualifier::configure(const BlueprintScene& scene,
     centers_ = geo.obstacleCenters();
     radii_ = geo.obstacleRadii();
     large_obs_ = geo.largeObstacles();
+    narrow_passages_ = geo.narrowPassages();
 
     // ── Connectivity components on the qualifier's OWN grid at the
     //    endpoint clearance (2D reference semantics: 8-neighbour flood
@@ -394,8 +395,15 @@ void TaskRouteQualifier::losShortcut(std::vector<Vec2d>& path,
 }
 
 bool TaskRouteQualifier::routeSafe(const std::vector<Vec2d>& path,
-                                   double clearance) const {
+                                   double clearance,
+                                   double recovery_prefix_length) const {
     if (path.empty()) return false;
+    const double base = cfg_.endpointRequiredClearance();
+    double acc = 0.0;
+    // Every ADJACENT segment is sampled continuously at <= res/2; each
+    // sample uses the BASE clearance when it lies inside the recovery
+    // prefix arc length, otherwise the route clearance.  2D reference:
+    // routeSafe(esdf, clearance, path, recovery_prefix_length).
     for (size_t i = 1; i < path.size(); ++i) {
         const Vec2d& a = path[i - 1];
         const Vec2d& b = path[i];
@@ -404,8 +412,15 @@ bool TaskRouteQualifier::routeSafe(const std::vector<Vec2d>& path,
                                          std::ceil(seg / (0.5 * res_))));
         for (int k = 0; k <= steps; ++k) {
             const Vec2d p = a + (b - a) * (static_cast<double>(k) / steps);
-            if (!isFree(p, clearance)) return false;
+            const double s = acc + seg * (static_cast<double>(k) / steps);
+            const double cl =
+                (recovery_prefix_length > 0.0 &&
+                 s <= recovery_prefix_length + 1e-9)
+                    ? base
+                    : clearance;
+            if (!isFree(p, cl)) return false;
         }
+        acc += seg;
     }
     return true;
 }
@@ -448,20 +463,159 @@ bool TaskRouteQualifier::passesBlockerOnSide(
 }
 
 // ────────────────────────────────────────────────────────────────────
-//  One side route (tangent gateways + 3-segment A* + LOS + homotopy)
+//  2D start-clearance recovery (§9)
+// ────────────────────────────────────────────────────────────────────
+bool TaskRouteQualifier::findStartRecoveryCell(
+    const Vec2d& start, double route_clearance, Vec2d& recovery_cell) const {
+    if (res_ <= 0.0 || w_ == 0 || h_ == 0) return false;
+    const double base = cfg_.endpointRequiredClearance();
+    const double max_radius = cfg_.qualification.start_recovery_max_radius_m;
+    const int max_ring = std::max(
+        1, static_cast<int>(std::ceil(max_radius / std::max(1e-6, res_))));
+    const int ix0 = ixOf(start.x());
+    const int iy0 = iyOf(start.y());
+    double best_dist = std::numeric_limits<double>::infinity();
+    int best_ix = std::numeric_limits<int>::max();
+    int best_iy = std::numeric_limits<int>::max();
+    bool found = false;
+    // Search the finite disk and select the nearest route-clear cell whose
+    // straight connector start→cell is continuously safe at the BASE
+    // clearance.  (Returning the first ring cell is insufficient because
+    // that connector may be blocked while another nearby one is valid.)
+    for (int dy = -max_ring; dy <= max_ring; ++dy) {
+        for (int dx = -max_ring; dx <= max_ring; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            const int ix = ix0 + dx;
+            const int iy = iy0 + dy;
+            if (!cellFreeStrict(ix, iy, route_clearance)) continue;
+            const Vec2d c = cellCenter(ix, iy);
+            const double d = (c - start).norm();
+            if (d > max_radius + 1e-9) continue;
+            if (!straightSafe(start, c, base)) continue;
+            if (d < best_dist - 1e-9 ||
+                (std::fabs(d - best_dist) <= 1e-9 &&
+                 std::tie(iy, ix) < std::tie(best_iy, best_ix))) {
+                best_dist = d;
+                best_ix = ix;
+                best_iy = iy;
+                recovery_cell = c;
+                found = true;
+            }
+        }
+    }
+    return found;
+}
+
+void TaskRouteQualifier::prependRecovery(const Vec2d& start,
+                                         const Vec2d& route_start,
+                                         std::vector<Vec2d>& path) const {
+    if (path.empty()) return;
+    if (!path.empty() && (path.front() - route_start).norm() < 1e-9) {
+        path.erase(path.begin());
+    }
+    const double seg = (route_start - start).norm();
+    const int steps =
+        std::max(1, static_cast<int>(std::ceil(seg / std::max(1e-6, res_))));
+    std::vector<Vec2d> full;
+    full.reserve(path.size() + steps + 1);
+    full.push_back(start);
+    for (int k = 1; k <= steps; ++k) {
+        full.push_back(start + (route_start - start) *
+                                   (static_cast<double>(k) / steps));
+    }
+    full.insert(full.end(), path.begin(), path.end());
+    path.swap(full);
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  Narrow-passage traversal evidence (qualified route only)
+// ────────────────────────────────────────────────────────────────────
+bool TaskRouteQualifier::routeTraversesNarrowPassage(
+    const std::vector<Vec2d>& path, const NarrowPassage& np) const {
+    // Passage corridor: the segment between the two obstacle centres,
+    // widened by the passage half-width (width/2 + a small tolerance).
+    // The route "traverses" it when it has samples on BOTH sides of the
+    // passage axis (projected along-axis monotonic crossing) inside the
+    // corridor half-width.
+    const Vec2d ab = np.b_center - np.a_center;
+    const double ab_len = std::max(1e-6, ab.norm());
+    const Vec2d ax = ab / ab_len;
+    const double half_w = np.width * 0.5 + 0.05;  // corridor half-width
+    double prev_side = 0.0;
+    bool in_corridor = false;
+    bool crossed = false;
+    for (size_t i = 0; i < path.size(); ++i) {
+        const Vec2d rel = path[i] - np.a_center;
+        const double along = rel.dot(ax);
+        if (along < -0.1 || along > ab_len + 0.1) continue;  // beyond the pair
+        const double off = (rel - ax * along).norm();
+        if (off > half_w) {
+            in_corridor = false;
+            continue;
+        }
+        // Sample is inside the passage corridor.
+        if (!in_corridor) {
+            // Entering the corridor: record which lateral side we are on
+            // (cross of the passage axis with the offset).
+            const Vec2d offv = rel - ax * along;
+            const double side = cross2(ax, offv);
+            if (prev_side != 0.0 && side != 0.0 && prev_side * side < 0.0) {
+                crossed = true;
+            }
+            prev_side = side;
+        }
+        in_corridor = true;
+    }
+    return crossed;
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  One side route (tangent gateways + 3-segment A* + LOS + homotopy +
+//  start-clearance recovery).  `task_side_budget` is SHARED between LEFT
+//  and RIGHT and is deducted per segment.
 // ────────────────────────────────────────────────────────────────────
 void TaskRouteQualifier::planSideRoute(
     const Vec2d& start, const Vec2d& goal, const Vec2d& blocker_center,
     double blocker_radius, const Vec2d& axis_u, bool left_side,
-    SideRouteResult& out) const {
+    uint64_t& task_side_budget, SideRouteResult& out,
+    std::vector<Vec2d>* path_out) const {
     out = SideRouteResult{};
     out.checked = true;
     out.reject_reason = "";
     const double clearance = cfg_.routeQualificationClearance();
+    const double base = cfg_.endpointRequiredClearance();
     const int side_sign = left_side ? 1 : -1;
     const double bias = cfg_.qualification.side_bias;
     const Vec2d axis = axis_u * (goal - start).norm();
     const int cap = cfg_.qualification.max_side_route_expansions;
+
+    // ── Start-clearance recovery (2D §9) ───────────────────────────
+    // If the A* start cell is NOT route-clear while the CONTINUOUS start
+    // is still base-clear (endpoint clearance 0.5 < route clearance 0.65),
+    // find the nearest route-clear cell inside a bounded radius whose
+    // connector is base-safe and prepend it as a recovery prefix.  The
+    // recovery prefix is verified at the BASE clearance; everything after
+    // it at the route clearance.  Never changes LEFT/RIGHT.
+    Vec2d route_start = start;
+    Vec2d recovery_cell(0.0, 0.0);
+    double recovery_len = 0.0;
+    bool recovery_used = false;
+    if (!cellFreeStrict(ixOf(start.x()), iyOf(start.y()), clearance) &&
+        isFree(start, base)) {
+        if (findStartRecoveryCell(start, clearance, recovery_cell) &&
+            straightSafe(start, recovery_cell, base)) {
+            route_start = recovery_cell;
+            recovery_len = (recovery_cell - start).norm();
+            recovery_used = true;
+        }
+    }
+
+    // ── Shared per-task side budget: each segment may use at most
+    //    min(max_side_route_expansions, remaining_task_budget). ──────
+    auto segmentBudget = [&]() {
+        return static_cast<int>(
+            std::min<uint64_t>(static_cast<uint64_t>(cap), task_side_budget));
+    };
 
     // The blocker is always inflated by the route clearance (the tangent
     // points must keep that much room from the blocker surface).
@@ -477,48 +631,75 @@ void TaskRouteQualifier::planSideRoute(
 
     std::vector<Vec2d> path;
     uint32_t exp_total = 0;
-    auto s1 = astarPath(start, gP_legal, clearance, axis, blocker_center, bias,
-                        side_sign, cap, exp_total);
-    uint32_t e2 = 0, e3 = 0;
-    auto s2 = astarPath(gP_legal, gG_legal, clearance, axis, blocker_center,
-                        bias, side_sign, cap, e2);
-    auto s3 = astarPath(gG_legal, goal, clearance, axis, blocker_center, bias,
-                        side_sign, cap, e3);
-    exp_total += e2 + e3;
-    out.expanded_nodes = exp_total;
-    if (!s1.empty() && !s2.empty() && !s3.empty()) {
-        // Per-segment shortcut so the forced gateways are never shortcut
-        // away and the homotopy side cannot flip.
-        losShortcut(s1, clearance);
-        losShortcut(s2, clearance);
-        losShortcut(s3, clearance);
-        if (routeSafe(s1, clearance) && routeSafe(s2, clearance) &&
-            routeSafe(s3, clearance)) {
-            path = s1;
-            path.insert(path.end(), s2.begin() + 1, s2.end());
-            path.insert(path.end(), s3.begin() + 1, s3.end());
+    bool budget_exhausted = false;
+    if (task_side_budget > 0) {
+        uint32_t e1 = 0, e2 = 0, e3 = 0;
+        auto s1 = astarPath(route_start, gP_legal, clearance, axis,
+                            blocker_center, bias, side_sign,
+                            segmentBudget(), e1);
+        task_side_budget -= e1;
+        exp_total += e1;
+        auto s2 = astarPath(gP_legal, gG_legal, clearance, axis,
+                            blocker_center, bias, side_sign,
+                            segmentBudget(), e2);
+        task_side_budget -= e2;
+        exp_total += e2;
+        auto s3 = astarPath(gG_legal, goal, clearance, axis, blocker_center,
+                            bias, side_sign, segmentBudget(), e3);
+        task_side_budget -= e3;
+        exp_total += e3;
+        out.expanded_nodes = exp_total;
+        if (task_side_budget == 0 && (s1.empty() || s2.empty() || s3.empty())) {
+            budget_exhausted = true;
         }
+        if (!s1.empty() && !s2.empty() && !s3.empty()) {
+            // Per-segment shortcut so the forced gateways are never
+            // shortcut away and the homotopy side cannot flip.
+            losShortcut(s1, clearance);
+            losShortcut(s2, clearance);
+            losShortcut(s3, clearance);
+            if (routeSafe(s1, clearance, 0.0) &&
+                routeSafe(s2, clearance, 0.0) &&
+                routeSafe(s3, clearance, 0.0)) {
+                path = s1;
+                path.insert(path.end(), s2.begin() + 1, s2.end());
+                path.insert(path.end(), s3.begin() + 1, s3.end());
+            }
+        }
+    } else {
+        budget_exhausted = true;
     }
-    if (path.empty()) {
+    if (path.empty() && !budget_exhausted && task_side_budget > 0) {
         // Fallback: single side-constrained A* (no forced gateways).
         uint32_t e0 = 0;
-        path = astarPath(start, goal, clearance, axis, blocker_center, bias,
-                         side_sign, cap, e0);
-        out.expanded_nodes = exp_total + e0;
+        path = astarPath(route_start, goal, clearance, axis, blocker_center,
+                         bias, side_sign, segmentBudget(), e0);
+        task_side_budget -= e0;
+        exp_total += e0;
+        out.expanded_nodes = exp_total;
+        if (task_side_budget == 0 && path.empty()) budget_exhausted = true;
         if (!path.empty()) {
             losShortcut(path, clearance);
-            if (!routeSafe(path, clearance)) path.clear();
+            if (!routeSafe(path, clearance, 0.0)) path.clear();
         }
     }
     if (path.empty()) {
         out.feasible = false;
         // Distinguish "search hit its node budget" from "genuinely no
         // route" so the diagnostics can tell a timeout from a dead end.
-        out.reject_reason =
-            (out.expanded_nodes >= static_cast<uint32_t>(cap))
-                ? "side_search_budget_exceeded"
-                : "side_route_not_found";
+        out.reject_reason = budget_exhausted ? "side_search_budget_exceeded"
+                                             : "side_route_not_found";
         return;
+    }
+    // Prepend the recovery connection (verified at BASE clearance) and
+    // re-verify the FULL path with the explicit recovery-prefix split.
+    if (recovery_used) {
+        prependRecovery(start, route_start, path);
+        if (!routeSafe(path, clearance, recovery_len)) {
+            out.feasible = false;
+            out.reject_reason = "recovery_connection_unsafe";
+            return;
+        }
     }
 
     // Homotopy: the path must actually pass the blocker on the requested
@@ -550,6 +731,9 @@ void TaskRouteQualifier::planSideRoute(
     }
     if (!std::isfinite(out.min_clearance_m)) out.min_clearance_m = 0.0;
     out.feasible = true;
+    // Optional polyline out (used ONLY for narrow-passage traversal
+    // evidence in qualify(); dropped immediately, never stored).
+    if (path_out) *path_out = std::move(path);
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -618,79 +802,101 @@ void TaskRouteQualifier::qualify(const Vec2d& start, const Vec2d& goal,
     out.primary_blocker_radius = blocker_radius;
     out.blocking_obstacle_ids = std::move(blocking_ids);
 
-    // ── 4. optional global-route confirmation (bounded A* at the ROUTE
-    //    clearance — a same-component pair at the base clearance is not a
-    //    guarantee of a planner-compatible route). ──────────────────
+    // ── 4. optional global connectivity A* confirmation.  The 2D
+    //    reference astarConnected() uses the BASIC safety clearance; this
+    //    A* confirms basic traversable connectivity (NOT the stricter side
+    //    route clearance — a pair in the 0.50..0.65 m band must not fail
+    //    here).  Budget exhaustion is reported separately from "no path".
     if (qcfg.run_astar_confirmation) {
         uint32_t e = 0;
         const Vec2d axis = goal - start;
         const std::vector<Vec2d> route =
-            astarPath(start, goal, cfg_.routeQualificationClearance(), axis,
+            astarPath(start, goal, cfg_.connectivityRequiredClearance(), axis,
                       blocker_center, 0.0, 1, qcfg.max_astar_expansions, e);
         counters.total_astar_expansions += e;
         if (route.empty()) {
             out.qualification_class = "blocked_no_global_route";
-            out.reject_reason = "global_route_missing";
-            ++counters.reject_global_route;
+            if (e >= static_cast<uint32_t>(qcfg.max_astar_expansions)) {
+                out.reject_reason = "global_astar_budget_exceeded";
+                ++counters.reject_global_astar_budget;
+            } else {
+                out.reject_reason = "global_route_missing";
+                ++counters.reject_global_route;
+            }
             return;
         }
     }
 
     // ── 5. causal LEFT / RIGHT route qualification ─────────────────
+    // The LEFT and RIGHT searches SHARE one per-task expansion budget.
     ++counters.side_qualification_attempt;
     const Vec2d axis_u = (goal - start).normalized();
+    uint64_t task_side_budget =
+        static_cast<uint64_t>(qcfg.max_total_side_route_expansions);
+    std::vector<Vec2d> left_path, right_path;
     planSideRoute(start, goal, blocker_center, blocker_radius, axis_u, true,
-                  out.left);
+                  task_side_budget, out.left, &left_path);
     planSideRoute(start, goal, blocker_center, blocker_radius, axis_u, false,
-                  out.right);
+                  task_side_budget, out.right, &right_path);
     counters.total_astar_expansions +=
         out.left.expanded_nodes + out.right.expanded_nodes;
 
     const bool left_ok = out.left.feasible;
     const bool right_ok = out.right.feasible;
+    // Budget exhaustion is NEVER counted as "infeasible" (semantics differ:
+    // a timeout must not be misread as a proven dead end).
     if (out.left.reject_reason.find("budget") != std::string::npos ||
         out.right.reject_reason.find("budget") != std::string::npos) {
         ++counters.reject_side_search_budget;
     }
+    // Narrow-passage traversal evidence: a task is NARROW only when at
+    // least one ACCEPTED qualified route actually traverses a cached
+    // narrow passage (not merely "a narrow passage lies near the straight
+    // segment").
+    if (left_ok || right_ok) {
+        for (size_t pi = 0; pi < narrow_passages_.size(); ++pi) {
+            const NarrowPassage& np = narrow_passages_[pi];
+            const bool lt = left_ok && routeTraversesNarrowPassage(left_path, np);
+            const bool rt = right_ok && routeTraversesNarrowPassage(right_path, np);
+            if (lt || rt) {
+                out.narrow_passage_id = static_cast<int>(pi);
+                out.route_traverses_narrow = true;
+                break;
+            }
+        }
+    }
+
+    // ── acceptance: 2D reference causalQualify() ────────────────────
+    //   require_both_sides_feasible=true  -> left_ok && right_ok
+    //   relaxed (false)                   -> right_ok ONLY (the runtime
+    //                                        deterministically defaults to
+    //                                        RIGHT on ambiguity; accepting a
+    //                                        LEFT-only task would knowingly
+    //                                        admit a causal runtime failure)
+    if (!left_ok) ++counters.reject_left_infeasible;
+    if (!right_ok) ++counters.reject_right_infeasible;
     if (left_ok && right_ok) {
         ++counters.both_sides_feasible;
         out.qualification_class = "blocked_both_feasible";
         out.accepted = true;
-    } else if (!left_ok && !right_ok) {
-        out.qualification_class = "blocked_no_side";
-        out.reject_reason = "no_feasible_side_route";
-        ++counters.reject_left_infeasible;
-        ++counters.reject_right_infeasible;
-        if (!left_ok) out.left.reject_reason = out.left.reject_reason.empty()
-                                                   ? "infeasible"
-                                                   : out.left.reject_reason;
-        if (!right_ok)
-            out.right.reject_reason = out.right.reject_reason.empty()
-                                          ? "infeasible"
-                                          : out.right.reject_reason;
-        return;
-    } else {
-        // Single side feasible.
+    } else if (qcfg.require_both_sides_feasible) {
         out.qualification_class = "blocked_single_side";
-        ++counters.reject_left_infeasible;
-        ++counters.reject_right_infeasible;
-        if (!left_ok)
-            out.left.reject_reason = out.left.reject_reason.empty()
-                                         ? "infeasible"
-                                         : out.left.reject_reason;
-        if (!right_ok)
-            out.right.reject_reason = out.right.reject_reason.empty()
-                                          ? "infeasible"
-                                          : out.right.reject_reason;
-        if (qcfg.require_both_sides_feasible) {
-            out.reject_reason = "require_both_sides_feasible";
-            ++counters.reject_both_sides_required;
-            return;
-        }
-        // Relaxed mode: accept a single feasible side (right preferred by
-        // the deterministic runtime default).
-        out.accepted = right_ok ? true : left_ok;
+        out.reject_reason = "require_both_sides_feasible";
+        ++counters.reject_both_sides_required;
+        return;
+    } else if (right_ok) {
+        // Relaxed, RIGHT feasible (LEFT may be infeasible): accept.
         out.qualification_class = "blocked_single_side_accepted";
+        out.accepted = true;
+    } else {
+        // Relaxed but RIGHT infeasible: reject (a LEFT-only task is not
+        // acceptable because the runtime default is RIGHT).
+        out.qualification_class = "blocked_no_side";
+        out.reject_reason =
+            right_ok ? "no_feasible_side_route"
+                     : (left_ok ? "relaxed_requires_right_side"
+                                : "no_feasible_side_route");
+        return;
     }
 
     // ── 6. privileged route stretch ────────────────────────────────

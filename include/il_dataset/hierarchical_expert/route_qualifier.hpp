@@ -123,17 +123,44 @@ private:
     bool straightSafe(const Vec2d& a, const Vec2d& b, double clearance) const;
     void losShortcut(std::vector<Vec2d>& path, double clearance) const;
     /// Continuous polyline verification at `clearance` (sampled <= res/2).
-    bool routeSafe(const std::vector<Vec2d>& path, double clearance) const;
+    /// When `recovery_prefix_length` > 0 the first that many metres are
+    /// verified at the BASE endpoint clearance (recovery prefix) and the
+    /// remainder at `clearance` (route clearance) — 2D reference
+    /// `routeSafe(esdf, clearance, path, recovery_prefix_length)`.
+    bool routeSafe(const std::vector<Vec2d>& path, double clearance,
+                   double recovery_prefix_length = 0.0) const;
     bool passesBlockerOnSide(const Vec2d& side_axis, const Vec2d& side_center,
                              const Vec2d& blocker_center,
                              double blocker_radius, bool left_side,
                              const std::vector<Vec2d>& path) const;
+    /// 2D start-clearance recovery (§9): when the A* start cell is NOT
+    /// route-clear while the CONTINUOUS start is base-clear, find the
+    /// nearest route-clear cell inside a bounded radius whose straight
+    /// connector is base-safe.  Returns false when none exists.
+    bool findStartRecoveryCell(const Vec2d& start, double route_clearance,
+                               Vec2d& recovery_cell) const;
+    /// Prepend a densified start→route_start recovery connection (drops the
+    /// duplicate first waypoint).  2D reference `prependRecovery`.
+    void prependRecovery(const Vec2d& start, const Vec2d& route_start,
+                         std::vector<Vec2d>& path) const;
+    /// True iff the polyline actually traverses the narrow passage: at
+    /// least one route point is inside the passage corridor (within the
+    /// passage half-width of the passage axis) with the route crossing from
+    /// one side of the passage to the other (projected-along monotonicity
+    /// or side-sign change).  Lightweight corridor intersection.
+    bool routeTraversesNarrowPassage(const std::vector<Vec2d>& path,
+                                     const NarrowPassage& np) const;
     /// Build one side route (tangent gateways + 3-segment side-A* + LOS +
-    /// homotopy).  Fills `out` result.
+    /// homotopy + start-clearance recovery).  `task_side_budget` is the
+    /// SHARED LEFT+RIGHT expansion budget for this task (each segment
+    /// deducts from it; 0 stops the search).  When `path_out` is non-null
+    /// the densified polyline is returned for narrow-passage traversal
+    /// checks (dropped afterwards; never stored in the manifest).
     void planSideRoute(const Vec2d& start, const Vec2d& goal,
                        const Vec2d& blocker_center, double blocker_radius,
                        const Vec2d& axis_u, bool left_side,
-                       SideRouteResult& out) const;
+                       uint64_t& task_side_budget, SideRouteResult& out,
+                       std::vector<Vec2d>* path_out) const;
 
     // ── scene-static state ─────────────────────────────────────────
     BlueprintGenerationConfig cfg_;
@@ -145,6 +172,9 @@ private:
     std::vector<Vec2d> centers_;
     std::vector<double> radii_;
     std::vector<int> large_obs_;
+    // Narrow passages (copied once from the SceneGeometryCache; used only
+    // for the qualified-route traversal evidence, never stored further).
+    std::vector<NarrowPassage> narrow_passages_;
     // Connectivity components of the qualifier's own ESDF grid at the
     // endpoint clearance (exact 2D semantics; built once per scene).
     std::vector<int> comp_;       // -1 = not selectable, else component id

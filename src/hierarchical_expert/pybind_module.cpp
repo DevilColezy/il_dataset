@@ -317,6 +317,9 @@ void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
         auto gi = [&](const char* k, int dflt) {
             return d.contains(k) ? py::cast<int>(d[k]) : dflt;
         };
+        auto gu = [&](const char* k, uint64_t dflt) {
+            return d.contains(k) ? py::cast<uint64_t>(d[k]) : dflt;
+        };
         auto gd = [&](const char* k, double dflt) {
             return d.contains(k) ? py::cast<double>(d[k]) : dflt;
         };
@@ -333,9 +336,17 @@ void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
         b.qualification.max_side_route_expansions = gi(
             "max_side_route_expansions",
             b.qualification.max_side_route_expansions);
-        b.qualification.max_total_side_route_expansions = gi(
+        b.qualification.max_total_side_route_expansions = gu(
             "max_total_side_route_expansions",
             b.qualification.max_total_side_route_expansions);
+        // Generation-wide cap on all privileged qualification A* work.
+        b.qualification.max_total_qualification_expansions = gu(
+            "max_total_qualification_expansions",
+            b.qualification.max_total_qualification_expansions);
+        // Start-endpoint recovery disk radius (2D macro start recovery).
+        b.qualification.start_recovery_max_radius_m = gd(
+            "start_recovery_max_radius_m",
+            b.qualification.start_recovery_max_radius_m);
         b.qualification.side_bias =
             gd("side_bias", b.qualification.side_bias);
         b.qualification.homotopy_side_tolerance_m = gd(
@@ -910,6 +921,10 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                        &TaskQualificationSummary::blocking_obstacle_ids)
         .def_readwrite("left", &TaskQualificationSummary::left)
         .def_readwrite("right", &TaskQualificationSummary::right)
+        .def_readwrite("narrow_passage_id",
+                       &TaskQualificationSummary::narrow_passage_id)
+        .def_readwrite("route_traverses_narrow",
+                       &TaskQualificationSummary::route_traverses_narrow)
         .def_readwrite("privileged_min_route_stretch",
                        &TaskQualificationSummary::privileged_min_route_stretch)
         .def_readwrite("realized_geom_type",
@@ -935,6 +950,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readonly("reject_different_component",
                       &QualificationCounters::reject_different_component)
         .def_readonly("reject_global_route", &QualificationCounters::reject_global_route)
+        .def_readonly("reject_global_astar_budget",
+                      &QualificationCounters::reject_global_astar_budget)
         .def_readonly("reject_left_infeasible", &QualificationCounters::reject_left_infeasible)
         .def_readonly("reject_right_infeasible", &QualificationCounters::reject_right_infeasible)
         .def_readonly("reject_both_sides_required",

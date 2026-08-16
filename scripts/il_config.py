@@ -513,9 +513,11 @@ def _validate_config(cfg):
                   "min_grouped_correction_samples", errors)
 
         et = bp.get("early_termination", {}) or {}
-        _positive(et.get("no_progress_window_ticks", 150),
+        # 0 = the no-progress watchdog is DISABLED (valid, intended
+        # production default).  Only negative values are rejected.
+        _positive(et.get("no_progress_window_ticks", 0),
                   "blueprint_generation.early_termination."
-                  "no_progress_window_ticks", errors)
+                  "no_progress_window_ticks", errors, allow_zero=True)
         _positive(et.get("stall_window_ticks", 90),
                   "blueprint_generation.early_termination.stall_window_ticks",
                   errors)
@@ -534,6 +536,12 @@ def _validate_config(cfg):
         _positive(tq.get("max_total_side_route_expansions", 120000),
                   "blueprint_generation.task_qualification."
                   "max_total_side_route_expansions", errors)
+        _positive(tq.get("max_total_qualification_expansions", 400000),
+                  "blueprint_generation.task_qualification."
+                  "max_total_qualification_expansions", errors)
+        _positive(tq.get("start_recovery_max_radius_m", 0.5),
+                  "blueprint_generation.task_qualification."
+                  "start_recovery_max_radius_m", errors)
         if float(tq.get("side_bias", 0.4)) < 0.0:
             errors.append("blueprint_generation.task_qualification.side_bias "
                           "must be >= 0")
@@ -541,12 +549,19 @@ def _validate_config(cfg):
             errors.append("blueprint_generation.task_qualification."
                           "min_route_stretch_for_long_detour must be >= 1.0")
 
-        # Preflight control rate (Hz) must be positive; it should match the
-        # expert control rate (the preflight tick grid).
+        # Preflight control rate (Hz): the production tick grid is FIXED at
+        # 30 Hz (dt = 1/30 s is the preflight/stall time base everywhere).
         bp_rate = float(bp.get("control_rate_hz", 30.0))
-        _positive(bp_rate, "blueprint_generation.control_rate_hz", errors)
         he_rate = float((g.get("hierarchical_expert", {}) or {}).get(
             "control_hz", 30.0))
+        if abs(bp_rate - 30.0) > 1e-6:
+            errors.append(
+                "blueprint_generation.control_rate_hz must be exactly "
+                "30.0 Hz (production tick grid); got %g" % bp_rate)
+        if abs(he_rate - 30.0) > 1e-6:
+            errors.append(
+                "hierarchical_expert.control_hz must be exactly 30.0 Hz "
+                "(production tick grid); got %g" % he_rate)
         if abs(bp_rate - he_rate) > 1e-6:
             errors.append(
                 "blueprint_generation.control_rate_hz must equal "

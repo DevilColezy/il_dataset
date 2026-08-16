@@ -644,6 +644,10 @@ class JointV2Manager(object):
                     },
                     "privileged_min_route_stretch":
                         _fin(t.qualification.privileged_min_route_stretch),
+                    "narrow_passage_id":
+                        int(t.qualification.narrow_passage_id),
+                    "route_traverses_narrow":
+                        bool(t.qualification.route_traverses_narrow),
                     "realized_geom_type":
                         str(t.qualification.realized_geom_type),
                     "qualification_class":
@@ -746,6 +750,8 @@ class JointV2Manager(object):
                     int(result.qualification.reject_different_component),
                 "reject_global_route":
                     int(result.qualification.reject_global_route),
+                "reject_global_astar_budget":
+                    int(result.qualification.reject_global_astar_budget),
                 "reject_left_infeasible":
                     int(result.qualification.reject_left_infeasible),
                 "reject_right_infeasible":
@@ -794,6 +800,8 @@ class JointV2Manager(object):
                             int(r.qualification.reject_different_component),
                         "reject_global_route":
                             int(r.qualification.reject_global_route),
+                        "reject_global_astar_budget":
+                            int(r.qualification.reject_global_astar_budget),
                         "reject_both_sides_required":
                             int(r.qualification.reject_both_sides_required),
                         "total_astar_expansions":

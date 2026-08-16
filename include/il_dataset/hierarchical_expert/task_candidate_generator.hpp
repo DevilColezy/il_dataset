@@ -41,12 +41,25 @@ public:
 
     /// FINAL geometric classification using the PRIVILEGED qualification
     /// result (straight-corridor status, primary blocker, side-route
-    /// stretch, narrow-passage relevance, chicane geometry).  Decided from
-    /// the actual task geometry, never from the scene profile alone.
+    /// stretch, narrow-passage traversal, chicane alternation).  Decided
+    /// from the actual task geometry, never from the scene profile alone.
+    /// Priority (documented + tested): CHICANE > NARROW_BUT_PLANNABLE >
+    /// LONG_DETOUR > LARGE_OCCLUSION > MULTI_OBSTACLE > LOCAL_AVOIDANCE >
+    /// OFFSET_AVOIDANCE > CLEAR.
     TaskGeomType classifyQualified(const SceneGeometryCache& geo,
                                    const BlueprintScene& scene,
                                    const Vec2d& start, const Vec2d& goal,
                                    const TaskQualificationSummary& q) const;
+
+    /// CHICANE evidence: count the lateral-sign alternations of the
+    /// obstacles near the task corridor, sorted by their along-coordinate
+    /// relative to the task forward direction (rotation invariant).  A
+    /// (+ - + -) sequence is a chicane; (+ + - -) is not, even though both
+    /// left and right obstacles exist.
+    int countTaskChicaneAlternations(const std::vector<Vec2d>& centers,
+                                     const std::vector<double>& radii,
+                                     const Vec2d& start,
+                                     const Vec2d& goal) const;
 
     /// Scene-level feasibility mask for the geometric proxy classes.  A
     /// class is marked feasible only when the SCENE can actually produce

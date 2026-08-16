@@ -618,8 +618,19 @@ struct BlueprintGenerationConfig {
         // Node-expansion caps (hard; a search that hits the cap is a
         // reject reason, never an unbounded search).
         int max_astar_expansions = 30000;        // global connectivity A*
-        int max_side_route_expansions = 20000;   // per side A*
-        int max_total_side_route_expansions = 120000;  // per task, both sides
+        int max_side_route_expansions = 20000;   // per segment A*
+        // Per-TASK shared cap across LEFT + RIGHT (each segment deducts
+        // from this; a query whose remaining budget is 0 stops and reports
+        // side_search_budget_exceeded).
+        int max_total_side_route_expansions = 120000;
+        // Blueprint-generation-level hard upper bound on ALL A* expansions
+        // (global connectivity + side routes across every candidate).
+        // Once reached, no further qualification searches run and the
+        // generation ends with a clear reason.
+        uint64_t max_total_qualification_expansions = 400000;
+        // Bounded radius (m) used by the start-clearance recovery (mirrors
+        // the 2D macro_start_recovery_max_radius_m = 0.5).
+        double start_recovery_max_radius_m = 0.5;
         // Side-A* lateral bias (0 = side-neutral).  Mirrors the 2D
         // macro_route_side_bias=0.4; the SAME fixed axis (start->goal) and
         // blocker centre define LEFT/RIGHT for the whole qualification.
@@ -704,6 +715,11 @@ struct TaskQualificationSummary {
     // min(left.length, right.length) / straight_distance (0 when clear or
     // no feasible side).
     double privileged_min_route_stretch = 0.0;
+    // Narrow-passage traversal evidence: set when at least one FEASIBLE
+    // qualified side route actually traverses a cached narrow passage
+    // (route crosses the passage corridor from one side to the other).
+    int narrow_passage_id = -1;
+    bool route_traverses_narrow = false;
     // Realized geometric class (CLEAR / LOCAL_AVOIDANCE / ... ) decided
     // from the qualification geometry, NOT from the scene profile alone.
     std::string realized_geom_type = "CLEAR";
@@ -729,6 +745,7 @@ struct QualificationCounters {
     uint64_t reject_clearance = 0;
     uint64_t reject_different_component = 0;
     uint64_t reject_global_route = 0;
+    uint64_t reject_global_astar_budget = 0;
     uint64_t reject_left_infeasible = 0;
     uint64_t reject_right_infeasible = 0;
     uint64_t reject_both_sides_required = 0;
@@ -747,6 +764,8 @@ enum class BudgetExhaustion : uint8_t {
     PREFLIGHT_TICK_BUDGET = 3,
     GENERATION_ROUND_BUDGET = 4,
     TASK_CANDIDATE_BUDGET = 5,
+    // Privileged qualification A* expansion budget (generation-wide).
+    QUALIFICATION_EXPANSION_BUDGET = 6,
 };
 
 inline const char* budgetExhaustionName(BudgetExhaustion b) {
@@ -761,6 +780,8 @@ inline const char* budgetExhaustionName(BudgetExhaustion b) {
             return "generation_round_budget";
         case BudgetExhaustion::TASK_CANDIDATE_BUDGET:
             return "task_candidate_budget";
+        case BudgetExhaustion::QUALIFICATION_EXPANSION_BUDGET:
+            return "qualification_expansion_budget";
     }
     return "none";
 }

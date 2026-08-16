@@ -166,7 +166,6 @@ TaskGeomType TaskCandidateGenerator::classifyQualified(
     // classifyGeometry); cheap and scene-cached.
     int near_count = 0;
     bool large_blocker = false;
-    int left_count = 0, right_count = 0;
     for (size_t i = 0; i < centers.size(); ++i) {
         const Vec2d& c = centers[i];
         const double d = distToSeg(c, start, goal);
@@ -175,31 +174,18 @@ TaskGeomType TaskCandidateGenerator::classifyQualified(
         if (along < 0.5) continue;  // only obstacles ahead of the start
         const double clear = d - radii[i];
         if (clear < chw) ++near_count;
-        if (clear < free_clr) {
-            if (std::find(large.begin(), large.end(), static_cast<int>(i)) !=
+        if (clear < free_clr &&
+            std::find(large.begin(), large.end(), static_cast<int>(i)) !=
                 large.end()) {
-                large_blocker = true;
-            }
-        }
-        if (clear < chw + 1.0) {
-            if (signedDistToSeg(c, start, goal) >= 0.0) {
-                ++left_count;
-            } else {
-                ++right_count;
-            }
+            large_blocker = true;
         }
     }
-    // Narrow-passage relevance (the task corridor must pass through a
-    // cached narrow passage).
-    bool narrow_relevant = false;
-    for (const auto& np : geo.narrowPassages()) {
-        if (distToSeg(np.center, start, goal) < chw + 1.0) {
-            narrow_relevant = true;
-            break;
-        }
-    }
-
-    const bool is_long = len >= cfg_.path_long_min_m - 1e-9;
+    // CHICANE evidence: real lateral sign alternation of the obstacles
+    // NEAR the task corridor, sorted by their along-coordinate relative to
+    // the task forward direction.  (+ - + -) is a chicane; (+ + - -) is
+    // not, even though both left and right obstacles exist.
+    const int chicane_flips = countTaskChicaneAlternations(centers, radii,
+                                                           start, goal);
 
     // ── Straight corridor clear at the route qualification clearance ──
     if (q.straight_corridor_clear) {
@@ -213,34 +199,76 @@ TaskGeomType TaskCandidateGenerator::classifyQualified(
         return TaskGeomType::CLEAR;
     }
 
-    // ── Blocked: use the qualification geometry, not the scene profile. ─
+    // ── Blocked: classification priority is EXPLICIT (documented + tested,
+    //    not an implicit if-order side effect):
+    //    CHICANE > NARROW_BUT_PLANNABLE > LONG_DETOUR > LARGE_OCCLUSION >
+    //    MULTI_OBSTACLE > LOCAL_AVOIDANCE > OFFSET_AVOIDANCE > CLEAR ─────
     const double stretch = q.privileged_min_route_stretch;
     const bool blocker_large =
         q.primary_blocker_radius >= largeRadiusThreshold();
-    if (is_long && (blocker_large || stretch >=
-                    cfg_.qualification.min_route_stretch_for_long_detour)) {
+
+    if (chicane_flips >= std::max(1, cfg_.min_chicane_alternations)) {
+        return TaskGeomType::CHICANE;
+    }
+    // NARROW requires PROOF that an accepted qualified route actually
+    // traverses a cached narrow passage (set by TaskRouteQualifier).
+    // Priority NARROW > LARGE_OCCLUSION: a route squeezed through a narrow
+    // gap is NARROW even when the flanking obstacles are large.
+    if (q.route_traverses_narrow && q.narrow_passage_id >= 0) {
+        return TaskGeomType::NARROW_BUT_PLANNABLE;
+    }
+    // LONG_DETOUR: the CORE criterion is the privileged route stretch
+    // (min feasible route / straight distance), independent of whether the
+    // straight distance itself is "long".  A 12 m straight with a 20 m
+    // route (stretch 1.67) is a LONG_DETOUR even though 12 m < 20 m.
+    if (stretch >= cfg_.qualification.min_route_stretch_for_long_detour) {
         return TaskGeomType::LONG_DETOUR;
     }
     if (blocker_large) {
         return TaskGeomType::LARGE_OCCLUSION;
     }
-    // Chicane: the scene is a chicane AND the segment spans it with true
-    // left/right alternation (never "all chicane tasks are CHICANE").
-    const bool chicane_scene =
-        scene.profile == "chicane" &&
-        (scene.structure_orientation == StructureOrientation::HORIZONTAL ||
-         scene.structure_orientation == StructureOrientation::VERTICAL);
-    if (chicane_scene && near_count >= 2 && left_count >= 1 &&
-        right_count >= 1) {
-        return TaskGeomType::CHICANE;
-    }
-    if (narrow_relevant && !blocker_large) {
-        return TaskGeomType::NARROW_BUT_PLANNABLE;
-    }
-    if (q.blocking_obstacle_ids.size() >= 2) {
+    if (q.blocking_obstacle_ids.size() >= 2 || near_count >= 2) {
         return TaskGeomType::MULTI_OBSTACLE;
     }
     return TaskGeomType::LOCAL_AVOIDANCE;
+}
+
+int TaskCandidateGenerator::countTaskChicaneAlternations(
+    const std::vector<Vec2d>& centers, const std::vector<double>& radii,
+    const Vec2d& start, const Vec2d& goal) const {
+    const Vec2d axis = goal - start;
+    const double len = std::max(1e-6, axis.norm());
+    const Vec2d fwd = axis / len;
+    const Vec2d left(-fwd.y(), fwd.x());
+    const double chw = corridorHalfWidth();
+    // Candidate obstacles: those whose surface is within a lateral band of
+    // the task corridor (reuse the chw+1 band used by the classifier).
+    std::vector<std::pair<double, double>> seq;  // (along, lateral)
+    for (size_t i = 0; i < centers.size() && i < radii.size(); ++i) {
+        const Vec2d rel = centers[i] - start;
+        const double along = rel.dot(fwd);
+        const double lateral = rel.dot(left);
+        if (along < 0.5 || along > len) continue;
+        const double off = std::fabs(lateral);
+        if (off - radii[i] > chw + 1.0) continue;  // not near the corridor
+        seq.emplace_back(along, lateral);
+    }
+    if (seq.size() < 4) return 0;
+    std::sort(seq.begin(), seq.end());
+    int flips = 0;
+    double prev = 0.0;
+    bool first = true;
+    for (const auto& s : seq) {
+        const double side = s.second;  // lateral sign (LEFT positive)
+        if (first) {
+            prev = side;
+            first = false;
+            continue;
+        }
+        if (prev * side < 0.0) ++flips;
+        prev = side;
+    }
+    return flips;
 }
 
 double TaskCandidateGenerator::sampleInitialYaw(

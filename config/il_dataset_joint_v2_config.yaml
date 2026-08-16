@@ -122,6 +122,8 @@ global:
       max_astar_expansions: 30000
       max_side_route_expansions: 20000
       max_total_side_route_expansions: 120000
+      max_total_qualification_expansions: 400000
+      start_recovery_max_radius_m: 0.5
       side_bias: 0.4
       min_route_stretch_for_long_detour: 1.5
     distribution_targets: []

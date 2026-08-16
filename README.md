@@ -210,27 +210,58 @@ expert preflight —
      when an obstacle surface comes within `routeQualificationClearance()`
      of the start→goal segment; the nearest forward blocker (ties by
      penetration then id) is recorded;
-  4. *causal LEFT / RIGHT routes* (only for blocked tasks): side-constrained
+  4. *bounded global connectivity A*** (optional, `run_astar_confirmation`):
+     a confirmation A* at the BASIC safety clearance
+     (`connectivityRequiredClearance()`, 0.50 m) — NOT the stricter route
+     clearance: a same-component pair in the 0.50–0.65 m band must not
+     fail here.  Budget exhaustion is reported separately from "no path"
+     (`global_astar_budget_exceeded` vs `global_route_missing`);
+  5. *causal LEFT / RIGHT routes* (only for blocked tasks): side-constrained
      A* routes are planned around the primary blocker via tangent gateways
      + a lateral side-bias potential + LOS shortcut + homotopy check, with
-     a per-side node-expansion budget and reusable generation-marked A*
-     buffers.  LEFT/RIGHT are relative to the FIXED start→goal axis
-     (rotation invariant); with `require_both_sides_feasible=true` a
-     blocked task is accepted only when BOTH branches are globally
-     feasible (a local-causal expert cannot know a hidden one-sided dead
-     end).  Clear tasks skip the side search entirely.
+     reusable generation-marked A* buffers.  LEFT/RIGHT are relative to the
+     FIXED start→goal axis (rotation invariant).  The two side searches
+     SHARE one per-task node budget (`max_total_side_route_expansions`):
+     each segment is capped to `min(max_side_route_expansions, remaining)`
+     and the LEFT+RIGHT sum can never exceed the per-task budget.
+     *Start-clearance recovery*: when the start cell is NOT route-clear but
+     the continuous start is base-clear (0.50 < esdf < 0.65), a recovery
+     prefix is prepended from the nearest base-safe route-clear cell inside
+     `start_recovery_max_radius_m`; the prefix is verified at the BASE
+     clearance, the rest of the route at the route clearance (the GOAL gets
+     no recovery).  Acceptance follows the 2D `causalQualify()` reference:
+     `require_both_sides_feasible=true` → LEFT **and** RIGHT feasible;
+     relaxed (`false`) → RIGHT ONLY (`accepted = right_ok`), because the
+     runtime deterministically defaults to RIGHT on ambiguity.  Clear
+     tasks skip the side search entirely.
 All route / blocker / stretch data is PRIVILEGED truth: it is written to
 the Blueprint manifest and generation statistics but is NEVER fed to the
 5 Hz / 30 Hz expert or to the DatasetWriter student inputs.  The realized
 geometric class is then decided from the qualification geometry
-(`classifyQualified`: CLEAR / LOCAL_AVOIDANCE / LARGE_OCCLUSION /
-LONG_DETOUR via `privileged_min_route_stretch` / NARROW_BUT_PLANNABLE
-when the qualified corridor passes a planner-compatible narrow passage /
-CHICANE only for real chicane tasks), never from the scene profile alone.
+(`classifyQualified`) with an EXPLICIT priority:
+**CHICANE > NARROW_BUT_PLANNABLE > LONG_DETOUR > LARGE_OCCLUSION >
+MULTI_OBSTACLE > LOCAL_AVOIDANCE > OFFSET_AVOIDANCE > CLEAR**, where
+- CHICANE = real lateral-sign alternation of the obstacles near the task
+  corridor, sorted by their along-coordinate relative to the task forward
+  (>= `min_chicane_alternations` flips; a `+ - + -` sequence is a chicane,
+  a `+ + - -` sequence is not, even though both left and right obstacles
+  exist);
+- NARROW_BUT_PLANNABLE = an ACCEPTED qualified route actually traverses a
+  planner-compatible narrow passage (`route_traverses_narrow` +
+  `narrow_passage_id`), never mere proximity of the straight segment;
+- LONG_DETOUR = the CORE criterion is `privileged_min_route_stretch >=
+  min_route_stretch_for_long_detour` (min feasible route / straight
+  distance), independent of the straight distance itself;
+- LARGE_OCCLUSION = a large primary blocker (>= 1.5 m radius) whose detour
+  is below the LONG_DETOUR threshold.
 Per-round aggregate qualification counters (endpoint / connectivity /
-straight-clear / blocked / side attempts / both-sides / rejects) and the
+straight-clear / blocked / side attempts / both-sides / per-side rejects /
+global-A* budget / side-search budget / total expansions) and the
 efficiency ratios (`qualification_pass_ratio`,
 `full_preflight_success_after_qualification_ratio`) are reported.
+A generation-wide hard bound on ALL privileged qualification A* work
+(`max_total_qualification_expansions`) ends the run with
+`budget_exhausted_reason = qualification_expansion_budget`.
 
 **Budgets**: `max_scene_candidates`, `max_task_candidates_per_scene`,
 `max_generation_rounds`, `max_total_preflight_tasks`,

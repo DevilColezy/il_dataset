@@ -64,6 +64,7 @@ inline void accumulateQual(QualificationCounters& dst,
     dst.reject_clearance += src.reject_clearance;
     dst.reject_different_component += src.reject_different_component;
     dst.reject_global_route += src.reject_global_route;
+    dst.reject_global_astar_budget += src.reject_global_astar_budget;
     dst.reject_left_infeasible += src.reject_left_infeasible;
     dst.reject_right_infeasible += src.reject_right_infeasible;
     dst.reject_both_sides_required += src.reject_both_sides_required;
@@ -664,6 +665,13 @@ BlueprintResult BlueprintGenerationController::generate() {
             budget_exhausted = BudgetExhaustion::PREFLIGHT_TICK_BUDGET;
             return true;
         }
+        // Generation-wide privileged-qualification A* expansion hard bound.
+        if (cfg_.qualification.enabled &&
+            qual_total.total_astar_expansions >=
+                cfg_.qualification.max_total_qualification_expansions) {
+            budget_exhausted = BudgetExhaustion::QUALIFICATION_EXPANSION_BUDGET;
+            return true;
+        }
         return false;
     };
 
@@ -941,7 +949,8 @@ BlueprintResult BlueprintGenerationController::generate() {
                          "endpoint=%llu conn=%llu straight_clear=%llu "
                          "blocked=%llu side_attempt=%llu both=%llu "
                          "accept=%llu reject[endpoint=%llu comp=%llu "
-                         "global_route=%llu both_required=%llu] "
+                         "global_route=%llu global_astar_budget=%llu "
+                         "side_budget=%llu both_required=%llu] "
                          "astar_exp=%llu\n",
                          static_cast<unsigned long long>(round),
                          static_cast<unsigned long long>(q.candidates_checked),
@@ -955,6 +964,8 @@ BlueprintResult BlueprintGenerationController::generate() {
                          static_cast<unsigned long long>(q.reject_endpoint),
                          static_cast<unsigned long long>(q.reject_different_component),
                          static_cast<unsigned long long>(q.reject_global_route),
+                         static_cast<unsigned long long>(q.reject_global_astar_budget),
+                         static_cast<unsigned long long>(q.reject_side_search_budget),
                          static_cast<unsigned long long>(q.reject_both_sides_required),
                          static_cast<unsigned long long>(q.total_astar_expansions));
         }

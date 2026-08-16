@@ -303,13 +303,22 @@ global:
       # Blocked tasks must have BOTH homotopy branches globally feasible:
       # a local-causal expert cannot know a hidden one-sided dead end.
       require_both_sides_feasible: true
-      # Bounded global A* confirmation at the ROUTE clearance (same
-      # component at the base clearance does not guarantee a
-      # planner-compatible route).
+      # Bounded global A* connectivity confirmation at the BASIC safety
+      # clearance (mirrors the 2D astarConnected: a same-component pair at
+      # the base clearance must not fail the global check).
       run_astar_confirmation: true
       max_astar_expansions: 30000
       max_side_route_expansions: 20000
+      # Per-task budget SHARED between the LEFT and RIGHT side searches
+      # (a single task may not exceed this total).
       max_total_side_route_expansions: 120000
+      # Generation-wide cap on ALL privileged qualification A* expansions
+      # (global A* + both side searches across every task candidate).
+      max_total_qualification_expansions: 400000
+      # Start-endpoint recovery disk radius (2D macro start recovery:
+      # when the start cell is NOT route-clear but IS free at the base
+      # clearance, prepend a recovery prefix at the base clearance).
+      start_recovery_max_radius_m: 0.5
       # Lateral bias of the side A* (0 = side-neutral).  LEFT/RIGHT are
       # defined relative to the FIXED start->goal axis (rotation
       # invariant), never world axes.

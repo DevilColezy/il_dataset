@@ -781,6 +781,17 @@ BlueprintScene makeChainScene(double y_lo, double y_hi, bool with_gap,
     return makeScene(obs);
 }
 
+/// A solid vertical wall at x=0 (r=1.5 circles, spacing 3.0 => surface
+/// gaps 0) spanning y in [1.9, 25.9].  The only routes around it are the
+/// long way over the top or under the bottom -> genuine LONG_DETOUR.
+BlueprintScene makeWallScene() {
+    std::vector<std::array<double, 3>> obs;
+    for (double y = 3.4; y <= 24.4 + 1e-9; y += 3.0) {
+        obs.push_back({0.0, y, 1.5});
+    }
+    return makeScene(obs);
+}
+
 struct QualFixture {
     BlueprintScene scene;
     BlueprintGenerationConfig cfg;
@@ -792,6 +803,17 @@ struct QualFixture {
     QualFixture(std::vector<std::array<double, 3>> obs,
                 bool require_both = true) {
         scene = makeScene(std::move(obs));
+        cfg = makeCfg();
+        cfg.qualification.require_both_sides_feasible = require_both;
+        meta = SceneMetadata{};
+        geo.build(scene, cfg, meta);
+        qual.configure(scene, geo, cfg);
+        gen = TaskCandidateGenerator(cfg);
+    }
+
+    /// Scene-based fixture (makeChainScene and friends return a scene).
+    QualFixture(const BlueprintScene& s, bool require_both = true) {
+        scene = s;
         cfg = makeCfg();
         cfg.qualification.require_both_sides_feasible = require_both;
         meta = SceneMetadata{};
@@ -848,19 +870,44 @@ static void testQualification() {
               "small blocker: realized LOCAL_AVOIDANCE");
     }
 
-    // ── large symmetric blocker: LARGE_OCCLUSION ──────────────────
+    // ── large symmetric blocker (legal endpoints, endpoints-first): the
+    //    r=5 disk forces a small tangent detour (stretch ~1.05 < 1.5) so
+    //    the realized class is LARGE_OCCLUSION, NOT LONG_DETOUR. ──────
     {
         QualFixture f({{0.0, 15.0, 5.0}});
-        TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
+        // start 0.6 m from the left boundary / 1.4 m from the blocker
+        // surface; goal 1.0 m from the right boundary.
+        TaskQualificationSummary q = f.qualify(-6.4, 15.0, 9.0, 15.0);
+        check(q.endpoint_valid, "large blocker: endpoints valid");
         check(!q.straight_corridor_clear, "large blocker: corridor blocked");
         check(q.left.feasible && q.right.feasible,
               "large blocker: both sides feasible");
         check(q.accepted, "large blocker: accepted");
         check(q.primary_blocker_radius >= 5.0 - 1e-9,
               "large blocker: primary blocker radius recorded");
-        const TaskGeomType cls = f.classify(-5, 15, 5, 15, q);
+        check(q.privileged_min_route_stretch < 1.5,
+              "large blocker: stretch below the LONG_DETOUR threshold");
+        const TaskGeomType cls = f.classify(-6.4, 15, 9, 15, q);
         check(cls == TaskGeomType::LARGE_OCCLUSION,
               "large blocker: realized LARGE_OCCLUSION");
+    }
+
+    // ── LONG_DETOUR is STRETCH-based (NOT distance-based): a 15 m task
+    //    whose only routes go all the way over/under a tall wall has
+    //    stretch ~2.4 even though 15 m < path_long_min_m (20 m). ──────
+    {
+        QualFixture f(makeWallScene());
+        TaskQualificationSummary q = f.qualify(-6.0, 16.0, 9.0, 16.0);
+        check(q.endpoint_valid, "wall: endpoints valid");
+        check(!q.straight_corridor_clear, "wall: corridor blocked");
+        check(q.left.feasible && q.right.feasible,
+              "wall: both sides feasible");
+        check(q.accepted, "wall: accepted");
+        check(q.privileged_min_route_stretch >= 1.5,
+              "wall: stretch >= 1.5 (long detour)");
+        const TaskGeomType cls = f.classify(-6, 16, 9, 16, q);
+        check(cls == TaskGeomType::LONG_DETOUR,
+              "wall: realized LONG_DETOUR (stretch criterion)");
     }
 
     // ── LEFT-only (barrier below blocks the RIGHT/down route) ─────
@@ -901,17 +948,39 @@ static void testQualification() {
         check(!q.accepted, "neither: rejected (no side route)");
     }
 
-    // ── both-sides acceptance rules (D): relaxed mode accepts single ─
+    // ── relaxed acceptance = RIGHT ONLY (2D causalQualify() reference:
+    //    return res.right_valid).  A LEFT-only task is REJECTED even in
+    //    relaxed mode because the runtime deterministically defaults to
+    //    RIGHT on ambiguity. ──────────────────────────────────────────
     {
-        // LEFT-only scene but with require_both=false: accepted (right by
-        // the deterministic default) — here LEFT is feasible so accepted.
+        // LEFT-only scene (barrier below blocks RIGHT/down).
         QualFixture f({{0.0, 15.0, 1.5}, {0.0, 11.5, 1.5}, {0.0, 8.0, 1.5},
                        {0.0, 4.5, 1.5}, {0.0, 1.0, 1.5}},
                       false);
         TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
         check(q.left.feasible && !q.right.feasible,
-              "relaxed left-only: single side");
-        check(q.accepted, "relaxed left-only: accepted");
+              "relaxed left-only: single side (LEFT)");
+        check(!q.accepted,
+              "relaxed left-only: REJECTED (relaxed requires RIGHT)");
+    }
+    // Relaxed RIGHT-only scene (barrier above blocks LEFT/up): accepted.
+    {
+        QualFixture f({{0.0, 15.0, 1.5}, {0.0, 18.5, 1.5}, {0.0, 22.0, 1.5},
+                       {0.0, 25.5, 1.5}, {0.0, 29.0, 1.5}},
+                      false);
+        TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
+        check(!q.left.feasible && q.right.feasible,
+              "relaxed right-only: single side (RIGHT)");
+        check(q.accepted,
+              "relaxed right-only: accepted (RIGHT feasible)");
+    }
+    // Relaxed both-sides scene: accepted.
+    {
+        QualFixture f({{0.0, 15.0, 1.0}}, false);
+        TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
+        check(q.left.feasible && q.right.feasible,
+              "relaxed both: both sides feasible");
+        check(q.accepted, "relaxed both: accepted");
     }
 
     // ── endpoint near the region boundary must still be valid ──────
@@ -925,15 +994,103 @@ static void testQualification() {
         check(!q2.endpoint_valid, "endpoint 0.1m from the boundary invalid");
     }
 
+    // ── START-CLEARANCE RECOVERY (2D macro start recovery) ─────────
+    // A rear obstacle at (-5.6,15) r=1.0 reduces the start clearance; the
+    // forward blocker (0,15) r=1.0 blocks the straight corridor.  Start
+    // esdf at x: 0.7 (no recovery), 0.55 (recovery), 0.45 (invalid).
+    {
+        const std::vector<std::array<double, 3>> obs = {
+            {0.0, 15.0, 1.0}, {-5.6, 15.0, 1.0}};
+        // Case A: start clearance 0.70 > 0.65 => no recovery prefix; the
+        // whole route must stay at the ROUTE clearance.
+        {
+            QualFixture f(obs);
+            TaskQualificationSummary q = f.qualify(-3.9, 15.0, 5.0, 15.0);
+            check(q.endpoint_valid, "recov A: endpoint valid");
+            check(q.accepted, "recov A: accepted");
+            check(q.left.feasible && q.right.feasible,
+                  "recov A: both sides feasible");
+            check(q.left.min_clearance_m >= 0.65 - 0.02,
+                  "recov A: no recovery (min clearance >= route)");
+        }
+        // Case B: start clearance 0.55 in (0.5, 0.65) => recovery prefix
+        // at the BASE clearance; the route min clearance drops below the
+        // route clearance (that is the point of the recovery).
+        {
+            QualFixture f(obs);
+            TaskQualificationSummary q = f.qualify(-4.05, 15.0, 5.0, 15.0);
+            check(q.endpoint_valid, "recov B: endpoint valid");
+            check(q.accepted, "recov B: accepted (recovery succeeds)");
+            check(q.left.feasible && q.right.feasible,
+                  "recov B: both sides feasible");
+            check(q.left.min_clearance_m < 0.65 - 0.02 &&
+                      q.left.min_clearance_m >= 0.5 - 0.02,
+                  "recov B: recovery prefix verified at BASE clearance");
+        }
+        // Case C: start clearance 0.45 < 0.5 => endpoint FAIL (rejected
+        // before any side search; no recovery can fix a sub-base start).
+        {
+            QualFixture f(obs);
+            TaskQualificationSummary q = f.qualify(-4.15, 15.0, 5.0, 15.0);
+            check(!q.endpoint_valid, "recov C: endpoint invalid");
+            check(!q.accepted, "recov C: rejected");
+        }
+    }
+
+    // ── GLOBAL A* USES THE BASIC CLEARANCE, NOT THE ROUTE CLEARANCE ─
+    // Start clearance 0.58 in (0.5, 0.65) and goal clearance > 0.65 with
+    // connectivity present: the bounded global confirmation A* must pass
+    // at the BASIC clearance (a 0.58-clear start is still traversable).
+    // Under the old route-clearance behavior this task was rejected as
+    // "global_route_missing".
+    {
+        QualFixture f({{0.0, 15.0, 1.0}, {-5.6, 15.0, 1.0}});
+        TaskQualificationSummary q = f.qualify(-4.02, 15.0, 5.0, 15.0);
+        check(q.endpoint_valid, "gastar: endpoint valid (0.58 clearance)");
+        check(q.connectivity_valid, "gastar: connectivity valid");
+        check(q.reject_reason.find("global") == std::string::npos,
+              "gastar: not rejected by the global A*");
+        check(q.accepted, "gastar: accepted (global A* passes at 0.50)");
+    }
+
     // ── different components: a full barrier splits the region ────
     {
         // Vertical barrier spanning the whole height at x=0 (no gap):
         // start/goal on opposite sides => different components.
-        QualFixture f(makeChainScene(1.0, 29.0, false).obstacles);
+        QualFixture f(makeChainScene(1.0, 29.0, false));
         TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
         check(!q.connectivity_valid,
               "full barrier: start/goal in different components");
         check(!q.accepted, "full barrier: rejected (different component)");
+    }
+
+    // ── SHARED per-task LEFT+RIGHT budget ──────────────────────────
+    // max_side_route_expansions=100 caps each single A* segment;
+    // max_total_side_route_expansions=250 is the per-task budget SHARED
+    // between LEFT and RIGHT.  The LEFT search may consume up to 250,
+    // leaving 0 for RIGHT, but the SUM over both sides must NEVER exceed
+    // the per-task budget.
+    {
+        QualFixture f(makeWallScene());
+        f.cfg.qualification.max_side_route_expansions = 100;
+        f.cfg.qualification.max_total_side_route_expansions = 250;
+        f.qual.configure(f.scene, f.geo, f.cfg);
+        TaskQualificationSummary q = f.qualify(-6.0, 16.0, 9.0, 16.0);
+        const uint64_t total =
+            static_cast<uint64_t>(q.left.expanded_nodes) +
+            static_cast<uint64_t>(q.right.expanded_nodes);
+        check(total <= 250,
+              "shared budget: LEFT+RIGHT expansions never exceed the "
+              "per-task budget");
+        if (total > 250) {
+            std::fprintf(stderr,
+                         "  [info] shared budget test: total=%llu left=%llu "
+                         "right=%llu\n",
+                         static_cast<unsigned long long>(total),
+                         static_cast<unsigned long long>(q.left.expanded_nodes),
+                         static_cast<unsigned long long>(
+                             q.right.expanded_nodes));
+        }
     }
 }
 
@@ -985,43 +1142,118 @@ static void testQualificationRotationInvariance() {
 // ── 13. narrow passage valid / invalid ─────────────────────────────
 static void testQualificationNarrow() {
     std::fprintf(stderr, "test: narrow passage qualification\n");
-    // Valid: two obstacles with a planner-compatible gap (2.2 m in
-    // [1.4,2.8]).  The straight corridor is blocked by both; the side
-    // routes pass through the gap; realized NARROW_BUT_PLANNABLE.
+    // Valid: a solid vertical wall at x=0 reaching the floor (circles at
+    // y = -0.5..9.5) topped by S at (0,11.5) and the primary blocker B at
+    // (0,15) r=1.0.  B and S form a planner-compatible passage of 1.5 m in
+    // [1.4,2.8].  The LEFT route goes over B; the RIGHT route is FUNNELED
+    // through the 1.5 m passage (the ONLY opening below B — the wall
+    // reaches the floor and B closes the top), so route_traverses_narrow
+    // is PROVEN by an actual qualified route, not by mere proximity of the
+    // straight segment.
     {
-        QualFixture f({{-2.1, 15.0, 1.0}, {2.1, 15.0, 1.0}});
+        std::vector<std::array<double, 3>> obs;
+        for (double y = -0.5; y <= 9.5 + 1e-9; y += 2.0) {
+            obs.push_back({0.0, y, 1.0});  // solid wall to the floor
+        }
+        obs.push_back({0.0, 11.5, 1.0});  // passage flank below
+        obs.push_back({0.0, 15.0, 1.0});  // primary blocker (passage flank above)
+        QualFixture f(obs);
         TaskQualificationSummary q = f.qualify(-6.0, 15.0, 6.0, 15.0);
+        check(q.endpoint_valid, "narrow valid: endpoints valid");
         check(!q.straight_corridor_clear, "narrow valid: corridor blocked");
         check(q.left.feasible && q.right.feasible,
               "narrow valid: both sides feasible");
         check(q.accepted, "narrow valid: accepted");
+        check(q.route_traverses_narrow && q.narrow_passage_id >= 0,
+              "narrow valid: an accepted route traverses a narrow passage");
         const TaskGeomType cls = f.classify(-6, 15, 6, 15, q);
         check(cls == TaskGeomType::NARROW_BUT_PLANNABLE,
               "narrow valid: realized NARROW_BUT_PLANNABLE");
     }
-    // Invalid: the only passage through a solid barrier is 0.8 m wide
-    // (< planner-required 1.4) => both side routes infeasible => reject.
+    // NEGATIVE: two obstacles at (+-2.0,15) r=1.0 leave a 2.0 m gap.
+    // The gap IS registered as a narrow-passage candidate geometrically,
+    // but the straight corridor (1.3 m) fits through it, so the task is
+    // CLEAR: NO qualified route traverses the passage -> must NOT be
+    // classified NARROW (the old straight-segment-proximity rule would
+    // have wrongly flagged it).
     {
-        // Chain solid except a single 0.8 m gap at y=15.
-        const double gap_w = 0.8;
-        const double gap_cy = 15.0;
-        const double r = 1.5;
+        QualFixture f({{-2.0, 15.0, 1.0}, {2.0, 15.0, 1.0}});
+        TaskQualificationSummary q = f.qualify(-6.0, 15.0, 6.0, 15.0);
+        check(q.straight_corridor_clear,
+              "narrow negative: 2.0 m gap leaves the corridor clear");
+        check(!q.route_traverses_narrow,
+              "narrow negative: no narrow traversal evidence");
+        check(f.classify(-6, 15, 6, 15, q) != TaskGeomType::NARROW_BUT_PLANNABLE,
+              "narrow negative: NOT classified NARROW");
+    }
+    // Invalid: a full-height barrier with a single 1.2 m gap.  The gap is
+    // endpoint-clear (1.2 > 1.0, so connectivity holds) but sub-planner
+    // (1.2 < 1.4), so no side route is feasible => rejected.
+    {
+        // Flanking circles at 12.9 and 17.1 give a 1.2 m gap at y=15; the
+        // barrier extends to y=0.9 (surface -0.6) and y=29.1 (surface
+        // 30.6), i.e. no route around either end.
         std::vector<std::array<double, 3>> obs;
-        for (double y = 2.0; y + r <= 28.0; y += 3.0) {
-            const double top = y + r, bot = y - r;
-            if (top > gap_cy - gap_w * 0.5 - 1e-9 &&
-                bot < gap_cy + gap_w * 0.5 + 1e-9) {
-                continue;
-            }
-            obs.push_back({0.0, y, r});
+        for (double y = 0.9; y <= 12.9 + 1e-9; y += 3.0) {
+            obs.push_back({0.0, y, 1.5});
+        }
+        for (double y = 17.1; y <= 29.1 + 1e-9; y += 3.0) {
+            obs.push_back({0.0, y, 1.5});
         }
         QualFixture f(obs);
         TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
+        check(q.endpoint_valid, "narrow invalid: endpoints valid");
         check(!q.straight_corridor_clear, "narrow invalid: corridor blocked");
         check(!q.left.feasible && !q.right.feasible,
               "narrow invalid: no feasible side route (gap too narrow)");
         check(!q.accepted,
               "narrow invalid: rejected (sub-planner passage)");
+    }
+}
+
+// ── 13b. CHICANE = real lateral-sign alternation along the task ────
+static void testQualificationChicaneAlternation() {
+    std::fprintf(stderr, "test: chicane alternation\n");
+    // Task forward = +y; LEFT = -x side (cross(forward, p-c) > 0).
+    // Positive: obstacle lateral signs along the corridor are + - + -
+    // (equivalently R,L,R,L) -> 3 alternations >= min_chicane_alternations.
+    {
+        QualFixture f({{1.5, 17.0, 1.0}, {-1.5, 19.0, 1.0},
+                       {1.5, 21.0, 1.0}, {-1.5, 23.0, 1.0}});
+        const int flips = f.gen.countTaskChicaneAlternations(
+            f.geo.obstacleCenters(), f.geo.obstacleRadii(),
+            Vec2d(0.0, 15.0), Vec2d(0.0, 25.0));
+        check(flips >= 2, "chicane positive: >= 2 alternations");
+        if (flips < 2)
+            std::fprintf(stderr, "  [info] chicane positive flips=%d\n", flips);
+        // The full qualification must accept (both sides weave through the
+        // 1.61 m gaps) and classify CHICANE (priority #1).
+        TaskQualificationSummary q = f.qualify(0.0, 15.0, 0.0, 25.0);
+        check(q.endpoint_valid, "chicane positive: endpoints valid");
+        check(q.accepted, "chicane positive: accepted");
+        if (q.accepted) {
+            const TaskGeomType cls = f.classify(0, 15, 0, 25, q);
+            check(cls == TaskGeomType::CHICANE,
+                  "chicane positive: realized CHICANE");
+        }
+    }
+    // Negative: lateral signs + + - - (R,R,L,L) -> only 1 alternation.
+    {
+        QualFixture f({{1.5, 17.0, 1.0}, {1.5, 19.0, 1.0},
+                       {-1.5, 21.0, 1.0}, {-1.5, 23.0, 1.0}});
+        const int flips = f.gen.countTaskChicaneAlternations(
+            f.geo.obstacleCenters(), f.geo.obstacleRadii(),
+            Vec2d(0.0, 15.0), Vec2d(0.0, 25.0));
+        check(flips < 2, "chicane negative: < 2 alternations");
+        if (flips >= 2)
+            std::fprintf(stderr, "  [info] chicane negative flips=%d\n", flips);
+        // Even if the task is accepted, it must NOT classify CHICANE.
+        TaskQualificationSummary q = f.qualify(0.0, 15.0, 0.0, 25.0);
+        if (q.accepted) {
+            const TaskGeomType cls = f.classify(0, 15, 0, 25, q);
+            check(cls != TaskGeomType::CHICANE,
+                  "chicane negative: NOT classified CHICANE");
+        }
     }
 }
 
@@ -1100,6 +1332,7 @@ int main() {
     testQualification();
     testQualificationRotationInvariance();
     testQualificationNarrow();
+    testQualificationChicaneAlternation();
     testQualificationChicaneTasks();
     std::fprintf(stderr, "checks=%d failures=%d\n", g_checks, g_failures);
     return g_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
