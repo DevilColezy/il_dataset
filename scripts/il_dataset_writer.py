@@ -201,8 +201,11 @@ class DatasetWriter(object):
     """Per-episode writer with atomic commit / reject."""
 
     def __init__(self, cfg, episode_id, output_root, scene_id, task_id,
-                 start_world, goal_world, initial_yaw, depth_cfg):
+                 start_world, goal_world, initial_yaw, depth_cfg,
+                 control_hz=30.0, macro_update_hz=5.0):
         self.cfg = cfg
+        self._control_hz = float(control_hz)
+        self._macro_update_hz = float(macro_update_hz)
         self.episode_id = episode_id
         self.scene_id = scene_id
         self.task_id = task_id
@@ -253,6 +256,30 @@ class DatasetWriter(object):
             "goal_world": self.goal_world.tolist(),
             "initial_yaw": self.initial_yaw,
             "depth_config": dict(depth_cfg),
+            "data_contract": (
+                "Fixed cadence: local_control_hz (=30) control ticks, one "
+                "row per tick at control_dt_s; macro_update_hz (=5) "
+                "decisions on macro_update_mask==1 rows (every 6th control "
+                "tick).  The 30 Hz sequence is continuous across the whole "
+                "episode; the 5 Hz student sequence is the mask==1 rows in "
+                "time order."),
+            "depth_encoding_contract": {
+                "format": "uint16_png",
+                "png_mode": "I;16",
+                "meters_per_unit": 0.01,
+                "decode_formula": "depth_m = uint16_pixel / 100.0",
+                "invalid_pixel_value": 0,
+                "invalid_semantics": (
+                    "pixel 0 = invalid / non-finite / <=0 depth (no "
+                    "return).  Loaders MUST mask it to max range, never "
+                    "treat it as a real 0-metre obstacle."),
+                "clip_range_pixels": [0, 65535],
+                "clip_range_m": [0.0, 655.35],
+                "unit": "metres",
+                "orientation": (
+                    "row-major, top-left origin; the AvoidBench flipud is "
+                    "applied before encoding, so decode needs no flip."),
+            },
             "schema_version": int(cfg.get("schema_version", 25)),
             "schema_extensions": ["two_level_expert_labels_v1"],
             "expert_stack_revision": "hierarchical_local_v1",
@@ -262,8 +289,8 @@ class DatasetWriter(object):
             "student_input_fields_5hz": STUDENT_INPUT_FIELDS_5HZ,
             "supervision_fields_5hz": SUPERVISION_FIELDS_5HZ,
             "privileged_diagnostic_fields": PRIVILEGED_DIAGNOSTIC_FIELDS,
-            "macro_update_hz": 5.0,
-            "local_control_hz": 30.0,
+            "macro_update_hz": self._macro_update_hz,
+            "local_control_hz": self._control_hz,
             "target_encoding_contract": (
                 "R = perception_range_m (5.0). ordinary target "
                 "distance_norm = min(real_horizontal_distance, R - 0.5) / R "

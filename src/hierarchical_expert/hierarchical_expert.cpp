@@ -179,15 +179,31 @@ void HierarchicalExpert::fillOutput(ExpertStepOutput& out,
     out.reject_other = fsm_out.local.reject_other;
 
     // ── 5 Hz labels (ZOH between 5 Hz boundaries) ──────────────────
+    // The PASS/NORMAL/TURN classification is unchanged, but the NORMAL /
+    // TURN numeric labels are NOT the directive-creation-time parameters:
+    // every 5 Hz boundary records the LIVE Effective Target — the
+    // world-latched target (NORMAL world point / TURN world direction)
+    // re-projected into the current body frame at the CURRENT pose
+    // (fsm_out.target_direction_*_body / target_distance_normalized are
+    // last_encoded_ of this very tick).  The NORMAL direction token is
+    // RE-QUANTIZED from that live body direction; TURN_* keep the fixed
+    // class tokens (0 / N+1); PASS_THROUGH stays -1.
     if (out.macro_update_mask) {
         const TargetCorrectionDirective& d = fsm_.lastDirective();
         last_macro_label_valid_ = d.valid ? 1 : 0;
         last_macro_correction_type_ = targetCorrectionTypeName(d.type);
-        last_macro_direction_token_ = d.direction_token;
-        last_macro_direction_flu_x_ = d.decoded_direction_body.x();
-        last_macro_direction_flu_y_ = d.decoded_direction_body.y();
+        const double live_x = fsm_out.target_direction_x_body;
+        const double live_y = fsm_out.target_direction_y_body;
+        last_macro_direction_flu_x_ = live_x;
+        last_macro_direction_flu_y_ = live_y;
         last_macro_direction_flu_z_ = 0.0;
-        last_macro_distance_norm_ = d.normalized_distance;
+        last_macro_distance_norm_ = fsm_out.target_distance_normalized;
+        if (d.type == TargetCorrectionType::NORMAL_CORRECTION) {
+            last_macro_direction_token_ =
+                adapter.quantizeBearing(std::atan2(live_y, live_x));
+        } else {
+            last_macro_direction_token_ = d.direction_token;
+        }
         last_macro_param_valid_ =
             (d.type == TargetCorrectionType::NORMAL_CORRECTION ||
              d.type == TargetCorrectionType::TURN_LEFT ||

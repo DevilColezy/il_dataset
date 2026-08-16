@@ -45,6 +45,8 @@ label paths and have been REMOVED entirely (deleted sources and tests):
 
 from __future__ import print_function, division
 
+import csv
+import glob
 import json
 import math
 import os
@@ -52,6 +54,7 @@ import sys
 import time
 import traceback
 import uuid
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -177,11 +180,13 @@ class EpisodeAudit(object):
 # ============================================================================
 
 class JointV2Manager(object):
-    def __init__(self, config_path=None, blueprint_only=False, dry_run=False):
+    def __init__(self, config_path=None, blueprint_only=False, dry_run=False,
+                 manifest_file=None):
         self._config = il_config.load_config(config_path)
         self._g = self._config["global"]
         self._blueprint_only = bool(blueprint_only)
         self._dry_run = bool(dry_run)
+        self._manifest_file = manifest_file
         self._episode_id_counter = 0
         self._current_episode_id = ""
 
@@ -455,6 +460,14 @@ class JointV2Manager(object):
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 "dataset", "il_data")
         os.makedirs(output_root, exist_ok=True)
+        # Regeneration always starts from a clean task folder: every old
+        # blueprint manifest is removed before the new one is written.
+        for old in sorted(glob.glob(
+                os.path.join(output_root, "*_manifest.json"))):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
         manifest = os.path.join(
             output_root, "joint_v2_blueprint_manifest.json")
 
@@ -826,6 +839,9 @@ class JointV2Manager(object):
             "selected_scene_ids": [int(s) for s in result.selected_scene_ids],
             "scenes": scenes,
             "tasks": [_task_dict(t) for t in result.tasks],
+            # The full preflight-accepted candidate pool, so a later
+            # collection-only run (manifest_file) can still top-up gaps.
+            "preflighted": [_task_dict(t) for t in result.preflighted],
             "note": (
                 "Manifest stores ONLY original start/goal/initial_yaw, scene "
                 "obstacles, seed, C++ behavior classification, the "
@@ -839,6 +855,98 @@ class JointV2Manager(object):
         with open(manifest, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         return manifest
+
+    # ═══════════════════════════════════════════════════════════════
+    #  Collection-only mode: load a previously generated task manifest
+    # ═══════════════════════════════════════════════════════════════
+    def _load_collection_manifest(self, path):
+        """Rebuild the collection plan (tasks / scenes / preflighted pool)
+        from a previously written blueprint manifest.
+
+        Returns a SimpleNamespace with `tasks`, `scenes` and `preflighted`
+        objects exposing the SAME field names as the pybind BlueprintTask /
+        BlueprintScene, so the collection loop and the committed top-up run
+        unchanged.  The candidate pool (preflighted) carries the C++
+        preflight distribution summaries (histograms as count lists).
+        """
+        class HistLite(object):
+            def __init__(self, counts):
+                self.counts = list(counts or [])
+                self.edges = list(range(len(self.counts) + 1))
+
+            def total(self):
+                return float(sum(self.counts))
+
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        scenes = []
+        for sd in payload.get("scenes", []):
+            s = SimpleNamespace()
+            s.scene_id = int(sd["scene_id"])
+            s.obstacles = [
+                SimpleNamespace(
+                    id=int(o["id"]), x=float(o["x"]), y=float(o["y"]),
+                    radius=float(o["radius"]),
+                    height_m=float(o["height_m"]))
+                for o in sd.get("obstacles", [])]
+            scenes.append(s)
+
+        def _task(td):
+            t = SimpleNamespace()
+            t.task_id = int(td["task_id"])
+            t.scene_id = int(td["scene_id"])
+            t.seed = int(td.get("seed", 0))
+            t.start_x = float(td["start"][0])
+            t.start_y = float(td["start"][1])
+            t.goal_x = float(td["goal"][0])
+            t.goal_y = float(td["goal"][1])
+            t.initial_yaw = float(td["initial_yaw"])
+            t.flight_height_m = float(td["flight_height_m"])
+            t.behavior_class = str(td.get("behavior_class", "clear"))
+            t.density_class = str(td.get("density_class", "medium"))
+            t.radius_class = str(td.get("radius_class", "medium"))
+            t.distance_class = str(td.get("distance_class", "medium"))
+            t.side_class = str(td.get("side_class", "none"))
+            ad = td.get("audit", {}) or {}
+            t.audit = SimpleNamespace(
+                accepted=bool(ad.get("accepted", True)),
+                preflight_ticks=int(ad.get("preflight_ticks", 0)),
+                min_truth_clearance_m=float(
+                    ad.get("min_truth_clearance_m", 0.0)),
+                goal_distance_m=float(ad.get("goal_distance_m", 0.0)),
+                preflight_status=str(ad.get("preflight_status", "loaded")))
+            sm = td.get("summary", {}) or {}
+            m5 = sm.get("macro5hz", {}) or {}
+            l30 = sm.get("local30hz", {}) or {}
+            s = SimpleNamespace()
+            s.macro_tick_total = int(m5.get("tick_total", 0))
+            s.macro_pass_count = int(m5.get("pass_count", 0))
+            s.macro_normal_count = int(m5.get("normal_count", 0))
+            s.macro_turn_left_count = int(m5.get("turn_left_count", 0))
+            s.macro_turn_right_count = int(m5.get("turn_right_count", 0))
+            s.local_direct_count = int(l30.get("direct_count", 0))
+            s.local_avoidance_count = int(l30.get("avoidance_count", 0))
+            s.macro_correction_angle_hist = HistLite(
+                m5.get("correction_angle_hist", []))
+            s.macro_correction_distance_hist = HistLite(
+                m5.get("correction_distance_hist", []))
+            s.local_deflection_hist = HistLite(
+                l30.get("deflection_hist", []))
+            s.local_yaw_rate_hist = HistLite(
+                l30.get("yaw_rate_hist", []))
+            s.local_speed_hist = HistLite(
+                l30.get("speed_hist", []))
+            t.summary = s
+            return t
+
+        tasks = [_task(td) for td in payload.get("tasks", [])]
+        if not tasks:
+            raise ValueError(
+                "manifest %s contains no tasks" % path)
+        preflighted = [_task(td) for td in payload.get("preflighted", [])]
+        return SimpleNamespace(tasks=tasks, scenes=scenes,
+                               preflighted=preflighted)
 
     # ═══════════════════════════════════════════════════════════════
     #  Unity binary depth decode (item 一)
@@ -958,21 +1066,51 @@ class JointV2Manager(object):
         # Discard handshake / scene-settle depth — the first episode frame
         # must never consume it.
         self._flush_bridge()
+        # Warm-up render (item): after scene objects are (re)placed, Unity's
+        # FIRST render can take far longer than the per-frame timeout, which
+        # otherwise rejects the FIRST episode of a scene at control tick 0
+        # (frame_retries_exceeded / all attempts unmatched).  Actively
+        # request one frame and confirm a matching response before the
+        # episode starts; the warm-up frame is discarded.
+        warm_ok = False
+        for _ in range(3):
+            warm_id = self._next_frame_id
+            self._next_frame_id += 1
+            self._bridge.send_pose(self._pose_message(
+                [0.0, 0.0, self._flight_height], None, warm_id))
+            m = self._wait_for_matching_frame(warm_id, 3.0)
+            if m is not None:
+                warm_ok = True
+                break
+        if not warm_ok:
+            rospy.logwarn(
+                "[Manager] scene %d: warm-up render did not return a "
+                "matching frame within the warm-up budget; the first "
+                "episode of this scene may be rejected", int(scene.scene_id))
         if retired:
             rospy.loginfo("[Manager] scene %d: retired %d stale objects",
                           int(scene.scene_id), retired)
 
     def _pose_message(self, pos, q, frame_id):
-        """Unity Pose message that CARRIES the render frame_id."""
+        """Unity Pose message that CARRIES the render frame_id.
+
+        `q` is the quaternion_xyzw, or None to use the yaw-0 identity
+        default of make_depth_vehicle (used by the scene warm-up render).
+        """
+        if q is None:
+            vehicle = il_common.make_depth_vehicle(
+                [float(pos[0]), float(pos[1]), float(pos[2])],
+                0.0, self._depth_cfg)
+        else:
+            vehicle = il_common.make_depth_vehicle(
+                [float(pos[0]), float(pos[1]), float(pos[2])],
+                0.0, self._depth_cfg,
+                quaternion_xyzw=[float(q[0]), float(q[1]),
+                                 float(q[2]), float(q[3])])
         return {
             "scene_id": int(self._g.get("scene_id", 1)),
             "frame_id": int(frame_id),
-            "vehicles": [
-                il_common.make_depth_vehicle(
-                    [float(pos[0]), float(pos[1]), float(pos[2])],
-                    0.0, self._depth_cfg,
-                    quaternion_xyzw=[float(q[0]), float(q[1]),
-                                     float(q[2]), float(q[3])])],
+            "vehicles": [vehicle],
             "objects": [],
         }
 
@@ -1371,6 +1509,489 @@ class JointV2Manager(object):
                 abs(audit.final_yaw_rate_rps)
         return True, "", ""
 
+    # ═══════════════════════════════════════════════════════════════
+    #  Committed-episode distribution stats + gap-driven top-up (item 十)
+    #
+    #  After the real Flightmare collection the 5 Hz (PASS / NORMAL /
+    #  TURN / direction / distance) and 30 Hz (deflection / speed /
+    #  yaw-rate) label distributions are RE-DERIVED from the COMMITTED
+    #  episodes ONLY (never from the blueprint preflight prediction).  Any
+    #  soft gap caused by real episode rejects is auto top-up-collected
+    #  from the blueprint candidate pool (BlueprintResult.preflighted),
+    #  ranking tasks by their predicted marginal contribution to the
+    #  current gaps.  Depth bands are NOT part of the top-up (their real
+    #  distribution would require reading every committed depth PNG).
+    # ═══════════════════════════════════════════════════════════════
+    def _distribution_cfg(self):
+        """Histogram edges / thresholds for the committed label stats.
+
+        Mirrors the C++ blueprint config (il_dataset_config.yaml
+        blueprint_generation.task_generation.histograms + requirements).
+        """
+        bp = self._g.get("blueprint_generation", {}) or {}
+        btg = bp.get("task_generation", {}) or {}
+        hist = btg.get("histograms", {}) or {}
+        req = bp.get("requirements", {}) or {}
+
+        def _edges(key, dflt):
+            v = hist.get(key)
+            if v:
+                return [float(x) for x in v]
+            return list(dflt)
+
+        return {
+            "correction_angle_edges": _edges(
+                "correction_angle_edges_deg",
+                [-90.0, -60.0, -45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0,
+                 60.0, 90.0]),
+            "correction_distance_edges": _edges(
+                "correction_distance_edges", [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]),
+            "deflection_edges": _edges(
+                "deflection_edges_deg",
+                [-90.0, -60.0, -30.0, -10.0, 10.0, 30.0, 60.0, 90.0]),
+            "yaw_rate_edges": _edges(
+                "yaw_rate_edges",
+                [-2.0, -1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0, 2.0]),
+            "speed_edges": _edges(
+                "speed_edges", [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]),
+            "min_deflection_speed_mps": float(
+                hist.get("min_deflection_speed_mps", 0.10)),
+            "mtc": int(req.get("min_macro_ticks_per_class", 24)),
+        }
+
+    @staticmethod
+    def _hist_bin_of(edges, v):
+        """Bin index for v (same clamp semantics as C++ Histogram1D)."""
+        if not edges or not math.isfinite(v):
+            return -1
+        if v <= edges[0]:
+            return 0
+        if v >= edges[-1]:
+            return len(edges) - 2
+        lo, hi = 0, len(edges)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if edges[mid] <= v:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo - 1
+
+    @staticmethod
+    def _wrap_angle_deg(a):
+        while a > 180.0:
+            a -= 360.0
+        while a < -180.0:
+            a += 360.0
+        return a
+
+    def _new_committed_stats(self, cfg):
+        """Empty committed-label distribution accumulator."""
+        def _zeros(edges):
+            return [0] * max(0, len(edges) - 1)
+        return {
+            "counts": {
+                "macro:total": 0, "macro:pass": 0, "macro:normal": 0,
+                "macro:turn_left": 0, "macro:turn_right": 0,
+                "local:direct": 0, "local:avoidance": 0,
+            },
+            "hists": {
+                "macro_correction_angle": _zeros(
+                    cfg["correction_angle_edges"]),
+                "macro_correction_distance": _zeros(
+                    cfg["correction_distance_edges"]),
+                "local_deflection": _zeros(cfg["deflection_edges"]),
+                "local_yaw_rate": _zeros(cfg["yaw_rate_edges"]),
+                "local_speed": _zeros(cfg["speed_edges"]),
+            },
+            "episodes": 0,
+            "rows": 0,
+        }
+
+    @staticmethod
+    def _hist_add(counts, edges, v):
+        b = JointV2Manager._hist_bin_of(edges, v)
+        if 0 <= b < len(counts):
+            counts[b] += 1
+
+    def _add_committed_episode(self, stats, episode_dir, cfg):
+        """Accumulate the label distribution of ONE committed episode.
+
+        Mirrors the C++ preflight summary statistics exactly:
+          * 5 Hz (macro_update_mask==1 rows): PASS / NORMAL / TURN_LEFT /
+            TURN_RIGHT counts; for NORMAL_CORRECTION with
+            target_correction_active: correction angle = effective-target
+            direction vs original navigation-goal direction, and the
+            normalized distance.
+          * 30 Hz (every row): direct / avoidance counts, command speed,
+            yaw rate, and deflection = command velocity direction vs the
+            effective-target direction (only when speed >= the minimum).
+        """
+        csv_path = os.path.join(episode_dir, "data.csv")
+        if not os.path.isfile(csv_path):
+            return 0
+        n = 0
+        with open(csv_path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("episode_valid") != "1":
+                    continue
+                n += 1
+                # ── 30 Hz behaviour ────────────────────────────────
+                if row.get("hierarchical_mode") == "direct":
+                    stats["counts"]["local:direct"] += 1
+                if row.get("avoidance_active") == "1":
+                    stats["counts"]["local:avoidance"] += 1
+                try:
+                    vx = float(row.get("target_velocity_flu_x", 0.0))
+                    vy = float(row.get("target_velocity_flu_y", 0.0))
+                except (TypeError, ValueError):
+                    vx = vy = 0.0
+                speed = math.hypot(vx, vy)
+                self._hist_add(stats["hists"]["local_speed"],
+                               cfg["speed_edges"], speed)
+                try:
+                    yr = float(row.get("target_yaw_rate", 0.0))
+                except (TypeError, ValueError):
+                    yr = 0.0
+                self._hist_add(stats["hists"]["local_yaw_rate"],
+                               cfg["yaw_rate_edges"], yr)
+                gx = gy = 0.0
+                try:
+                    gx = float(row.get("goal_direction_flu_x", 0.0))
+                    gy = float(row.get("goal_direction_flu_y", 0.0))
+                except (TypeError, ValueError):
+                    pass
+                if speed >= cfg["min_deflection_speed_mps"]:
+                    gl = math.hypot(gx, gy)
+                    if gl > 1e-6:
+                        ang = self._wrap_angle_deg(math.degrees(
+                            math.atan2(gx * vy - gy * vx,
+                                       gx * vx + gy * vy)))
+                        self._hist_add(stats["hists"]["local_deflection"],
+                                       cfg["deflection_edges"], ang)
+                # ── 5 Hz labels ────────────────────────────────────
+                if row.get("macro_update_mask") == "1":
+                    stats["counts"]["macro:total"] += 1
+                    ct = row.get("macro_correction_type", "")
+                    if ct == "PASS_THROUGH":
+                        stats["counts"]["macro:pass"] += 1
+                    elif ct == "NORMAL_CORRECTION":
+                        stats["counts"]["macro:normal"] += 1
+                    elif ct == "TURN_LEFT":
+                        stats["counts"]["macro:turn_left"] += 1
+                    elif ct == "TURN_RIGHT":
+                        stats["counts"]["macro:turn_right"] += 1
+                    if ct == "NORMAL_CORRECTION" and \
+                            row.get("target_correction_active") == "1":
+                        ngx = ngy = 0.0
+                        try:
+                            ngx = float(row.get(
+                                "navigation_goal_direction_flu_x", 0.0))
+                            ngy = float(row.get(
+                                "navigation_goal_direction_flu_y", 0.0))
+                        except (TypeError, ValueError):
+                            pass
+                        ngl = math.hypot(ngx, ngy)
+                        el = math.hypot(gx, gy)
+                        if ngl > 1e-6 and el > 1e-6:
+                            ang = self._wrap_angle_deg(math.degrees(
+                                math.atan2(ngx * gy - ngy * gx,
+                                           ngx * gx + ngy * gy)))
+                            self._hist_add(
+                                stats["hists"]["macro_correction_angle"],
+                                cfg["correction_angle_edges"], ang)
+                        try:
+                            dn = float(row.get("macro_distance_norm", 0.0))
+                        except (TypeError, ValueError):
+                            dn = 0.0
+                        if math.isfinite(dn):
+                            self._hist_add(
+                                stats["hists"][
+                                    "macro_correction_distance"],
+                                cfg["correction_distance_edges"],
+                                max(0.0, min(1.0, dn)))
+        stats["episodes"] += 1
+        stats["rows"] += n
+        return n
+
+    def _gap_targets(self, cfg):
+        """Soft distribution targets (replicates the C++ buildDefaultTargets
+        target values; depth bands are deliberately excluded).  Returns a
+        list of (key, metric, target, weight)."""
+        mtc = max(1, cfg["mtc"])
+        targets = []
+
+        def _add(key, metric, target, weight):
+            targets.append((key, metric, float(target), float(weight)))
+
+        # ── 5 Hz macro coverage ────────────────────────────────────
+        _add("macro:total", "count:macro:total", 4.0 * mtc, 0.5)
+        _add("macro:pass", "count:macro:pass", 3.0 * mtc, 1.0)
+        _add("macro:normal", "count:macro:normal", 3.0 * mtc, 1.0)
+        _add("macro:turn_left", "count:macro:turn_left", 3.0 * mtc, 2.0)
+        _add("macro:turn_right", "count:macro:turn_right", 3.0 * mtc, 2.0)
+        _add("corr_angle_total", "hist_total:macro_correction_angle",
+             4.0 * mtc, 1.0)
+        for i in range(len(cfg["correction_angle_edges"]) - 1):
+            _add("corr_angle:bin%d" % i,
+                 "hist_bin:macro_correction_angle:%d" % i, 2.0, 0.8)
+        for i in range(len(cfg["correction_distance_edges"]) - 1):
+            _add("corr_dist:bin%d" % i,
+                 "hist_bin:macro_correction_distance:%d" % i, 2.0, 0.6)
+        # ── 30 Hz avoidance coverage ───────────────────────────────
+        _add("local:avoidance", "count:local:avoidance", 3.0 * mtc, 1.2)
+        _add("local:direct", "count:local:direct", 3.0 * mtc, 0.4)
+        _add("deflection_total", "hist_total:local_deflection",
+             4.0 * mtc, 1.0)
+        n_def = len(cfg["deflection_edges"]) - 1
+        for i in range(n_def):
+            strong = (i == 0 or i == n_def - 1)
+            medium = (i == 1 or i == n_def - 2)
+            tgt = 6.0 if strong else (5.0 if medium else 4.0)
+            _add("deflection:bin%d" % i,
+                 "hist_bin:local_deflection:%d" % i, tgt,
+                 1.4 if strong else 1.0)
+        # ── 30 Hz speed / yaw-rate bin coverage (soft, uniform) ────
+        sp_tgt = max(1, mtc // 2)
+        for i in range(len(cfg["speed_edges"]) - 1):
+            _add("speed:bin%d" % i, "hist_bin:local_speed:%d" % i,
+                 sp_tgt, 0.6)
+        for i in range(len(cfg["yaw_rate_edges"]) - 1):
+            _add("yaw_rate:bin%d" % i, "hist_bin:local_yaw_rate:%d" % i,
+                 sp_tgt, 0.6)
+        return targets
+
+    def _achieved_metric(self, stats, metric):
+        if metric.startswith("count:"):
+            return float(stats["counts"].get(metric[6:], 0))
+        if metric.startswith("hist_total:"):
+            return float(sum(stats["hists"].get(metric[11:], [])))
+        if metric.startswith("hist_bin:"):
+            rest = metric[9:]
+            name, _, bs = rest.rpartition(":")
+            counts = stats["hists"].get(name, [])
+            b = int(bs) if bs.isdigit() else -1
+            return float(counts[b]) if 0 <= b < len(counts) else 0.0
+        return 0.0
+
+    def _evaluate_gaps(self, stats, targets):
+        """Soft gaps: {key: (achieved, target, deficit, weight)}."""
+        gaps = {}
+        for key, metric, target, weight in targets:
+            a = self._achieved_metric(stats, metric)
+            d = max(0.0, target - a)
+            if d > 1e-9:
+                gaps[key] = (a, target, d, weight)
+        return gaps
+
+    @staticmethod
+    def _task_hist(s, name):
+        if name == "macro_correction_angle":
+            return s.macro_correction_angle_hist
+        if name == "macro_correction_distance":
+            return s.macro_correction_distance_hist
+        if name == "local_deflection":
+            return s.local_deflection_hist
+        if name == "local_yaw_rate":
+            return s.local_yaw_rate_hist
+        if name == "local_speed":
+            return s.local_speed_hist
+        return None
+
+    def _task_contribution(self, task, metric):
+        """Predicted marginal contribution of a blueprint task to a metric
+        (from its C++ preflight TaskDistributionSummary)."""
+        s = task.summary
+        if metric.startswith("count:"):
+            key = metric[6:]
+            m = {
+                "macro:total": s.macro_tick_total,
+                "macro:pass": s.macro_pass_count,
+                "macro:normal": s.macro_normal_count,
+                "macro:turn_left": s.macro_turn_left_count,
+                "macro:turn_right": s.macro_turn_right_count,
+                "local:direct": s.local_direct_count,
+                "local:avoidance": s.local_avoidance_count,
+            }
+            return float(m.get(key, 0.0))
+        if metric.startswith("hist_total:"):
+            h = self._task_hist(s, metric[11:])
+            return float(h.total()) if h is not None else 0.0
+        if metric.startswith("hist_bin:"):
+            rest = metric[9:]
+            name, _, bs = rest.rpartition(":")
+            h = self._task_hist(s, name)
+            b = int(bs) if bs.isdigit() else -1
+            if h is None or not (0 <= b < len(h.counts)):
+                return 0.0
+            return float(h.counts[b])
+        return 0.0
+
+    def _score_task_for_gaps(self, task, stats, targets):
+        """Greedy gain score (replicates the C++ scoreTask)."""
+        score = 0.0
+        for key, metric, target, weight in targets:
+            c = self._task_contribution(task, metric)
+            if c <= 0.0:
+                continue
+            cur = self._achieved_metric(stats, metric)
+            after = cur + c
+            if after <= target + 1e-9:
+                gain = c
+            elif cur < target:
+                gain = max(0.0, target - cur)
+            else:
+                gain = 0.0
+            score += weight * gain
+        return score
+
+    def _collect_task_once(self, scene, task, tick_base):
+        """Run ONE real Flightmare episode for a blueprint task.
+
+        Returns (committed, reason, audit_summary, final_dir).  Handles
+        the scene switch (once), the writer lifecycle and the episode
+        audit; the caller tracks committed directories / used task ids.
+        """
+        if self._last_scene_id is None or \
+                int(scene.scene_id) != self._last_scene_id:
+            self._send_scene_to_unity(scene)
+            self._last_scene_id = int(scene.scene_id)
+        task_id = int(task.task_id)
+        episode_id = "joint_v2_%06d_%s" % (
+            self._episode_id_counter, uuid.uuid4().hex[:8])
+        self._episode_id_counter += 1
+        ds_cfg = self._g.get("dataset_logging", {}) or {}
+        writer = il_dataset_writer.DatasetWriter(
+            ds_cfg, episode_id, self._output_root, int(scene.scene_id),
+            task_id,
+            [float(task.start_x), float(task.start_y),
+             float(task.flight_height_m)],
+            [float(task.goal_x), float(task.goal_y),
+             float(task.flight_height_m)],
+            float(task.initial_yaw), self._depth_cfg,
+            control_hz=self._control_hz,
+            macro_update_hz=self._macro_update_hz)
+        writer.add_metadata({
+            "expert_stack_revision": "hierarchical_local_v1",
+            "schema_extensions": ["two_level_expert_labels_v1"],
+            "blueprint_seed": int(task.seed),
+            "blueprint_behavior_class": str(task.behavior_class),
+            "blueprint_density_class": str(task.density_class),
+            "blueprint_radius_class": str(task.radius_class),
+            "blueprint_distance_class": str(task.distance_class),
+            "blueprint_side_class": str(task.side_class),
+            "blueprint_preflight_audit": {
+                "accepted": bool(task.audit.accepted),
+                "preflight_ticks": int(task.audit.preflight_ticks),
+                "min_truth_clearance_m":
+                    float(task.audit.min_truth_clearance_m)
+                    if math.isfinite(float(task.audit.min_truth_clearance_m))
+                    else 0.0,
+                "goal_distance_m": float(task.audit.goal_distance_m),
+                "preflight_status": str(task.audit.preflight_status),
+            },
+        })
+        committed, reason, audit_summary = self._episode(
+            scene, task, writer, tick_base)
+        success = bool(committed) and reason == "goal_reached"
+        writer.add_metadata({
+            "reached_goal": bool(audit_summary.get("reached_goal", False)),
+            "quality_committed": success,
+            "episode_audit": audit_summary,
+        })
+        final_dir = writer.finish(success, reason, {
+            "audit": audit_summary,
+        })
+        rospy.loginfo(
+            "[Manager] episode %s %s (%s) matched=%d unmatched=%d "
+            "none_depth=%d min_clr=%.3f",
+            episode_id, "committed" if success else "rejected", reason,
+            audit_summary.get("matched", 0),
+            audit_summary.get("unmatched", 0),
+            audit_summary.get("none_depth", 0),
+            audit_summary.get("min_truth_clearance_m", 0.0))
+        return committed, reason, audit_summary, final_dir
+
+    def _run_topup(self, plan, scene_map):
+        """Recompute the 5 Hz / 30 Hz label distributions from the
+        COMMITTED episodes only, then auto top-up the remaining soft gaps
+        from the blueprint candidate pool (preflighted) — the real
+        collection outcome never trusts the blueprint preflight
+        prediction.  Budget: at most `max_rounds` top-up rounds; stops
+        when the pool is exhausted or a round produces no new committed
+        episode.
+        """
+        cfg = self._distribution_cfg()
+        targets = self._gap_targets(cfg)
+        topup_cfg = ((self._g.get("blueprint_generation", {}) or {}).get(
+            "topup", {}) or {})
+        max_rounds = int(topup_cfg.get("max_rounds", 3))
+        stats = self._new_committed_stats(cfg)
+        for d in self._committed_dirs:
+            self._add_committed_episode(stats, d, cfg)
+        rospy.loginfo(
+            "[Manager] topup: committed episodes=%d rows=%d (targets=%d)",
+            stats["episodes"], stats["rows"], len(targets))
+
+        for rnd in range(1, max_rounds + 1):
+            gaps = self._evaluate_gaps(stats, targets)
+            if not gaps:
+                rospy.loginfo(
+                    "[Manager] topup: committed distribution targets met "
+                    "after round %d", rnd - 1)
+                break
+            pool = [t for t in plan.preflighted
+                    if int(t.task_id) not in self._used_task_ids]
+            if not pool:
+                rospy.logwarn(
+                    "[Manager] topup round %d: candidate pool exhausted; "
+                    "%d soft gaps remain", rnd, len(gaps))
+                break
+            scored = sorted(
+                pool, key=lambda t: -self._score_task_for_gaps(
+                    t, stats, targets))
+            collected = 0
+            for t in scored:
+                if rospy.is_shutdown():
+                    break
+                if not gaps:
+                    break
+                scene = scene_map.get(int(t.scene_id))
+                if scene is None:
+                    continue
+                committed, reason, audit_summary, final_dir = \
+                    self._collect_task_once(
+                        scene, t, int(t.task_id) * 600000)
+                self._used_task_ids.add(int(t.task_id))
+                if committed and final_dir:
+                    self._committed_dirs.append(final_dir)
+                    self._add_committed_episode(stats, final_dir, cfg)
+                    collected += 1
+                    gaps = self._evaluate_gaps(stats, targets)
+                    rospy.loginfo(
+                        "[Manager] topup round %d: committed %s; "
+                        "soft gaps remaining=%d", rnd, reason, len(gaps))
+            if collected == 0:
+                rospy.logwarn(
+                    "[Manager] topup round %d: no new committed episode; "
+                    "stopping", rnd)
+                break
+
+        gaps = self._evaluate_gaps(stats, targets)
+        if gaps:
+            detail = "; ".join("%s=%.0f/%.0f" % (k, v[0], v[1])
+                                for k, v in sorted(gaps.items()))
+            rospy.logwarn(
+                "[Manager] topup finished: %d soft gaps remaining: %s",
+                len(gaps), detail)
+        else:
+            rospy.loginfo(
+                "[Manager] topup finished: committed distribution targets "
+                "met (episodes=%d rows=%d)", stats["episodes"],
+                stats["rows"])
+        return stats, gaps
+
     def _gravity_flu(self, q_xyzw):
         """Unit gravity direction in the FLU body frame (student input)."""
         q = np.asarray(q_xyzw, dtype=np.float64)
@@ -1561,58 +2182,69 @@ class JointV2Manager(object):
                       self._control_hz, self._macro_update_hz,
                       self._params.obs_range_m)
 
-        # 1. FULL blueprint (C++): all scenes -> all connected tasks ->
-        #    per-task preflight with the SAME expert -> classifier + quotas.
-        blueprint = self._generate_blueprint()
-        # 2. Write the manifest (normal AND blueprint_only use the SAME
-        #    C++ generator), recording ACTUAL counts / quota status.
-        manifest = self._write_blueprint_manifest(blueprint)
-        rospy.loginfo(
-            "[Manager] blueprint: generation_ok=%s (hard=%s soft=%s) "
-            "rounds=%d scenes=%d/%d sampled=%d preflight=%d pool=%d/%d "
-            "selected=%d strata=%d/%d cheap_rej=%d deficits=%d -> %s",
-            blueprint.generation_ok, blueprint.hard_minimums_met,
-            blueprint.soft_targets_met, blueprint.generation_rounds,
-            blueprint.scenes_valid, blueprint.scenes_generated,
-            blueprint.tasks_sampled, blueprint.tasks_preflighted,
-            blueprint.tasks_pool_accepted, blueprint.tasks_pool_target,
-            blueprint.tasks_quota_accepted, blueprint.strata_covered,
-            blueprint.strata_required, blueprint.cheap_filter_rejected,
-            len(blueprint.remaining_deficits), manifest)
-        # 3. HARD GATE for ALL modes: a broken blueprint never prints a
-        # success line, and normal mode never connects Flightmare.  The
-        # gate runs BEFORE any blueprint_only/dry_run early-return.
-        if not blueprint.generation_ok:
-            rospy.logerr(
-                "[Manager] blueprint generation FAILED (%s); NOT connecting "
-                "Flightmare.  hard_minimums_met=%s deficits=%s "
-                "pool_budget_exhausted=%s",
-                blueprint.failure_reason, blueprint.hard_minimums_met,
-                list(blueprint.remaining_deficits),
-                blueprint.pool_budget_exhausted)
-            raise RuntimeError(
-                "blueprint generation failed: %s" % blueprint.failure_reason)
-        if self._blueprint_only or self._dry_run:
-            rospy.loginfo("[Manager] %s mode: generation_ok, manifest "
-                          "written; no Unity collection",
-                          "blueprint_only" if self._blueprint_only
-                          else "dry_run")
-            return
+        # 1. Task plan: collection-only mode loads a previously generated
+        #    manifest (NEVER re-generate / re-randomise); otherwise a fresh
+        #    C++ blueprint is generated and saved first.
+        if self._manifest_file and os.path.isfile(self._manifest_file):
+            plan = self._load_collection_manifest(self._manifest_file)
+            rospy.loginfo(
+                "[Manager] collection from manifest %s: tasks=%d scenes=%d "
+                "pool=%d", self._manifest_file, len(plan.tasks),
+                len(plan.scenes), len(plan.preflighted))
+        else:
+            blueprint = self._generate_blueprint()
+            manifest = self._write_blueprint_manifest(blueprint)
+            rospy.loginfo(
+                "[Manager] blueprint: generation_ok=%s (hard=%s soft=%s) "
+                "rounds=%d scenes=%d/%d sampled=%d preflight=%d pool=%d/%d "
+                "selected=%d strata=%d/%d cheap_rej=%d deficits=%d -> %s",
+                blueprint.generation_ok, blueprint.hard_minimums_met,
+                blueprint.soft_targets_met, blueprint.generation_rounds,
+                blueprint.scenes_valid, blueprint.scenes_generated,
+                blueprint.tasks_sampled, blueprint.tasks_preflighted,
+                blueprint.tasks_pool_accepted, blueprint.tasks_pool_target,
+                blueprint.tasks_quota_accepted, blueprint.strata_covered,
+                blueprint.strata_required, blueprint.cheap_filter_rejected,
+                len(blueprint.remaining_deficits), manifest)
+            # HARD GATE: a broken blueprint never prints a success line and
+            # normal mode never connects Flightmare.
+            if not blueprint.generation_ok:
+                rospy.logerr(
+                    "[Manager] blueprint generation FAILED (%s); NOT "
+                    "connecting Flightmare.  hard_minimums_met=%s "
+                    "deficits=%s pool_budget_exhausted=%s",
+                    blueprint.failure_reason, blueprint.hard_minimums_met,
+                    list(blueprint.remaining_deficits),
+                    blueprint.pool_budget_exhausted)
+                raise RuntimeError(
+                    "blueprint generation failed: %s" %
+                    blueprint.failure_reason)
+            if self._blueprint_only or self._dry_run:
+                rospy.loginfo("[Manager] %s mode: generation_ok, manifest "
+                              "written; no Unity collection",
+                              "blueprint_only" if self._blueprint_only
+                              else "dry_run")
+                return
+            plan = SimpleNamespace(tasks=blueprint.tasks,
+                                   scenes=blueprint.scenes,
+                                   preflighted=blueprint.preflighted)
 
-        # 4. Only NOW connect Unity + create dynamics.
+        # 2. Only NOW connect Unity + create dynamics.
         self._connect()
         self._create_dynamics()
 
-        # 5. Strictly per manifest (normal mode never re-randomises).
-        scene_map = {int(s.scene_id): s for s in blueprint.scenes}
+        # 3. Strictly per plan (never re-randomises).
+        scene_map = {int(s.scene_id): s for s in plan.scenes}
         output_root = os.path.expanduser(self._g.get("output_dir", ""))
         if not output_root:
             output_root = os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 "dataset", "il_data")
-        ds_cfg = self._g.get("dataset_logging", {}) or {}
-        last_scene_id = None
-        for task in blueprint.tasks:
+        self._output_root = output_root
+        self._last_scene_id = None
+        self._committed_dirs = []
+        self._used_task_ids = set()
+        for task in plan.tasks:
             if rospy.is_shutdown():
                 break
             scene = scene_map.get(int(task.scene_id))
@@ -1620,63 +2252,18 @@ class JointV2Manager(object):
                 rospy.logwarn("[Manager] task %d: unknown scene %d; skipped",
                               int(task.task_id), int(task.scene_id))
                 continue
-            # Scene change: send + settle + retire old objects once.
-            if last_scene_id is None or int(scene.scene_id) != last_scene_id:
-                self._send_scene_to_unity(scene)
-                last_scene_id = int(scene.scene_id)
+            committed, reason, audit_summary, final_dir = \
+                self._collect_task_once(scene, task,
+                                        int(task.task_id) * 600000)
+            self._used_task_ids.add(int(task.task_id))
+            if committed and final_dir:
+                self._committed_dirs.append(final_dir)
 
-            task_id = int(task.task_id)
-            episode_id = "joint_v2_%06d_%s" % (
-                self._episode_id_counter, uuid.uuid4().hex[:8])
-            self._episode_id_counter += 1
-            tick_base = task_id * 600000
-            writer = il_dataset_writer.DatasetWriter(
-                ds_cfg, episode_id, output_root, int(scene.scene_id),
-                task_id,
-                [float(task.start_x), float(task.start_y),
-                 float(task.flight_height_m)],
-                [float(task.goal_x), float(task.goal_y),
-                 float(task.flight_height_m)],
-                float(task.initial_yaw), self._depth_cfg)
-            writer.add_metadata({
-                "expert_stack_revision": "hierarchical_local_v1",
-                "schema_extensions": ["two_level_expert_labels_v1"],
-                "blueprint_seed": int(task.seed),
-                "blueprint_behavior_class": str(task.behavior_class),
-                "blueprint_density_class": str(task.density_class),
-                "blueprint_radius_class": str(task.radius_class),
-                "blueprint_distance_class": str(task.distance_class),
-                "blueprint_side_class": str(task.side_class),
-                "blueprint_preflight_audit": {
-                    "accepted": bool(task.audit.accepted),
-                    "preflight_ticks": int(task.audit.preflight_ticks),
-                    "min_truth_clearance_m":
-                        float(task.audit.min_truth_clearance_m)
-                        if math.isfinite(float(task.audit.min_truth_clearance_m))
-                        else 0.0,
-                    "goal_distance_m": float(task.audit.goal_distance_m),
-                    "preflight_status": str(task.audit.preflight_status),
-                },
-            })
-            committed, reason, audit_summary = self._episode(
-                scene, task, writer, tick_base)
-            success = bool(committed) and reason == "goal_reached"
-            writer.add_metadata({
-                "reached_goal": bool(audit_summary.get("reached_goal", False)),
-                "quality_committed": success,
-                "episode_audit": audit_summary,
-            })
-            writer.finish(success, reason, {
-                "audit": audit_summary,
-            })
-            rospy.loginfo(
-                "[Manager] episode %s %s (%s) matched=%d unmatched=%d "
-                "none_depth=%d min_clr=%.3f",
-                episode_id, "committed" if success else "rejected", reason,
-                audit_summary.get("matched", 0),
-                audit_summary.get("unmatched", 0),
-                audit_summary.get("none_depth", 0),
-                audit_summary.get("min_truth_clearance_m", 0.0))
+        # 4. Real-collection commit audit (item 十): re-derive the 5 Hz /
+        #    30 Hz label distributions from the COMMITTED episodes ONLY
+        #    and auto top-up the soft gaps from the candidate pool — never
+        #    trust the preflight prediction for the real collection.
+        self._run_topup(plan, scene_map)
 
 
 def main():
@@ -1689,17 +2276,21 @@ def main():
         pass
     blueprint_only = False
     dry_run = False
+    manifest_file = None
     try:
         if rospy.has_param("~blueprint_only"):
             blueprint_only = bool(rospy.get_param("~blueprint_only"))
         if rospy.has_param("~dry_run"):
             dry_run = bool(rospy.get_param("~dry_run"))
+        if rospy.has_param("~manifest_file"):
+            manifest_file = rospy.get_param("~manifest_file")
     except Exception:
         pass
     manager = JointV2Manager(
         config_path=config_file,
         blueprint_only=blueprint_only,
-        dry_run=dry_run)
+        dry_run=dry_run,
+        manifest_file=manifest_file)
     try:
         manager.run()
     except rospy.ROSInterruptException:

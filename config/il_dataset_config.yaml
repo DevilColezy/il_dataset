@@ -527,8 +527,12 @@ global:
     max_none_depth_pct:             20.0
     # Strict per-frame exact-match wait (NOT a flight trajectory timeout):
     # the manager waits this long for the exact pub_frame_id depth of ONE
-    # render attempt, then retries on the same control state.
-    frame_match_timeout_s:           0.15
+    # render attempt, then retries on the same control state.  A scene
+    # change (or the very first frame after Unity places a new obstacle
+    # set) can take longer than the steady-state per-frame latency; the
+    # warm-up render in il_manager confirms the pipeline before an episode
+    # starts, and this timeout is a tolerant fallback for that cold start.
+    frame_match_timeout_s:           1.0
 
   commit:
     strict_collision_policy: true

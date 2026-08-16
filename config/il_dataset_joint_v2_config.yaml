@@ -133,6 +133,15 @@ global:
       max_yaw_imbalance_ratio: 0.20
       min_grouped_deflection_samples: 8
       min_grouped_correction_samples: 4
+    # Real-collection top-up (item 十): after the first Flightmare pass,
+    # the 5 Hz / 30 Hz label distributions are re-derived from the
+    # COMMITTED episodes ONLY and the soft gaps caused by real episode
+    # rejects are auto-filled from the blueprint candidate pool
+    # (preflighted).  max_rounds caps the number of top-up passes; the
+    # pool is never re-used and a round with zero new committed episodes
+    # stops the loop.
+    topup:
+      max_rounds: 3
 
   # ── Hierarchical local expert (production path) ───────────────────
   # Overrides the public defaults in il_dataset_config.yaml.  R = 5.0 m

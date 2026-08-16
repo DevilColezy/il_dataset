@@ -19,11 +19,16 @@
        default="$(find il_dataset)/config/il_dataset_joint_v2_config.yaml" />
   <arg name="blueprint_only" default="false" />
   <arg name="dry_run" default="false" />
+  <!-- Collection-only mode: load a previously generated task manifest
+       (e.g. blueprint_only:=true produced it) and skip C++ generation
+       entirely.  Leave empty to generate + collect in one run. -->
+  <arg name="manifest_file" default="" />
 
   <node pkg="il_dataset" type="il_manager.py" name="il_dataset_manager"
         output="screen" required="true">
     <param name="config_file" value="$(arg config_file)" />
     <param name="blueprint_only" value="$(arg blueprint_only)" />
     <param name="dry_run" value="$(arg dry_run)" />
+    <param name="manifest_file" value="$(arg manifest_file)" />
   </node>
 </launch>
