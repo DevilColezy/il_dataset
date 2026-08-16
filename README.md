@@ -260,8 +260,18 @@ global-A* budget / side-search budget / total expansions) and the
 efficiency ratios (`qualification_pass_ratio`,
 `full_preflight_success_after_qualification_ratio`) are reported.
 A generation-wide hard bound on ALL privileged qualification A* work
-(`max_total_qualification_expansions`) ends the run with
-`budget_exhausted_reason = qualification_expansion_budget`.
+(`max_total_qualification_expansions`) is a TRUE hard budget, enforced in
+REAL TIME (not at round end): the controller keeps a live expansion
+counter, hands only the REMAINING budget to each `qualify()` call, and
+every global/side A* node is deducted from it inside the call.  No task,
+round or failure can ever overshoot the cap
+(`total_qualification_expansions <= max_total_qualification_expansions`
+always); the task that runs the budget dry reports
+`qualification_expansion_budget` / `side_search_budget_exceeded` /
+`global_astar_budget_exceeded` (never `no_route` / `infeasible`), and the
+run ends with `budget_exhausted_reason = qualification_expansion_budget`.
+Budget-exhausted searches are NEVER counted as geometric infeasibility
+(per-side rejects / both-sides-required stays clean for real dead ends).
 
 **Budgets**: `max_scene_candidates`, `max_task_candidates_per_scene`,
 `max_generation_rounds`, `max_total_preflight_tasks`,

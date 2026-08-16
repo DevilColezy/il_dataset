@@ -59,10 +59,16 @@ public:
 
     /// Run the full qualification pipeline for one candidate.  Fills
     /// `out` (accepted + reasons + side routes) and updates `counters`
-    /// (aggregate).  Never throws; always deterministic for (start,goal).
+    /// (aggregate).  `remaining_global` is the generation-wide expansion
+    /// budget left for this task (mutable): EVERY A* node expanded inside
+    /// this call is deducted from it, and no search may expand past it, so
+    /// the caller's `total_used <= max - remaining_global` invariant holds
+    /// even if a single task would otherwise want more.  Never throws;
+    /// always deterministic for (start,goal).
     void qualify(const Vec2d& start, const Vec2d& goal,
                  TaskQualificationSummary& out,
-                 QualificationCounters& counters) const;
+                 QualificationCounters& counters,
+                 uint64_t& remaining_global) const;
 
     /// True when the ESDF grid is built and usable.
     bool valid() const { return w_ > 0 && h_ > 0; }
@@ -79,6 +85,17 @@ public:
                              int& blocker_id, Vec2d& blocker_center,
                              double& blocker_radius,
                              std::vector<int>& blocking_ids) const;
+    /// True iff the polyline actually traverses the narrow passage: at
+    /// least one route point is inside the local passage corridor (within
+    /// the passage half-width of the passage axis, along the segment
+    /// between the two obstacle centres) with the route crossing from one
+    /// side of the passage to the other.  Each polyline segment is sampled
+    /// densely (<= res/2), so sparse LOS-shortcut waypoints cannot miss a
+    /// crossing.  A `+ -> 0 -> -` (or `- -> 0 -> +`) sequence counts as a
+    /// crossing; entering and leaving on the SAME side does not.  Exposed
+    /// publicly for precise unit tests of the traversal evidence.
+    bool routeTraversesNarrowPassage(const std::vector<Vec2d>& path,
+                                     const NarrowPassage& np) const;
 
 private:
     // ── grid ───────────────────────────────────────────────────────
@@ -143,23 +160,21 @@ private:
     /// duplicate first waypoint).  2D reference `prependRecovery`.
     void prependRecovery(const Vec2d& start, const Vec2d& route_start,
                          std::vector<Vec2d>& path) const;
-    /// True iff the polyline actually traverses the narrow passage: at
-    /// least one route point is inside the passage corridor (within the
-    /// passage half-width of the passage axis) with the route crossing from
-    /// one side of the passage to the other (projected-along monotonicity
-    /// or side-sign change).  Lightweight corridor intersection.
-    bool routeTraversesNarrowPassage(const std::vector<Vec2d>& path,
-                                     const NarrowPassage& np) const;
     /// Build one side route (tangent gateways + 3-segment side-A* + LOS +
     /// homotopy + start-clearance recovery).  `task_side_budget` is the
-    /// SHARED LEFT+RIGHT expansion budget for this task (each segment
-    /// deducts from it; 0 stops the search).  When `path_out` is non-null
-    /// the densified polyline is returned for narrow-passage traversal
-    /// checks (dropped afterwards; never stored in the manifest).
+    /// SHARED LEFT+RIGHT expansion budget for this task; `remaining_global`
+    /// is the generation-wide budget (the OUTER cap).  Each A* segment is
+    /// capped by min(per_segment, task_side_budget, remaining_global) and
+    /// deducts its actual expansions from BOTH counters, so the side
+    /// search can never overshoot the generation-wide budget.  When
+    /// `path_out` is non-null the densified polyline is returned for
+    /// narrow-passage traversal checks (dropped afterwards; never stored
+    /// in the manifest).
     void planSideRoute(const Vec2d& start, const Vec2d& goal,
                        const Vec2d& blocker_center, double blocker_radius,
                        const Vec2d& axis_u, bool left_side,
-                       uint64_t& task_side_budget, SideRouteResult& out,
+                       uint64_t& task_side_budget,
+                       uint64_t& remaining_global, SideRouteResult& out,
                        std::vector<Vec2d>* path_out) const;
 
     // ── scene-static state ─────────────────────────────────────────

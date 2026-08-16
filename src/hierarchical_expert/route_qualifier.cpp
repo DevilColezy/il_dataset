@@ -532,53 +532,64 @@ void TaskRouteQualifier::prependRecovery(const Vec2d& start,
 // ────────────────────────────────────────────────────────────────────
 bool TaskRouteQualifier::routeTraversesNarrowPassage(
     const std::vector<Vec2d>& path, const NarrowPassage& np) const {
-    // Passage corridor: the segment between the two obstacle centres,
-    // widened by the passage half-width (width/2 + a small tolerance).
-    // The route "traverses" it when it has samples on BOTH sides of the
-    // passage axis (projected along-axis monotonic crossing) inside the
-    // corridor half-width.
+    if (path.size() < 2) return false;
+    // Local passage corridor: the axis SEGMENT between the two obstacle
+    // centres (not the whole infinite axis line), widened by the passage
+    // half-width plus a small tolerance.  Only samples INSIDE this local
+    // region count towards the lateral-sign evidence.
     const Vec2d ab = np.b_center - np.a_center;
     const double ab_len = std::max(1e-6, ab.norm());
     const Vec2d ax = ab / ab_len;
     const double half_w = np.width * 0.5 + 0.05;  // corridor half-width
-    double prev_side = 0.0;
-    bool in_corridor = false;
-    bool crossed = false;
-    for (size_t i = 0; i < path.size(); ++i) {
-        const Vec2d rel = path[i] - np.a_center;
-        const double along = rel.dot(ax);
-        if (along < -0.1 || along > ab_len + 0.1) continue;  // beyond the pair
-        const double off = (rel - ax * along).norm();
-        if (off > half_w) {
-            in_corridor = false;
-            continue;
-        }
-        // Sample is inside the passage corridor.
-        if (!in_corridor) {
-            // Entering the corridor: record which lateral side we are on
-            // (cross of the passage axis with the offset).
+    const double along_lo = -0.1;
+    const double along_hi = ab_len + 0.1;
+    // Dense sampling: every polyline segment is sampled at <= res/2, so a
+    // long LOS-shortcut waypoint hop straight through the passage can
+    // never be missed (the A* waypoints alone are NOT dense enough).
+    const double step = std::max(1e-3, 0.5 * res_);
+    // Last NONZERO lateral side seen inside the corridor.  A zero lateral
+    // (on/near the centreline) never overwrites it, so a `+ -> 0 -> -`
+    // (or `- -> 0 -> +`) sequence is recognised as a real crossing, while
+    // entering and leaving on the SAME side is not.
+    int prev_side = 0;
+    for (size_t i = 1; i < path.size(); ++i) {
+        const Vec2d a = path[i - 1];
+        const Vec2d b = path[i];
+        const double seg = (b - a).norm();
+        const int steps =
+            std::max(1, static_cast<int>(std::ceil(seg / step)));
+        for (int k = 0; k <= steps; ++k) {
+            const Vec2d p = a + (b - a) * (static_cast<double>(k) / steps);
+            const Vec2d rel = p - np.a_center;
+            const double along = rel.dot(ax);
+            if (along < along_lo || along > along_hi) continue;
             const Vec2d offv = rel - ax * along;
-            const double side = cross2(ax, offv);
-            if (prev_side != 0.0 && side != 0.0 && prev_side * side < 0.0) {
-                crossed = true;
-            }
+            const double off = offv.norm();
+            if (off > half_w) continue;  // outside the local corridor
+            const double lateral = cross2(ax, offv);  // signed side
+            int side = 0;
+            if (lateral > 1e-9) side = 1;
+            else if (lateral < -1e-9) side = -1;
+            if (side == 0) continue;  // centreline: keep previous nonzero
+            if (prev_side != 0 && side != prev_side) return true;  // crossed
             prev_side = side;
         }
-        in_corridor = true;
     }
-    return crossed;
+    return false;
 }
 
 // ────────────────────────────────────────────────────────────────────
 //  One side route (tangent gateways + 3-segment A* + LOS + homotopy +
 //  start-clearance recovery).  `task_side_budget` is SHARED between LEFT
-//  and RIGHT and is deducted per segment.
+//  and RIGHT; `remaining_global` is the generation-wide budget (the OUTER
+//  cap).  Every A* segment is capped by min(per_segment, task_side_budget,
+//  remaining_global) and deducts its actual expansions from BOTH.
 // ────────────────────────────────────────────────────────────────────
 void TaskRouteQualifier::planSideRoute(
     const Vec2d& start, const Vec2d& goal, const Vec2d& blocker_center,
     double blocker_radius, const Vec2d& axis_u, bool left_side,
-    uint64_t& task_side_budget, SideRouteResult& out,
-    std::vector<Vec2d>* path_out) const {
+    uint64_t& task_side_budget, uint64_t& remaining_global,
+    SideRouteResult& out, std::vector<Vec2d>* path_out) const {
     out = SideRouteResult{};
     out.checked = true;
     out.reject_reason = "";
@@ -610,11 +621,21 @@ void TaskRouteQualifier::planSideRoute(
         }
     }
 
-    // ── Shared per-task side budget: each segment may use at most
-    //    min(max_side_route_expansions, remaining_task_budget). ──────
+    // ── Budget hierarchy: per-segment A* cap <= task-side (shared LEFT
+    //    + RIGHT) <= generation-wide remaining.  Each A* call deducts its
+    //    ACTUAL expansions from BOTH task_side_budget and remaining_global
+    //    (never double counted). ──────────────────────────────────────
     auto segmentBudget = [&]() {
-        return static_cast<int>(
-            std::min<uint64_t>(static_cast<uint64_t>(cap), task_side_budget));
+        return static_cast<int>(std::min<uint64_t>(
+            static_cast<uint64_t>(cap),
+            std::min(task_side_budget, remaining_global)));
+    };
+    auto deduct = [&](uint32_t e) {
+        const uint64_t eu = e;
+        task_side_budget =
+            (eu <= task_side_budget) ? task_side_budget - eu : 0;
+        remaining_global =
+            (eu <= remaining_global) ? remaining_global - eu : 0;
     };
 
     // The blocker is always inflated by the route clearance (the tangent
@@ -631,26 +652,29 @@ void TaskRouteQualifier::planSideRoute(
 
     std::vector<Vec2d> path;
     uint32_t exp_total = 0;
-    bool budget_exhausted = false;
-    if (task_side_budget > 0) {
+    bool side_budget_exhausted = false;   // per-task side budget ran dry
+    bool global_budget_exhausted = false; // generation-wide budget ran dry
+    if (task_side_budget > 0 && remaining_global > 0) {
         uint32_t e1 = 0, e2 = 0, e3 = 0;
         auto s1 = astarPath(route_start, gP_legal, clearance, axis,
                             blocker_center, bias, side_sign,
                             segmentBudget(), e1);
-        task_side_budget -= e1;
+        deduct(e1);
         exp_total += e1;
         auto s2 = astarPath(gP_legal, gG_legal, clearance, axis,
                             blocker_center, bias, side_sign,
                             segmentBudget(), e2);
-        task_side_budget -= e2;
+        deduct(e2);
         exp_total += e2;
         auto s3 = astarPath(gG_legal, goal, clearance, axis, blocker_center,
                             bias, side_sign, segmentBudget(), e3);
-        task_side_budget -= e3;
+        deduct(e3);
         exp_total += e3;
         out.expanded_nodes = exp_total;
-        if (task_side_budget == 0 && (s1.empty() || s2.empty() || s3.empty())) {
-            budget_exhausted = true;
+        if ((task_side_budget == 0 || remaining_global == 0) &&
+            (s1.empty() || s2.empty() || s3.empty())) {
+            if (remaining_global == 0) global_budget_exhausted = true;
+            else side_budget_exhausted = true;
         }
         if (!s1.empty() && !s2.empty() && !s3.empty()) {
             // Per-segment shortcut so the forced gateways are never
@@ -667,17 +691,24 @@ void TaskRouteQualifier::planSideRoute(
             }
         }
     } else {
-        budget_exhausted = true;
+        // No budget at all: a timeout, not a proven dead end.
+        if (remaining_global == 0) global_budget_exhausted = true;
+        else side_budget_exhausted = true;
     }
-    if (path.empty() && !budget_exhausted && task_side_budget > 0) {
+    if (path.empty() && !side_budget_exhausted && !global_budget_exhausted &&
+        task_side_budget > 0 && remaining_global > 0) {
         // Fallback: single side-constrained A* (no forced gateways).
         uint32_t e0 = 0;
         path = astarPath(route_start, goal, clearance, axis, blocker_center,
                          bias, side_sign, segmentBudget(), e0);
-        task_side_budget -= e0;
+        deduct(e0);
         exp_total += e0;
         out.expanded_nodes = exp_total;
-        if (task_side_budget == 0 && path.empty()) budget_exhausted = true;
+        if ((task_side_budget == 0 || remaining_global == 0) &&
+            path.empty()) {
+            if (remaining_global == 0) global_budget_exhausted = true;
+            else side_budget_exhausted = true;
+        }
         if (!path.empty()) {
             losShortcut(path, clearance);
             if (!routeSafe(path, clearance, 0.0)) path.clear();
@@ -685,10 +716,15 @@ void TaskRouteQualifier::planSideRoute(
     }
     if (path.empty()) {
         out.feasible = false;
-        // Distinguish "search hit its node budget" from "genuinely no
-        // route" so the diagnostics can tell a timeout from a dead end.
-        out.reject_reason = budget_exhausted ? "side_search_budget_exceeded"
-                                             : "side_route_not_found";
+        // Distinguish "budget ran out" from "genuinely no route" so the
+        // diagnostics can tell a timeout from a proven dead end.
+        if (global_budget_exhausted) {
+            out.reject_reason = "qualification_expansion_budget";
+        } else if (side_budget_exhausted) {
+            out.reject_reason = "side_search_budget_exceeded";
+        } else {
+            out.reject_reason = "side_route_not_found";
+        }
         return;
     }
     // Prepend the recovery connection (verified at BASE clearance) and
@@ -738,10 +774,20 @@ void TaskRouteQualifier::planSideRoute(
 
 // ────────────────────────────────────────────────────────────────────
 //  qualify() — the whole pipeline
+//  Budget hierarchy (all expansion counts, never double-counted):
+//    generation-wide remaining (passed in, mutable, OUTER hard cap)
+//      -> task total budget = min(max_astar + max_total_side, remaining)
+//        -> global connectivity A*   (capped by min(max_astar, task_total))
+//        -> LEFT/RIGHT shared side   (capped by remaining task_total)
+//          -> per-segment A*         (capped by min(per_seg, side, global))
+//  Every layer deducts its ACTUAL expansions, so
+//  total_qualification_expansions <= max_total_qualification_expansions
+//  holds even mid-task / mid-round.
 // ────────────────────────────────────────────────────────────────────
 void TaskRouteQualifier::qualify(const Vec2d& start, const Vec2d& goal,
                                  TaskQualificationSummary& out,
-                                 QualificationCounters& counters) const {
+                                 QualificationCounters& counters,
+                                 uint64_t& remaining_global) const {
     out = TaskQualificationSummary{};
     const auto& qcfg = cfg_.qualification;
     const double endpoint_clr = cfg_.endpointRequiredClearance();
@@ -807,17 +853,42 @@ void TaskRouteQualifier::qualify(const Vec2d& start, const Vec2d& goal,
     //    A* confirms basic traversable connectivity (NOT the stricter side
     //    route clearance — a pair in the 0.50..0.65 m band must not fail
     //    here).  Budget exhaustion is reported separately from "no path".
+    //    Task budget = min(max_astar + max_total_side, remaining_global).
+    const uint64_t task_total_budget_init = std::min<uint64_t>(
+        static_cast<uint64_t>(qcfg.max_astar_expansions) +
+            static_cast<uint64_t>(qcfg.max_total_side_route_expansions),
+        remaining_global);
+    uint64_t task_total_budget = task_total_budget_init;
     if (qcfg.run_astar_confirmation) {
+        // The effective per-A* cap is min(max_astar_expansions, remaining
+        // task budget).  When the cap came from the generation-wide budget
+        // the reject is reported as qualification_expansion_budget.
+        const uint32_t astar_budget = static_cast<uint32_t>(
+            std::min<uint64_t>(
+                static_cast<uint64_t>(qcfg.max_astar_expansions),
+                task_total_budget));
+        const bool capped_by_global =
+            static_cast<uint64_t>(astar_budget) <
+            static_cast<uint64_t>(qcfg.max_astar_expansions);
         uint32_t e = 0;
         const Vec2d axis = goal - start;
         const std::vector<Vec2d> route =
             astarPath(start, goal, cfg_.connectivityRequiredClearance(), axis,
-                      blocker_center, 0.0, 1, qcfg.max_astar_expansions, e);
+                      blocker_center, 0.0, 1, static_cast<int>(astar_budget),
+                      e);
+        const uint64_t eu = e;
+        task_total_budget =
+            (eu <= task_total_budget) ? task_total_budget - eu : 0;
+        remaining_global =
+            (eu <= remaining_global) ? remaining_global - eu : 0;
         counters.total_astar_expansions += e;
         if (route.empty()) {
             out.qualification_class = "blocked_no_global_route";
-            if (e >= static_cast<uint32_t>(qcfg.max_astar_expansions)) {
-                out.reject_reason = "global_astar_budget_exceeded";
+            if (e >= astar_budget && astar_budget > 0) {
+                // Search hit its node cap -> BUDGET, not "no route".
+                out.reject_reason = capped_by_global
+                                        ? "qualification_expansion_budget"
+                                        : "global_astar_budget_exceeded";
                 ++counters.reject_global_astar_budget;
             } else {
                 out.reject_reason = "global_route_missing";
@@ -828,26 +899,42 @@ void TaskRouteQualifier::qualify(const Vec2d& start, const Vec2d& goal,
     }
 
     // ── 5. causal LEFT / RIGHT route qualification ─────────────────
-    // The LEFT and RIGHT searches SHARE one per-task expansion budget.
+    // The LEFT and RIGHT searches SHARE one per-task expansion budget,
+    // itself capped by the generation-wide remaining budget.
     ++counters.side_qualification_attempt;
     const Vec2d axis_u = (goal - start).normalized();
-    uint64_t task_side_budget =
-        static_cast<uint64_t>(qcfg.max_total_side_route_expansions);
+    uint64_t task_side_budget = std::min<uint64_t>(
+        static_cast<uint64_t>(qcfg.max_total_side_route_expansions),
+        task_total_budget);
     std::vector<Vec2d> left_path, right_path;
     planSideRoute(start, goal, blocker_center, blocker_radius, axis_u, true,
-                  task_side_budget, out.left, &left_path);
+                  task_side_budget, remaining_global, out.left, &left_path);
     planSideRoute(start, goal, blocker_center, blocker_radius, axis_u, false,
-                  task_side_budget, out.right, &right_path);
+                  task_side_budget, remaining_global, out.right, &right_path);
     counters.total_astar_expansions +=
         out.left.expanded_nodes + out.right.expanded_nodes;
 
     const bool left_ok = out.left.feasible;
     const bool right_ok = out.right.feasible;
-    // Budget exhaustion is NEVER counted as "infeasible" (semantics differ:
-    // a timeout must not be misread as a proven dead end).
-    if (out.left.reject_reason.find("budget") != std::string::npos ||
-        out.right.reject_reason.find("budget") != std::string::npos) {
+    // Budget exhaustion is NEVER counted as "infeasible" (a timeout must
+    // not be misread as a proven dead end) and never as a both-sides
+    // topology reject: an incomplete search proves NOTHING about the
+    // geometry, so the task is rejected with a budget reason instead.
+    const bool left_budget =
+        out.left.reject_reason == "side_search_budget_exceeded" ||
+        out.left.reject_reason == "qualification_expansion_budget";
+    const bool right_budget =
+        out.right.reject_reason == "side_search_budget_exceeded" ||
+        out.right.reject_reason == "qualification_expansion_budget";
+    if (left_budget || right_budget) {
         ++counters.reject_side_search_budget;
+        out.qualification_class = "blocked_budget";
+        out.reject_reason =
+            (out.left.reject_reason == "qualification_expansion_budget" ||
+             out.right.reject_reason == "qualification_expansion_budget")
+                ? "qualification_expansion_budget"
+                : "side_search_budget_exceeded";
+        return;
     }
     // Narrow-passage traversal evidence: a task is NARROW only when at
     // least one ACCEPTED qualified route actually traverses a cached

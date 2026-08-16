@@ -792,6 +792,15 @@ BlueprintScene makeWallScene() {
     return makeScene(obs);
 }
 
+/// Fixture config: production defaults + the requested side-feasibility
+/// rule.  Separated so the QualFixture can initialise its members in the
+/// initializer list (TaskCandidateGenerator has NO default constructor).
+static BlueprintGenerationConfig makeQualCfg(bool require_both) {
+    BlueprintGenerationConfig cfg = makeCfg();
+    cfg.qualification.require_both_sides_feasible = require_both;
+    return cfg;
+}
+
 struct QualFixture {
     BlueprintScene scene;
     BlueprintGenerationConfig cfg;
@@ -801,33 +810,44 @@ struct QualFixture {
     TaskCandidateGenerator gen;
 
     QualFixture(std::vector<std::array<double, 3>> obs,
-                bool require_both = true) {
-        scene = makeScene(std::move(obs));
-        cfg = makeCfg();
-        cfg.qualification.require_both_sides_feasible = require_both;
+                bool require_both = true)
+        : scene(makeScene(std::move(obs))),
+          cfg(makeQualCfg(require_both)),
+          gen(cfg) {
         meta = SceneMetadata{};
         geo.build(scene, cfg, meta);
         qual.configure(scene, geo, cfg);
-        gen = TaskCandidateGenerator(cfg);
     }
 
     /// Scene-based fixture (makeChainScene and friends return a scene).
-    QualFixture(const BlueprintScene& s, bool require_both = true) {
-        scene = s;
-        cfg = makeCfg();
-        cfg.qualification.require_both_sides_feasible = require_both;
+    QualFixture(const BlueprintScene& s, bool require_both = true)
+        : scene(s),
+          cfg(makeQualCfg(require_both)),
+          gen(cfg) {
         meta = SceneMetadata{};
         geo.build(scene, cfg, meta);
         qual.configure(scene, geo, cfg);
-        gen = TaskCandidateGenerator(cfg);
     }
 
-    /// Run the qualification for start/goal, return the summary.
+    /// Run the qualification for start/goal with an UNLIMITED
+    /// generation-wide budget (tests that do not exercise the global cap).
     TaskQualificationSummary qualify(double sx, double sy, double gx,
                                      double gy) {
         TaskQualificationSummary q;
         QualificationCounters c;
-        qual.qualify(Vec2d(sx, sy), Vec2d(gx, gy), q, c);
+        uint64_t unlimited = std::numeric_limits<uint64_t>::max();
+        qual.qualify(Vec2d(sx, sy), Vec2d(gx, gy), q, c, unlimited);
+        return q;
+    }
+
+    /// Run the qualification with an explicit generation-wide remaining
+    /// budget (mutable; the qualify() call deducts its actual expansions
+    /// from it — mirrors the controller's real-time hard budget).
+    TaskQualificationSummary qualify(double sx, double sy, double gx,
+                                     double gy, uint64_t& remaining_global) {
+        TaskQualificationSummary q;
+        QualificationCounters c;
+        qual.qualify(Vec2d(sx, sy), Vec2d(gx, gy), q, c, remaining_global);
         return q;
     }
     TaskGeomType classify(double sx, double sy, double gx, double gy,
@@ -1092,6 +1112,80 @@ static void testQualification() {
                              q.right.expanded_nodes));
         }
     }
+
+    // ── GENERATION-WIDE hard expansion budget (REAL-TIME, not round-end)
+    //    Mirror the controller: a single mutable `remaining` is threaded
+    //    across consecutive tasks; EVERY node expanded is deducted, so
+    //    total can never exceed the cap and the task that runs the budget
+    //    dry reports a BUDGET reason (never no-route / infeasible). ─────
+    {
+        QualFixture f(makeWallScene());  // expensive side search
+        uint64_t remaining = 250;        // generation-wide cap
+        uint64_t total_used = 0;
+        for (int i = 0; i < 16 && remaining > 0; ++i) {
+            const uint64_t before = remaining;
+            TaskQualificationSummary q =
+                f.qualify(-6.0, 16.0, 9.0, 16.0, remaining);
+            const uint64_t used = before - remaining;
+            total_used += used;
+            check(used <= 250, "global budget: one task never overshoots");
+            if (remaining == 0 && !q.accepted) {
+                // The task that consumed the last budget must be reported
+                // as a BUDGET stop, not a geometry no-route.
+                check(q.reject_reason == "qualification_expansion_budget" ||
+                          q.reject_reason == "side_search_budget_exceeded" ||
+                          q.reject_reason == "global_astar_budget_exceeded",
+                      "global budget: exhausted task reports a BUDGET "
+                      "reason (not no-route/infeasible)");
+            }
+        }
+        check(total_used <= 250,
+              "global budget: total_qualification_expansions <= cap (hard)");
+        if (total_used > 250) {
+            std::fprintf(stderr,
+                         "  [info] global budget test: total_used=%llu "
+                         "cap=250\n",
+                         static_cast<unsigned long long>(total_used));
+        }
+    }
+    // Tiny remaining budget: the very first qualify() must stop inside the
+    // global A* with a qualification_expansion_budget reason (the global
+    // A* is capped by the remaining budget, which is < max_astar).
+    {
+        QualFixture f({{0.0, 15.0, 1.0}});  // blocked task (needs A*)
+        uint64_t remaining = 1;
+        TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0, remaining);
+        check(remaining == 0, "tiny budget: remaining consumed to 0");
+        check(q.reject_reason == "qualification_expansion_budget" ||
+                  q.reject_reason == "global_astar_budget_exceeded",
+              "tiny budget: budget reason, NOT global_route_missing");
+    }
+
+    // ── COMBINED: generation-wide remaining is the OUTER cap on the side
+    //    search.  per-segment=100, per-task side=250, global remaining=130
+    //    => LEFT+RIGHT can never use more than 130. ────────────────────
+    {
+        QualFixture f(makeWallScene());
+        f.cfg.qualification.max_side_route_expansions = 100;
+        f.cfg.qualification.max_total_side_route_expansions = 250;
+        f.qual.configure(f.scene, f.geo, f.cfg);
+        uint64_t remaining = 130;
+        TaskQualificationSummary q =
+            f.qualify(-6.0, 16.0, 9.0, 16.0, remaining);
+        const uint64_t side_total =
+            static_cast<uint64_t>(q.left.expanded_nodes) +
+            static_cast<uint64_t>(q.right.expanded_nodes);
+        check(side_total <= 130,
+              "combined budget: global remaining caps the side search "
+              "below its own 250");
+        if (side_total > 130) {
+            std::fprintf(stderr,
+                         "  [info] combined budget test: side_total=%llu "
+                         "remaining=%llu\n",
+                         static_cast<unsigned long long>(side_total),
+                         static_cast<unsigned long long>(remaining));
+        }
+    }
 }
 
 // ── 12. rotation invariance ────────────────────────────────────────
@@ -1211,6 +1305,63 @@ static void testQualificationNarrow() {
     }
 }
 
+// ── 13a. routeTraversesNarrowPassage unit tests (dense sampling +
+//        nonzero-sign crossing + local corridor semantics) ──────────
+static void testNarrowTraversalEvidence() {
+    std::fprintf(stderr, "test: narrow traversal evidence\n");
+    // A synthetic passage between two r=1.0 obstacles at (+-2.0, 15):
+    // surface gap 2.0 m, axis (1,0), centre (0,15).  Local corridor:
+    // along x in [-0.1,4.1], |lateral| <= width/2+0.05 = 1.05.
+    NarrowPassage np;
+    np.a_center = Vec2d(-2.0, 15.0);
+    np.b_center = Vec2d(2.0, 15.0);
+    np.center = Vec2d(0.0, 15.0);
+    np.axis = Vec2d(1.0, 0.0);
+    np.width = 2.0;
+    np.a_id = 0;
+    np.b_id = 1;
+
+    QualFixture f({});  // empty scene; traversal logic needs no obstacles
+    const auto& tr = f.qual;
+
+    // POSITIVE: two sparse waypoints spanning the passage from one side to
+    // the other.  The single long segment must be densely sampled, so the
+    // crossing (which happens mid-segment at x=0) cannot be missed.
+    {
+        const std::vector<Vec2d> path = {Vec2d(-2.5, 16.0), Vec2d(2.5, 14.0)};
+        check(tr.routeTraversesNarrowPassage(path, np),
+              "narrow evidence: sparse segment crossing is detected");
+    }
+    // POSITIVE with explicit centreline zero: `+ -> 0 -> -` must count.
+    {
+        const std::vector<Vec2d> path = {Vec2d(-2.0, 16.0), Vec2d(0.0, 15.0),
+                                         Vec2d(2.0, 14.0)};
+        check(tr.routeTraversesNarrowPassage(path, np),
+              "narrow evidence: + -> 0 -> - counts as a crossing");
+    }
+    // NEGATIVE (bypass): the route passes outside the local corridor.
+    {
+        const std::vector<Vec2d> path = {Vec2d(-3.0, 17.5), Vec2d(3.0, 17.5)};
+        check(!tr.routeTraversesNarrowPassage(path, np),
+              "narrow evidence: bypass (outside corridor) is NOT traversal");
+    }
+    // NEGATIVE (same-side): the route enters the corridor but leaves on
+    // the SAME side (never crosses the axis).
+    {
+        const std::vector<Vec2d> path = {Vec2d(-3.0, 16.0), Vec2d(3.0, 16.0)};
+        check(!tr.routeTraversesNarrowPassage(path, np),
+              "narrow evidence: same-side entry/exit is NOT traversal");
+    }
+    // NEGATIVE (beyond the along extent): a lateral sign flip that happens
+    // OUTSIDE the passage's along segment must not count.
+    {
+        const std::vector<Vec2d> path = {Vec2d(-4.0, 16.0), Vec2d(-2.2, 14.0)};
+        check(!tr.routeTraversesNarrowPassage(path, np),
+              "narrow evidence: flip beyond the along extent is NOT "
+              "traversal");
+    }
+}
+
 // ── 13b. CHICANE = real lateral-sign alternation along the task ────
 static void testQualificationChicaneAlternation() {
     std::fprintf(stderr, "test: chicane alternation\n");
@@ -1275,12 +1426,7 @@ static void testQualificationChicaneTasks() {
         if (out.success) break;
     }
     if (!out.success) return;
-    QualFixture f({});
-    f.scene = out.scene;
-    f.meta = SceneMetadata{};
-    f.geo.build(f.scene, f.cfg, f.meta);
-    f.qual.configure(f.scene, f.geo, f.cfg);
-    f.gen = TaskCandidateGenerator(f.cfg);
+    QualFixture f(out.scene);
 
     // Task A: start and goal at opposite ends along the structure axis.
     // The chicane spans most of the free region; pick far-apart endpoints
@@ -1301,9 +1447,8 @@ static void testQualificationChicaneTasks() {
             const Vec2d sa = f.geo.cellCenter(ax, ay);
             const Vec2d gb = f.geo.cellCenter(bx, by);
             if ((gb - sa).norm() < 4.0) continue;
-            TaskQualificationSummary q;
-            QualificationCounters c;
-            f.qual.qualify(sa, gb, q, c);
+            const TaskQualificationSummary q =
+                f.qualify(sa.x(), sa.y(), gb.x(), gb.y());
             if (!q.accepted) continue;
             const TaskGeomType cls = f.gen.classifyQualified(
                 f.geo, f.scene, sa, gb, q);
@@ -1332,6 +1477,7 @@ int main() {
     testQualification();
     testQualificationRotationInvariance();
     testQualificationNarrow();
+    testNarrowTraversalEvidence();
     testQualificationChicaneAlternation();
     testQualificationChicaneTasks();
     std::fprintf(stderr, "checks=%d failures=%d\n", g_checks, g_failures);

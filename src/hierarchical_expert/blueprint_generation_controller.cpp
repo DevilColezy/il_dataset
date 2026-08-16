@@ -651,6 +651,10 @@ BlueprintResult BlueprintGenerationController::generate() {
     // Privileged task-qualification aggregates + preflight-after-qual
     // efficiency counters.
     QualificationCounters qual_total;
+    // REAL-TIME generation-wide qualification expansion counter: updated
+    // immediately after EVERY qualify() call (not at round end), and used
+    // by budgetExceeded() so a round can never overshoot by one task.
+    uint64_t total_qualification_expansions = 0;
     uint64_t full_preflight_after_qual = 0;
     uint64_t full_preflight_success_after_qual = 0;
     BudgetExhaustion budget_exhausted = BudgetExhaustion::NONE;
@@ -665,9 +669,11 @@ BlueprintResult BlueprintGenerationController::generate() {
             budget_exhausted = BudgetExhaustion::PREFLIGHT_TICK_BUDGET;
             return true;
         }
-        // Generation-wide privileged-qualification A* expansion hard bound.
+        // Generation-wide privileged-qualification A* expansion hard bound:
+        // the REAL-TIME counter is checked before every task, so a task is
+        // never started (nor a round continued) after the budget is spent.
         if (cfg_.qualification.enabled &&
-            qual_total.total_astar_expansions >=
+            total_qualification_expansions >=
                 cfg_.qualification.max_total_qualification_expansions) {
             budget_exhausted = BudgetExhaustion::QUALIFICATION_EXPANSION_BUDGET;
             return true;
@@ -834,9 +840,30 @@ BlueprintResult BlueprintGenerationController::generate() {
                     const Vec2d t_start(task.start_x, task.start_y);
                     const Vec2d t_goal(task.goal_x, task.goal_y);
                     TaskQualificationSummary q;
+                    // Generation-wide HARD budget: only the remaining
+                    // expansion budget is handed to this task; every node
+                    // it expands is deducted from it, so the task can
+                    // NEVER overshoot the global cap (even mid-round).
+                    const uint64_t max_global =
+                        cfg_.qualification.max_total_qualification_expansions;
+                    uint64_t remaining_global =
+                        max_global > total_qualification_expansions
+                            ? max_global - total_qualification_expansions
+                            : 0;
+                    if (remaining_global == 0) {
+                        budget_exhausted =
+                            BudgetExhaustion::QUALIFICATION_EXPANSION_BUDGET;
+                        break;
+                    }
                     const auto t_qual = Clock::now();
-                    qualifier_.qualify(t_start, t_goal, q, qc_round);
+                    qualifier_.qualify(t_start, t_goal, q, qc_round,
+                                       remaining_global);
                     timing.task_qualification_ms += msSince(t_qual);
+                    // Real-time accounting (immediate, not round-end).
+                    const uint64_t used =
+                        (max_global - total_qualification_expansions) -
+                        remaining_global;
+                    total_qualification_expansions += used;
                     task.qualification = q;
                     if (!q.accepted) {
                         ++result.qualification_rejected;
