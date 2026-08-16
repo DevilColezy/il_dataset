@@ -34,6 +34,40 @@ def ros_pos_to_unity(p):
     return [p[0], p[2], p[1]]
 
 
+def build_replacing_object_update(current_objects, known_object_ids):
+    """Build an AvoidBench-compatible replacement update for one scene.
+
+    AvoidBench's runtime ``Pose`` handler only creates/updates objects by ID;
+    it does not destroy an object omitted from the next message. Procedural
+    scenes use different ID families, so omission would accumulate obstacles
+    across scenes. Move every known but currently absent object far outside
+    the render and point-cloud volume.
+
+    ``known_object_ids`` is mutated in place and must live for the complete
+    Unity connection. Returns ``(wire_objects, retired_count)``.
+    """
+    objects = [dict(item) for item in (current_objects or [])]
+    current_ids = [str(item.get("ID", "")) for item in objects]
+    if any(not object_id for object_id in current_ids):
+        raise ValueError("every Unity object must have a non-empty ID")
+    if len(set(current_ids)) != len(current_ids):
+        raise ValueError("duplicate Unity object ID in one scene")
+    current_set = set(current_ids)
+    retired = sorted(set(known_object_ids).difference(current_set))
+    known_object_ids.update(current_set)
+    for object_id in retired:
+        objects.append({
+            "ID": object_id,
+            "prefabID": "Object",
+            # Unity coordinates [x, y(up), z]: far below every configured
+            # camera, collider and point-cloud sampling volume.
+            "position": [0.0, -1000.0, 0.0],
+            "rotation": [0.0, 0.0, 0.0, 1.0],
+            "size": [0.001, 0.001, 0.001],
+        })
+    return objects, len(retired)
+
+
 def yaw_to_unity_quat(yaw):
     """ROS yaw (z-up) -> Unity quaternion [x, y, z, w] (y-up)."""
     half = -0.5 * yaw
@@ -218,6 +252,18 @@ def make_depth_vehicle(ros_pos, yaw, depth_cfg, quaternion_xyzw=None):
         quat = yaw_to_unity_quat(yaw)
     near = float(depth_cfg.get("near", 0.01))
     far = float(depth_cfg.get("far", 1000.0))
+    # ── Single-source Unity T_BC (item 十) ─────────────────────────
+    # The camera→body matrix MUST come from the SAME validated
+    # `depth.t_bc` (16 row-major floats) that il_expert_config feeds into
+    # the C++ CameraRig2D.  il_config.load_config() injects the unique
+    # default when absent, so there is exactly ONE default and never a
+    # second hard-coded matrix here.  A missing entry is a config error.
+    t_bc = depth_cfg.get("t_bc")
+    if t_bc is None or not isinstance(t_bc, (list, tuple)) or len(t_bc) != 16:
+        raise ValueError(
+            "depth.t_bc must be present and a 16-element row-major 4x4 "
+            "(camera->body); the config loader injects the unique default")
+    t_bc = [float(v) for v in t_bc]
     return {
         "ID": "quadrotor0",
         "position": pos,
@@ -230,10 +276,7 @@ def make_depth_vehicle(ros_pos, yaw, depth_cfg, quaternion_xyzw=None):
             "fov": float(depth_cfg.get("fov", 90.0)),
             "nearClipPlane": [near] * 4,
             "farClipPlane": [far, 100.0, far, far],
-            "T_BC": [1.0, 0.0, 0.0, 0.0,
-                     0.0, 1.0, 0.0, 0.0,
-                     0.0, 0.0, 1.0, 0.3,
-                     0.0, 0.0, 0.0, 1.0],
+            "T_BC": t_bc,
             "isDepth": False,
             "enabledLayers": [True, False, False],
             "depthScale": 0.2,

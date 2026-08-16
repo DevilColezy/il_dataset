@@ -1,19 +1,27 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-il_config.py  —  Configuration loading / validation for the two-level
-navigation expert dataset collector.
+il_config.py  -  Configuration loading / validation for the NEW
+hierarchical local-expert IL dataset collector (both
+il_dataset_collect.launch and il_dataset_joint_v2_collect.launch).
 
-The YAML config is organized into the modules defined in the architecture:
-task_oracle, observed_map, macro_expert, macro_candidates,
-local_recoverability, local_path_search, trajectory_optimization,
-yaw_planning, trajectory_controller, execution_safety, dataset_logging
-plus infrastructure (fsm, depth, pointcloud, vehicle, control, sync, commit).
+The production runtime uses exactly one expert parameter source:
+  global.hierarchical_expert
+plus the expert-independent infrastructure (fsm, depth, vehicle, control,
+dynamics, navigation, scene_generation, task_generation, dataset_logging,
+sync, commit).
 
-Every parameter read here is consumed by the runtime code.
+The old expert modules (micro_detour_planner, goal_switching,
+trajectory_controller, execution_safety, task_qualifier, task_oracle,
+pointcloud, observed_map, macro_* / local_* / trajectory_optimization /
+yaw_planning / privileged_intervention) were REMOVED entirely: their
+sources, tests, old config recipes and builder functions are gone, they are
+not required and not validated, and the production manager never calls them.
 """
 
 from __future__ import print_function, division
 
+import copy
+import math
 import os
 
 import yaml
@@ -24,20 +32,33 @@ import rospy
 _PKG = "il_dataset"
 _DEFAULT_CONFIG_REL = "config/il_dataset_config.yaml"
 
-# Modules that must exist under `global`.
+# Modules that must exist under `global` (single production path).
 REQUIRED_MODULES = [
-    "fsm", "depth", "pointcloud", "vehicle", "control", "dynamics",
-    "task_oracle", "observed_map", "macro_expert", "macro_candidates",
-    "local_recoverability", "local_path_search", "trajectory_optimization",
-    "yaw_planning", "trajectory_controller", "execution_safety",
-    "dataset_logging", "sync", "commit", "privileged_intervention",
-    "navigation",
+    "fsm", "depth", "vehicle", "control", "dynamics", "navigation",
+    "scene_generation", "task_generation", "hierarchical_expert",
+    "dataset_logging", "sync", "commit",
+]
+
+# The ONE default Unity T_BC (camera->body, 16 floats row-major).  This is
+# the single default used when a config omits `depth.t_bc`; il_common.
+# make_depth_vehicle() reads the SAME validated matrix and il_expert_config
+# feeds it into the C++ CameraRig2D — there is no second default anywhere.
+DEFAULT_T_BC = [
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.3,
+    0.0, 0.0, 0.0, 1.0,
 ]
 
 
 def _resolve_path(cfg_path):
-    if cfg_path and os.path.isfile(cfg_path):
-        return cfg_path
+    if cfg_path:
+        requested = os.path.abspath(os.path.expanduser(str(cfg_path)))
+        if not os.path.isfile(requested):
+            # A launch-supplied config must never silently fall back to the
+            # default dataset recipe: that can erase the wrong output root.
+            raise ValueError("Config file not found: %s" % requested)
+        return requested
     try:
         rospack = rospkg.RosPack()
         pkg_dir = rospack.get_path(_PKG)
@@ -49,13 +70,74 @@ def _resolve_path(cfg_path):
         return os.path.normpath(candidate)
 
 
-def _get_nested(cfg, path, default=None):
-    node = cfg
-    for key in path:
-        if not isinstance(node, dict) or key not in node:
-            return default
-        node = node[key]
-    return node
+def _deep_merge_config(base, override):
+    """Recursively merge a small override YAML onto a complete base YAML.
+
+    Scene profiles are a named list, not a positional list: an override such
+    as ``- name: dense_small; scene_count: 1`` changes only that profile and
+    retains its geometry/distribution fields from the base configuration.
+    Other lists deliberately replace their base value in full.
+    """
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = copy.deepcopy(base)
+        for key, value in override.items():
+            merged[key] = _deep_merge_config(merged[key], value) \
+                if key in merged else copy.deepcopy(value)
+        return merged
+    if isinstance(base, list) and isinstance(override, list) and \
+            all(isinstance(v, dict) and "name" in v for v in base) and \
+            all(isinstance(v, dict) and "name" in v for v in override):
+        patches = {str(value["name"]): value for value in override}
+        merged = []
+        seen = set()
+        for value in base:
+            name = str(value["name"])
+            merged.append(_deep_merge_config(value, patches[name])
+                          if name in patches else copy.deepcopy(value))
+            seen.add(name)
+        merged.extend(copy.deepcopy(value) for value in override
+                      if str(value["name"]) not in seen)
+        return merged
+    return copy.deepcopy(override)
+
+
+def _load_yaml_with_extends(path, ancestry=None):
+    """Load YAML, resolving an optional relative ``extends`` parent."""
+    path = os.path.abspath(path)
+    ancestry = list(ancestry or [])
+    if path in ancestry:
+        raise ValueError("circular config extends: %s" % " -> ".join(
+            ancestry + [path]))
+    with open(path, "r", encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle) or {}
+    if not isinstance(cfg, dict):
+        raise ValueError("Config must be a mapping: %s" % path)
+    parent = cfg.pop("extends", None)
+    if parent is None:
+        return cfg
+    if not isinstance(parent, str) or not parent:
+        raise ValueError("config extends must be a non-empty relative path")
+    parent_path = os.path.normpath(os.path.join(os.path.dirname(path), parent))
+    if not os.path.isfile(parent_path):
+        raise ValueError("base config not found: %s" % parent_path)
+    base = _load_yaml_with_extends(parent_path, ancestry + [path])
+    return _deep_merge_config(base, cfg)
+
+
+def _inject_defaults(cfg):
+    """Fill the UNIQUE default for `global.depth.t_bc` when the config
+    omits it (item 十: single default, never a second copy on the Unity
+    wire side).  ``make_depth_vehicle`` and the C++ camera rig both read
+    the same `depth.t_bc` afterwards."""
+    global_cfg = cfg.get("global", {})
+    depth = global_cfg.get("depth")
+    if depth is not None and not isinstance(depth, dict):
+        return
+    if depth is None:
+        global_cfg["depth"] = {}
+        depth = global_cfg["depth"]
+    if depth.get("t_bc") is None:
+        depth["t_bc"] = list(DEFAULT_T_BC)
 
 
 def _positive(value, name, errors, allow_zero=False):
@@ -77,463 +159,394 @@ def _bounded(value, name, lo, hi, errors):
         errors.append("%s must be in [%s, %s]" % (name, lo, hi))
 
 
+def _pos_list(value, name, errors):
+    if not isinstance(value, list) or not value or \
+            any(not isinstance(v, (int, float)) or isinstance(v, bool)
+                or float(v) <= 0.0 for v in value):
+        errors.append("%s must be a non-empty list of positive numbers"
+                      % name)
+
+
 def _validate_config(cfg):
+    """Validate the NEW hierarchical local-expert configuration (the single
+    production path used by both launches).
+
+    Only the expert-independent infrastructure (fsm / depth / vehicle /
+    control / dynamics / navigation / scene_generation / task_generation /
+    dataset_logging / sync / commit) plus the ONE expert source
+    `global.hierarchical_expert` are validated.  The old expert modules
+    (micro_detour_planner, goal_switching, trajectory_controller,
+    execution_safety, task_qualifier, task_oracle, pointcloud, ...) were
+    REMOVED entirely and are not required and not validated.
+    """
     errors = []
     g = cfg.get("global", {})
     for module in REQUIRED_MODULES:
         if not isinstance(g.get(module), dict):
             errors.append("missing global.%s module" % module)
 
-    # Cross-module consistency
-    depth_max = _get_nested(g, ["depth", "max_m"], 5.0)
-    om = g.get("observed_map", {})
-    me = g.get("macro_expert", {})
-    mc = g.get("macro_candidates", {})
-    lr = g.get("local_recoverability", {})
-    lps = g.get("local_path_search", {})
-    to = g.get("trajectory_optimization", {})
-    yp = g.get("yaw_planning", {})
-    tc = g.get("trajectory_controller", {})
-    ctrl = g.get("control", {})
-    veh = g.get("vehicle", {})
-    ds = g.get("dataset_logging", {})
-
-    control_hz = ctrl.get("control_hz", None)
-    record_hz = ctrl.get("record_hz", 30.0)
-    if control_hz is not None:
-        errors.append("global.control.control_hz is removed; the control "
-                      "sample rate is dynamics.control_hz, the record rate "
-                      "is global.control.record_hz")
-    _positive(record_hz, "global.control.record_hz", errors)
-
-    # Wall-clock task watchdog (section "time"): independent of the sim
-    # trajectory_timeout, bounds the PROCESS time of one episode so a
-    # stalled simulation / degraded loop cannot hang the collector.
+    # ── fsm (lifecycle timeouts) ──────────────────────────────────
+    _positive(g.get("fsm", {}).get("connect_timeout", 60.0),
+              "global.fsm.connect_timeout", errors)
+    # trajectory_wall_timeout_s == 0 DISABLES the production flight wall
+    # timeout (episodes end only on an expert terminal state or shutdown).
     _positive(g.get("fsm", {}).get("trajectory_wall_timeout_s", 600.0),
-              "global.fsm.trajectory_wall_timeout_s", errors)
+              "global.fsm.trajectory_wall_timeout_s", errors, allow_zero=True)
+    _positive(g.get("fsm", {}).get("depth_warmup_timeout", 30.0),
+              "global.fsm.depth_warmup_timeout", errors)
 
-    me_hz = me.get("update_hz", 5.0)
-    _positive(me_hz, "global.macro_expert.update_hz", errors)
-    if me_hz >= record_hz:
-        errors.append("global.macro_expert.update_hz must be < record_hz")
-    frames_per_macro = int(round(record_hz / me_hz))
-    if abs(record_hz / me_hz - frames_per_macro) > 1e-6:
-        errors.append("record_hz / macro update_hz must be an integer")
+    # ── depth (fixed camera; R is the single perception range) ────
+    depth = g.get("depth", {})
+    _positive(depth.get("width", 640), "global.depth.width", errors)
+    _positive(depth.get("height", 480), "global.depth.height", errors)
+    _positive(depth.get("fov", 90.0), "global.depth.fov", errors)
+    _positive(depth.get("max_m", 5.0), "global.depth.max_m", errors)
+    depth_max = float(depth.get("max_m", 5.0))
+    depth_fov = float(depth.get("fov", 90.0))
+    # ── depth.t_bc (item 十): the SINGLE camera->body matrix shared by the
+    #    Unity wire (make_depth_vehicle) and the C++ CameraRig2D.  It must
+    #    be 16 finite row-major floats, the last row must be (0,0,0,1) and
+    #    the 3x3 rotation must be a proper rotation (orthonormal, det +1).
+    t_bc = depth.get("t_bc")
+    if t_bc is not None:
+        if (not isinstance(t_bc, (list, tuple)) or len(t_bc) != 16 or
+                any(not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(float(v)) for v in t_bc)):
+            errors.append("global.depth.t_bc must be 16 finite numbers "
+                          "(row-major 4x4, camera->body)")
+        else:
+            m = [[float(t_bc[r * 4 + c]) for c in range(4)] for r in range(4)]
+            last = m[3]
+            if any(abs(last[c] - (1.0 if c == 3 else 0.0)) > 1e-6
+                   for c in range(4)):
+                errors.append("global.depth.t_bc last row must be "
+                              "[0, 0, 0, 1] (affine 4x4)")
+            r00, r01, r02 = m[0][0], m[0][1], m[0][2]
+            r10, r11, r12 = m[1][0], m[1][1], m[1][2]
+            r20, r21, r22 = m[2][0], m[2][1], m[2][2]
+            rows = [(r00, r01, r02), (r10, r11, r12), (r20, r21, r22)]
+            cols = [(r00, r10, r20), (r01, r11, r21), (r02, r12, r22)]
+            ortho_ok = all(
+                abs(sum(a * b for a, b in zip(rows[i], rows[j])) -
+                    (1.0 if i == j else 0.0)) < 1e-6
+                for i in range(3) for j in range(3))
+            det = (r00 * (r11 * r22 - r12 * r21) -
+                   r01 * (r10 * r22 - r12 * r20) +
+                   r02 * (r10 * r21 - r11 * r20))
+            if not ortho_ok:
+                errors.append("global.depth.t_bc 3x3 rotation must be "
+                              "orthonormal (identity for the default rig)")
+            if ortho_ok and abs(det - 1.0) > 1e-6:
+                errors.append("global.depth.t_bc 3x3 rotation must have "
+                              "determinant +1 (proper rotation)")
 
-    _positive(om.get("resolution", 0.10), "observed_map.resolution", errors)
-    _positive(om.get("size_x_m", 12.0), "observed_map.size_x_m", errors)
-    _positive(om.get("size_y_m", 12.0), "observed_map.size_y_m", errors)
-    _positive(om.get("size_z_m", 5.0), "observed_map.size_z_m", errors)
-    _positive(om.get("history_seconds", 8.0), "observed_map.history_seconds", errors)
-    if me.get("map_history_seconds") is not None:
+    # ── vehicle / navigation (truth audit geometry) ────────────────
+    veh = g.get("vehicle", {})
+    nav = g.get("navigation", {})
+    _positive(veh.get("radius_m", 0.30), "global.vehicle.radius_m", errors)
+    _positive(nav.get("clearance_m", 0.30), "global.navigation.clearance_m",
+              errors)
+
+    # ── control / dynamics (single control backend) ────────────────
+    ctrl = g.get("control", {})
+    record_hz = float(ctrl.get("record_hz", 30.0))
+    _positive(record_hz, "global.control.record_hz", errors)
+    dyn = g.get("dynamics", {})
+    if dyn.get("backend", "flightmare") != "flightmare":
+        errors.append("global.dynamics.backend must be 'flightmare'")
+    if dyn.get("control_mode", "velocity_yaw_rate") != "velocity_yaw_rate":
+        errors.append("global.dynamics.control_mode must be velocity_yaw_rate")
+    _positive(dyn.get("simulation_hz", 200.0),
+              "global.dynamics.simulation_hz", errors)
+    _positive(dyn.get("control_hz", 50.0),
+              "global.dynamics.control_hz", errors)
+    if float(dyn.get("simulation_hz", 200.0)) < \
+            float(dyn.get("control_hz", 50.0)):
+        errors.append("dynamics.simulation_hz must be >= control_hz")
+    vc = (dyn.get("velocity_controller", {}) or {})
+    backend_yaw_rate = float(vc.get("maximum_yaw_rate_rps", 1.5))
+    backend_yaw_accel = float(vc.get("maximum_yaw_acceleration_rps2", 4.0))
+    if not bool(vc.get("use_existing_flightmare_controller", False)):
         errors.append(
-            "global.macro_expert.map_history_seconds is removed; use "
-            "observed_map.history_seconds")
+            "global.dynamics.velocity_controller."
+            "use_existing_flightmare_controller must be true")
 
-    # macro lookahead must fit within depth range and observed map size.
-    lookahead = me.get("macro_lookahead_distance_m", 4.5)
-    _positive(lookahead, "macro_expert.macro_lookahead_distance_m", errors)
-    if lookahead > depth_max:
-        errors.append("macro_lookahead_distance_m must be <= depth.max_m")
-    half_x = om.get("size_x_m", 12.0) / 2.0
-    half_y = om.get("size_y_m", 12.0) / 2.0
-    if lookahead > 0.9 * min(half_x, half_y):
-        errors.append("macro_lookahead_distance_m must fit the observed map")
-
-    _bounded(me.get("local_bend_max_deg", 25.0),
-             "macro_expert.local_bend_max_deg", 1.0, 89.0, errors)
-    _bounded(me.get("local_lateral_ratio_max", 0.30),
-             "macro_expert.local_lateral_ratio_max", 0.01, 2.0, errors)
-    _positive(me.get("local_failure_count_for_observe", 4),
-              "macro_expert.local_failure_count_for_observe", errors)
-    _positive(me.get("observe_target_failure_ticks", 2),
-              "macro_expert.observe_target_failure_ticks", errors)
-    _positive(me.get("observe_target_retire_max_speed_mps", 0.30),
-              "macro_expert.observe_target_retire_max_speed_mps", errors,
+    # ── scene / task generation (truth, expert-independent) ────────
+    sg = g.get("scene_generation", {}) or {}
+    _positive(sg.get("seed", 12345), "scene_generation.seed", errors)
+    _positive(sg.get("scene_count", 10), "scene_generation.scene_count",
+              errors)
+    _positive(sg.get("tasks_per_scene", 8),
+              "scene_generation.tasks_per_scene", errors, allow_zero=True)
+    _positive(sg.get("minimum_tasks_per_scene", 6),
+              "scene_generation.minimum_tasks_per_scene", errors,
               allow_zero=True)
-    _positive(me.get("initial_map_warmup_s", 1.0),
-              "macro_expert.initial_map_warmup_s", errors, allow_zero=True)
-    _bounded(me.get("initial_goal_alignment_tolerance_deg", 8.0),
-             "macro_expert.initial_goal_alignment_tolerance_deg",
-             1.0, 45.0, errors)
-    _positive(me.get("initial_goal_alignment_min_duration_s", 0.20),
-              "macro_expert.initial_goal_alignment_min_duration_s", errors,
+    if int(sg.get("minimum_tasks_per_scene", 6)) > \
+            int(sg.get("tasks_per_scene", 8)):
+        errors.append("scene_generation.minimum_tasks_per_scene must be "
+                      "<= tasks_per_scene")
+    full_strata = bool(sg.get("require_full_strata_coverage", True))
+    if full_strata and int(sg.get("scene_count", 10)) < 10:
+        errors.append(
+            "scene_generation.scene_count must be >= 10 when "
+            "require_full_strata_coverage is true (scene 0 = explicit empty "
+            "CLEAR scene + 9 non-empty sparse/medium/dense x small/medium/"
+            "large strata)")
+    scene_key_prefix = str(sg.get("scene_key_prefix", ""))
+    if scene_key_prefix and any(
+            not (char.isalnum() or char in "_-")
+            for char in scene_key_prefix):
+        errors.append("scene_generation.scene_key_prefix may contain only "
+                      "letters, digits, '_' and '-'")
+    sg_geometry = sg.get("geometry", {}) or {}
+    _positive(sg_geometry.get("minimum_surface_gap_m", 1.2),
+              "scene_generation.geometry.minimum_surface_gap_m", errors)
+    _positive(sg_geometry.get("boundary_margin_m", 1.2),
+              "scene_generation.geometry.boundary_margin_m", errors,
               allow_zero=True)
-    _bounded(me.get("observe_scan_half_angle_deg", 35.0),
-             "macro_expert.observe_scan_half_angle_deg", 5.0, 80.0,
+    _positive(sg_geometry.get("radius_min_m", 0.10),
+              "scene_generation.geometry.radius_min_m", errors)
+    _positive(sg_geometry.get("radius_max_m", 2.0),
+              "scene_generation.geometry.radius_max_m", errors)
+    if float(sg_geometry.get("radius_max_m", 2.0)) < \
+            float(sg_geometry.get("radius_min_m", 0.10)) - 1e-9:
+        errors.append("scene_generation.geometry.radius_max_m must be "
+                      ">= radius_min_m")
+    # ESDF free-cell semantics: dist = drone CENTRE -> obstacle SURFACE.
+    # A free cell needs dist > free_cell_surface_clearance_m, which must
+    # itself be >= vehicle radius (body-edge clearance = this - radius).
+    _positive(sg_geometry.get("free_cell_surface_clearance_m", 0.5),
+              "scene_generation.geometry.free_cell_surface_clearance_m",
+              errors)
+    if float(sg_geometry.get("free_cell_surface_clearance_m", 0.5)) < \
+            float(veh.get("radius_m", 0.30)) - 1e-9:
+        errors.append(
+            "scene_generation.geometry.free_cell_surface_clearance_m "
+            "must be >= vehicle.radius_m (drone centre->surface)")
+    _bounded(sg_geometry.get("esdf_resolution_m", 0.1),
+             "scene_generation.geometry.esdf_resolution_m", 0.02, 0.5,
              errors)
-    _positive(me.get("observe_scan_hold_s", 0.20),
-              "macro_expert.observe_scan_hold_s", errors,
-              allow_zero=True)
-    _bounded(me.get("observe_scan_yaw_tolerance_deg", 6.0),
-             "macro_expert.observe_scan_yaw_tolerance_deg", 1.0, 20.0,
+    required_surface_gap = 2.0 * (
+        float(veh.get("radius_m", 0.30)) + float(nav.get("clearance_m", 0.30)))
+    if float(sg_geometry.get("minimum_surface_gap_m", 1.2)) < \
+            required_surface_gap - 1e-9:
+        errors.append(
+            "scene_generation.geometry.minimum_surface_gap_m must be "
+            ">= %.3f m = 2 * (vehicle radius + clearance)" %
+            required_surface_gap)
+
+    tg = g.get("task_generation", {}) or {}
+    _positive(tg.get("flight_height_m", 2.0),
+              "task_generation.flight_height_m", errors)
+    _positive(tg.get("min_task_distance_m", 4.0),
+              "task_generation.min_task_distance_m", errors)
+    _positive(tg.get("max_task_distance_m", 20.0),
+              "task_generation.max_task_distance_m", errors)
+    if float(tg.get("min_task_distance_m", 4.0)) > \
+            float(tg.get("max_task_distance_m", 20.0)):
+        errors.append("task_generation.min_task_distance_m must be <= "
+                      "max_task_distance_m")
+    _positive(tg.get("initial_yaw_bias_deg", 15.0),
+              "task_generation.initial_yaw_bias_deg", errors, allow_zero=True)
+    _positive(tg.get("preflight_qualification_max_ticks", 1800),
+              "task_generation.preflight_qualification_max_ticks", errors)
+    # Oversampling / hard-quota budget (blueprint-only, never a flight
+    # timeout).  Finite bounds prevent silent under-generation.
+    _positive(tg.get("task_sample_attempts", 200),
+              "task_generation.task_sample_attempts", errors)
+    _positive(tg.get("candidate_pool_multiplier", 4),
+              "task_generation.candidate_pool_multiplier", errors)
+    _positive(tg.get("qualification_attempt_budget", 400),
+              "task_generation.qualification_attempt_budget", errors)
+    quotas = tg.get("quotas", {}) or {}
+    for qkey in ("min_per_behavior", "min_turn_per_side",
+                 "max_left_right_imbalance", "long_takeover_min_ticks",
+                 "min_per_density_level", "min_per_radius_level",
+                 "min_per_distance_level"):
+        _positive(quotas.get(qkey, 2),
+                  "task_generation.quotas.%s" % qkey, errors,
+                  allow_zero=True)
+    for qkey in ("distance_short_max_m", "distance_long_min_m",
+                 "radius_small_max_m", "radius_large_min_m",
+                 "density_sparse_max", "density_dense_min"):
+        _positive(quotas.get(qkey, 1.0),
+                  "task_generation.quotas.%s" % qkey, errors,
+                  allow_zero=True)
+    # Quota band ordering: the short/small/sparse bands must sit strictly
+    # below the long/large/dense bands (else the strata are degenerate).
+    if float(quotas.get("distance_short_max_m", 9.0)) >= \
+            float(quotas.get("distance_long_min_m", 15.0)):
+        errors.append("task_generation.quotas.distance_short_max_m must "
+                      "be < distance_long_min_m")
+    if float(quotas.get("radius_small_max_m", 0.6)) >= \
+            float(quotas.get("radius_large_min_m", 1.4)):
+        errors.append("task_generation.quotas.radius_small_max_m must "
+                      "be < radius_large_min_m")
+    if float(quotas.get("density_sparse_max", 7.0)) >= \
+            float(quotas.get("density_dense_min", 14.0)):
+        errors.append("task_generation.quotas.density_sparse_max must "
+                      "be < density_dense_min")
+
+    # ── hierarchical_expert: THE single expert parameter source ────
+    he = g.get("hierarchical_expert", {}) or {}
+    control_hz = float(he.get("control_hz", 30.0))
+    macro_hz = float(he.get("macro_update_hz", 5.0))
+    _positive(control_hz, "hierarchical_expert.control_hz", errors)
+    _positive(macro_hz, "hierarchical_expert.macro_update_hz", errors)
+    if abs(record_hz - control_hz) > 1e-6:
+        errors.append("hierarchical_expert.control_hz must equal "
+                      "control.record_hz (%g)" % record_hz)
+    if macro_hz <= 0.0 or \
+            abs(control_hz / macro_hz - round(control_hz / macro_hz)) > 1e-6:
+        errors.append("hierarchical_expert.macro_update_hz must divide "
+                      "control_hz exactly (5 Hz on a 30 Hz tick grid)")
+
+    region = he.get("region", {}) or {}
+    if float(region.get("max_x", 0.0)) <= float(region.get("min_x", 0.0)) or \
+            float(region.get("max_y", 0.0)) <= float(region.get("min_y", 0.0)):
+        errors.append("hierarchical_expert.region max bounds must exceed "
+                      "min bounds")
+    # The region (also the ESDF / start-goal domain) must fit the largest
+    # cylinder plus its boundary margin on BOTH axes.
+    fit_need = 2.0 * (float(sg_geometry.get("radius_max_m", 2.0)) +
+                      float(sg_geometry.get("boundary_margin_m", 1.2)))
+    region_w = float(region.get("max_x", 0.0)) - float(region.get("min_x", 0.0))
+    region_h = float(region.get("max_y", 0.0)) - float(region.get("min_y", 0.0))
+    if region_w < fit_need - 1e-9 or region_h < fit_need - 1e-9:
+        errors.append(
+            "hierarchical_expert.region must fit the largest obstacle: "
+            "both extents >= %.3f m = 2 * (radius_max + boundary_margin)"
+            % fit_need)
+
+    obs = he.get("observation", {}) or {}
+    fov = float(obs.get("fov_deg", 90.0))
+    perception = float(obs.get("range_m", 5.0))
+    _bounded(fov, "hierarchical_expert.observation.fov_deg", 1.0, 180.0,
              errors)
-    _positive(me.get("side_release_clear_ticks", 2),
-              "macro_expert.side_release_clear_ticks", errors)
-
-    _positive(me.get("goal_tolerance_m", 0.30), "macro_expert.goal_tolerance_m", errors)
-    _positive(me.get("goal_speed_tolerance_mps", 0.20),
-              "macro_expert.goal_speed_tolerance_mps", errors)
-    _positive(me.get("goal_approach_radius_m", 0.80),
-              "macro_expert.goal_approach_radius_m", errors)
-    if me.get("goal_approach_radius_m", 0.80) < \
-            me.get("goal_tolerance_m", 0.30):
-        errors.append("macro_expert.goal_approach_radius_m must be >= "
-                      "goal_tolerance_m")
-    _positive(me.get("direct_intervention_timeout", 5.0),
-              "macro_expert.direct_intervention_timeout", errors)
-    _positive(me.get("side_no_progress_seconds", 6.0),
-              "macro_expert.side_no_progress_seconds", errors)
-    _positive(me.get("observe_no_information_timeout", 4.0),
-              "macro_expert.observe_no_information_timeout", errors)
-    _positive(me.get("observe_no_progress_fail_ticks", 35),
-              "macro_expert.observe_no_progress_fail_ticks", errors)
-    _positive(me.get("viewpoint_reset_distance_m", 0.35),
-              "macro_expert.viewpoint_reset_distance_m", errors)
-    _positive(me.get("local_path_fail_threshold", 2),
-              "macro_expert.local_path_fail_threshold", errors)
-    _positive(me.get("blocker_rebind_ticks", 2),
-              "macro_expert.blocker_rebind_ticks", errors)
-    _positive(me.get("blocker_association_distance_m", 1.5),
-              "macro_expert.blocker_association_distance_m", errors)
-    _positive(me.get("blocker_overlap_pad_m", 0.5),
-              "macro_expert.blocker_overlap_pad_m", errors, allow_zero=True)
-    _positive(me.get("blocker_lost_grace_s", 2.0),
-              "macro_expert.blocker_lost_grace_s", errors)
-    _positive(me.get("direct_release_ticks", 3),
-              "macro_expert.direct_release_ticks", errors)
-    _positive(me.get("macro_intervention_absolute_safety_timeout", 45.0),
-              "macro_expert.macro_intervention_absolute_safety_timeout",
-              errors)
-    if me.get("macro_intervention_absolute_safety_timeout", 45.0) <= \
-            me.get("observe_no_information_timeout", 4.0):
+    _positive(perception, "hierarchical_expert.observation.range_m", errors)
+    _positive(obs.get("resolution", 0.1),
+              "hierarchical_expert.observation.resolution", errors)
+    _positive(obs.get("ray_angular_res_deg", 0.5),
+              "hierarchical_expert.observation.ray_angular_res_deg", errors)
+    # Item 十: depth.fov and observation.fov_deg are the SAME camera FOV
+    # (Unity wire + expert), and depth.max_m must cover observation.range_m.
+    if abs(depth_fov - fov) > 1e-6:
         errors.append(
-            "macro_expert.macro_intervention_absolute_safety_timeout must "
-            "be well above observe_no_information_timeout")
-    # P2/P4 side-commitment consistency and anti-oscillation.
-    _positive(me.get("side_min_hold_s", 1.5),
-              "macro_expert.side_min_hold_s", errors, allow_zero=True)
-    _positive(me.get("side_release_cooldown_s", 1.5),
-              "macro_expert.side_release_cooldown_s", errors, allow_zero=True)
-    _positive(me.get("side_unsafe_clearance_margin_m", 0.05),
-              "macro_expert.side_unsafe_clearance_margin_m", errors,
-              allow_zero=True)
-    _positive(me.get("observed_side_score_margin", 0.15),
-              "macro_expert.observed_side_score_margin", errors,
-              allow_zero=True)
-    _positive(me.get("observe_min_visible_gain", 0.05),
-              "macro_expert.observe_min_visible_gain", errors,
-              allow_zero=True)
-    _positive(me.get("observe_virtual_frontier_distance_m", 2.0),
-              "macro_expert.observe_virtual_frontier_distance_m", errors)
-    _positive(me.get("side_goal_regress_m", 0.35),
-              "macro_expert.side_goal_regress_m", errors, allow_zero=True)
-    _positive(me.get("side_goal_regress_ticks", 3),
-              "macro_expert.side_goal_regress_ticks", errors,
-              allow_zero=True)
+            "global.depth.fov must equal "
+            "hierarchical_expert.observation.fov_deg (single camera source)")
+    if perception > depth_max + 1e-6:
+        errors.append("hierarchical_expert.observation.range_m must be "
+                      "<= depth.max_m")
 
-    # candidate geometry
-    _positive(mc.get("side_corridor_radius_m", 0.55),
-              "macro_candidates.side_corridor_radius_m", errors)
-    _positive(mc.get("min_observe_move_distance_m", 0.50),
-              "macro_candidates.min_observe_move_distance_m", errors)
-    _positive(mc.get("frontier_prefix_horizon_m", 1.20),
-              "macro_candidates.frontier_prefix_horizon_m", errors)
-    if mc.get("frontier_prefix_horizon_m", 1.20) < \
-            mc.get("min_observe_move_distance_m", 0.50):
-        errors.append("macro_candidates.frontier_prefix_horizon_m must be >= "
-                      "min_observe_move_distance_m")
-    if mc.get("side_corridor_radius_m", 0.55) <= veh.get("radius_m", 0.30):
+    te = he.get("target_encoding", {}) or {}
+    bin_count = int(te.get("direction_bin_count", 11))
+    reserve = float(te.get("normal_distance_reserve_m", 0.5))
+    margin_deg = float(te.get("turn_ray_margin_deg", 10.0))
+    if bin_count < 3 or bin_count % 2 == 0:
+        errors.append("hierarchical_expert.target_encoding."
+                      "direction_bin_count must be odd and >= 3")
+    if not (0.0 <= reserve < perception):
+        errors.append("hierarchical_expert.target_encoding."
+                      "normal_distance_reserve_m must be in [0, range_m)")
+    if not (0.0 <= margin_deg < fov / 2.0):
+        errors.append("hierarchical_expert.target_encoding."
+                      "turn_ray_margin_deg must be in [0, fov_deg/2)")
+
+    lp = he.get("local_planner", {}) or {}
+    _positive(lp.get("max_speed", 3.0),
+              "hierarchical_expert.local_planner.max_speed", errors)
+    _positive(lp.get("max_accel", 2.0),
+              "hierarchical_expert.local_planner.max_accel", errors)
+    _positive(lp.get("max_yaw_rate", 1.5),
+              "hierarchical_expert.local_planner.max_yaw_rate", errors)
+    _positive(lp.get("max_yaw_accel", 4.0),
+              "hierarchical_expert.local_planner.max_yaw_accel", errors)
+    _positive(lp.get("min_clearance", 0.5),
+              "hierarchical_expert.local_planner.min_clearance", errors)
+    _positive(lp.get("control_period_s", 1.0 / 30.0),
+              "hierarchical_expert.local_planner.control_period_s", errors)
+    if float(lp.get("max_yaw_rate", 1.5)) > backend_yaw_rate + 1e-6:
         errors.append(
-            "macro_candidates.side_corridor_radius_m must exceed vehicle.radius_m")
-    # Active observation viewpoint search (section XV).
-    obs = mc.get("observation", {})
-    obs_lat = obs.get("lateral_distances_m", [0.4, 0.8, 1.2, 1.6])
-    obs_fwd = obs.get("forward_distances_m", [0.0, 0.4, 0.8, 1.2])
-    if not isinstance(obs_lat, list) or not obs_lat or \
-            any(float(v) <= 0 for v in obs_lat):
-        errors.append("macro_candidates.observation.lateral_distances_m "
-                      "must be a non-empty list of positive numbers")
-    if not isinstance(obs_fwd, list) or not obs_fwd or \
-            any(float(v) < 0 for v in obs_fwd):
-        errors.append("macro_candidates.observation.forward_distances_m "
-                      "must be a non-empty list of >= 0 numbers")
-    _positive(obs.get("max_viewpoint_candidates", 24),
-              "macro_candidates.observation.max_viewpoint_candidates", errors)
-    _positive(obs.get("max_viewpoint_searches_per_tick", 8),
-              "macro_candidates.observation.max_viewpoint_searches_per_tick",
+            "hierarchical_expert.local_planner.max_yaw_rate must not exceed "
+            "the Flightmare backend limit (%g)" % backend_yaw_rate)
+    if float(lp.get("max_yaw_accel", 4.0)) > backend_yaw_accel + 1e-6:
+        errors.append(
+            "hierarchical_expert.local_planner.max_yaw_accel must not exceed "
+            "the Flightmare backend limit (%g)" % backend_yaw_accel)
+    cw = lp.get("cost_weights", {}) or {}
+    for name, default in (("progress", 1.0), ("clearance", 2.0),
+                          ("obstacle_risk", 3.0)):
+        _bounded(cw.get(name, default),
+                 "hierarchical_expert.local_planner.cost_weights.%s" % name,
+                 0.0, 100.0, errors)
+
+    mc = he.get("corrector", {}) or {}
+    _positive(mc.get("reentry_guard_ticks", 30),
+              "hierarchical_expert.corrector.reentry_guard_ticks", errors,
+              allow_zero=True)
+    _positive(mc.get("correction_enter_stable_ticks", 1),
+              "hierarchical_expert.corrector."
+              "correction_enter_stable_ticks", errors, allow_zero=True)
+    _positive(mc.get("observable_frontier_min_distance_m", 1.5),
+              "hierarchical_expert.corrector."
+              "observable_frontier_min_distance_m", errors)
+    _positive(mc.get("corridor_half_width", 1.5),
+              "hierarchical_expert.corrector.corridor_half_width", errors)
+
+    ah = he.get("altitude_hold", {}) or {}
+    _positive(ah.get("kp", 1.5), "hierarchical_expert.altitude_hold.kp",
               errors)
-    _positive(obs.get("min_frontier_searches_per_tick", 2),
-              "macro_candidates.observation.min_frontier_searches_per_tick",
-              errors)
-    if int(obs.get("min_frontier_searches_per_tick", 2)) > \
-            int(obs.get("max_viewpoint_searches_per_tick", 8)):
-        errors.append("macro_candidates.observation."
-                      "min_frontier_searches_per_tick must be <= "
-                      "max_viewpoint_searches_per_tick")
-    _positive(obs.get("max_observe_move_distance_m", 6.0),
-              "macro_candidates.observation.max_observe_move_distance_m", errors)
-    _positive(obs.get("visibility_fov_deg", 90.0),
-              "macro_candidates.observation.visibility_fov_deg", errors)
-    if float(obs.get("visibility_fov_deg", 90.0)) > 180.0:
-        errors.append("macro_candidates.observation.visibility_fov_deg "
-                      "must be <= 180")
-    _positive(obs.get("visibility_ray_count", 31),
-              "macro_candidates.observation.visibility_ray_count", errors)
-    _positive(obs.get("visibility_range_m", 4.0),
-              "macro_candidates.observation.visibility_range_m", errors)
-    if int(obs.get("max_viewpoint_searches_per_tick", 8)) > \
-            int(obs.get("max_viewpoint_candidates", 24)):
-        errors.append("macro_candidates.observation."
-                      "max_viewpoint_searches_per_tick must be <= "
-                      "max_viewpoint_candidates")
-    # P3 known-free recovery (retreat) viewpoints.
-    _positive(obs.get("retreat_searches_per_tick", 3),
-              "macro_candidates.observation.retreat_searches_per_tick",
+    _positive(ah.get("kd", 0.6), "hierarchical_expert.altitude_hold.kd",
               errors, allow_zero=True)
-    ret_dist = obs.get("retreat_distances_m", [0.5, 1.0, 1.5])
-    if not isinstance(ret_dist, list) or not ret_dist or \
-            any(float(v) <= 0 for v in ret_dist):
-        errors.append("macro_candidates.observation.retreat_distances_m "
-                      "must be a non-empty list of positive numbers")
-    _positive(obs.get("retreat_lateral_m", 0.6),
-              "macro_candidates.observation.retreat_lateral_m", errors,
+    _positive(ah.get("deadband_m", 0.02),
+              "hierarchical_expert.altitude_hold.deadband_m", errors,
               allow_zero=True)
-    if int(obs.get("min_frontier_searches_per_tick", 2)) + \
-            int(obs.get("retreat_searches_per_tick", 3)) > \
-            int(obs.get("max_viewpoint_searches_per_tick", 8)):
-        errors.append("macro_candidates.observation."
-                      "min_frontier_searches_per_tick + "
-                      "retreat_searches_per_tick must be <= "
-                      "max_viewpoint_searches_per_tick")
+    _positive(ah.get("max_speed_mps", 0.6),
+              "hierarchical_expert.altitude_hold.max_speed_mps", errors)
 
-    # recoverability — unified LOCAL capability bounds (section II): the
-    # privileged audit shares the SAME rejoin distance / duration / path
-    # length / detour limits.
-    _positive(lr.get("rejoin_distance_m", 2.5),
-              "local_recoverability.rejoin_distance_m", errors)
-    _positive(lr.get("search_lateral_margin_m", 2.0),
-              "local_recoverability.search_lateral_margin_m", errors)
-    _positive(lr.get("search_longitudinal_margin_m", 2.0),
-              "local_recoverability.search_longitudinal_margin_m", errors)
-    _positive(lr.get("max_path_length_m", 6.0),
-              "local_recoverability.max_path_length_m", errors)
-    _positive(lr.get("max_duration_s", 2.5),
-              "local_recoverability.max_duration_s", errors)
-    _bounded(lr.get("min_terminal_alignment", 0.5),
-             "local_recoverability.min_terminal_alignment", 0.0, 1.0, errors)
-    if lr.get("max_detour_ratio", 1.6) < 1.0:
-        errors.append("local_recoverability.max_detour_ratio must be >= 1.0")
-    if lr.get("rejoin_distance_m", 2.5) > mc.get("lookahead_distance_m", 4.5):
-        errors.append(
-            "local_recoverability.rejoin_distance_m must be <= "
-            "macro_candidates.lookahead_distance_m")
-
-    # local path search
-    _positive(lps.get("max_time_ms", 20.0), "local_path_search.max_time_ms", errors)
-
-    # trajectory optimization
-    _positive(to.get("planning_time_budget_ms", 30.0),
-              "trajectory_optimization.planning_time_budget_ms", errors)
-    _positive(to.get("trajectory_dt", 0.04),
-              "trajectory_optimization.trajectory_dt", errors)
-    _positive(to.get("nominal_speed", 1.8),
-              "trajectory_optimization.nominal_speed", errors)
-    _positive(to.get("max_velocity", 2.5),
-              "trajectory_optimization.max_velocity", errors)
-    if to.get("max_velocity", 2.5) < to.get("nominal_speed", 1.8):
-        errors.append("trajectory_optimization.max_velocity must be >= nominal_speed")
-    _positive(to.get("max_acceleration", 8.0),
-              "trajectory_optimization.max_acceleration", errors)
-    if to.get("optimizer", "auto") not in ("auto", "nlopt", "native"):
-        errors.append("trajectory_optimization.optimizer must be auto|nlopt|native")
-    _positive(to.get("goal_stop_tolerance_m", 0.4),
-              "trajectory_optimization.goal_stop_tolerance_m", errors)
-
-    # yaw planning
-    _positive(yp.get("max_yaw_rate", 2.0), "yaw_planning.max_yaw_rate", errors)
-    _positive(yp.get("max_yaw_accel", 8.0), "yaw_planning.max_yaw_accel", errors)
-    _bounded(yp.get("fov_half_deg", 45.0), "yaw_planning.fov_half_deg", 1.0, 89.0, errors)
-    _positive(yp.get("fov_margin_deg", 5.0), "yaw_planning.fov_margin_deg", errors, allow_zero=True)
-
-    # trajectory controller
-    _positive(tc.get("velocity_lookahead_time_s", 0.08),
-              "trajectory_controller.velocity_lookahead_time_s", errors)
-    _positive(tc.get("position_gain", 2.0),
-              "trajectory_controller.position_gain", errors)
-    _positive(tc.get("max_velocity_mps", 2.5),
-              "trajectory_controller.max_velocity_mps", errors)
-    _positive(tc.get("max_acceleration_mps2", 3.5),
-              "trajectory_controller.max_acceleration_mps2", errors)
-    _positive(tc.get("max_yaw_rate_rps", 2.0),
-              "trajectory_controller.max_yaw_rate_rps", errors)
-    ah = tc.get("altitude_hold", {})
-    if not isinstance(ah, dict):
-        errors.append("trajectory_controller.altitude_hold must be a mapping")
-    else:
-        _positive(ah.get("kp", 1.5),
-                  "trajectory_controller.altitude_hold.kp", errors)
-        _positive(ah.get("kd", 0.6),
-                  "trajectory_controller.altitude_hold.kd", errors,
-                  allow_zero=True)
-        _positive(ah.get("deadband_m", 0.02),
-                  "trajectory_controller.altitude_hold.deadband_m", errors,
-                  allow_zero=True)
-        _positive(ah.get("max_speed_mps", 0.6),
-                  "trajectory_controller.altitude_hold.max_speed_mps", errors)
-    _positive(tc.get("max_yaw_accel_rps2", 8.0),
-              "trajectory_controller.max_yaw_accel_rps2", errors)
-    _positive(tc.get("emergency_brake_distance_m", 0.8),
-              "trajectory_controller.emergency_brake_distance_m", errors)
-    if tc.get("command_change_rate_limit_mps2") is not None:
-        errors.append(
-            "global.trajectory_controller.command_change_rate_limit_mps2 is "
-            "removed; use max_jerk_mps3 + max_acceleration_mps2 instead")
-    _positive(tc.get("max_jerk_mps3", 25.0),
-              "trajectory_controller.max_jerk_mps3", errors)
-    gc = tc.get("goal_capture", {})
-    if not isinstance(gc, dict):
-        errors.append("trajectory_controller.goal_capture must be a mapping")
-    else:
-        _positive(gc.get("approach_deceleration_mps2", 2.5),
-                  "trajectory_controller.goal_capture."
-                  "approach_deceleration_mps2", errors)
-        _positive(gc.get("max_approach_speed_mps", 0.8),
-                  "trajectory_controller.goal_capture."
-                  "max_approach_speed_mps", errors)
-        _positive(gc.get("return_speed_mps", 0.25),
-                  "trajectory_controller.goal_capture.return_speed_mps",
-                  errors)
-        _positive(gc.get("position_gain", 1.0),
-                  "trajectory_controller.goal_capture.position_gain",
-                  errors)
-
-    # execution safety
-    es = g.get("execution_safety", {})
-    _positive(es.get("max_plan_age_s", 0.5),
-              "execution_safety.max_plan_age_s", errors)
-    _positive(es.get("min_remaining_trajectory_s", 0.25),
-              "execution_safety.min_remaining_trajectory_s", errors)
-    _positive(es.get("active_guide_replan_distance_m", 0.50),
-              "execution_safety.active_guide_replan_distance_m", errors)
-    _positive(es.get("active_yaw_replan_delta_rad", 0.20),
-              "execution_safety.active_yaw_replan_delta_rad", errors)
-    _positive(es.get("max_position_error_m", 0.6),
-              "execution_safety.max_position_error_m", errors)
-    _positive(es.get("max_velocity_error_mps", 1.0),
-              "execution_safety.max_velocity_error_mps", errors)
-    _positive(es.get("emergency_deceleration_mps2", 3.0),
-              "execution_safety.emergency_deceleration_mps2", errors)
-    _positive(es.get("brake_reaction_delay_s", 0.10),
-              "execution_safety.brake_reaction_delay_s", errors)
-    _positive(es.get("max_brake_hold_seconds", 1.0),
-              "execution_safety.max_brake_hold_seconds", errors)
-    _positive(es.get("max_emergency_stop_seconds", 2.0),
-              "execution_safety.max_emergency_stop_seconds", errors)
-
-    # dataset logging
-    _positive(ds.get("schema_version", 24),
+    # ── dataset logging (schema v25; R must match the expert) ─────
+    ds = g.get("dataset_logging", {}) or {}
+    _positive(ds.get("schema_version", 25),
               "dataset_logging.schema_version", errors)
-    if ds.get("schema_version", 24) != 24:
-        errors.append("dataset_logging.schema_version must be 24")
-    _positive(ds.get("perception_range_m", 5.0),
-              "dataset_logging.perception_range_m", errors)
+    if int(ds.get("schema_version", 25)) != 25:
+        errors.append("dataset_logging.schema_version must remain 25 "
+                      "(save_net compatibility)")
+    ds_perception = float(ds.get("perception_range_m", 5.0))
+    if abs(ds_perception - perception) > 1e-6:
+        errors.append(
+            "dataset_logging.perception_range_m must equal "
+            "hierarchical_expert.observation.range_m (single source)")
     _positive(ds.get("flush_interval_rows", 64),
               "dataset_logging.flush_interval_rows", errors)
     _bounded(ds.get("depth_png_compress_level", 4),
              "dataset_logging.depth_png_compress_level", 0, 9, errors)
 
-    # privileged intervention (privileged LOCAL-SCALE audit, section II)
-    pi = g.get("privileged_intervention", {})
-    _positive(pi.get("search_max_time_ms", 20.0),
-              "privileged_intervention.search_max_time_ms", errors)
-    # Capability bounds are shared with local_recoverability (single
-    # source).
-    _positive(pi.get("rejoin_radius_m", 0.6),
-              "privileged_intervention.rejoin_radius_m", errors)
-    _positive(pi.get("loop_ignore_recent_s", 2.5),
-              "privileged_intervention.loop_ignore_recent_s", errors)
-    if pi.get("loop_leave_radius_m", 1.6) < pi.get("loop_revisit_radius_m", 0.8):
-        errors.append(
-            "privileged_intervention.loop_leave_radius_m must be >= "
-            "loop_revisit_radius_m")
-    _positive(pi.get("loop_revisit_radius_m", 0.8),
-              "privileged_intervention.loop_revisit_radius_m", errors)
-    _positive(pi.get("loop_leave_radius_m", 1.6),
-              "privileged_intervention.loop_leave_radius_m", errors)
-    _positive(pi.get("loop_min_speed_mps", 0.3),
-              "privileged_intervention.loop_min_speed_mps", errors)
-    _positive(pi.get("loop_min_revisits", 2),
-              "privileged_intervention.loop_min_revisits", errors)
-    _positive(pi.get("cost_margin_m", 2.0),
-              "privileged_intervention.cost_margin_m", errors)
-
-    # task oracle
-    to_ = g.get("task_oracle", {})
-    _positive(to_.get("map_resolution_m", 0.10),
-              "task_oracle.map_resolution_m", errors)
-
-    # ── UNIFIED navigation clearance (problem 4) ────────────────────
-    # `navigation.clearance_m` is the SINGLE effective safety boundary for
-    # every module (global connectivity/cost-to-go, local A*, recoverability,
-    # privileged intervention, trajectory optimisation/validation, goal
-    # stop, braking risk, start/goal/task generation).  The ESDFs already
-    # subtract the vehicle radius, so this is purely the additional margin.
-    nav = g.get("navigation", {})
-    _positive(nav.get("clearance_m", 0.20), "navigation.clearance_m", errors)
-    # P1 dynamic executability margin: speed-dependent extra buffer for the
-    # LOCAL layer only (planner + braking).  Never a second clearance value.
-    _positive(nav.get("margin_tracking_m", 0.05),
-              "navigation.margin_tracking_m", errors, allow_zero=True)
-    _positive(nav.get("margin_latency_s", 0.10),
-              "navigation.margin_latency_s", errors, allow_zero=True)
-    _positive(nav.get("margin_max_m", 0.25),
-              "navigation.margin_max_m", errors, allow_zero=True)
-    _positive(nav.get("planning_quality_margin_m", 0.10),
-              "navigation.planning_quality_margin_m", errors,
-              allow_zero=True)
-
-    # scene generation (section LXXV)
-    sg = g.get("scene_generation", {})
-    if sg.get("enabled", True):
-        _positive(sg.get("seed", 12345), "scene_generation.seed", errors)
-        _positive(sg.get("tasks_per_scene", 12),
-                  "scene_generation.tasks_per_scene", errors, allow_zero=True)
-        _positive(sg.get("minimum_tasks_per_scene", 1),
-                  "scene_generation.minimum_tasks_per_scene", errors,
-                  allow_zero=True)
-        if sg.get("minimum_tasks_per_scene", 1) > \
-                sg.get("tasks_per_scene", 12):
-            errors.append(
-                "scene_generation.minimum_tasks_per_scene must be <= "
-                "tasks_per_scene")
-        if not sg.get("profiles"):
-            errors.append("scene_generation.profiles must not be empty")
-
-    # task generation (section LXXV)
-    tg = g.get("task_generation", {})
-    if tg.get("enabled", True):
-        _positive(tg.get("robustness_margin_m", 0.10),
-                  "task_generation.robustness_margin_m", errors,
-                  allow_zero=True)
-        _positive(tg.get("validation_speed_mps", 0.0),
-                  "task_generation.validation_speed_mps", errors,
-                  allow_zero=True)
-        _positive(tg.get("candidate_batch_size", 64),
-                  "task_generation.candidate_batch_size", errors)
-        _positive(tg.get("maximum_batches_per_scene", 6),
-                  "task_generation.maximum_batches_per_scene", errors)
-        _positive(tg.get("flight_height_m", 5.0),
-                  "task_generation.flight_height_m", errors)
-        if not tg.get("class_weights"):
-            errors.append("task_generation.class_weights must not be empty")
-
-    # sync sanity
+    # ── sync / commit sanity ───────────────────────────────────────
     sync = g.get("sync", {})
-    if sync.get("unity_response_timeout_s", 2.0) <= 0:
+    if float(sync.get("unity_response_timeout_s", 2.0)) <= 0:
         errors.append("sync.unity_response_timeout_s must be > 0")
-    if sync.get("max_acceptable_latency_ms", 250.0) <= 0:
+    if float(sync.get("max_acceptable_latency_ms", 250.0)) <= 0:
         errors.append("sync.max_acceptable_latency_ms must be > 0")
+    # Percentages must be within [0, 100] (item 十三).
+    for pkey in ("max_unmatched_pct", "max_none_depth_pct",
+                 "max_latency_violation_pct"):
+        _bounded(sync.get(pkey, 1.0),
+                 "sync.%s" % pkey, 0.0, 100.0, errors)
+    # Catastrophic latency must be at least the acceptable threshold.
+    if float(sync.get("catastrophic_latency_ms", 5000.0)) < \
+            float(sync.get("max_acceptable_latency_ms", 250.0)):
+        errors.append("sync.catastrophic_latency_ms must be >= "
+                      "sync.max_acceptable_latency_ms")
+    # Strict per-frame exact-match wait for ONE render attempt.  > 0 only;
+    # this is per-frame retry waiting, never a trajectory timeout.
+    _positive(sync.get("frame_match_timeout_s", 0.15),
+              "sync.frame_match_timeout_s", errors)
+    commit = g.get("commit", {}) or {}
+    if not bool(commit.get("atomic_rename", True)):
+        errors.append("commit.atomic_rename must remain true")
+    # Max render attempts per control tick on the SAME saved state.
+    _positive(commit.get("max_frame_retries", 5),
+              "commit.max_frame_retries", errors, allow_zero=True)
 
     if errors:
         raise ValueError("Configuration errors:\n  - " + "\n  - ".join(errors))
@@ -544,13 +557,29 @@ def load_config(config_path=None, validate=True):
 
     Returns the full config dict (``config["global"]`` holds the modules).
     """
-    path = _resolve_path(config_path)
+    # roslaunch provides ``config_file`` as a private node parameter.  It
+    # must be read *before* resolving the YAML path; the old order always
+    # resolved the default first, then merely recorded this parameter in the
+    # already-loaded configuration.
+    requested_path = config_path
+    if not requested_path:
+        try:
+            if rospy.has_param("~config_file"):
+                requested_path = rospy.get_param("~config_file")
+        except Exception:
+            pass
+    path = _resolve_path(requested_path)
     if not os.path.isfile(path):
         raise ValueError("Config file not found: %s" % path)
-    with open(path, "r") as f:
-        cfg = yaml.safe_load(f)
+    # Explicit UTF-8: the YAML comments use box-drawing characters and the
+    # default locale on Windows (cp936) cannot decode them.
+    cfg = _load_yaml_with_extends(path)
     if not isinstance(cfg, dict) or "global" not in cfg:
         raise ValueError("Config must have a top-level 'global' section")
+    # Item 十: fill the UNIQUE default depth.t_bc before anything reads it,
+    # so the Unity wire (make_depth_vehicle) and the C++ camera rig share
+    # exactly one matrix.
+    _inject_defaults(cfg)
     g = cfg["global"]
 
     # ROS param overrides (ports and scene id).
@@ -561,8 +590,7 @@ def load_config(config_path=None, validate=True):
             g["sub_port"] = rospy.get_param("~sub_port")
         if rospy.has_param("~scene_id"):
             g["scene_id"] = int(rospy.get_param("~scene_id"))
-        if rospy.has_param("~config_file"):
-            g["_config_source"] = str(rospy.get_param("~config_file"))
+        g["_config_source"] = path
     except Exception:
         pass
 
@@ -579,337 +607,3 @@ def load_config(config_path=None, validate=True):
     return cfg
 
 
-# ============================================================================
-#  Builders for the C++ (pybind) configuration objects.
-#  Every parameter below is consumed by the corresponding C++ module.
-# ============================================================================
-
-def build_observed_map_config(g, module):
-    om = g.get("observed_map", {})
-    cfg = module.ObservedMapConfig()
-    cfg.resolution = float(om.get("resolution", 0.10))
-    cfg.size_x_m = float(om.get("size_x_m", 12.0))
-    cfg.size_y_m = float(om.get("size_y_m", 12.0))
-    cfg.size_z_m = float(om.get("size_z_m", 5.0))
-    cfg.history_seconds = float(om.get("history_seconds", 8.0))
-    cfg.occupied_endpoint_margin_m = float(
-        om.get("occupied_endpoint_margin_m", 0.05))
-    cfg.vehicle_radius_m = float(g.get("vehicle", {}).get("radius_m", 0.30))
-    cfg.max_depth_m = float(g.get("depth", {}).get("max_m", 5.0))
-    cfg.horizontal_fov_deg = float(g.get("depth", {}).get("fov", 90.0))
-    cfg.esdf_max_distance_m = float(om.get("esdf_max_distance_m", 5.0))
-    cfg.free_space_spacing_m = float(om.get("free_space_sample_spacing_m", 0.10))
-    cfg.depth_integration_step = int(om.get("depth_integration_step", 2))
-    cfg.rebuild_every_n_frames = int(om.get("rebuild_every_n_frames", 3))
-    cfg.recenter_threshold_m = float(om.get("recenter_threshold_m", 3.0))
-    return cfg
-
-
-def build_goal_capture_config(g, module):
-    macro = g.get("macro_expert", {})
-    controller = g.get("trajectory_controller", {})
-    capture = controller.get("goal_capture", {})
-    cfg = module.GoalCaptureConfig()
-    cfg.position_tolerance_m = float(
-        macro.get("goal_tolerance_m", 0.30))
-    cfg.speed_tolerance_mps = float(
-        macro.get("goal_speed_tolerance_mps", 0.20))
-    cfg.approach_deceleration_mps2 = float(
-        capture.get("approach_deceleration_mps2", 2.5))
-    cfg.max_approach_speed_mps = float(
-        capture.get("max_approach_speed_mps", 0.80))
-    cfg.return_speed_mps = float(capture.get("return_speed_mps", 0.25))
-    cfg.position_gain = float(capture.get("position_gain", 1.0))
-    cfg.max_acceleration_mps2 = float(
-        controller.get("max_acceleration_mps2", 3.5))
-    cfg.max_jerk_mps3 = float(controller.get("max_jerk_mps3", 25.0))
-    return cfg
-
-
-def build_oracle_config(g, module):
-    to_ = g.get("task_oracle", {})
-    nav = g.get("navigation", {})
-    cfg = module.PrivilegedOracleConfig()
-    cfg.resolution = float(to_.get("map_resolution_m", 0.10))
-    cfg.vehicle_radius_m = float(g.get("vehicle", {}).get("radius_m", 0.30))
-    # UNIFIED navigation clearance (problem 4): the single additional
-    # safety margin used by every module.
-    cfg.clearance_m = float(nav.get("clearance_m", 0.20))
-    cfg.max_esdf_distance_m = float(to_.get("max_esdf_distance_m", 8.0))
-    cfg.map_margin_m = float(to_.get("map_margin_m", 2.0))
-    cfg.min_z_m = float(to_.get("min_z_m", 0.0))
-    cfg.max_z_m = float(to_.get("max_z_m", 8.0))
-    cfg.cost_to_go_cap_m = float(to_.get("cost_to_go_cap_m", 30.0))
-    s = cfg.scoring
-    s.weight_observed_cost = float(to_.get("weight_observed_cost", 1.0))
-    s.weight_cost_to_go = float(to_.get("weight_cost_to_go", 2.0))
-    s.weight_connectivity = float(to_.get("weight_connectivity", 6.0))
-    s.weight_clearance = float(to_.get("weight_clearance", 1.0))
-    s.weight_goal_progress = float(to_.get("weight_goal_progress", 1.0))
-    s.weight_information = float(to_.get("weight_information", 0.5))
-    s.weight_yaw_cost = float(to_.get("weight_yaw_cost", 0.5))
-    s.weight_side_switch = float(to_.get("weight_side_switch", 1.0))
-    s.weight_repeat = float(to_.get("weight_repeat", 0.5))
-    s.side_switch_penalty = float(to_.get("side_switch_penalty", 1.0))
-    s.repeat_penalty = float(to_.get("repeat_penalty", 1.0))
-    s.clearance_target_m = float(to_.get("clearance_target_m", 0.6))
-    s.yaw_cost_scale_rad = float(to_.get("yaw_cost_scale_rad", 1.0))
-    return cfg
-
-
-def build_macro_candidate_config(g, module):
-    mc = g.get("macro_candidates", {})
-    nav = g.get("navigation", {})
-    cfg = module.MacroCandidateConfig()
-    cfg.lookahead_distance_m = float(mc.get("lookahead_distance_m", 4.5))
-    cfg.side_corridor_length_m = float(mc.get("side_corridor_length_m", 4.0))
-    cfg.side_corridor_radius_m = float(mc.get("side_corridor_radius_m", 0.55))
-    cfg.edge_search_radius_m = float(mc.get("edge_search_radius_m", 5.0))
-    # UNIFIED navigation clearance (problem 4): candidate known-free and
-    # observed LocalPathSearch reachability use the SAME additional margin
-    # as every other module.
-    cfg.clearance_m = float(nav.get("clearance_m", 0.20))
-    # Round 5: the SAME dynamic-executability margin parameters the 30 Hz
-    # LocalPlanner uses (single source = navigation), so candidate endpoint
-    # filters and FULL-reachable A* are evaluated at a clearance never
-    # below what the planner validates with.
-    cfg.clearance_margin_tracking_m = float(
-        nav.get("margin_tracking_m", 0.05))
-    cfg.clearance_margin_latency_s = float(
-        nav.get("margin_latency_s", 0.10))
-    cfg.clearance_margin_max_m = float(nav.get("margin_max_m", 0.25))
-    cfg.planning_clearance_margin_m = float(
-        nav.get("planning_quality_margin_m", 0.10))
-    cfg.nominal_speed_mps = float(
-        g.get("trajectory_optimization", {}).get("nominal_speed", 1.8))
-    cfg.candidate_spacing_m = float(mc.get("candidate_spacing_m", 0.5))
-    cfg.observe_step_m = float(mc.get("observe_step_m", 0.6))
-    cfg.min_observe_move_distance_m = float(
-        mc.get("min_observe_move_distance_m", 0.50))
-    # Active observation viewpoint search: lattice + FULL LocalPathSearch
-    # budget + FOV/known-occlusion-aware expected visibility.
-    obs = mc.get("observation", {})
-    cfg.observe_lateral_distances_m = [float(v) for v in
-        obs.get("lateral_distances_m", [0.4, 0.8, 1.2, 1.6])]
-    cfg.observe_forward_distances_m = [float(v) for v in
-        obs.get("forward_distances_m", [0.0, 0.4, 0.8, 1.2])]
-    cfg.max_viewpoint_candidates = int(obs.get("max_viewpoint_candidates", 24))
-    # Reserve the C++ candidate search exclusively for known-free,
-    # goal-directed frontier prefixes.  With the lattice and retreat budgets
-    # disabled below, this is also the exact FULL-path validation budget.
-    cfg.max_viewpoint_searches_per_tick = max(
-        1, int(obs.get("min_frontier_searches_per_tick", 2)))
-    cfg.min_frontier_searches_per_tick = int(
-        obs.get("min_frontier_searches_per_tick", 2))
-    # P3 known-free recovery (retreat) viewpoints.
-    cfg.retreat_searches_per_tick = 0
-    cfg.retreat_distances_m = [float(v) for v in
-        obs.get("retreat_distances_m", [0.5, 1.0, 1.5])]
-    cfg.retreat_lateral_m = float(obs.get("retreat_lateral_m", 0.6))
-    cfg.max_observe_move_distance_m = float(
-        obs.get("max_observe_move_distance_m", 6.0))
-    cfg.observe_visibility_fov_deg = float(
-        obs.get("visibility_fov_deg", 90.0))
-    cfg.observe_visibility_ray_count = int(
-        obs.get("visibility_ray_count", 31))
-    cfg.observe_visibility_range_m = float(
-        obs.get("visibility_range_m", 4.0))
-    cfg.max_frontier_candidates = int(mc.get("max_frontier_candidates", 8))
-    cfg.frontier_standoff_m = float(mc.get("frontier_standoff_m", 0.45))
-    cfg.frontier_prefix_horizon_m = float(
-        mc.get("frontier_prefix_horizon_m", 1.20))
-    cfg.goal_frontier_cone_deg = float(mc.get("goal_frontier_cone_deg", 70.0))
-    cfg.corridor_check_spacing_m = float(mc.get("corridor_check_spacing_m", 0.10))
-    # Observed-map path-search parameters for REAL SIDE-candidate
-    # reachability (section XII).  Taken from local_path_search.
-    lps = g.get("local_path_search", {})
-    cfg.search_max_time_ms = float(lps.get("max_time_ms", 20.0))
-    cfg.search_region_margin_m = float(lps.get("region_margin_m", 2.0))
-    cfg.side_bias_gain = float(lps.get("side_bias_gain", 2.0))
-    return cfg
-
-
-def build_intervention_config(g, module):
-    # The privileged LOCAL-SCALE audit shares the SAME capability bounds as
-    # the observed local recoverability (section II).
-    lr = g.get("local_recoverability", {})
-    pi = g.get("privileged_intervention", {})
-    nav = g.get("navigation", {})
-    cfg = module.PrivilegedInterventionConfig()
-    # UNIFIED navigation clearance (problem 4).
-    cfg.clearance_m = float(nav.get("clearance_m", 0.20))
-    cfg.search_max_time_ms = float(pi.get("search_max_time_ms", 20.0))
-    cfg.rejoin_distance_m = float(lr.get("rejoin_distance_m", 2.5))
-    cfg.search_lateral_margin_m = float(lr.get("search_lateral_margin_m", 2.0))
-    cfg.search_longitudinal_margin_m = float(
-        lr.get("search_longitudinal_margin_m", 2.0))
-    cfg.max_duration_s = float(lr.get("max_duration_s", 2.5))
-    cfg.max_path_length_m = float(lr.get("max_path_length_m", 6.0))
-    cfg.nominal_speed_mps = float(
-        g.get("trajectory_optimization", {}).get("nominal_speed", 1.8))
-    cfg.max_detour_ratio = float(lr.get("max_detour_ratio", 1.6))
-    cfg.min_goal_progress_m = float(lr.get("min_goal_progress_m", 0.30))
-    cfg.min_terminal_alignment = float(lr.get("min_terminal_alignment", 0.5))
-    cfg.terminal_tangent_min_baseline = float(
-        lr.get("terminal_tangent_min_baseline", 0.3))
-    cfg.loop_ignore_recent_s = float(pi.get("loop_ignore_recent_s", 2.5))
-    cfg.loop_leave_radius_m = float(pi.get("loop_leave_radius_m", 1.6))
-    cfg.loop_revisit_radius_m = float(pi.get("loop_revisit_radius_m", 0.8))
-    cfg.loop_min_speed_mps = float(pi.get("loop_min_speed_mps", 0.3))
-    cfg.loop_min_revisits = int(pi.get("loop_min_revisits", 2))
-    cfg.loop_history_size = int(pi.get("loop_history_size", 60))
-    return cfg
-
-
-def build_recoverability_config(g, module):
-    lr = g.get("local_recoverability", {})
-    nav = g.get("navigation", {})
-    cfg = module.RecoverabilityConfig()
-    cfg.rejoin_distance_m = float(lr.get("rejoin_distance_m", 2.5))
-    # UNIFIED navigation clearance (problem 4).
-    cfg.clearance_m = float(nav.get("clearance_m", 0.20))
-    # Round 6: the SAME dynamic-executability margin parameters the 30 Hz
-    # LocalPlanner and the macro candidate search use (single source =
-    # navigation), so the recoverability query is never more permissive
-    # than actual local planning.
-    cfg.clearance_margin_tracking_m = float(
-        nav.get("margin_tracking_m", 0.05))
-    cfg.clearance_margin_latency_s = float(
-        nav.get("margin_latency_s", 0.10))
-    cfg.clearance_margin_max_m = float(nav.get("margin_max_m", 0.25))
-    cfg.planning_clearance_margin_m = float(
-        nav.get("planning_quality_margin_m", 0.10))
-    cfg.max_duration_s = float(lr.get("max_duration_s", 2.5))
-    cfg.max_path_length_m = float(lr.get("max_path_length_m", 6.0))
-    cfg.min_goal_progress_m = float(lr.get("min_goal_progress_m", 0.30))
-    cfg.min_terminal_alignment = float(lr.get("min_terminal_alignment", 0.5))
-    cfg.max_detour_ratio = float(lr.get("max_detour_ratio", 1.6))
-    cfg.nominal_speed_mps = float(
-        g.get("trajectory_optimization", {}).get("nominal_speed", 1.8))
-    cfg.terminal_tangent_min_baseline = float(
-        lr.get("terminal_tangent_min_baseline", 0.3))
-    cfg.side_corridor_length_m = float(lr.get("side_corridor_length_m", 4.0))
-    cfg.side_corridor_radius_m = float(lr.get("side_corridor_radius_m", 0.55))
-    cfg.edge_search_radius_m = float(lr.get("edge_search_radius_m", 5.0))
-    return cfg
-
-
-def build_task_generation_config(g, module):
-    """Build the C++ TaskGenerationConfig (sections XXVIII/XXXIX).
-
-    The clearance is the single UNIFIED navigation clearance
-    (`navigation.clearance_m`, problem 4): the global ESDF already subtracts
-    the vehicle radius, so this is purely the additional safety margin used
-    for start/goal free tests, the direct corridor, the lateral probes AND
-    the local audit.  The capability bounds come from local_recoverability
-    / local_path_search so the generated classes match the real behaviour
-    scale.
-    """
-    tg = g.get("task_generation", {})
-    lr = g.get("local_recoverability", {})
-    lps = g.get("local_path_search", {})
-    nav = g.get("navigation", {})
-    cfg = module.TaskGenerationConfig()
-    cfg.clearance_m = float(nav.get("clearance_m", 0.20))
-    cfg.clearance_margin_tracking_m = float(
-        nav.get("margin_tracking_m", 0.05))
-    cfg.clearance_margin_latency_s = float(
-        nav.get("margin_latency_s", 0.10))
-    cfg.clearance_margin_max_m = float(nav.get("margin_max_m", 0.25))
-    cfg.planning_clearance_margin_m = float(
-        nav.get("planning_quality_margin_m", 0.10))
-    cfg.task_robustness_margin_m = float(
-        tg.get("robustness_margin_m", 0.10))
-    cfg.nominal_speed_mps = float(
-        g.get("trajectory_optimization", {}).get("nominal_speed", 1.8))
-    # Task validity and all online modules use the same fixed nominal speed.
-    cfg.validation_speed_mps = float(
-        g.get("trajectory_optimization", {}).get("nominal_speed", 1.8))
-    bands = tg.get("distance_bands", {}) or {}
-    mins = [float(b.get("min_m", 4.0)) for b in bands.values()]
-    maxs = [float(b.get("max_m", 28.0)) for b in bands.values()]
-    cfg.min_task_distance_m = float(min(mins)) if mins else 3.0
-    cfg.max_task_distance_m = float(max(maxs)) if maxs else 30.0
-    sampling = tg.get("sampling", {}) or {}
-    cfg.lateral_probe_offset_m = float(
-        sampling.get("lateral_probe_offset_m", 1.2))
-    cfg.lateral_probe_spacing_m = float(
-        sampling.get("lateral_probe_spacing_m", 0.6))
-    cfg.lateral_probe_count = int(sampling.get("lateral_probe_count", 4))
-    # Local-scale audit capability (same as local_recoverability).  The
-    # clearance is the SAME unified navigation clearance set above.
-    cfg.search_max_time_ms = float(lps.get("max_time_ms", 20.0))
-    cfg.rejoin_distance_m = float(lr.get("rejoin_distance_m", 2.5))
-    cfg.max_duration_s = float(lr.get("max_duration_s", 2.5))
-    cfg.max_path_length_m = float(lr.get("max_path_length_m", 6.0))
-    cfg.nominal_speed_mps = float(
-        g.get("trajectory_optimization", {}).get("nominal_speed", 1.8))
-    cfg.max_detour_ratio = float(lr.get("max_detour_ratio", 1.6))
-    cfg.min_goal_progress_m = float(lr.get("min_goal_progress_m", 0.30))
-    cfg.min_terminal_alignment = float(lr.get("min_terminal_alignment", 0.5))
-    cfg.terminal_tangent_min_baseline = float(
-        lr.get("terminal_tangent_min_baseline", 0.3))
-    cfg.search_lateral_margin_m = float(lr.get("search_lateral_margin_m", 2.0))
-    cfg.search_longitudinal_margin_m = float(
-        lr.get("search_longitudinal_margin_m", 2.0))
-    return cfg
-
-
-def build_planner_config(g, module):
-    to = g.get("trajectory_optimization", {})
-    lps = g.get("local_path_search", {})
-    yp = g.get("yaw_planning", {})
-    nav = g.get("navigation", {})
-    cfg = module.TrajectoryOptimizationConfig()
-    cfg.planning_time_budget_ms = float(to.get("planning_time_budget_ms", 30.0))
-    cfg.trajectory_dt = float(to.get("trajectory_dt", 0.04))
-    cfg.horizon_time = float(to.get("horizon_time", 2.5))
-    cfg.optimizer = str(to.get("optimizer", "auto"))
-    cfg.control_points = int(to.get("control_points", 12))
-    cfg.max_iterations = int(to.get("max_iterations", 10000))
-    cfg.convergence_tolerance = float(to.get("convergence_tolerance", 1.0e-4))
-    cfg.initial_step_size = float(to.get("initial_step_size", 0.1))
-    cfg.minimum_step_size = float(to.get("minimum_step_size", 1.0e-4))
-    cfg.seed_trust_radius = float(to.get("seed_trust_radius", 0.35))
-    cfg.horizontal_avoidance_only = bool(to.get("horizontal_avoidance_only", True))
-    # UNIFIED navigation clearance (problem 4): the single effective safety
-    # boundary — both the optimizer's soft target and the hard validation
-    # floor.  The observed ESDF already subtracts the vehicle radius.
-    cfg.clearance_m = float(nav.get("clearance_m", 0.20))
-    # P1 dynamic executability margin (single source with the Python
-    # braking check): speed-dependent extra buffer for the LOCAL layer.
-    cfg.clearance_margin_tracking_m = float(
-        nav.get("margin_tracking_m", 0.05))
-    cfg.clearance_margin_latency_s = float(
-        nav.get("margin_latency_s", 0.10))
-    cfg.clearance_margin_max_m = float(nav.get("margin_max_m", 0.25))
-    cfg.planning_clearance_margin_m = float(
-        nav.get("planning_quality_margin_m", 0.10))
-    cfg.collision_check_spacing = float(to.get("collision_check_spacing", 0.05))
-    cfg.weight_path_length = float(to.get("weight_path_length", 0.05))
-    cfg.weight_smooth = float(to.get("weight_smooth", 1.0))
-    cfg.weight_jerk = float(to.get("weight_jerk", 0.2))
-    cfg.weight_obstacle = float(to.get("weight_obstacle", 4.0))
-    cfg.weight_dynamics = float(to.get("weight_dynamics", 1.0))
-    cfg.nominal_speed = float(to.get("nominal_speed", 1.8))
-    cfg.max_velocity = float(to.get("max_velocity", 2.5))
-    cfg.max_acceleration = float(to.get("max_acceleration", 8.0))
-    cfg.max_jerk = float(to.get("max_jerk", 50.0))
-    cfg.lookahead_distance = float(to.get("lookahead_distance", 4.0))
-    cfg.terminal_speed_ratio = float(to.get("terminal_speed_ratio", 0.85))
-    cfg.goal_stop_tolerance_m = float(to.get("goal_stop_tolerance_m", 0.4))
-    cfg.warm_start_max_age_s = float(to.get("warm_start_max_age_s", 0.25))
-    cfg.warm_start_max_terminal_deviation_m = float(
-        to.get("warm_start_max_terminal_deviation_m", 1.5))
-    # Local A* search parameters come from the local_path_search module.
-    # The clearance is the SAME unified navigation clearance set above.
-    cfg.search_max_time_ms = float(lps.get("max_time_ms", 18.0))
-    cfg.search_region_margin_m = float(lps.get("region_margin_m", 2.0))
-    cfg.search_side_bias_gain = float(lps.get("side_bias_gain", 2.0))
-    # Yaw planning parameters come from the yaw_planning module.
-    cfg.yaw_max_rate = float(yp.get("max_yaw_rate", 2.0))
-    cfg.yaw_max_accel = float(yp.get("max_yaw_accel", 8.0))
-    cfg.yaw_fov_half_deg = float(yp.get("fov_half_deg", 45.0))
-    cfg.yaw_fov_margin_deg = float(yp.get("fov_margin_deg", 5.0))
-    cfg.yaw_speed_threshold_mps = float(yp.get("speed_threshold_mps", 0.20))
-    return cfg

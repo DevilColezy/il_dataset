@@ -1,0 +1,125 @@
+# ============================================================================
+#  joint_v2 — production collection recipe for the NEW hierarchical local
+#  expert (both il_dataset_collect.launch and
+#  il_dataset_joint_v2_collect.launch use this config by default).
+# ============================================================================
+#
+#  Deployment contract this dataset trains:
+#      goal-planning network (5 Hz)          -> PASS_THROUGH / NORMAL_CORRECTION
+#                                              / TURN_LEFT / TURN_RIGHT
+#      local-avoidance network (30 Hz LSTM)  -> FLU velocity + yaw_rate
+#
+#  The ONLY expert is global.hierarchical_expert (inherited from
+#  il_dataset_config.yaml, overridden here for the joint_v2 recipe).
+#
+#  INFORMATION BOUNDARY (strict):
+#    - navigation_goal : final task endpoint.  Used ONLY for task
+#      generation, final-success judgement and the 5 Hz student input
+#      (navigation_goal_*).  It is NEVER written into the 30 Hz student
+#      input goal_* fields.
+#    - goal_* (30 Hz)  : the CURRENT effective target of the hierarchical
+#      expert (PASS: original goal; NORMAL: live re-expressed world-latched
+#      correction; TURN: live re-expressed world-latched turn direction,
+#      distance_norm EXACTLY 1).
+#    - truth (exact generated cylinders) : scene generation, start/goal
+#      connectivity screening, collision/clearance/brake audits and the
+#      episode commit decision ONLY.  Never feeds the expert path or any
+#      label.  There is no PLY / global ESDF truth behind expert actions.
+#
+#  Preflight and real Flightmare collection use the SAME expert logic,
+#  the SAME parameters and the SAME target encoding (the C++
+#  PreflightSimulator wraps the same HierarchicalExpert).  The blueprint
+#  manifest stores ONLY the original navigation endpoint per task plus the
+#  new-architecture behavior-classifier statistics — no CausalLocalTarget
+#  stream, no future 5 Hz correction sequence.
+extends: il_dataset_config.yaml
+
+global:
+  output_dir: "/home/devil/flightmare_ws/il_data_joint_v2"
+
+  scene_generation:
+    seed: 260812
+    scene_key_prefix: "joint_v2"
+    # 10 scenes = scene 0 (explicit EMPTY / CLEAR scene, 0 obstacles) +
+    # 9 non-empty sparse/medium/dense × small/medium/large strata aligned
+    # to the quota thresholds.  Coverage reflects the ACTUAL obstacle
+    # geometry, never scene_id.
+    scene_count: 10
+    tasks_per_scene: 8
+    minimum_tasks_per_scene: 6
+    require_full_strata_coverage: true
+    geometry:
+      minimum_surface_gap_m: 1.20
+      boundary_margin_m: 1.20
+      radius_min_m: 0.10
+      radius_max_m: 2.00
+      max_obstacles: 20
+      height_m: 8.0
+      free_cell_surface_clearance_m: 0.50
+      esdf_resolution_m: 0.10
+
+  task_generation:
+    flight_height_m: 2.0
+    min_task_distance_m: 4.0
+    max_task_distance_m: 20.0
+    # Initial yaw: aim at the goal + left/right symmetric random bias.
+    initial_yaw_bias_deg: 15.0
+    # Oversampling (blueprint-only, never a Flightmare flight timeout).
+    # candidate_pool_multiplier ACTUALLY drives the per-scene preflight
+    # candidate pool target = tasks_per_scene * multiplier; a budget
+    # shortfall below it is an explicit generation failure.
+    task_sample_attempts: 200
+    candidate_pool_multiplier: 4
+    qualification_attempt_budget: 400
+    # Named finite preflight qualification budget (30 Hz ticks) — never
+    # reused as a production episode timeout (fsm.trajectory_wall_timeout_s
+    # is 0.0 = disabled, inherited from the base config).
+    preflight_qualification_max_ticks: 1800
+    # HARD quotas.  min_turn_per_side / left-right balance count ONLY real
+    # TURN_LEFT/TURN_RIGHT tasks (NORMAL token laterality is never a TURN).
+    quotas:
+      min_per_behavior: 2
+      min_turn_per_side: 2
+      max_left_right_imbalance: 2
+      min_per_density_level: 4
+      min_per_radius_level: 4
+      min_per_distance_level: 4
+      distance_short_max_m: 9.0
+      distance_long_min_m: 15.0
+      radius_small_max_m: 0.6
+      radius_large_min_m: 1.4
+      density_sparse_max: 7.0
+      density_dense_min: 14.0
+      long_takeover_min_ticks: 30
+
+  # ── Hierarchical local expert (production path) ───────────────────
+  # Overrides the public defaults in il_dataset_config.yaml.  R = 5.0 m
+  # (single perception range); normal_distance_reserve_m = 0.5 ⇒ ordinary
+  # distance_norm max = 0.9 < 1.  The region matches the joint_v2 scene.
+  hierarchical_expert:
+    enabled: true
+    control_hz: 30.0
+    macro_update_hz: 5.0
+    region:
+      min_x: -7.0
+      max_x: 10.0
+      min_y: 0.0
+      max_y: 30.0
+    drone_radius_m: 0.30
+    scene_safety_clearance_m: 0.30
+    macro_route_clearance_margin_m: 0.0
+    goal_tolerance_m: 0.40
+    observation:
+      fov_deg: 90.0
+      range_m: 5.0
+      resolution: 0.10
+      ray_angular_res_deg: 0.5
+      history_max_age_ticks: 120
+    local_planner:
+      max_yaw_rate: 1.5
+      max_yaw_accel: 4.0
+    altitude_hold:
+      kp: 1.5
+      kd: 0.6
+      deadband_m: 0.02
+      max_speed_mps: 0.6

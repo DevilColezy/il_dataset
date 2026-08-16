@@ -1,25 +1,34 @@
 # ============================================================================
-#  Imitation Learning Dataset Collection — Two-Level Navigation Expert (schema v24)
+#  Imitation Learning Dataset Collection — NEW hierarchical local expert
+#  (single production path; schema v25 + two_level_expert_labels_v1)
 # ============================================================================
 #
-#  Architecture:
-#    task_oracle        privileged global map + cost-to-go (built once/task)
-#    observed_map       causal rolling occupancy + ESDF + known mask (C++)
-#    macro_expert       5 Hz strategic state machine
-#    macro_candidates   5 Hz candidate generation (C++)
-#    local_recoverability 5 Hz query: can the local layer recover direct intent?
-#    local_path_search  observed-map A* (C++, 30 Hz)
-#    trajectory_optimization  B-spline trajectory optimization (C++, 30 Hz)
-#    yaw_planning       FOV-constrained yaw trajectory (C++)
-#    privileged_intervention  privileged LOCAL-SCALE audit (C++, section II)
-#    trajectory_controller  30 Hz command extraction + limits
-#    execution_safety   fresh/cached/rotate/brake/emergency selection
-#    dataset_logging    recorded fields and files
+#  Production path (BOTH launches start il_manager.py with this stack):
+#    C++ scene/task generation + preflight
+#      -> Flightmare current depth frame
+#      -> C++ local observation + causal history map
+#      -> 5 Hz VisibilityTargetCorrector
+#      -> EffectiveTargetAdapter
+#      -> 30 Hz LocalPlanner30Hz
+#      -> FlightmareDynamics (_flightmare_dynamics)
+#      -> new two-level labels written to data.csv
 #
-#  Yaw convention (unified): yaw = atan2(world_y, world_x) - pi/2
-#  (yaw=0 => body +Y faces world +Y; nose world dir = (-sin yaw, cos yaw)).
+#  The ONLY expert parameter source is `global.hierarchical_expert`
+#  (R, FOV, map resolution, kinematics limits, label encoding, altitude
+#  hold).  The old expert modules (micro_detour_planner, goal_switching,
+#  trajectory_controller, execution_safety, task_qualifier, task_oracle,
+#  pointcloud, observed_map, macro_expert, macro_candidates,
+#  local_recoverability, local_path_search, trajectory_optimization,
+#  yaw_planning, privileged_intervention) were REMOVED entirely: their
+#  sources, tests, old config recipes and dispatch are gone.
 #
-#  Every parameter below is read and used by the runtime code.
+#  Yaw convention (unified, preserved): yaw = atan2(world_y, world_x) - pi/2
+#  (yaw=0 => nose faces world +Y; nose world dir = (-sin yaw, cos yaw)).
+#  Expert yaw = Flightmare yaw + pi/2 (single CoordinateAdapter).
+#
+#  Truth (scene geometry / PLY) is used ONLY for scene generation,
+#  start/goal connectivity screening, collision/clearance audits and the
+#  episode commit decision — never to generate expert actions.
 # ============================================================================
 
 global:
@@ -31,26 +40,18 @@ global:
   # ── FSM timeouts (seconds) ─────────────────────────────────────────
   fsm:
     connect_timeout:         60.0
-    pc_export_timeout:      600.0
     drone_stable_timeout:    10.0
     trajectory_timeout:     120.0
-    # Independent WALL-CLOCK cap per task (section "time"): the sim-based
-    # trajectory_timeout alone cannot bound a stalled simulation or a
-    # severely degraded loop.  Generous, so it only fires on pathological
-    # stalls; never affects navigation timing.
-    trajectory_wall_timeout_s: 600.0
+    # Independent WALL-CLOCK cap per task.  WARNING: 0.0 DISABLES the
+    # production flight wall timeout entirely (an episode ends only when
+    # the C++ expert FSM reaches a terminal state, or on shutdown).  The
+    # manager only enforces it when > 0.
+    trajectory_wall_timeout_s: 0.0
     keep_alive_period:        3.0
-    # Keep AvoidBench's 5 s connection timeout from reloading the scene
-    # during the blocking map-build / task-generation phases.
     block_keepalive_period:   2.0
-    # Wait for the first depth frame before recording a task (seconds).
     depth_warmup_timeout:    30.0
 
-  # ── Scene runtime / settle (section VIII) ─────────────────────────
-  # `ready` is ONLY an initial AvoidBench handshake condition.  After a
-  # procedural object update we settle by TIME (no second ready is
-  # expected): keep re-sending the scene Pose and drain the queue, then
-  # proceed to the point cloud export once settle_time_s elapses.
+  # ── Scene runtime / settle ─────────────────────────────────────────
   scene_runtime:
     settle_time_s:           8.0
     settle_keepalive_hz:     5.0
@@ -63,179 +64,111 @@ global:
     max_m:   5.0
     near:    0.01
     far:  1000.0
-
-  # ── Point cloud export (privileged global map input) ───────────────
-  # Completion is decided by the PLY file itself (existence + stable
-  # size); get_pc_msg / save_pc_success messages are only diagnostics.
-  # VERIFIED AvoidBench semantics (SavePointCloud.cs): `origin` is the
-  # CENTER of the sampled box and `range` is the FULL extent, so the box
-  # is origin +/- range/2 = x[-12,15] y[-6,38] z[-0.5,7.5] — designed to
-  # cover the factory (Warehouse) WALLS.
-  pointcloud:
-    range:        [27.0, 44.0, 8.0]
-    origin:       [1.5, 16.0, 3.5]
-    resolution:   0.10
-    export_file:  "obstacle_cloud.ply"
-    min_file_bytes: 1024
-    stable_window_s:  0.5
-    max_retries:      3
+    # Unity T_BC (camera->body), 16 floats row-major.  MUST match the
+    # camera sent to Unity (il_common.make_depth_vehicle): identity
+    # rotation + 0.3 m forward offset.  The C++ observation builder
+    # derives the true camera pose from the vehicle pose + this extrinsic.
+    t_bc: [1.0, 0.0, 0.0, 0.0,
+           0.0, 1.0, 0.0, 0.0,
+           0.0, 0.0, 1.0, 0.3,
+           0.0, 0.0, 0.0, 1.0]
 
   # ── Vehicle geometry ───────────────────────────────────────────────
   vehicle:
     radius_m:        0.30
-    # Scene-generation-only geometry spacing margin.  It is NOT a
-    # navigation clearance: the unified navigation safety boundary is
-    # `navigation.clearance_m` below.
-    safety_margin_m: 0.20
+    safety_margin_m: 0.30
 
-  # ── UNIFIED navigation clearance (problem 4) ───────────────────────
-  # The SINGLE effective safety boundary for EVERY navigation module
-  # (global connectivity / cost-to-go, observed-map A*, local
-  # recoverability, privileged intervention, trajectory optimisation /
-  # validation, goal-stop, braking risk and start/goal/task generation).
-  # Both ESDFs (observed and privileged) already subtract the vehicle
-  # radius, so this is purely the additional margin on top of the inflated
-  # vehicle body.  No module may use a different, more permissive value.
+  # ── Navigation clearance (truth audit / scene geometry) ────────────
+  # Single additional margin on top of the inflated vehicle body.  The
+  # expert's own clearance (hierarchical_expert.local_planner.min_clearance
+  # = 0.5 m) is a separate, expert-internal quantity; this navigation
+  # clearance is used ONLY by the truth-based scene/task/audit layer.
   navigation:
-    clearance_m: 0.20
-    # ── P1 dynamic executability margin ────────────────────────────
-    # The LOCAL 30 Hz layer plans/validates its executable trajectory with
-    # `clearance_m + min(margin_max_m, margin_tracking_m +
-    # margin_latency_s * speed)` so a fast drone gets a wider effective
-    # safety boundary than a hovering one (control latency + tracking
-    # error).  These three parameters are the SINGLE source for both the
-    # C++ LocalPlanner and the Python swept-braking check; the unified
-    # clearance_m above remains the module-consistency boundary for every
-    # other module.
-    margin_tracking_m:  0.05
-    margin_latency_s:   0.10
-    margin_max_m:       0.25
-    # Fresh plans and generated tasks require this extra quality gap beyond
-    # the hard dynamic safety boundary. Cached-suffix and braking checks
-    # continue to use the hard boundary itself.
-    planning_quality_margin_m: 0.10
+    clearance_m: 0.30
 
-  # ── Procedural scene generation (section XXII/XXXII-XXXVI) ─────────
+  # ── Procedural scene generation (truth, expert-independent) ────────
   scene_generation:
     enabled: true
-    seed: 12345
-    tasks_per_scene: 12
-    minimum_tasks_per_scene: 1
+    seed: 260812
+    scene_key_prefix: "joint_v2"
+    # 10 scenes = scene 0 (explicit EMPTY / CLEAR scene, 0 obstacles,
+    # radius class "none") + 9 non-empty sparse/medium/dense ×
+    # small/medium/large strata aligned to the quota thresholds
+    # (density_sparse_max/density_dense_min/radius_small_max/
+    # radius_large_min).  Coverage reflects the ACTUAL obstacle geometry,
+    # never scene_id (C++ SceneTaskBlueprintGenerator).
+    scene_count: 10
+    tasks_per_scene: 8
+    minimum_tasks_per_scene: 6
     max_generation_attempts: 24
-    obstacle_region:
-      # Factory (Warehouse, scene_id=1) interior — VERIFIED 'fixed' values
-      # (x[-7,10] y[0,30] z[0,8]).  The point-cloud grid covers the walls
-      # around it; obstacles must stay inside this inner region.
-      min_x: -7.0
-      max_x: 10.0
-      min_y: 0.0
-      max_y: 30.0
-      min_z: 0.0
-      max_z: 8.0
+    # Hard gate: generation_ok=false unless every stratum has a valid scene.
+    require_full_strata_coverage: true
     geometry:
-      # Full-height cylinders (sections XV-XVIII): obstacle height and
-      # center are DERIVED from the region vertical span
-      # (height = max_z - min_z, center_z = 0.5*(min_z + max_z)) so all
-      # independent/cluster/chain obstacles cover the whole flight range
-      # (2.5D LEFT/RIGHT topology).  `height_m` is informational only.
-      height_m:              8.0
-      minimum_surface_gap_m: 0.30
-      boundary_margin_m:     0.6
-      max_obstacles:       120
-    min_free_fraction:      0.35
-    coarse_grid:            24
-    profiles:
-      - name: sparse_mixed
-        scene_count: 20
-        radius_min_m: 0.15
-        radius_max_m: 1.2
-        target_occupancy: [0.05, 0.10]
-        cluster_probability: 0.10
-        chain_probability:   0.05
-      - name: dense_small
-        scene_count: 20
-        radius_min_m: 0.10
-        radius_max_m: 0.50
-        target_occupancy: [0.08, 0.15]
-        cluster_probability: 0.20
-        chain_probability:   0.10
-      - name: mixed_scale
-        scene_count: 30
-        radius_min_m: 0.10
-        radius_max_m: 2.5
-        target_occupancy: [0.08, 0.18]
-        cluster_probability: 0.15
-        chain_probability:   0.10
-      - name: clustered_barrier
-        scene_count: 30
-        radius_min_m: 0.10
-        radius_max_m: 1.0
-        target_occupancy: [0.10, 0.20]
-        cluster_probability: 0.30
-        chain_probability:   0.20
+      # 2 * (vehicle radius 0.30 m + navigation clearance 0.30 m) = 1.20 m.
+      minimum_surface_gap_m: 1.20
+      boundary_margin_m:     1.20
+      # Full-height cylinders (2.5D horizontal avoidance): a task keeps one
+      # flight height and the obstacles cover it.  radius range 0.10..2.00
+      # is the ACTUAL generated range (strata over it).
+      radius_min_m: 0.10
+      radius_max_m: 2.00
+      max_obstacles: 20
+      height_m: 8.0
+      # ESDF free-cell semantics: drone CENTRE → obstacle SURFACE distance;
+      # must be >= vehicle.radius_m (validated).  Body-edge clearance of a
+      # free cell = this − vehicle radius.
+      free_cell_surface_clearance_m: 0.50
+      esdf_resolution_m: 0.10
 
-  # ── Multi-scale task generation (section XXVIII/XXXVII-XXXIX) ──────
-  # Behavioural scale classes (TaskClass) are generation/diagnostic only —
-  # never student inputs and never forced onto the macro expert mode.
+  # ── Task generation (truth, expert-independent) ────────────────────
   task_generation:
     enabled: true
-    # Keep generated tasks away from the exact online feasibility boundary.
-    # This is dataset qualification slack, not a second runtime clearance.
-    robustness_margin_m: 0.10
-    # Validate against the nominal executed speed, not a stationary vehicle.
-    # This rejects corridors that are globally connected but cannot satisfy
-    # the local planner's dynamic clearance while flying.
-    validation_speed_mps: 1.8
-    # VERIFIED 'fixed' flight height: 1.8-2.2 m inside the factory z[0,8].
     flight_height_m: 2.0
-    task_seed_base: 999983
-    # Factory drivable box covering all verified start/goal sampling
-    # regions (starts y~-1 / x~-8 / x~11.5; goals y~31 / x~-8 / x~11.5).
-    # Sits inside the point-cloud grid x[-12,15] y[-6,38] z[-0.5,7.5].
-    region_min: [-8.5, -1.5, 0.0]
-    region_max: [11.5, 32.0, 8.0]
-    distance_bands:
-      short:
-        min_m: 4.0
-        max_m: 8.0
-      medium:
-        min_m: 8.0
-        max_m: 16.0
-      long:
-        min_m: 16.0
-        max_m: 28.0
-    class_weights:
-      open_direct:       0.10
-      local_reactive:    0.30
-      near_occluded:     0.15
-      strategic_blocker: 0.20
-      asymmetric_side:   0.10
-      ambiguous_side:    0.05
-      compound_barrier:  0.10
-    sampling:
-      candidate_batch_size: 64
-      maximum_batches_per_scene: 6
-      max_goal_sample_attempts: 40   # per start; exhausted -> candidate rejected
-      lateral_probe_offset_m: 1.2
-      lateral_probe_spacing_m: 0.6
-      lateral_probe_count: 4
-    classification:
-      near_occluded_max_blocker_distance_m: 2.0
-      compound_min_blockers: 2
-      ambiguous_max_path_diff_m: 1.0
-    initial_yaw:
-      goal_aligned_probability: 0.5
-      random_offset_deg: 60.0
-    runtime_classification:
-      enabled: true
+    min_task_distance_m: 4.0
+    max_task_distance_m: 20.0
+    # Initial yaw: aim at the goal (Flightmare convention B) plus a
+    # LEFT/RIGHT symmetric random bias (degrees).
+    initial_yaw_bias_deg: 15.0
+    # Oversampling: per-candidate start/goal attempts; candidate pool
+    # multiplier over tasks_per_scene; finite per-scene qualification
+    # attempts (blueprint only, NEVER a Flightmare flight timeout).
+    task_sample_attempts: 200
+    candidate_pool_multiplier: 4
+    qualification_attempt_budget: 400
+    # Named, finite preflight qualification budget (30 Hz ticks).  This is
+    # the PREFLIGHT budget only — it is never reused as a production
+    # episode timeout (fsm.trajectory_wall_timeout_s == 0 disables that).
+    preflight_qualification_max_ticks: 1800
+    initial_velocity:
+      std_mps: [0.08, 0.08, 0.02]
+      yaw_rate_std_rps: 0.05
+      max_speed_mps: 0.6
+    # Dataset-level quotas (C++ SceneTaskBlueprintGenerator, HARD: any
+    # unmet quota ⇒ generation_ok=false).  min_turn_per_side and the
+    # left/right balance count ONLY tasks that actually issued TURN_LEFT /
+    # TURN_RIGHT directives (NORMAL_CORRECTION token laterality is never a
+    # TURN).  Per-scene floor minimum_tasks_per_scene is enforced for EVERY
+    # scene_id 0..scene_count-1 (a scene with no accepted task counts as 0).
+    quotas:
+      min_per_behavior: 2
+      min_turn_per_side: 2
+      max_left_right_imbalance: 2
+      min_per_density_level: 4
+      min_per_radius_level: 4
+      min_per_distance_level: 4
+      distance_short_max_m: 9.0
+      distance_long_min_m: 15.0
+      radius_small_max_m: 0.6
+      radius_large_min_m: 1.4
+      density_sparse_max: 7.0
+      density_dense_min: 14.0
+      long_takeover_min_ticks: 30
 
   # ── Recording rate ─────────────────────────────────────────────────
   control:
-    # Unity depth at 640x480 cannot reliably be consumed at 50 Hz; 30 Hz is
-    # the record (and control sample) rate.
-    record_hz:  30.0
+    record_hz: 30.0
 
-  # ── Flightmare dynamics backend (retained execution layer) ─────────
+  # ── Flightmare dynamics backend (real flightlib Quadrotor) ─────────
   dynamics:
     backend: "flightmare"
     control_mode: "velocity_yaw_rate"
@@ -260,375 +193,132 @@ global:
       initial_velocity_noise_std_mps: [0.0, 0.0, 0.0]
       initial_angular_velocity_noise_std_rps: [0.0, 0.0, 0.0]
 
-  # ── Privileged global map (section VII) ────────────────────────────
-  # The global ESDF value is  esdf = distance_to_obstacle_surface -
-  # vehicle_radius.  Free space is everywhere  esdf > navigation.clearance_m
-  # (never re-subtracting the vehicle radius).
-  task_oracle:
-    # Global privileged map config.  Tasks are now generated ONLINE per
-    # scene (scene_generation / task_generation); no external manifests
-    # are required as inputs (section VI).
-    map_resolution_m:      0.10
-    map_margin_m:          2.0
-    max_esdf_distance_m:   8.0
-    min_z_m:              -5.0
-    max_z_m:               8.0
-    cost_to_go_cap_m:     30.0
-    # Candidate scoring weights (lower score = better).
-    weight_observed_cost:  1.0
-    weight_cost_to_go:     2.0
-    weight_connectivity:   6.0
-    weight_clearance:      1.0
-    weight_goal_progress:  1.0
-    weight_information:    0.5
-    weight_yaw_cost:       0.5
-    weight_side_switch:    1.0
-    weight_repeat:         0.5
-    side_switch_penalty:   1.0
-    repeat_penalty:        1.0
-    clearance_target_m:    0.6
-    yaw_cost_scale_rad:    1.0
+  # ── Dataset logging (schema v25) ──────────────────────────────────
+  dataset_logging:
+    schema_version: 25
+    # MUST equal hierarchical_expert.observation.range_m (single source).
+    perception_range_m: 5.0
+    flush_interval_rows: 64
+    depth_png_compress_level: 4
 
-  # ── Causal observed map (section X.1) ──────────────────────────────
-  observed_map:
-    resolution:                  0.10
-    size_x_m:                   12.0
-    size_y_m:                   12.0
-    size_z_m:                    5.0
-    history_seconds:             8.0
-    occupied_endpoint_margin_m:  0.05
-    esdf_max_distance_m:         5.0
-    rebuild_every_n_frames:      3
-    depth_integration_step:      2
-    free_space_sample_spacing_m: 0.10
-    recenter_threshold_m:        3.0
-
-  # ── 5 Hz macro expert (section IV) ─────────────────────────────────
-  macro_expert:
-    update_hz:               5.0
-    # Observed reference-path horizon (min(goal_distance, this)).
-    macro_lookahead_distance_m: 4.5
-    # A known occupied blocker remains a local DIRECT problem only while its
-    # observed detour has both small turn and small lateral deviation.
-    local_bend_max_deg:        25.0
-    local_lateral_ratio_max:    0.30
-    # Let initial depth frames establish a nonzero known-free prefix before
-    # local failures can trigger frontier observation.
-    initial_map_warmup_s: 1.0
-    # Before any motion, point the depth FOV at the goal ray and wait for a
-    # goal-facing map update.  This is a one-shot initialization action.
-    initial_goal_alignment_tolerance_deg: 8.0
-    initial_goal_alignment_min_duration_s: 0.20
-    # Last-resort deterministic goal-relative camera sweep.  It is used
-    # only when no known-free executable motion prefix exists.
-    observe_scan_half_angle_deg: 35.0
-    observe_scan_hold_s: 0.20
-    observe_scan_yaw_tolerance_deg: 6.0
-    # UNKNOWN is a continuation frontier, never an obstacle.  After this
-    # many 30 Hz failures, advance to a known-free frontier prefix; rotate
-    # only when no such prefix exists.
-    local_failure_count_for_observe: 4
-    # Retire an OBSERVE movement target only after persistent intervals with
-    # no fresh/cached execution, and only once the vehicle is nearly stopped.
-    # This prevents a single failed replan from producing a new macro target
-    # while the previous target's velocity is still being executed.
-    observe_target_failure_ticks: 2
-    observe_target_retire_max_speed_mps: 0.30
-    # A frontier guide rejected by the executing local planner is excluded
-    # until the vehicle has moved this far; never retry it for the timeout.
-    frontier_rejection_radius_m: 0.40
-    frontier_rejection_reset_distance_m: 0.50
-    # Release a SIDE commitment only after this many clear goal-ray ticks.
-    side_release_clear_ticks:  2
-    goal_progress_epsilon_m:   0.05
-    # DIRECT long no-progress (goal distance not decreasing for this long)
-    # is ALSO causal evidence -> macro intervention, never an immediate
-    # episode FAILED (section XI/XII).
-    direct_intervention_timeout: 5.0
-    # Rolling SIDE / OBSERVE progress thresholds (section VII/XVI).
-    side_no_progress_seconds:   6.0
-    observe_no_information_timeout: 4.0
-    # Round 5 termination: after this many consecutive OBSERVE ticks with
-    # NO real information progress (rotation, retreat AND frontier all
-    # fruitless), the macro fails with observe_no_recovery_path instead of
-    # continuing meaningless rotation / viewpoint cycling.  A true session
-    # entry (new mode / new blocker) or real progress resets the counter;
-    # an anchor re-base alone does not.
-    observe_no_progress_fail_ticks: 35
-    progress_cost_epsilon_m:    0.10
-    local_path_fail_threshold:  2
-    # Blocker tracking (sections VII/X): world-geometry association of the
-    # ACTIVE blocker; side memory is rebound to a confirmed NEW blocker
-    # only after blocker_rebind_ticks consecutive off-track observations.
-    blocker_association_distance_m: 1.5
-    blocker_overlap_pad_m:          0.5
-    blocker_lost_grace_s:           2.0
-    blocker_rebind_ticks:           2
-    # Stable DIRECT release (sections X-XV): after this many CONSECUTIVE
-    # macro ticks with DIRECT genuinely stable (observed recoverable + no
-    # causal evidence + no local-unrecoverable interval), the old blocker
-    # topology memory is released.  A single DIRECT tick never releases it.
-    direct_release_ticks:           3
-    # Goal reached condition (distance + speed).
-    goal_tolerance_m:           0.30
-    goal_speed_tolerance_mps:   0.20
-    # Start terminal deceleration before the goal. The 30 Hz capture latch
-    # preserves it if the vehicle crosses the tolerance disc between 5 Hz
-    # macro ticks.
-    goal_approach_radius_m:     0.80
-    # OBSERVE rotate sweep speed and cap.  OBSERVE never FAILs on a short
-    # fixed duration: it runs while it keeps gaining information (section
-    # XIX/XX).  The absolute safety limit below is only a large final
-    # anti-deadlock guard, well above any single observation window.
-    observe_rotation_rate_rps:  1.5
-    # OBSERVE yaw sweep cap (half-FOV of the camera).
-    observe_fov_half_deg:      45.0
-    # Active-observation scan lifecycle (sections XXI-XXXV): rotation-only
-    # stagnation cap, minimum info gain for a viewpoint to count as clearly
-    # better than continuing the sweep, and previous-viewpoint hysteresis.
-    max_stagnant_rotate_s:            2.0
-    observe_info_gain_move_threshold: 0.05
-    # An OBSERVE movement endpoint must causally expose at least this much
-    # unknown space in its predicted camera FOV; reachable-but-blind points
-    # are excluded (RETREAT is a separate safety recovery action).
-    observe_min_visible_gain:         0.05
-    # A virtual target may lie beyond the observed frontier, but the C++
-    # local planner still executes only its verified known-free partial path.
-    # This prevents active perception from degrading into rotate-only when
-    # no fully reachable viewpoint has been observed yet.
-    observe_virtual_frontier_distance_m: 2.0
-    observe_viewpoint_hysteresis_m:   0.8
-    observe_viewpoint_hysteresis_bonus: 0.15
-    # Distance a real OBSERVE_MOVE must travel before the current
-    # observation anchor is considered "new" (sections XXI-XXIV): beyond
-    # this, scan exhaustion / yaw reference / stagnation / info baselines
-    # are re-based at the new viewpoint.  Small drifts never reset scan
-    # state (section XLIII).
-    viewpoint_reset_distance_m:      0.35
-    # Episode-level final anti-deadlock guard (section XXII).
-    macro_intervention_absolute_safety_timeout: 45.0
-    # ── P2/P4 side-commitment consistency and anti-oscillation ─────
-    # Minimum time a committed SIDE is held even if the other side looks
-    # cheaper (SIDE<->SIDE / DIRECT<->SIDE thrash suppression).
-    side_min_hold_s:            1.5
-    # After a committed side is released (lost viability / unsafe
-    # clearance / goal regression) it is not re-picked for this long,
-    # unless it is the only option.
-    side_release_cooldown_s:    1.5
-    # Extra margin (m) above clearance_m used to judge the drone's global
-    # clearance / committed-candidate path clearance as "unsafe" -> the
-    # side is released immediately instead of approaching the obstacle.
-    side_unsafe_clearance_margin_m: 0.05
-    # Both observed sides being FULL-reachable is not enough to force a
-    # strategic LEFT/RIGHT label.  When their causal utilities are this
-    # close, enter OBSERVE instead of using hidden global topology to break
-    # the tie; this keeps labels learnable from depth history.
-    observed_side_score_margin:   0.15
-    # Goal distance may regress by at most this much before the committed
-    # side is considered a dead end (released after the tick count below).
-    side_goal_regress_m:        0.35
-    side_goal_regress_ticks:    3
-    # Confidence gate: below this the macro marks labels ambiguous.
-    confidence_gate:            0.5
-
-  # ── Macro candidate generation (section VIII) ──────────────────────
-  macro_candidates:
-    lookahead_distance_m:       4.5
-    side_corridor_length_m:     4.0
-    side_corridor_radius_m:     0.55
-    edge_search_radius_m:       5.0
-    candidate_spacing_m:        0.5
-    observe_step_m:             0.6
-    # Minimum candidate->current distance for an OBSERVE candidate to be
-    # emitted.  Zero-distance probes are never generated (no fake MOVE).
-    min_observe_move_distance_m: 0.50
-    max_frontier_candidates:    8
-    frontier_standoff_m:        0.45
-    frontier_prefix_horizon_m:  1.20
-    goal_frontier_cone_deg:     70.0
-    corridor_check_spacing_m:   0.10
-    # ── Active observation viewpoint search (section XV) ───────────
-    # A small lateral x forward lattice around the current position on BOTH
-    # sides replaces the old two fixed ±observe_step_m probes.  Endpoints
-    # must be known-free with the unified navigation clearance
-    # (`navigation.clearance_m`); reachability is verified with a real
-    # observed LocalPathSearch (FULL_GOAL_REACHED only, never a straight-
-    # corridor proxy).  All fields are diagnostic / expert-side; none enter
-    # the student input.
+  # ── Hierarchical local expert (THE single expert parameter source) ─
+  # 5 Hz VisibilityTargetCorrector (PASS_THROUGH / NORMAL_CORRECTION /
+  # TURN_LEFT / TURN_RIGHT) + 30 Hz LocalPlanner30Hz + EffectiveTargetAdapter
+  # + HierarchicalExpertFsm, ported from il_2d_multiscale_debug (v9).
+  # R = observation.range_m = 5.0 (single perception range; NEVER
+  # hard-code 5 or 6 in any module).
+  # normal_distance_reserve_m = 0.5 ⇒ ordinary distance_norm max =
+  # (5.0 - 0.5) / 5.0 = 0.9 < 1; TURN distance_norm == 1 exactly.
+  hierarchical_expert:
+    enabled: true
+    control_hz: 30.0
+    macro_update_hz: 5.0
+    region:
+      min_x: -7.0
+      max_x: 10.0
+      min_y: 0.0
+      max_y: 30.0
+    drone_radius_m: 0.30
+    scene_safety_clearance_m: 0.30
+    macro_route_clearance_margin_m: 0.0
+    goal_tolerance_m: 0.40
+    episode_timeout_s: 0.0
     observation:
-      lateral_distances_m:       [0.4, 0.8, 1.2, 1.6]
-      forward_distances_m:       [0.0, 0.4, 0.8, 1.2]
-      max_viewpoint_candidates:  24
-      max_viewpoint_searches_per_tick: 11
-      # Minimum FULL searches reserved for GOAL_FRONTIER each tick (the
-      # lattice can never starve the frontier source).
-      min_frontier_searches_per_tick: 2
-      max_observe_move_distance_m: 6.0
-      # Candidate value is the expected first UNKNOWN frontier visible from
-      # its predicted yaw, using this FOV and known-obstacle ray occlusion.
-      # It is not a disk count of UNKNOWN cells behind walls.
-      visibility_fov_deg:         90.0
-      visibility_ray_count:       31
-      visibility_range_m:          4.0
-      # ── P3 known-free recovery (retreat) viewpoints ──────────────
-      # Dedicated FULL-search budget + geometry for recovery points BEHIND
-      # the drone (negative goal progress allowed).  When rotation produces
-      # no FULL forward viewpoint the macro moves to a safe known-free
-      # retreat instead of ROTATE_ONLY forever; reachability is verified
-      # by the real observed LocalPathSearch.  Never lets the drone cross
-      # unknown space (endpoints must be known-free with clearance_m).
-      retreat_searches_per_tick: 3
-      retreat_distances_m:       [0.5, 1.0, 1.5]
-      retreat_lateral_m:         0.6
-
-  # ── Local recoverability query (section VI) ────────────────────────
-  # The clearance is the unified `navigation.clearance_m` (single source).
-  # These bounds define the LOCAL capability and are shared with the
-  # privileged local-scale audit (section II): observed and privileged use
-  # the SAME rejoin distance, duration, path-length and detour limits.
-  local_recoverability:
-    rejoin_distance_m:           2.5
-    # Privileged A* search-region expansion in REAL METRES (section III):
-    # perpendicular / along the guide direction, so the search can route
-    # around a local obstacle (a few 0.1 m cells is NOT enough).
-    search_lateral_margin_m:     2.0
-    search_longitudinal_margin_m: 2.0
-    max_path_length_m:           6.0
-    max_duration_s:              2.5
-    max_detour_ratio:            1.6
-    min_terminal_alignment:      0.5
-    min_goal_progress_m:         0.30
-    nominal_speed_mps:           1.8
-    side_corridor_length_m:      4.0
-    side_corridor_radius_m:      0.55
-    edge_search_radius_m:        5.0
-
-  # ── Observed-map A* (section X.2) ──────────────────────────────────
-  # The unified navigation clearance lives in `navigation.clearance_m`.
-  local_path_search:
-    side_bias_gain:     2.0
-    max_expansions: 200000
-    max_time_ms:        20.0
-    region_margin_m:     2.0
-    forbid_unknown:     true
-
-  # ── Privileged LOCAL-SCALE audit (section II/III) ──────────────────
-  # Runs a short-range A* on the FULL map with geometry matching the
-  # observed local recoverability (same rejoin distance and capability
-  # bounds from local_recoverability); ALLOWS local bypass.  Its result is
-  # an auxiliary label / audit — it never directly changes the main macro
-  # mode without causal evidence.  The clearance is the unified
-  # `navigation.clearance_m`.
-  privileged_intervention:
-    search_max_time_ms:    20.0
-    # Loop detection (section IX).
-    loop_ignore_recent_s:   2.5
-    loop_leave_radius_m:    1.6
-    loop_revisit_radius_m:  0.8
-    loop_min_speed_mps:     0.3
-    loop_min_revisits:      2
-    loop_history_size:     60
-    # Side-selection cost margin (Python): only switch sides when the
-    # privileged global cost difference is at least this large.
-    cost_margin_m:          2.0
-
-  # ── B-spline trajectory optimization (section X.4) ─────────────────
-  # The clearance is the unified `navigation.clearance_m` (both the soft
-  # optimisation target and the hard validation floor).  The A* search and
-  # yaw parameters live in local_path_search and yaw_planning respectively
-  # (single source per concern).
-  trajectory_optimization:
-    planning_time_budget_ms: 30.0
-    trajectory_dt:           0.04
-    horizon_time:            2.5
-    optimizer:              "auto"
-    control_points:          12
-    max_iterations:       10000
-    convergence_tolerance:    1.0e-4
-    initial_step_size:        0.1
-    minimum_step_size:        1.0e-4
-    seed_trust_radius:        0.35
-    horizontal_avoidance_only: true
-    collision_check_spacing:  0.05
-    weight_path_length:       0.05
-    weight_smooth:            1.0
-    weight_jerk:              0.2
-    weight_obstacle:          4.0
-    weight_dynamics:          1.0
-    nominal_speed:            1.8
-    max_velocity:             2.5
-    max_acceleration:         8.0
-    max_jerk:                50.0
-    lookahead_distance:       4.0
-    terminal_speed_ratio:     0.85
-    goal_stop_tolerance_m:    0.4
-    warm_start_max_age_s:     0.25
-    warm_start_max_terminal_deviation_m: 1.5
-
-  # ── Yaw planning (section XI) ──────────────────────────────────────
-  yaw_planning:
-    max_yaw_rate:        2.0
-    max_yaw_accel:       8.0
-    fov_half_deg:       45.0
-    fov_margin_deg:      5.0
-    speed_threshold_mps: 0.20
-
-  # ── 30 Hz trajectory controller (section XII) ──────────────────────
-  trajectory_controller:
-    velocity_lookahead_time_s:  0.08
-    position_gain:              2.0
-    acceleration_feedforward_time_s: 0.30
-    yaw_gain:                   2.0
-    max_velocity_mps:           2.5
-    max_acceleration_mps2:      3.5
-    max_jerk_mps3:             25.0
-    max_yaw_rate_rps:           2.0
-    max_yaw_accel_rps2:         8.0
-    emergency_brake_distance_m: 0.8
-    brake_deceleration_mps2:    3.0
-    goal_capture:
-      approach_deceleration_mps2: 2.5
-      max_approach_speed_mps:      0.8
-      return_speed_mps:            0.25
-      position_gain:               1.0
-    # Keep the fixed task flight slice through rotate/brake and replanning
-    # degradation; the 2-D local search must not follow simulator z drift.
+      fov_deg: 90.0
+      range_m: 5.0
+      resolution: 0.10
+      ray_angular_res_deg: 0.5
+      history_max_age_ticks: 120
+    local_planner:
+      horizon_s: 2.5
+      dt: 0.1
+      speed_samples: [0.0, 0.3, 0.6, 1.2, 1.8, 2.5]
+      lateral_ratio_samples: [-0.5, -0.3, -0.15, -0.05, 0.0, 0.05, 0.15, 0.3, 0.5]
+      yaw_rate_samples: [-2.0, -1.0, -0.5, -0.25, -0.15, 0.0, 0.15, 0.25, 0.5, 1.0, 2.0]
+      max_speed: 3.0
+      max_accel: 2.0
+      # Must not exceed the Flightmare velocity-controller backend limit
+      # (dynamics.velocity_controller.maximum_yaw_rate_rps = 1.5) so the
+      # recorded label equals the actually executed command.
+      max_yaw_rate: 1.5
+      max_yaw_accel: 4.0
+      min_clearance: 0.5
+      soft_clearance_radius_m: 2.0
+      clearance_discretization_margin_m: 0.05
+      obstacle_reaction_time_s: 0.20
+      control_period_s: 0.0333333333
+      max_allowed_regress_m: 0.05
+      limit_cycle_window_ticks: 15
+      limit_cycle_net_progress_m: 0.10
+      limit_cycle_min_blocked_ticks: 8
+      limit_cycle_lateral_flip_count: 2
+      turn_enter_deg: 42.0
+      turn_exit_deg: 8.0
+      turn_exit_max_yaw_rate: 0.15
+      turn_k: 2.5
+      near_goal_heading_relax_distance: 1.0
+      near_goal_turn_enter_deg: 75.0
+      terminal_control_distance: 1.2
+      terminal_speed_gain: 1.0
+      terminal_max_speed: 0.6
+      terminal_max_yaw_rate: 0.5
+      min_progress_m: 0.05
+      min_progress_speed_mps: 0.03
+      min_progress_epsilon_m: 0.01
+      target_discontinuity_reset_m: 1.5
+      nominal_clearance_m: 0.65
+      risk_corridor_half_width: 1.0
+      risk_distance_horizon_m: 5.0
+      risk_ttc_horizon_s: 2.5
+      risk_trajectory_radius_m: 1.0
+      avoidance_active_threshold: 0.10
+      brake_stop_margin_m: 0.3
+      min_executable_prefix_s: 0.2
+      scoring_horizon_s: 0.8
+      cost_tie_tolerance: 0.000001
+      cross_track_normalize_m: 2.0
+      cost_weights:
+        progress: 1.0
+        clearance: 2.0
+        smoothness: 0.5
+        speed_change: 0.3
+        yaw_rate_change: 0.3
+        terminal_heading: 1.0
+        velocity_alignment: 1.2
+        cross_track: 0.8
+        obstacle_risk: 3.0
+    corrector:
+      local_failure_duration_s: 0.4
+      reentry_guard_ticks: 30
+      correction_enter_stable_ticks: 1
+      observable_frontier_min_distance_m: 1.5
+      observable_frontier_min_progress_m: 0.5
+      observable_unknown_margin_cells: 3
+      side_evidence_margin: 0.5
+      evidence_ray_step_deg: 1.0
+      min_evidence_ray_pairs: 4
+      corridor_half_width: 1.5
+      corridor_rear_tolerance_m: 0.5
+      local_recovery_prefix_m: 0.8
+      local_candidate_bearing_step_deg: 5.0
+      local_candidate_distance_step_m: 0.5
+      local_target_event_tolerance_m: 0.05
+      unknown_recovery_threshold_ticks: 60
+    target_encoding:
+      direction_bin_count: 11
+      normal_distance_reserve_m: 0.5
+      turn_ray_margin_deg: 10.0
+    vehicle:
+      goal_stop_speed_mps: 0.20
+      stationary_speed_mps: 0.05
+    # Vertical channel (single control source, alongside the horizontal
+    # expert).  Produces vz (FLU +up); merged with the expert vx/vy/yaw_rate
+    # before sending to Flightmare and recording target_velocity_flu_z.
     altitude_hold:
-      enabled: true
       kp: 1.5
       kd: 0.6
       deadband_m: 0.02
       max_speed_mps: 0.6
-
-  # ── Execution safety / degradation (section XIII) ──────────────────
-  execution_safety:
-    # Replanning stays at 30 Hz, while an active suffix executes on its own
-    # simulation-time axis after every per-frame safety validation.
-    max_plan_age_s:          0.70
-    min_remaining_trajectory_s: 0.10
-    active_guide_replan_distance_m: 0.50
-    active_yaw_replan_delta_rad: 0.20
-    max_position_error_m:    0.50
-    max_velocity_error_mps:  1.00
-    emergency_deceleration_mps2: 5.0
-    brake_reaction_delay_s:  0.10
-    max_brake_hold_seconds:  1.0
-    max_emergency_stop_seconds: 2.0
-
-  # ── Dataset logging (section XIV) ──────────────────────────────────
-  dataset_logging:
-    schema_version: 24
-    depth_in_memory: true
-    write_local_plan_points: true
-    collect_privileged_diagnostics: true
-    perception_range_m: 5.0
-    flush_interval_rows: 64
-    depth_png_compress_level: 4
-    # Debug mode (section "debug"): when true, every 5 Hz macro tick also
-    # writes the expert's internal state to trace.jsonl inside each
-    # episode directory, for post-hoc review with scripts/debug_viewer.py.
-    # Pure diagnostic — never part of the student input.
-    debug_trace: false
 
   # ── Sync & commit thresholds ───────────────────────────────────────
   sync:
@@ -638,7 +328,15 @@ global:
     unity_response_timeout_s:        2.0
     max_unmatched_pct:               1.0
     max_none_depth_pct:             20.0
+    # Strict per-frame exact-match wait (NOT a flight trajectory timeout):
+    # the manager waits this long for the exact pub_frame_id depth of ONE
+    # render attempt, then retries on the same control state.
+    frame_match_timeout_s:           0.15
 
   commit:
     strict_collision_policy: true
     atomic_rename:           true
+    # Max render attempts per control tick on the SAME saved state.  When
+    # exceeded the episode is safely stopped and REJECTED (never a
+    # trainable episode).  This is per-frame, not a trajectory timeout.
+    max_frame_retries: 5

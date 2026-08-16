@@ -98,10 +98,11 @@ class DynamicsBackend:
 class FlightmareDynamicsBackend(DynamicsBackend):
     """Adapter for the repository's real ``flightlib::Quadrotor``.
 
-    ``_il_local_planner.FlightmareDynamics`` is a deliberately small pybind
-    wrapper around ``Quadrotor.reset(QuadState)``, ``Quadrotor.run(Command,
-    dt)`` and ``Quadrotor.getState``.  Failure to import that compiled bridge
-    is fatal; production collection never falls back to kinematics.
+    ``_flightmare_dynamics.FlightmareDynamics`` is a deliberately small
+    standalone pybind wrapper around ``Quadrotor.reset(QuadState)``,
+    ``Quadrotor.run(Command, dt)`` and ``Quadrotor.getState`` — it does
+    NOT pull in the old expert stack.  Failure to import that compiled
+    bridge is fatal; production collection never falls back to kinematics.
     """
 
     def __init__(self, config):
@@ -144,7 +145,7 @@ class FlightmareDynamicsBackend(DynamicsBackend):
             dtype=np.float64)
 
         try:
-            from _il_local_planner import FlightmareDynamics
+            from _flightmare_dynamics import FlightmareDynamics
             self._quad_dynamics = FlightmareDynamics()
         except Exception as e:
             raise RuntimeError(

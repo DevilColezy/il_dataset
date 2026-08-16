@@ -7,9 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Keep Eigen's architecture-dependent ABI consistent with flightlib.  The
-# pybind module allocates flightlib::Quadrotor and also exchanges Eigen-bearing
-# local-planner types with il_local_planner_lib, so every il_dataset C++ target
-# must use the same architecture flags as flightlib.
+# _flightmare_dynamics module allocates flightlib::Quadrotor and the
+# hierarchical-expert library exchanges Eigen types with flightlib, so every
+# il_dataset C++ target must use the same architecture flags as flightlib.
 if("${CMAKE_HOST_SYSTEM_PROCESSOR}" STREQUAL "armv7l")
   set(IL_DATASET_ARCH_FLAGS
     -Wno-psabi
@@ -29,9 +29,8 @@ else()
 endif()
 
 # ── AddressSanitizer (optional native crash diagnosis) ────────────────
-# The C++ local planner can corrupt the heap (glibc abort: "double free or
-# corruption") only when obstacles are actually encountered.  Enable this
-# option to locate the exact out-of-bounds WRITE:
+# Enable this option to locate the exact out-of-bounds WRITE in the C++
+# hierarchical-expert / FlightmareDynamics code:
 #   catkin build il_dataset --cmake-args -DIL_DATASET_ASAN=ON
 # then re-run; AddressSanitizer prints the offending file:line.  Turn it
 # OFF again for normal collection (ASan is slower).
@@ -57,10 +56,6 @@ find_package(Eigen3 REQUIRED)
 
 # ── OpenCV (required by flightlib headers) ──────────────────────
 find_package(OpenCV REQUIRED)
-
-# Optional external nonlinear optimizer.  The planner remains buildable on
-# systems without NLopt and falls back to its bounded native optimizer.
-find_package(NLopt QUIET)
 
 # ── pybind11 ────────────────────────────────────────────────────
 find_package(pybind11 QUIET)
@@ -104,95 +99,92 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
 )
 
-# ── C++ local planner static library ────────────────────────────
-set(LOCAL_PLANNER_SOURCES
-  src/local_planner/observed_map.cpp
-  src/local_planner/goal_capture_controller.cpp
-  src/local_planner/esdf_grid.cpp
-  src/local_planner/local_path_search.cpp
-  src/local_planner/local_recoverability.cpp
-  src/local_planner/macro_candidate_search.cpp
-  src/local_planner/privileged_oracle.cpp
-  src/local_planner/privileged_intervention_oracle.cpp
-  src/local_planner/task_generation_oracle.cpp
-  src/local_planner/spline_planner.cpp
-  src/local_planner/yaw_planner.cpp
+# ── Hierarchical local expert (v9 port from il_2d_multiscale_debug) ─
+# Pure C++17 + Eigen (NO Qt, NO ROS headers, NO truth input at runtime).
+# Owns: 5 Hz VisibilityTargetCorrector + 30 Hz LocalPlanner30Hz +
+# EffectiveTargetAdapter + HierarchicalExpertFsm + ObservedGrid2D +
+# Flightmare2DObservation (depth->grid) + PreflightSimulator.
+set(HIERARCHICAL_EXPERT_SOURCES
+  src/hierarchical_expert/observed_grid_2d.cpp
+  src/hierarchical_expert/effective_target_adapter.cpp
+  src/hierarchical_expert/macro_expert_5hz.cpp
+  src/hierarchical_expert/local_planner_30hz.cpp
+  src/hierarchical_expert/hierarchical_expert_fsm.cpp
+  src/hierarchical_expert/flightmare_2d_observation.cpp
+  src/hierarchical_expert/hierarchical_expert.cpp
+  src/hierarchical_expert/preflight_simulator.cpp
+  src/hierarchical_expert/scene_task_blueprint.cpp
 )
 
-add_library(il_local_planner_lib STATIC ${LOCAL_PLANNER_SOURCES})
-set_target_properties(il_local_planner_lib PROPERTIES
+add_library(il_hierarchical_expert_lib STATIC ${HIERARCHICAL_EXPERT_SOURCES})
+set_target_properties(il_hierarchical_expert_lib PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
-target_compile_options(il_local_planner_lib PRIVATE
+target_compile_options(il_hierarchical_expert_lib PRIVATE
   ${IL_DATASET_OPT_FLAGS} -Wall -Wextra ${IL_DATASET_SAN_FLAGS} ${IL_DATASET_ARCH_FLAGS}
 )
-target_link_libraries(il_local_planner_lib
+target_link_libraries(il_hierarchical_expert_lib
   ${catkin_LIBRARIES}
   ${IL_DATASET_SAN_FLAGS}
 )
-if(NLopt_FOUND)
-  target_compile_definitions(il_local_planner_lib PRIVATE IL_DATASET_HAS_NLOPT=1)
 
-  # Ubuntu/ROS distributions ship different FindNLopt implementations.
-  # Some expose an imported target without propagating its include directory;
-  # others only expose one of these legacy variables.  Add every populated
-  # spelling explicitly (empty entries are harmless).
-  target_include_directories(il_local_planner_lib PRIVATE
-    ${NLOPT_INCLUDE_DIR}
-    ${NLOPT_INCLUDE_DIRS}
-    ${NLopt_INCLUDE_DIRS}
-  )
-
-  if(TARGET NLopt::nlopt)
-    target_link_libraries(il_local_planner_lib NLopt::nlopt)
-  elseif(TARGET nlopt)
-    target_link_libraries(il_local_planner_lib nlopt)
-  else()
-    target_link_libraries(il_local_planner_lib
-      ${NLOPT_LIBRARIES}
-      ${NLopt_LIBRARIES}
-    )
-  endif()
-  message(STATUS "il_dataset: NLopt enabled for local trajectory optimization")
-  message(STATUS "il_dataset: NLopt include dirs: ${NLOPT_INCLUDE_DIR};${NLOPT_INCLUDE_DIRS};${NLopt_INCLUDE_DIRS}")
-else()
-  message(STATUS "il_dataset: NLopt not found; using native bounded optimizer")
-endif()
-
-# ── pybind11 Python module ──────────────────────────────────────
-pybind11_add_module(_il_local_planner
-  src/local_planner/pybind_module.cpp
+# ── pybind11 Python module for the hierarchical expert ──────────
+pybind11_add_module(_il_hierarchical_expert
+  src/hierarchical_expert/pybind_module.cpp
 )
-target_compile_options(_il_local_planner PRIVATE
+target_compile_options(_il_hierarchical_expert PRIVATE
   ${IL_DATASET_OPT_FLAGS} -Wall -Wextra ${IL_DATASET_SAN_FLAGS} ${IL_DATASET_ARCH_FLAGS}
 )
-target_link_libraries(_il_local_planner PRIVATE
-  il_local_planner_lib
+target_link_libraries(_il_hierarchical_expert PRIVATE
+  il_hierarchical_expert_lib
   ${catkin_LIBRARIES}
   ${IL_DATASET_SAN_FLAGS}
   stdc++fs
 )
 
-# Place the .so next to the Python scripts so "import _il_local_planner" works
-set_target_properties(_il_local_planner PROPERTIES
+# Place the .so next to the Python scripts so "import _il_hierarchical_expert"
+# works (same convention as the other modules).
+set_target_properties(_il_hierarchical_expert PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/scripts"
+)
+
+# ── Standalone FlightmareDynamics bridge (production) ─────────────
+# The ONLY flightlib consumer from Python.  Independent of the (legacy)
+# old expert stack so the manager never loads old expert modules just to
+# drive the real quadrotor dynamics.
+pybind11_add_module(_flightmare_dynamics
+  src/flightmare_dynamics/pybind_module.cpp
+)
+target_compile_options(_flightmare_dynamics PRIVATE
+  ${IL_DATASET_OPT_FLAGS} -Wall -Wextra ${IL_DATASET_SAN_FLAGS} ${IL_DATASET_ARCH_FLAGS}
+)
+target_link_libraries(_flightmare_dynamics PRIVATE
+  ${catkin_LIBRARIES}
+  ${IL_DATASET_SAN_FLAGS}
+  stdc++fs
+)
+set_target_properties(_flightmare_dynamics PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/scripts"
 )
 
 # ── Catkin package (minimal — no install, works in devel space) ─
 catkin_package(
   INCLUDE_DIRS include
-  LIBRARIES il_local_planner_lib
+  LIBRARIES il_hierarchical_expert_lib
 )
 
-# ── ROS Python node installation (sections XIII/XVII) ────────────
-# Install the manager so `roslaunch il_dataset il_dataset_collect.launch`
-# resolves the node executable directly, without any manual chmod or
-# `python3 scripts/il_manager.py` invocation.  Only true ROS executables
-# are listed; the il_* helper modules are plain import modules and stay in
-# the source tree (they are found via _SCRIPT_DIR / rospack on sys.path).
+# ── ROS Python node installation ─────────────────────────────────
+# Install the manager so `roslaunch il_dataset ...` resolves the node
+# executable directly.  Only true ROS executables are listed; the il_*
+# helper modules are plain import modules and stay in the source tree.
 catkin_install_python(
   PROGRAMS
     scripts/il_manager.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+
+# The legacy CausalLocalTargetStream / PrivilegedMicroDetourPlanner /
+# observed-map A* / spline / blueprint-rollout sources and their tests were
+# REMOVED entirely (item 九): no old-expert target is built here, not even
+# under CATKIN_ENABLE_TESTING, and no test block remains.
 

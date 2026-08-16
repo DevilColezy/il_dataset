@@ -3,12 +3,20 @@
   <name>il_dataset</name>
   <version>0.2.0</version>
   <description>
-    Imitation-Learning Dataset Collection — two-level navigation expert:
-    a 5 Hz macro expert (DIRECT_GUIDE / SIDE_GUIDE / OBSERVE / GOAL_REACHED /
-    FAILED) and a 30 Hz local expert (observed-map A* + B-spline trajectory
-    optimization).  C++ handles all map, search and optimization loops; Python
-    owns episode lifecycle, 5/30 Hz scheduling, recording and low-frequency
-    decisions.  Collects via AvoidBench Unity / Flightmare.
+    Imitation-Learning Dataset Collection — two-level hierarchical local
+    expert (joint_v2 production path): a 5 Hz C++ VisibilityTargetCorrector
+    (PASS_THROUGH / NORMAL_CORRECTION / TURN_LEFT / TURN_RIGHT) + a 30 Hz
+    C++ LocalPlanner30Hz, unified by a single C++ HierarchicalExpertFsm and
+    an EffectiveTargetAdapter (body-FLU unit direction + normalized
+    distance information bottleneck).  C++17 owns all expert / map / search
+    / label logic (library il_hierarchical_expert_lib, pybind module
+    _il_hierarchical_expert); Python (il_manager.py) owns the ROS/Flightmare
+    lifecycle, depth/state sync, expert invocation and dataset writing.
+    Collects via AvoidBench Unity / Flightmare (schema v25 + 5 Hz extension
+    two_level_expert_labels_v1).  The legacy CausalLocalTargetStream /
+    PrivilegedMicroDetourPlanner / Python MacroExpert chain was REMOVED
+    entirely (deleted sources, tests and old expert targets; the C++ build
+    never builds them, even under CATKIN_ENABLE_TESTING).
   </description>
 
   <maintainer email="user@example.com">flightmare_ws user</maintainer>
@@ -20,8 +28,6 @@
   <build_depend>flightlib</build_depend>
   <build_depend>std_msgs</build_depend>
   <build_depend>eigen</build_depend>
-  <!-- Optional but recommended: sudo apt install libnlopt-cxx-dev -->
-  <build_depend>nlopt</build_depend>
 
   <exec_depend>rospy</exec_depend>
   <exec_depend>flightlib</exec_depend>

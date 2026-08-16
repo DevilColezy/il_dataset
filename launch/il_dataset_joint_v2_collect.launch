@@ -1,0 +1,29 @@
+<launch>
+  <!--
+    joint_v2 hierarchical local expert collection (production path).
+
+    SAME node and SAME expert stack as il_dataset_collect.launch: the
+    manager (scripts/il_manager.py) drives exactly ONE C++ HierarchicalExpert
+    (_il_hierarchical_expert: 5 Hz VisibilityTargetCorrector + 30 Hz
+    LocalPlanner30Hz + EffectiveTargetAdapter + FSM), the sole generator of
+    every horizontal control command.  Python owns the ROS/Flightmare
+    lifecycle, depth/state sync, expert invocation and dataset writing only.
+
+    The legacy chain (CausalLocalTargetStream / PrivilegedMicroDetourPlanner
+    / old Python MacroExpert / micro-detour controller / goal switcher) is
+    NOT run by this launch nor by il_dataset_collect.launch.
+  -->
+  <param name="use_sim_time" value="false" />
+  <!-- Build first: catkin build il_dataset -->
+  <arg name="config_file"
+       default="$(find il_dataset)/config/il_dataset_joint_v2_config.yaml" />
+  <arg name="blueprint_only" default="false" />
+  <arg name="dry_run" default="false" />
+
+  <node pkg="il_dataset" type="il_manager.py" name="il_dataset_manager"
+        output="screen" required="true">
+    <param name="config_file" value="$(arg config_file)" />
+    <param name="blueprint_only" value="$(arg blueprint_only)" />
+    <param name="dry_run" value="$(arg dry_run)" />
+  </node>
+</launch>
