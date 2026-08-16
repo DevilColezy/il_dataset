@@ -19,6 +19,18 @@
 namespace il_dataset {
 namespace expert {
 
+/// A task-relevant NARROW passage: an obstacle pair whose surface gap is
+/// within [plannerRequiredPassage, narrow_max] and is therefore a real
+/// "narrow but planable" constraint for any task whose start-goal corridor
+/// passes through it.  Computed ONCE per scene (never per task).
+struct NarrowPassage {
+    Vec2d center{0.0, 0.0};   // midpoint of the pair
+    Vec2d axis{1.0, 0.0};     // unit vector along the gap direction
+    double width = 0.0;       // surface gap (m)
+    int a_id = -1, b_id = -1; // obstacle ids
+    Vec2d a_center{0.0, 0.0}, b_center{0.0, 0.0};
+};
+
 class SceneGeometryCache {
 public:
     /// Build the cache for one scene.  Returns false when the scene is
@@ -65,6 +77,18 @@ public:
     /// Narrowest obstacle-pair surface gap in the scene (0 when <2).
     double estimatedCorridorWidth() const { return estimated_corridor_width_; }
 
+    // ── scene-level immutable geometry (computed ONCE, reused per task) ──
+    const std::vector<Vec2d>& obstacleCenters() const { return obs_centers_; }
+    const std::vector<double>& obstacleRadii() const { return obs_radii_; }
+    const std::vector<int>& largeObstacles() const { return large_obs_; }
+    /// All narrow passages (pair gaps in
+    /// [plannerRequiredPassage, 2*plannerRequiredPassage]).
+    const std::vector<NarrowPassage>& narrowPassages() const {
+        return narrow_passages_;
+    }
+    /// The scene-level minimum obstacle-pair surface gap (0 when <2 obs).
+    double minPairGap() const { return estimated_corridor_width_; }
+
 private:
     double res_ = 0.1;
     Vec2d min_bounds_{0.0, 0.0};
@@ -77,6 +101,11 @@ private:
     std::vector<double> valid_clearances_;
     double estimated_corridor_width_ = 0.0;
     BlueprintGenerationConfig cfg_;
+    // scene-level geometry (built once by build())
+    std::vector<Vec2d> obs_centers_;
+    std::vector<double> obs_radii_;
+    std::vector<int> large_obs_;
+    std::vector<NarrowPassage> narrow_passages_;
 };
 
 }  // namespace expert

@@ -55,10 +55,15 @@ private:
     /// Full closed-loop preflight of ONE task with the SAME expert, plus
     /// the TaskDistributionSummary.  `yaw_error_signed_deg` is the signed
     /// goal-bearing error sampled with the task.  Returns the audit
-    /// `accepted` flag.
+    /// `accepted` flag.  Out-params: `total_preflight_ticks` accumulates
+    /// the 30 Hz ticks consumed (success + failure), `early_terminated` is
+    /// set when the no-progress / stall detector cut the episode short and
+    /// `depth_proxy_ms` accumulates the DepthProxyEvaluator wall time.
     bool preflightOne(BlueprintTask& task, const BlueprintScene& scene,
                       uint64_t tick_base, TaskDistributionSummary& summary,
-                      double yaw_error_signed_deg) const;
+                      double yaw_error_signed_deg,
+                      uint64_t& total_preflight_ticks, bool& early_terminated,
+                      double& depth_proxy_ms) const;
 
     /// Legacy 3x3 density x radius strata coverage (manifest compat).
     void updateLegacyStrata(BlueprintResult& result,

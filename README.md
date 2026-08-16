@@ -90,7 +90,10 @@ observation.range_m`.  The writer metadata records the actual `depth.t_bc`.
 `blueprint_generation.warehouse.free_region` = `[-7,10] x [0,30]` (must
 equal `hierarchical_expert.region`, validated).  The outer
 `wall_extension_m` (1 m) is the non-traversable envelope.  No fake
-internal static structure is ever constructed.
+internal static structure is ever constructed.  Out-of-bounds ALWAYS
+means crossing the FREE region boundary (matching the real Flightmare
+truth audit); the wall shell is only optionally visible in the synthetic
+depth observation (`walls_visible_in_observation`).
 
 **Scene Profiles (scene generation)**: `SceneProfileGenerator` realizes
 random scenes from a profile catalog — `empty`, `sparse_tiny`,
@@ -127,34 +130,59 @@ samples the INITIAL YAW from a layered distribution over the absolute
 goal-bearing error (`0-15 / 15-35 / 35-55 / 55-90 / 90-150 / 150-180 deg`,
 weights emphasise 35-55 — the ±45° FOV decision boundary — while the wide
 bins keep out-of-FOV / rear-goal turns), with mirror-balanced signs.
-The initial yaw is no longer limited to goal-heading ±15°.
+The initial yaw is no longer limited to goal-heading ±15°.  Classification
+is O(1) per pair (narrow passages / large obstacles are cached once per
+scene), and LONG_DETOUR / NARROW_BUT_PLANNABLE use DIRECTIONAL sampling
+(start/goal on opposite sides of a blocker / passage centre) instead of
+waiting for a lucky random pair.
 
 **Preflight + distribution summary**: every candidate first passes a
 CHEAP staged filter (bounds / clearance / distance / main component /
 straight swept segment) and only then runs the closed-loop
-`PreflightSimulator` (the SAME expert).  Each preflight produces a
-`TaskDistributionSummary`: actual path length + stretch ratio,
-5 Hz tick-level PASS/NORMAL/TURN_LEFT/TURN_RIGHT counts + correction-angle
-and correction-distance histograms, 30 Hz deflection / yaw-rate / speed
-histograms (deflection skipped below `min_deflection_speed_mps` to avoid
-NaN), min/mean observed clearance, and a 2D synthetic raycast DEPTH
-PROXY (near/mid/far/free counts at a temporal stride).
+`PreflightSimulator` (the SAME expert).  The synthetic observation is an
+ANALYTIC ray cast (closed-form ray-circle + ray-rectangle slab, no
+spatial marching); when `synthetic_observation.walls_visible_in_observation`
+is true the warehouse wall envelope appears in the synthetic depth, but
+it NEVER changes the out-of-bounds audit (that stays the FREE region
+`[-7,10] x [0,30]`, matching the real Flightmare truth audit).  Each
+preflight produces a `TaskDistributionSummary`: actual path length +
+stretch ratio, 5 Hz tick-level PASS/NORMAL/TURN_LEFT/TURN_RIGHT counts +
+correction-angle and correction-distance histograms, 30 Hz deflection /
+yaw-rate / speed histograms (deflection skipped below
+`min_deflection_speed_mps` to avoid NaN), min/mean observed clearance, and
+a 2D synthetic raycast DEPTH PROXY (near/mid/far/free counts at a
+temporal stride).  Preflights that stall or make no progress are cut
+short by the `early_termination` detector (blueprint-only, never changes
+expert labels) so the budgets are spent on viable candidates.
 
 **Distribution targets + deficits (quotas replaced)**: the global
 `DistributionAnalyzer` accumulates the summaries and computes per-target
 deficits (5 Hz coverage, 30 Hz deflection, depth bands, yaw bins, path
 length classes, left/right balance).  Missing types steer the next
 generation round (weighted profile / task-type / yaw-stratum sampling);
-soft shortfalls only produce warnings.  The final `select()` is a
-deterministic greedy scorer (contribution to deficient targets minus
-over-supply penalties) with a `scene_switch_penalty`, so the manifest
-prefers FEWER scenes with multiple complementary tasks per scene.
+soft shortfalls only produce warnings.  `evaluateCoverage` adds GROUPED
+HARD checks (deflection strong-right/right/near-direct/left/strong-left
+and correction right/near/left groups — an anti-degeneracy guard against
+a pool that passes per-bin soft targets while piling into one side).  The
+final `select()` is a deterministic greedy scorer (contribution to
+deficient targets minus over-supply penalties) with a balance-aware
+marginal bonus for the minority turn / yaw side, and a TWO-STAGE flow:
+greedy coverage first, then a scene-consolidation pass that drops entire
+scenes whose tasks are not needed for hard coverage (fewer scenes, more
+complementary tasks per scene).  `selection_score` is written per task.
 
 **Budgets**: `max_scene_candidates`, `max_task_candidates_per_scene`,
 `max_generation_rounds`, `max_total_preflight_tasks`,
-`max_preflight_ticks_per_task`, `max_scene_generation_attempts`,
-`max_task_generation_attempts`.  Reaching a budget ends the run normally
-with the achieved distribution + remaining deficits.
+`max_total_preflight_ticks`, `max_preflight_ticks_per_task`,
+`max_scene_generation_attempts`, `max_task_generation_attempts`.
+The preflight budgets are enforced on ATTEMPTS and TICKS (success +
+failure) — never on the accepted pool size alone.  Reaching a budget ends
+the run normally with the achieved distribution + remaining deficits and
+a `budget_exhausted_reason`.  The result reports efficiency diagnostics:
+`preflight_attempt_count / preflight_success_count / preflight_failure_count`,
+`total_preflight_ticks`, `full_preflight_attempted/success`,
+`preflight_acceptance_ratio`, `selected_per_preflight_ratio`, and per-round
+`round_logs` (also logged to stderr with `early_termination.log_rounds`).
 
 **generation_ok (new semantics)**: false ONLY when a HARD minimum
 coverage / structural balance / scene / task-count gate fails; soft

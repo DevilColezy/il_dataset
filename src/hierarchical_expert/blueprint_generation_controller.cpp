@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <deque>
 #include <limits>
 #include <map>
 #include <set>
@@ -91,7 +93,9 @@ bool BlueprintGenerationController::cheapFilterPass(
 
 bool BlueprintGenerationController::preflightOne(
     BlueprintTask& task, const BlueprintScene& scene, uint64_t tick_base,
-    TaskDistributionSummary& summary, double yaw_error_signed_deg) const {
+    TaskDistributionSummary& summary, double yaw_error_signed_deg,
+    uint64_t& total_preflight_ticks, bool& early_terminated,
+    double& depth_proxy_ms) const {
     PreflightSimulator sim(p_);
     Scene2D s2d;
     s2d.min_bounds = cfg_.warehouse.freeMin();
@@ -104,7 +108,16 @@ bool BlueprintGenerationController::preflightOne(
         ob.id = o.id;
         s2d.obstacles.push_back(ob);
     }
-    sim.configure(s2d, s2d.min_bounds, s2d.max_bounds);
+    early_terminated = false;
+    const Vec2d wall_envelope_min = cfg_.warehouse.envelopeMin();
+    const Vec2d wall_envelope_max = cfg_.warehouse.envelopeMax();
+    const Vec2d* wall_min = nullptr;
+    const Vec2d* wall_max = nullptr;
+    if (cfg_.walls_visible_in_observation) {
+        wall_min = &wall_envelope_min;
+        wall_max = &wall_envelope_max;
+    }
+    sim.configure(s2d, s2d.min_bounds, s2d.max_bounds, wall_min, wall_max);
 
     TruthCylinderAudit truth;
     truth.configure(scene.obstacles, p_.drone_radius, s2d.min_bounds,
@@ -129,6 +142,7 @@ bool BlueprintGenerationController::preflightOne(
     summary.local_speed_hist.configure(cfg_.speed_edges);
 
     DepthProxyEvaluator depth_proxy(cfg_, p_);
+    const bool depth_walls = cfg_.walls_visible_in_observation;
 
     // ── closed-loop preflight ──────────────────────────────────────
     Vec2d prev(task.start_x, task.start_y);
@@ -145,13 +159,23 @@ bool BlueprintGenerationController::preflightOne(
     uint64_t turn_update_frames = 0, normal_update_frames = 0;
     bool saw_turn_left = false, saw_turn_right = false;
 
+    // Early-termination bookkeeping (blueprint-only; never changes expert
+    // labels): no-progress over a rolling window, and a stall detector.
+    const Vec2d orig_goal(task.goal_x, task.goal_y);
+    std::deque<double> goal_dist_window;
+    const int no_prog_win = std::max(1, cfg_.no_progress_window_ticks);
+    int stall_consecutive = 0;
+    const int stall_win = std::max(1, cfg_.stall_window_ticks);
+
     for (uint64_t t = 0; t < budget; ++t) {
         // Depth proxy at stride BEFORE the step (matches runtime: the
         // depth used by the expert is the one at the CURRENT pose).
         if (t % stride == 0) {
-            const auto sample =
-                depth_proxy.castAt(sim.state().position, sim.state().yaw,
-                                   scene.obstacles);
+            const auto t_depth = Clock::now();
+            const auto sample = depth_proxy.castAt(
+                sim.state().position, sim.state().yaw, scene.obstacles,
+                depth_walls, wall_envelope_min, wall_envelope_max);
+            depth_proxy_ms += msSince(t_depth);
             depth_proxy.accumulate(sample, summary);
         }
 
@@ -261,8 +285,52 @@ bool BlueprintGenerationController::preflightOne(
             reached = true;
             break;
         }
+
+        // ── Early termination (budget-only, no label impact) ───────
+        // No-progress: over a rolling window of `no_progress_window_ticks`
+        // the distance to the ORIGINAL goal must have shrunk by at least
+        // `no_progress_min_progress_m`.  Stalled / circling drones burn
+        // the whole preflight budget for nothing; cut them short.
+        {
+            const double d_to_goal = (orig_goal - res.state.position).norm();
+            goal_dist_window.push_back(d_to_goal);
+            if (static_cast<int>(goal_dist_window.size()) > no_prog_win + 1) {
+                goal_dist_window.pop_front();
+            }
+            if (static_cast<int>(goal_dist_window.size()) == no_prog_win + 1) {
+                const double shrink =
+                    goal_dist_window.front() - goal_dist_window.back();
+                if (shrink < cfg_.no_progress_min_progress_m) {
+                    early_terminated = true;
+                    break;
+                }
+            }
+        }
+        // Stall: |velocity| (per-tick displacement proxy) below the stall
+        // threshold for `stall_window_ticks` while not in a legitimate
+        // TURN update.
+        {
+            const double disp =
+                (res.state.position - prev).norm();  // per 1/30 s step
+            const bool in_turn =
+                out.macro_correction_type == "TURN_LEFT" ||
+                out.macro_correction_type == "TURN_RIGHT";
+            if (!in_turn && disp < cfg_.stall_speed_mps / 30.0) {
+                ++stall_consecutive;
+            } else {
+                stall_consecutive = 0;
+            }
+            if (stall_consecutive >= stall_win) {
+                early_terminated = true;
+                break;
+            }
+        }
     }
-    if (ticks >= budget && !reached) qual_exceeded = true;
+    if (early_terminated) {
+        // The episode was cut by the detector, not by the tick budget.
+        qual_exceeded = false;
+    }
+    if (ticks >= budget && !reached && !early_terminated) qual_exceeded = true;
 
     // ── summary quality fields ─────────────────────────────────────
     summary.preflight_ticks = ticks;
@@ -298,19 +366,22 @@ bool BlueprintGenerationController::preflightOne(
         reached && !collision && !out_of_bounds && !macro_label_invalid &&
         !qual_exceeded;
 
+    total_preflight_ticks += ticks;
     if (!task.audit.accepted) {
         task.behavior_class = "rejected";
         task.side_class = "none";
         task.audit.preflight_status =
-            collision
-                ? "preflight_rejected:truth_collision"
-                : (out_of_bounds
-                       ? "preflight_rejected:out_of_bounds"
-                       : (qual_exceeded
-                              ? "preflight_rejected:qualification_budget"
-                              : (!reached
-                                     ? "preflight_rejected:goal_not_reached"
-                                     : "preflight_rejected:macro_label_invalid")));
+            early_terminated
+                ? "preflight_rejected:early_termination"
+                : (collision
+                       ? "preflight_rejected:truth_collision"
+                       : (out_of_bounds
+                              ? "preflight_rejected:out_of_bounds"
+                              : (qual_exceeded
+                                     ? "preflight_rejected:qualification_budget"
+                                     : (!reached
+                                            ? "preflight_rejected:goal_not_reached"
+                                            : "preflight_rejected:macro_label_invalid"))));
         return false;
     }
     task.audit.preflight_status = "preflight_accepted";
@@ -436,19 +507,56 @@ BlueprintResult BlueprintGenerationController::generate() {
     std::vector<BlueprintTask> global_pool;
     std::map<uint64_t, BlueprintScene> scenes;
 
+    // parallel_tasks is NOT implemented: fail fast instead of silently
+    // ignoring the requested concurrency (the il_config validator also
+    // rejects it, this is the C++ guard for direct API users).
+    if (cfg_.parallel_tasks) {
+        result.failure_reason =
+            "parallel_tasks is not implemented (must be false)";
+        return result;
+    }
+
     const int max_rounds = std::max(1, cfg_.max_generation_rounds);
     const int max_scene_candidates = std::max(1, cfg_.max_scene_candidates);
     const uint64_t max_preflights =
         std::max<uint64_t>(1, cfg_.max_total_preflight_tasks);
+    const uint64_t max_preflight_ticks =
+        std::max<uint64_t>(1, cfg_.max_total_preflight_ticks);
     const int max_tasks_per_scene = std::max(1, cfg_.max_task_candidates_per_scene);
 
     uint64_t global_task_id = 0;
     uint64_t scene_counter = 0;
     uint64_t pool_target = 0;
+    // Budget counters: the PREFLIGHT budgets are enforced on ATTEMPTS and
+    // TICKS (success + failure), never on the accepted pool size alone.
+    uint64_t total_preflight_attempts = 0;
+    uint64_t total_preflight_ticks = 0;
+    uint64_t full_preflight_attempted = 0;  // not early-terminated
+    uint64_t full_preflight_success = 0;    // accepted AND ran to completion
+    BudgetExhaustion budget_exhausted = BudgetExhaustion::NONE;
+    std::vector<RoundStats> round_logs;
+
+    auto budgetExceeded = [&]() {
+        if (total_preflight_attempts >= max_preflights) {
+            budget_exhausted = BudgetExhaustion::PREFLIGHT_ATTEMPT_BUDGET;
+            return true;
+        }
+        if (total_preflight_ticks >= max_preflight_ticks) {
+            budget_exhausted = BudgetExhaustion::PREFLIGHT_TICK_BUDGET;
+            return true;
+        }
+        return false;
+    };
 
     for (int round = 1; round <= max_rounds; ++round) {
-        if (global_pool.size() >= max_preflights) break;
-        if (scenes.size() >= static_cast<size_t>(max_scene_candidates)) break;
+        if (budgetExceeded()) break;
+        if (scenes.size() >= static_cast<size_t>(max_scene_candidates)) {
+            budget_exhausted = BudgetExhaustion::SCENE_BUDGET;
+            break;
+        }
+        const auto t_round = Clock::now();
+        RoundStats rs;
+        rs.round = static_cast<uint64_t>(round);
 
         const int scene_budget = max_scene_candidates - static_cast<int>(scenes.size());
         const int rounds_left = max_rounds - round + 1;
@@ -460,8 +568,11 @@ BlueprintResult BlueprintGenerationController::generate() {
         std::mt19937_64 round_rng(mixSeed(cfg_.base_seed, 0x0000F00DULL + round));
 
         for (int s = 0; s < round_scenes; ++s) {
-            if (global_pool.size() >= max_preflights) break;
-            if (scenes.size() >= static_cast<size_t>(max_scene_candidates)) break;
+            if (budgetExceeded()) break;
+            if (scenes.size() >= static_cast<size_t>(max_scene_candidates)) {
+                budget_exhausted = BudgetExhaustion::SCENE_BUDGET;
+                break;
+            }
 
             // ── profile pick (deficit-driven or explicit sequence) ──
             const SceneProfile* prof = nullptr;
@@ -484,12 +595,14 @@ BlueprintResult BlueprintGenerationController::generate() {
                 *prof, scene_id, scene_seed);
             timing.scene_generation_ms += msSince(t_scene);
             ++result.scenes_generated;
+            ++rs.scenes_generated;
             if (!out.success) {
                 out.scene.metadata = out.metadata;
                 result.scenes.push_back(out.scene);
                 continue;
             }
             ++result.scenes_valid;
+            ++rs.scenes_valid;
             scenes[scene_id] = out.scene;
 
             // ── one-time geometry cache (planning validity) ─────────
@@ -508,8 +621,12 @@ BlueprintResult BlueprintGenerationController::generate() {
             }
 
             // ── task candidates for this scene ──────────────────────
+            const uint64_t remaining_attempts =
+                max_preflights > total_preflight_attempts
+                    ? max_preflights - total_preflight_attempts
+                    : 0;
             const int remaining_preflight_cap = static_cast<int>(
-                std::min<uint64_t>(max_preflights - global_pool.size(),
+                std::min<uint64_t>(remaining_attempts,
                                    std::numeric_limits<int>::max()));
             const int task_target =
                 std::min(max_tasks_per_scene, remaining_preflight_cap);
@@ -519,7 +636,7 @@ BlueprintResult BlueprintGenerationController::generate() {
             int attempts = 0;
             while (static_cast<int>(scene_pool.size()) < task_target &&
                    attempts < cfg_.max_task_generation_attempts &&
-                   global_pool.size() < max_preflights) {
+                   !budgetExceeded()) {
                 ++attempts;
                 const uint64_t task_seed =
                     mixSeed(scene_seed, 0x5EEDF157ULL +
@@ -543,25 +660,44 @@ BlueprintResult BlueprintGenerationController::generate() {
                     timing.cheap_filter_ms += msSince(t_filter);
                     ++timing.cheap_filter_rejected;
                     ++result.cheap_filter_rejected;
+                    ++rs.cheap_rejected;
+                    ++rs.task_candidates;
                     continue;
                 }
                 timing.cheap_filter_ms += msSince(t_filter);
+                ++rs.task_candidates;
 
                 // ── full preflight + distribution summary ───────────
                 TaskDistributionSummary summary;
                 const uint64_t tick_base = task.task_id * 600000ull;
                 const auto t_pre = Clock::now();
-                const bool accepted =
-                    preflightOne(task, out.scene, tick_base, summary, yaw_err);
+                bool early_terminated = false;
+                double depth_proxy_ms = 0.0;
+                const uint64_t ticks_before = total_preflight_ticks;
+                const bool accepted = preflightOne(
+                    task, out.scene, tick_base, summary, yaw_err,
+                    total_preflight_ticks, early_terminated, depth_proxy_ms);
                 timing.preflight_total_ms += msSince(t_pre);
+                timing.depth_proxy_total_ms += depth_proxy_ms;
                 ++timing.preflight_count;
+                timing.preflight_ticks += (total_preflight_ticks - ticks_before);
                 ++result.tasks_preflighted;
+                ++total_preflight_attempts;
+                ++rs.preflight_attempted;
                 task.summary = summary;
 
+                if (!early_terminated) ++full_preflight_attempted;
                 if (accepted) {
+                    ++timing.preflight_success_count;
+                    ++result.preflight_success_tasks;
+                    ++rs.preflight_success;
+                    if (!early_terminated) ++full_preflight_success;
                     scene_pool.push_back(task);
                     global_pool.push_back(task);
                     analyzer_.addTask(summary);
+                } else {
+                    ++timing.preflight_failure_count;
+                    ++result.preflight_failure_count;
                 }
             }
             if (timing.preflight_count > 0) {
@@ -573,11 +709,45 @@ BlueprintResult BlueprintGenerationController::generate() {
                 static_cast<uint64_t>(scene_pool.size());
         }
 
+        // ── end-of-round stats + sanity log ─────────────────────────
         result.generation_rounds = static_cast<uint64_t>(round);
         analyzer_.recompute();
         const CoverageResult& cov = analyzer_.coverage();
-        if (cov.hard_minimums_met && cov.soft_targets_met) break;
-        if (global_pool.size() >= max_preflights) break;
+        rs.selected_pool = global_pool.size();
+        rs.elapsed_ms = msSince(t_round);
+        rs.preflight_avg_ms =
+            rs.preflight_attempted > 0
+                ? (timing.preflight_total_ms - timing.depth_proxy_total_ms) /
+                      static_cast<double>(rs.preflight_attempted)
+                : 0.0;
+        for (const auto& d : analyzer_.deficits()) {
+            if (d.deficit > 1e-9 || d.excess > 1e-9 || d.below_minimum) {
+                rs.remaining_deficits.push_back(d.summary());
+            }
+        }
+        if (cfg_.log_rounds) {
+            std::fprintf(stderr,
+                         "[blueprint] round %llu: scenes=%llu/%llu "
+                         "candidates=%llu cheap_rej=%llu preflight=%llu "
+                         "success=%llu pool=%llu hard=%s soft=%s "
+                         "elapsed_ms=%.1f\n",
+                         static_cast<unsigned long long>(round),
+                         static_cast<unsigned long long>(rs.scenes_valid),
+                         static_cast<unsigned long long>(rs.scenes_generated),
+                         static_cast<unsigned long long>(rs.task_candidates),
+                         static_cast<unsigned long long>(rs.cheap_rejected),
+                         static_cast<unsigned long long>(rs.preflight_attempted),
+                         static_cast<unsigned long long>(rs.preflight_success),
+                         static_cast<unsigned long long>(rs.selected_pool),
+                         cov.hard_minimums_met ? "1" : "0",
+                         cov.soft_targets_met ? "1" : "0", rs.elapsed_ms);
+        }
+        round_logs.push_back(rs);
+        if (cov.hard_minimums_met && cov.soft_targets_met) {
+            budget_exhausted = BudgetExhaustion::NONE;
+            break;
+        }
+        if (budgetExceeded()) break;
     }
 
     // ── final greedy selection ─────────────────────────────────────
@@ -591,8 +761,32 @@ BlueprintResult BlueprintGenerationController::generate() {
     result.preflighted = global_pool;  // candidate pool (manifest-compatible)
     result.tasks_pool_target = pool_target;
     result.pool_budget_exhausted =
-        global_pool.size() >= max_preflights &&
+        (total_preflight_attempts >= max_preflights ||
+         total_preflight_ticks >= max_preflight_ticks) &&
         analyzer_.coverage().hard_minimums_met == false;
+
+    // ── efficiency + budget diagnostics ────────────────────────────
+    result.preflight_attempt_count = total_preflight_attempts;
+    result.preflight_success_count = global_pool.size();
+    result.preflight_failure_count =
+        total_preflight_attempts > global_pool.size()
+            ? total_preflight_attempts - global_pool.size()
+            : 0;
+    result.total_preflight_ticks = total_preflight_ticks;
+    result.full_preflight_attempted = full_preflight_attempted;
+    result.full_preflight_success = full_preflight_success;
+    result.preflight_acceptance_ratio =
+        total_preflight_attempts > 0
+            ? static_cast<double>(global_pool.size()) /
+                  static_cast<double>(total_preflight_attempts)
+            : 0.0;
+    result.selected_per_preflight_ratio =
+        total_preflight_attempts > 0
+            ? static_cast<double>(result.tasks.size()) /
+                  static_cast<double>(total_preflight_attempts)
+            : 0.0;
+    result.budget_exhausted_reason = budgetExhaustionName(budget_exhausted);
+    result.round_logs = round_logs;
 
     // per-scene selected counts (indexed by scene_id, like the old quota
     // selector) + selected scene ids in order of first appearance.
@@ -604,13 +798,20 @@ BlueprintResult BlueprintGenerationController::generate() {
                 result.selected_scene_ids.push_back(t.scene_id);
             }
         }
+        result.selected_scene_count = seen.size();
     }
 
     // ── coverage on the SELECTED subset ────────────────────────────
+    // NOTE: the EFFECTIVE targets come from the analyzer (its copy is
+    // populated by buildDefaultTargets() when the config omits them); the
+    // raw cfg_.targets may be EMPTY and would silently pass coverage.
+    const std::vector<DistributionTarget>& effective_targets =
+        analyzer_.targets();
     DistributionAccumulator sel_acc;
     sel_acc.configure(cfg_);
     for (const auto& t : result.tasks) sel_acc.addTask(t.summary);
-    const CoverageResult sel_cov = evaluateCoverage(sel_acc, cfg_.targets, cfg_);
+    const CoverageResult sel_cov =
+        evaluateCoverage(sel_acc, effective_targets, cfg_);
     result.hard_minimums_met = sel_cov.hard_minimums_met;
     result.soft_targets_met = sel_cov.soft_targets_met;
     result.warnings = sel_cov.warnings;
@@ -652,19 +853,30 @@ BlueprintResult BlueprintGenerationController::generate() {
     // ── generation_ok (new semantics) ──────────────────────────────
     result.generation_ok =
         result.hard_minimums_met &&
-        result.scenes_valid >= static_cast<uint64_t>(cfg_.min_scenes) &&
+        result.selected_scene_count >=
+            static_cast<uint64_t>(std::max(1, cfg_.min_selected_scenes)) &&
         result.tasks.size() >= static_cast<size_t>(cfg_.min_tasks);
     if (!result.generation_ok) {
         if (!result.hard_minimums_met) {
             result.failure_reason = "distribution minimum coverage unmet";
-        } else if (result.scenes_valid < static_cast<uint64_t>(cfg_.min_scenes)) {
-            result.failure_reason = "insufficient valid scenes (" +
-                                    std::to_string(result.scenes_valid) + "<" +
-                                    std::to_string(cfg_.min_scenes) + ")";
-        } else {
+        } else if (result.selected_scene_count <
+                   static_cast<uint64_t>(std::max(1, cfg_.min_selected_scenes))) {
+            result.failure_reason =
+                "insufficient selected scenes (" +
+                std::to_string(result.selected_scene_count) + "<" +
+                std::to_string(cfg_.min_selected_scenes) + ")";
+        } else if (result.tasks.size() < static_cast<size_t>(cfg_.min_tasks)) {
             result.failure_reason = "insufficient selected tasks (" +
                                     std::to_string(result.tasks.size()) + "<" +
                                     std::to_string(cfg_.min_tasks) + ")";
+        }
+    }
+    if (result.generation_ok && budget_exhausted != BudgetExhaustion::NONE) {
+        // Reached the requirements but also exhausted a budget: keep the
+        // success but record the exhaustion reason for diagnostics.
+        if (result.budget_exhausted_reason == "none") {
+            result.budget_exhausted_reason =
+                budgetExhaustionName(budget_exhausted);
         }
     }
 

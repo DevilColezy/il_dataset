@@ -322,6 +322,76 @@ CoverageResult evaluateCoverage(const DistributionAccumulator& acc,
             }
         }
     }
+
+    // ── Grouped local-deflection coverage (avoid the degenerate case
+    // where bin-level soft targets are met but ALL samples pile into one
+    // side; each coarse behavioural group must have a hard minimum). ──
+    // deflection_edges: [-90,-60,-30,-10,10,30,60,90] -> 7 bins:
+    //   bin0 strong_right, bin1 right, bin2 slight_right, bin3 near_direct,
+    //   bin4 slight_left, bin5 left, bin6 strong_left
+    const Histogram1D* def_h = acc.histogram("local_deflection");
+    if (def_h && def_h->valid() && def_h->edges.size() >= 8) {
+        auto group = [&](int lo, int hi) {
+            uint64_t total = 0;
+            for (int i = lo; i <= hi; ++i) {
+                total += def_h->at(i);
+            }
+            return total;
+        };
+        struct { const char* name; int lo; int hi; uint64_t min; } def_groups[] = {
+            {"deflection_group:strong_right", 0, 1,
+             static_cast<uint64_t>(cfg.min_grouped_deflection_samples)},
+            {"deflection_group:right", 2, 2,
+             static_cast<uint64_t>(cfg.min_grouped_deflection_samples)},
+            {"deflection_group:near_direct", 3, 3,
+             static_cast<uint64_t>(cfg.min_grouped_deflection_samples)},
+            {"deflection_group:left", 4, 4,
+             static_cast<uint64_t>(cfg.min_grouped_deflection_samples)},
+            {"deflection_group:strong_left", 5, 6,
+             static_cast<uint64_t>(cfg.min_grouped_deflection_samples)},
+        };
+        for (const auto& g : def_groups) {
+            const uint64_t got = group(g.lo, g.hi);
+            if (got < g.min) {
+                res.hard_minimums_met = false;
+                res.warnings.push_back(
+                    std::string(g.name) + "=" + std::to_string(got) +
+                    " < " + std::to_string(g.min) + " [HARD]");
+            }
+        }
+    }
+
+    // ── Grouped macro-correction coverage (the same anti-degeneracy
+    // requirement for the 5 Hz steering-correction distribution). ──
+    // correction_angle_edges: [-90,-60,-45,-30,-15,0,15,30,45,60,90] ->
+    // 10 bins; groups: right=bins0-4, near=bins4-5, left=bins5-9.
+    const Histogram1D* corr_h = acc.histogram("macro_correction_angle");
+    if (corr_h && corr_h->valid()) {
+        auto group = [&](int lo, int hi) {
+            uint64_t total = 0;
+            for (int i = lo; i <= hi; ++i) {
+                total += corr_h->at(i);
+            }
+            return total;
+        };
+        struct { const char* name; int lo; int hi; uint64_t min; } corr_groups[] = {
+            {"correction_group:right", 0, 4,
+             static_cast<uint64_t>(cfg.min_grouped_correction_samples)},
+            {"correction_group:near", 4, 5,
+             static_cast<uint64_t>(cfg.min_grouped_correction_samples)},
+            {"correction_group:left", 5, 9,
+             static_cast<uint64_t>(cfg.min_grouped_correction_samples)},
+        };
+        for (const auto& g : corr_groups) {
+            const uint64_t got = group(g.lo, g.hi);
+            if (got < g.min) {
+                res.hard_minimums_met = false;
+                res.warnings.push_back(
+                    std::string(g.name) + "=" + std::to_string(got) +
+                    " < " + std::to_string(g.min) + " [HARD]");
+            }
+        }
+    }
     res.soft_targets_met =
         res.hard_minimums_met &&
         std::none_of(res.warnings.begin(), res.warnings.end(),
@@ -669,6 +739,55 @@ std::vector<BlueprintTask> DistributionAnalyzer::select(
     std::vector<BlueprintTask> selected;
     selected.reserve(pool_size);
 
+    // Balance-aware marginal bonus: a task that feeds the MINORITY side of
+    // the turn / yaw balance shrinks the imbalance and is rewarded; one
+    // feeding the MAJORITY side is penalised.  Pure delta-of-imbalance, so
+    // it is zero while both sides are empty and never distorts the start.
+    const double turn_balance_weight = 1.2;
+    const double yaw_balance_weight = 1.0;
+    auto balanceDelta = [](double a, double b, double ca, double cb) {
+        const double cur = std::abs(a - b) / (a + b + 1.0);
+        const double an = a + ca, bn = b + cb;
+        const double after = std::abs(an - bn) / (an + bn + 1.0);
+        return after - cur;  // <0 means the task improved the balance
+    };
+
+    auto balanceAdjustedScore = [&](const BlueprintTask& c) {
+        double s = scoreTask(c.summary, acc, targets);
+        const auto& sm = c.summary;
+        // turn side
+        {
+            const double tl = static_cast<double>(acc.count("macro:turn_left"));
+            const double tr = static_cast<double>(acc.count("macro:turn_right"));
+            const double ca = sm.macro_turn_left_count > 0 ? 1.0 : 0.0;
+            const double cb = sm.macro_turn_right_count > 0 ? 1.0 : 0.0;
+            const double delta = balanceDelta(tl, tr, ca, cb);
+            s -= turn_balance_weight * delta;
+            const double an = tl + ca, bn = tr + cb;
+            const double after = std::abs(an - bn) / (an + bn + 1.0);
+            if (after > cfg_.max_turn_imbalance_ratio) {
+                s -= turn_balance_weight *
+                     (after - cfg_.max_turn_imbalance_ratio) * 4.0;
+            }
+        }
+        // yaw side (initial yaw error sign)
+        {
+            const double yl = static_cast<double>(acc.count("yaw:left"));
+            const double yr = static_cast<double>(acc.count("yaw:right"));
+            const double ca = sm.initial_yaw_error_signed_deg >= 0.0 ? 1.0 : 0.0;
+            const double cb = sm.initial_yaw_error_signed_deg < 0.0 ? 1.0 : 0.0;
+            const double delta = balanceDelta(yl, yr, ca, cb);
+            s -= yaw_balance_weight * delta;
+            const double an = yl + ca, bn = yr + cb;
+            const double after = std::abs(an - bn) / (an + bn + 1.0);
+            if (after > cfg_.max_yaw_imbalance_ratio) {
+                s -= yaw_balance_weight *
+                     (after - cfg_.max_yaw_imbalance_ratio) * 4.0;
+            }
+        }
+        return s;
+    };
+
     for (int iter = 0; iter < max_iter && selected.size() < pool_size; ++iter) {
         const BlueprintTask* best = nullptr;
         double best_score = -1e18;
@@ -680,7 +799,7 @@ std::vector<BlueprintTask> DistributionAnalyzer::select(
             const bool opened = scene_opened[sid];
             for (const BlueprintTask* c : kv.second) {
                 if (used_task_ids.count(c->task_id)) continue;
-                double score = scoreTask(c->summary, acc, targets);
+                double score = balanceAdjustedScore(*c);
                 if (!opened) score -= cfg_.scene_switch_penalty;
                 if (score > best_score) {
                     best_score = score;
@@ -699,15 +818,67 @@ std::vector<BlueprintTask> DistributionAnalyzer::select(
         }
 
         selected.push_back(*best);
+        selected.back().selection_score = best_score;
         used_task_ids.insert(best->task_id);
         scene_count[best->scene_id] += 1;
         scene_opened[best->scene_id] = true;
         acc.addTask(best->summary);
     }
 
+    // ── Scene consolidation ────────────────────────────────────────
+    // After greedy coverage, drop entire scenes whose tasks are NOT needed
+    // to satisfy the hard minimums.  Greedily try to remove scenes in
+    // ascending order of total marginal value (least valuable first) and
+    // keep a removal whenever the hard coverage still holds afterwards.
+    {
+        // Group the currently-selected tasks by scene.
+        std::map<uint64_t, std::vector<size_t>> sel_by_scene;
+        for (size_t i = 0; i < selected.size(); ++i) {
+            sel_by_scene[selected[i].scene_id].push_back(i);
+        }
+        std::vector<uint64_t> scene_order;
+        for (const auto& kv : sel_by_scene) scene_order.push_back(kv.first);
+        std::sort(scene_order.begin(), scene_order.end(),
+                  [&](uint64_t a, uint64_t b) {
+                      const auto& va = sel_by_scene[a];
+                      const auto& vb = sel_by_scene[b];
+                      double sa = 0.0, sb = 0.0;
+                      for (size_t i : va) sa += selected[i].selection_score;
+                      for (size_t i : vb) sb += selected[i].selection_score;
+                      if (sa != sb) return sa < sb;
+                      return a < b;
+                  });
+
+        std::vector<bool> removed(selected.size(), false);
+        for (const uint64_t sid : scene_order) {
+            // Rebuild the accumulator from every kept task except this
+            // scene's; if the hard minimums still hold, drop the scene.
+            DistributionAccumulator trial;
+            trial.configure(cfg_);
+            for (size_t i = 0; i < selected.size(); ++i) {
+                if (removed[i]) continue;
+                if (selected[i].scene_id == sid) continue;
+                trial.addTask(selected[i].summary);
+            }
+            const CoverageResult cov = evaluateCoverage(trial, cfg_.targets, cfg_);
+            if (cov.hard_minimums_met) {
+                for (const size_t i : sel_by_scene[sid]) removed[i] = true;
+            }
+        }
+        // Rebuild the selected list without the dropped scenes.
+        std::vector<BlueprintTask> consolidated;
+        consolidated.reserve(selected.size());
+        for (size_t i = 0; i < selected.size(); ++i) {
+            if (!removed[i]) consolidated.push_back(selected[i]);
+        }
+        selected.swap(consolidated);
+    }
+
     per_scene_accepted.assign(static_cast<size_t>(max_scene_id) + 1, 0);
-    for (const auto& kv : scene_count) {
-        per_scene_accepted[kv.first] = kv.second;
+    scene_count.clear();
+    for (const auto& t : selected) {
+        per_scene_accepted[t.scene_id] += 1;
+        scene_count[t.scene_id] += 1;
     }
     return selected;
 }

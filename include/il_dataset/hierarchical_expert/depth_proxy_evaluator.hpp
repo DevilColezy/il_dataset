@@ -26,9 +26,14 @@ public:
 
     /// One synthetic raycast sample from a vehicle pose (expert frame).
     /// `pos_expert`/`yaw_expert` are the expert-2D position and yaw
-    /// (world XY identity with the Flightmare frame).
+    /// (world XY identity with the Flightmare frame).  `has_wall` /
+    /// `wall_min` / `wall_max` add the warehouse wall envelope to the ray
+    /// hits (analytic slab intersection, same helper as the preflight).
     DepthProxySample castAt(const Vec2d& pos_expert, double yaw_expert,
-                            const std::vector<BlueprintObstacle>& obstacles) const;
+                            const std::vector<BlueprintObstacle>& obstacles,
+                            bool has_wall = false,
+                            const Vec2d& wall_min = Vec2d(0, 0),
+                            const Vec2d& wall_max = Vec2d(0, 0)) const;
 
     /// Merge one sample into a TaskDistributionSummary (raw counts).
     void accumulate(const DepthProxySample& s,

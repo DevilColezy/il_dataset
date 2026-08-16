@@ -1,6 +1,7 @@
 #include "il_dataset/hierarchical_expert/preflight_simulator.hpp"
 
 #include "il_dataset/hierarchical_expert/coordinate_adapter.hpp"
+#include "il_dataset/hierarchical_expert/ray_cast_2d.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -24,10 +25,18 @@ inline double distToSegment(const Vec2d& p, const Vec2d& a, const Vec2d& b) {
 
 void PreflightSimulator::configure(const Scene2D& scene,
                                    const Vec2d& min_bounds,
-                                   const Vec2d& max_bounds) {
+                                   const Vec2d& max_bounds,
+                                   const Vec2d* wall_min,
+                                   const Vec2d* wall_max) {
     scene_ = scene;
     min_bounds_ = min_bounds;
     max_bounds_ = max_bounds;
+    has_wall_ = false;
+    if (wall_min && wall_max) {
+        has_wall_ = true;
+        wall_min_ = *wall_min;
+        wall_max_ = *wall_max;
+    }
     expert_.configure(p_, min_bounds_, max_bounds_);
     configured_ = true;
 }
@@ -61,7 +70,16 @@ LocalObservation PreflightSimulator::synthesizePatch(uint64_t tick) const {
     const double ray_da = deg2rad(p_.obs_ray_angular_res_deg);
     const int n_rays = std::max(
         1, static_cast<int>(std::ceil(fov / std::max(1e-9, ray_da))));
-    const double march_step = p_.obs_resolution * 0.5;
+
+    // Pre-extract the circle geometry (avoid per-ray Scene2D dereferences).
+    std::vector<Vec2d> centers;
+    std::vector<double> radii;
+    centers.reserve(scene_.obstacles.size());
+    radii.reserve(scene_.obstacles.size());
+    for (const auto& o : scene_.obstacles) {
+        centers.push_back(o.center);
+        radii.push_back(o.radius);
+    }
 
     std::vector<double> ray_hit(n_rays + 1,
                                 std::numeric_limits<double>::infinity());
@@ -73,22 +91,13 @@ LocalObservation PreflightSimulator::synthesizePatch(uint64_t tick) const {
             -fov / 2.0 + fov * (static_cast<double>(i) / n_rays);
         double dir[2];
         rig.rayWorldDirXY(bearing, dir);
-        double hit = std::numeric_limits<double>::infinity();
-        for (double d = march_step; d <= range + 1e-9; d += march_step) {
-            const Vec2d p = cam2 + Vec2d(dir[0] * d, dir[1] * d);
-            bool inside = false;
-            for (const auto& o : scene_.obstacles) {
-                if ((p - o.center).norm() < o.radius) {
-                    inside = true;
-                    break;
-                }
-            }
-            if (inside) {
-                hit = d;
-                break;
-            }
-        }
-        ray_hit[i] = hit;
+        // ANALYTIC ray-circle + ray-wall intersection: O(obstacles) per
+        // ray, no spatial marching (was O(range/steps x obstacles)).
+        const double hit = rayNearestObstacleHit(
+            cam2, Vec2d(dir[0], dir[1]), centers, radii, has_wall_,
+            wall_min_, wall_max_);
+        ray_hit[i] = (hit > range) ? std::numeric_limits<double>::infinity()
+                                   : hit;
         ray_seen[i] = true;  // valid return (hit or no-hit to R)
     }
 

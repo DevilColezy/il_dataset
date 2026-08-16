@@ -418,6 +418,11 @@ class JointV2Manager(object):
             "path": dict(btg.get("path", {}) or {}),
             "performance": dict(perf),
             "requirements": dict(req),
+            "synthetic_observation": dict(
+                bp.get("synthetic_observation", {}) or {}),
+            "early_termination": dict(bp.get("early_termination", {}) or {}),
+            "distribution_targets": list(
+                bp.get("distribution_targets", []) or []),
             "legacy": dict(leg),
         }
         legacy["blueprint"] = blueprint
@@ -633,6 +638,35 @@ class JointV2Manager(object):
             "preflight_success_tasks": int(result.preflight_success_tasks),
             "cheap_filter_rejected": int(result.cheap_filter_rejected),
             "pool_budget_exhausted": bool(result.pool_budget_exhausted),
+            # ── NEW: efficiency + budget diagnostics ───────────────
+            "preflight_attempt_count": int(result.preflight_attempt_count),
+            "preflight_success_count": int(result.preflight_success_count),
+            "preflight_failure_count": int(result.preflight_failure_count),
+            "total_preflight_ticks": int(result.total_preflight_ticks),
+            "full_preflight_attempted": int(result.full_preflight_attempted),
+            "full_preflight_success": int(result.full_preflight_success),
+            "selected_scene_count": int(result.selected_scene_count),
+            "preflight_acceptance_ratio":
+                float(result.preflight_acceptance_ratio),
+            "selected_per_preflight_ratio":
+                float(result.selected_per_preflight_ratio),
+            "budget_exhausted_reason": str(result.budget_exhausted_reason),
+            "round_logs": [
+                {
+                    "round": int(r.round),
+                    "scenes_generated": int(r.scenes_generated),
+                    "scenes_valid": int(r.scenes_valid),
+                    "task_candidates": int(r.task_candidates),
+                    "cheap_rejected": int(r.cheap_rejected),
+                    "preflight_attempted": int(r.preflight_attempted),
+                    "preflight_success": int(r.preflight_success),
+                    "selected_pool": int(r.selected_pool),
+                    "elapsed_ms": _fin(r.elapsed_ms),
+                    "preflight_avg_ms": _fin(r.preflight_avg_ms),
+                    "remaining_deficits": [str(d) for d in r.remaining_deficits],
+                }
+                for r in result.round_logs
+            ],
             # ── NEW: distribution report + iteration summary ───────
             "generation_rounds": int(result.generation_rounds),
             "hard_minimums_met": bool(result.hard_minimums_met),

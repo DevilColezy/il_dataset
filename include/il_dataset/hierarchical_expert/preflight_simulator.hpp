@@ -41,8 +41,13 @@ public:
         : p_(p), expert_(), obs_builder_(p) {}
 
     /// Configure with the scene (truth) and the global grid anchor.
+    /// `wall_min` / `wall_max` are the OPTIONAL warehouse wall envelope
+    /// (the synthetic observation casts rays against the walls, but the
+    /// out-of-bounds audit always uses the FREE region bounds).  Pass an
+    /// empty / identical envelope to disable wall hits.
     void configure(const Scene2D& scene, const Vec2d& min_bounds,
-                   const Vec2d& max_bounds);
+                   const Vec2d& max_bounds, const Vec2d* wall_min = nullptr,
+                   const Vec2d* wall_max = nullptr);
 
     /// Reset a preflight episode.  start/goal are world XY, initial_yaw is
     /// the Flightmare yaw.
@@ -82,6 +87,9 @@ private:
     Scene2D scene_;
     Vec2d min_bounds_{-20.0, -20.0};
     Vec2d max_bounds_{20.0, 20.0};
+    bool has_wall_ = false;
+    Vec2d wall_min_{-20.0, -20.0};
+    Vec2d wall_max_{20.0, 20.0};
     HierarchicalExpert expert_;
     Flightmare2DObservation obs_builder_;
     VehicleState2D state_;

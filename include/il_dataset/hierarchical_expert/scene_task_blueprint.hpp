@@ -182,6 +182,18 @@ struct BlueprintResult {
     std::vector<uint64_t> selected_scene_ids;
     bool hard_minimums_met = false;
     bool soft_targets_met = false;
+    // ── new: efficiency + budget diagnostics ───────────────────────
+    uint64_t preflight_attempt_count = 0;     // total preflight calls
+    uint64_t preflight_success_count = 0;     // accepted candidates
+    uint64_t preflight_failure_count = 0;     // rejected candidates
+    uint64_t total_preflight_ticks = 0;       // 30 Hz ticks, all attempts
+    uint64_t full_preflight_attempted = 0;    // attempts NOT early-terminated
+    uint64_t full_preflight_success = 0;      // accepted AND ran to completion
+    uint64_t selected_scene_count = 0;        // scenes in the final selection
+    double preflight_acceptance_ratio = 0.0;  // success / attempts
+    double selected_per_preflight_ratio = 0.0;  // selected / attempts
+    std::string budget_exhausted_reason = "none";
+    std::vector<RoundStats> round_logs;
 };
 
 // ═══════════════════════════════════════════════════════════════════

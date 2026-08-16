@@ -31,9 +31,10 @@ public:
     explicit TaskCandidateGenerator(const BlueprintGenerationConfig& cfg)
         : cfg_(cfg) {}
 
-    /// Geometric PROXY class of a start/goal pair (uses only scene truth;
-    /// privileged, offline, never a student input).
-    TaskGeomType classifyGeometry(const BlueprintScene& scene,
+    /// Geometric PROXY class of a start/goal pair (uses ONLY the cached
+    /// scene-level geometry — narrow passages / large obstacles are
+    /// computed once in SceneGeometryCache, never re-derived per pair).
+    TaskGeomType classifyGeometry(const SceneGeometryCache& geo,
                                   const Vec2d& start,
                                   const Vec2d& goal) const;
 
@@ -53,6 +54,20 @@ public:
     double sampleInitialYaw(double goal_bearing_expert,
                             const std::vector<double>& yaw_weights,
                             Rng& rng) const;
+
+    /// Directional sampling: pick start/goal on OPPOSITE sides of a
+    /// reference point (a large blocker or a narrow-passage centre) so the
+    /// desired geometric type is produced with high probability instead of
+    /// waiting for a lucky random pair.  Returns false when no such pair
+    /// was found within the attempt budget.
+    bool sampleAcrossReference(const SceneGeometryCache& geo,
+                               const Vec2d& ref, const Vec2d& normal,
+                               double min_dist, TaskGeomType required,
+                               const std::vector<double>& yaw_weights,
+                               uint64_t seed, Rng& rng, uint64_t task_id,
+                               uint64_t scene_id, BlueprintTask& out,
+                               TaskGeomType& geom_out,
+                               double& yaw_error_signed_deg) const;
 
 private:
     /// The straight corridor half-width (m) used by the proxy classifier:

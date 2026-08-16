@@ -59,11 +59,22 @@ private:
     bool placeOne(const BlueprintScene& scene, const SceneProfile& profile,
                   const BlueprintGenerationConfig& cfg, Rng& rng,
                   BlueprintObstacle& out) const;
-    /// Structured placement helpers (all rejection-sample and re-check the
-    /// pairwise gap + boundary rules via placeOne).
+    /// Structured placement (clustered / corridor / bottleneck / chicane /
+    /// central_blocker / edge_clutter).  Orientation and cluster centres
+    /// are drawn ONCE per scene realization and reused for every obstacle;
+    /// per-side along-spacing is enforced so the pairwise surface gap is
+    /// guaranteed by construction (rejection rarely triggers).
     bool realizeStructured(const SceneProfile& profile, const BlueprintGenerationConfig& cfg,
                            Rng& rng, int desired, std::vector<BlueprintObstacle>& out,
                            int& placed) const;
+    /// Post-realization sanity validation: a realization must actually
+    /// match its own profile structure (clustered groups, corridor free
+    /// channel, bottleneck narrowing, chicane alternation).  Returns false
+    /// (with reason) when the realization should be rejected and retried.
+    bool validateProfileStructure(const SceneProfile& profile,
+                                  const BlueprintGenerationConfig& cfg,
+                                  const BlueprintScene& scene,
+                                  std::string& reason) const;
     /// Compute the geometric metadata (radius bands, density proxy) from
     /// the realized obstacle set.
     SceneMetadata computeMetadata(const SceneProfile& profile,

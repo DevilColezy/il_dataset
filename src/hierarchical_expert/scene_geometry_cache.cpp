@@ -104,20 +104,48 @@ bool SceneGeometryCache::build(const BlueprintScene& scene,
         }
     }
 
-    // ── Narrowest obstacle-pair surface gap (corridor-width proxy) ─
+    // ── Scene-level immutable geometry (computed ONCE, reused by every
+    //    task candidate — never recomputed per start/goal pair) ──────
+    obs_centers_.clear();
+    obs_radii_.clear();
+    large_obs_.clear();
+    narrow_passages_.clear();
+    for (const auto& o : scene.obstacles) {
+        obs_centers_.emplace_back(o.x, o.y);
+        obs_radii_.push_back(o.radius);
+    }
+    const double large_r = 1.5;  // same threshold as the task proxy
+    const double narrow_lo = cfg.plannerRequiredPassage();
+    const double narrow_hi = 2.0 * narrow_lo;
     estimated_corridor_width_ = 0.0;
     if (scene.obstacles.size() >= 2) {
         double best = std::numeric_limits<double>::infinity();
         for (size_t i = 0; i < scene.obstacles.size(); ++i) {
+            if (obs_radii_[i] >= large_r) large_obs_.push_back(static_cast<int>(i));
             for (size_t j = i + 1; j < scene.obstacles.size(); ++j) {
-                const double gap =
-                    std::hypot(scene.obstacles[i].x - scene.obstacles[j].x,
-                               scene.obstacles[i].y - scene.obstacles[j].y) -
-                    scene.obstacles[i].radius - scene.obstacles[j].radius;
+                const double gap = std::hypot(obs_centers_[i].x() - obs_centers_[j].x(),
+                                              obs_centers_[i].y() - obs_centers_[j].y()) -
+                                   obs_radii_[i] - obs_radii_[j];
                 best = std::min(best, gap);
+                // Narrow-but-planable passage candidate.
+                if (gap >= narrow_lo - 1e-9 && gap <= narrow_hi + 1e-9) {
+                    NarrowPassage np;
+                    np.a_id = static_cast<int>(i);
+                    np.b_id = static_cast<int>(j);
+                    np.a_center = obs_centers_[i];
+                    np.b_center = obs_centers_[j];
+                    np.center = (obs_centers_[i] + obs_centers_[j]) * 0.5;
+                    np.width = gap;
+                    Vec2d ab = obs_centers_[j] - obs_centers_[i];
+                    const double abn = ab.norm();
+                    np.axis = abn > 1e-9 ? ab / abn : Vec2d(1.0, 0.0);
+                    narrow_passages_.push_back(np);
+                }
             }
         }
         if (std::isfinite(best)) estimated_corridor_width_ = best;
+    } else if (scene.obstacles.size() == 1) {
+        if (obs_radii_[0] >= large_r) large_obs_.push_back(0);
     }
 
     // ── Planning validity ──────────────────────────────────────────

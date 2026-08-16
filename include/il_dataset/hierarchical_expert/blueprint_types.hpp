@@ -482,15 +482,39 @@ struct BlueprintGenerationConfig {
     int max_scene_candidates = 64;
     int max_task_candidates_per_scene = 40;
     int max_generation_rounds = 6;
+    // Every full preflight call — success OR failure — consumes 1 unit.
     int max_total_preflight_tasks = 1800;
+    // Total 30 Hz ticks across ALL preflight calls (success + failure).
+    uint64_t max_total_preflight_ticks = 500000;
     int max_preflight_ticks_per_task = 900;   // 30 s @ 30 Hz
     int max_scene_generation_attempts = 96;
     int max_task_generation_attempts = 600;
-    bool parallel_tasks = false;  // optional; kept false by default
-    double scene_switch_penalty = 0.25;
+    bool parallel_tasks = false;  // NOT IMPLEMENTED: must stay false
+    // Legacy constant penalty (weak); the selector now uses a two-stage
+    // coverage + scene-consolidation flow (see DistributionAnalyzer::select).
+    double scene_switch_penalty = 0.10;
+
+    // ── synthetic observation / preflight behaviour ────────────────
+    // Whether the warehouse wall envelope appears in the synthetic depth
+    // observation (depth proxy + preflight patch).  NEVER changes the
+    // out-of-bounds semantics (that stays the FREE region, matching the
+    // real Flightmare truth audit).
+    bool walls_visible_in_observation = true;
+    // Early termination (blueprint-only, never changes expert labels):
+    //  * no-progress: original-goal distance shrinks by less than
+    //    no_progress_min_progress_m over no_progress_window_ticks;
+    //  * stall: |velocity| < stall_speed_mps for stall_window_ticks while
+    //    not in a legitimate TURN.
+    int    no_progress_window_ticks = 150;      // 5 s @ 30 Hz
+    double no_progress_min_progress_m = 1.0;
+    int    stall_window_ticks = 90;             // 3 s @ 30 Hz
+    double stall_speed_mps = 0.02;
+    // Per-round sanity log to stderr (one line per round).
+    bool log_rounds = true;
 
     // ── result requirements ────────────────────────────────────────
-    int min_scenes = 4;
+    int min_scenes = 4;              // must be met by the SELECTED scenes
+    int min_selected_scenes = 4;     // selected-scene diversity gate
     int min_tasks = 24;
     int min_tasks_per_scene = 4;
     int max_tasks_per_scene = 12;
@@ -498,8 +522,17 @@ struct BlueprintGenerationConfig {
     int min_depth_samples_per_band = 40;   // near/mid/far/free
     int min_yaw_samples_per_bin = 3;       // per absolute-yaw bin
     int min_path_samples_per_class = 4;    // short/medium/long
-    double max_turn_imbalance_ratio = 0.66;
-    double max_yaw_imbalance_ratio = 0.66;
+    // Initial yaw is directly sampled, so it can be tightly balanced.
+    double max_yaw_imbalance_ratio = 0.20;
+    // TURN behaviour depends on real geometry; slightly looser.
+    double max_turn_imbalance_ratio = 0.30;
+    // Grouped coverage (avoid the "only near-direct samples" trap):
+    //  * deflection: strong-right-group / right / near-direct / left /
+    //    strong-left-group each need at least this many 30 Hz ticks;
+    //  * correction: right / near-forward / left groups each need at
+    //    least this many 5 Hz NORMAL_CORRECTION ticks.
+    int min_grouped_deflection_samples = 8;
+    int min_grouped_correction_samples = 4;
 
     // ── legacy strata thresholds (manifest compatibility only) ─────
     // Used to map realized scenes onto the legacy 3x3 density x radius
@@ -514,7 +547,35 @@ struct BlueprintGenerationConfig {
 };
 
 // ═══════════════════════════════════════════════════════════════════
-//  GenerationTiming — lightweight performance statistics
+//  BudgetExhaustion — which budget stopped the generation (diagnostic)
+// ═══════════════════════════════════════════════════════════════════
+enum class BudgetExhaustion : uint8_t {
+    NONE = 0,
+    SCENE_BUDGET = 1,
+    PREFLIGHT_ATTEMPT_BUDGET = 2,
+    PREFLIGHT_TICK_BUDGET = 3,
+    GENERATION_ROUND_BUDGET = 4,
+    TASK_CANDIDATE_BUDGET = 5,
+};
+
+inline const char* budgetExhaustionName(BudgetExhaustion b) {
+    switch (b) {
+        case BudgetExhaustion::NONE: return "none";
+        case BudgetExhaustion::SCENE_BUDGET: return "scene_budget";
+        case BudgetExhaustion::PREFLIGHT_ATTEMPT_BUDGET:
+            return "preflight_attempt_budget";
+        case BudgetExhaustion::PREFLIGHT_TICK_BUDGET:
+            return "preflight_tick_budget";
+        case BudgetExhaustion::GENERATION_ROUND_BUDGET:
+            return "generation_round_budget";
+        case BudgetExhaustion::TASK_CANDIDATE_BUDGET:
+            return "task_candidate_budget";
+    }
+    return "none";
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  GenerationTiming — lightweight performance statistics (real timers)
 // ═══════════════════════════════════════════════════════════════════
 struct GenerationTiming {
     double scene_generation_ms = 0.0;
@@ -523,10 +584,14 @@ struct GenerationTiming {
     double cheap_filter_ms = 0.0;
     double preflight_total_ms = 0.0;
     double preflight_average_ms = 0.0;
-    uint64_t preflight_count = 0;
+    uint64_t preflight_count = 0;          // attempts (success + failure)
+    uint64_t preflight_success_count = 0;
+    uint64_t preflight_failure_count = 0;
+    uint64_t preflight_ticks = 0;          // total ticks across attempts
     uint64_t cheap_filter_rejected = 0;
-    double depth_proxy_total_ms = 0.0;
+    double depth_proxy_total_ms = 0.0;     // timed inside preflightOne
     double selection_ms = 0.0;
+    double consolidation_ms = 0.0;
     double total_ms = 0.0;
 
     std::map<std::string, double> asMap() const {
@@ -538,8 +603,24 @@ struct GenerationTiming {
                 {"preflight_average_ms", preflight_average_ms},
                 {"depth_proxy_total_ms", depth_proxy_total_ms},
                 {"selection_ms", selection_ms},
+                {"consolidation_ms", consolidation_ms},
                 {"total_ms", total_ms}};
     }
+};
+
+/// One round of generation (lightweight sanity log + manifest report).
+struct RoundStats {
+    uint64_t round = 0;
+    uint64_t scenes_generated = 0;
+    uint64_t scenes_valid = 0;
+    uint64_t task_candidates = 0;     // sampled candidates this round
+    uint64_t cheap_rejected = 0;
+    uint64_t preflight_attempted = 0;
+    uint64_t preflight_success = 0;
+    uint64_t selected_pool = 0;       // pool size after this round
+    double elapsed_ms = 0.0;
+    double preflight_avg_ms = 0.0;
+    std::vector<std::string> remaining_deficits;
 };
 
 }  // namespace expert

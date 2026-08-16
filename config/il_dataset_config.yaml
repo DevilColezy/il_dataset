@@ -250,13 +250,38 @@ global:
       max_task_candidates_per_scene: 40
       max_generation_rounds: 6
       max_total_preflight_tasks: 1800
+      # Hard total 30 Hz tick budget across ALL preflight attempts
+      # (success + failure): 1800 attempts x up to 900 ticks would be 1.62M
+      # ticks; this caps wasted ticks from stalled / circling candidates
+      # (~28% of the naive worst case).  Early termination makes the cap
+      # a safety net, not the common path.
+      max_total_preflight_ticks: 500000
       max_preflight_ticks_per_task: 900
       max_scene_generation_attempts: 96
       max_task_generation_attempts: 600
       parallel_tasks: false
-      scene_switch_penalty: 0.25
+      scene_switch_penalty: 0.10
+    # Synthetic observation semantics: the warehouse wall envelope MAY
+    # appear in the synthetic depth (preflight patch + depth proxy) but it
+    # NEVER changes the out-of-bounds audit (that stays the FREE region,
+    # matching the real Flightmare TruthCylinderAudit).
+    synthetic_observation:
+      walls_visible_in_observation: true
+    # Blueprint-only early termination (never changes expert labels): cut
+    # preflights that are stalled or not progressing toward the goal so
+    # the preflight budgets are spent on viable candidates.
+    early_termination:
+      no_progress_window_ticks: 150
+      no_progress_min_progress_m: 1.0
+      stall_window_ticks: 90
+      stall_speed_mps: 0.02
+      log_rounds: true
+    # Explicit distribution targets.  Empty -> built-in defaults (see
+    # distribution_analyzer.cpp buildDefaultTargets).
+    distribution_targets: []
     requirements:
       min_scenes: 4
+      min_selected_scenes: 4
       min_tasks: 24
       min_tasks_per_scene: 4
       max_tasks_per_scene: 12
@@ -264,8 +289,17 @@ global:
       min_depth_samples_per_band: 40
       min_yaw_samples_per_bin: 3
       min_path_samples_per_class: 4
-      max_turn_imbalance_ratio: 0.66
-      max_yaw_imbalance_ratio: 0.66
+      # Initial yaw is directly sampled, so it can be tightly balanced;
+      # TURN behaviour depends on real geometry, slightly looser.
+      max_turn_imbalance_ratio: 0.30
+      max_yaw_imbalance_ratio: 0.20
+      # Grouped coverage (anti-degeneracy): deflection strong-right /
+      # right / near-direct / left / strong-left groups each need at least
+      # min_grouped_deflection_samples 30 Hz ticks; correction right /
+      # near / left groups need at least min_grouped_correction_samples
+      # 5 Hz NORMAL_CORRECTION ticks.
+      min_grouped_deflection_samples: 8
+      min_grouped_correction_samples: 4
     legacy:
       density_sparse_max: 7.0
       density_dense_min: 14.0

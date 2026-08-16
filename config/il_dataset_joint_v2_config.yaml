@@ -101,6 +101,22 @@ global:
   blueprint_generation:
     enabled: true
     base_seed: 260812
+    # The rest of the section (warehouse, profiles, tasks, performance,
+    # synthetic_observation, early_termination, distribution_targets,
+    # requirements, legacy) is inherited from il_dataset_config.yaml.
+    # These are re-stated explicitly because joint_v2 is the production
+    # recipe and the tightened balance / budget gates MUST hold here.
+    performance:
+      max_total_preflight_ticks: 500000
+    synthetic_observation:
+      walls_visible_in_observation: true
+    distribution_targets: []
+    requirements:
+      min_selected_scenes: 4
+      max_turn_imbalance_ratio: 0.30
+      max_yaw_imbalance_ratio: 0.20
+      min_grouped_deflection_samples: 8
+      min_grouped_correction_samples: 4
 
   # ── Hierarchical local expert (production path) ───────────────────
   # Overrides the public defaults in il_dataset_config.yaml.  R = 5.0 m

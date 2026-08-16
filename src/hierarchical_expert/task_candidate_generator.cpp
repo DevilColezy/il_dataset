@@ -36,23 +36,25 @@ inline double signedDistToSeg(const Vec2d& p, const Vec2d& a, const Vec2d& b) {
 }  // namespace
 
 TaskGeomType TaskCandidateGenerator::classifyGeometry(
-    const BlueprintScene& scene, const Vec2d& start,
+    const SceneGeometryCache& geo, const Vec2d& start,
     const Vec2d& goal) const {
     const Vec2d axis = goal - start;
     const double len = std::max(1e-6, axis.norm());
     const double chw = corridorHalfWidth();
-    const double large_r = largeRadiusThreshold();
     const double free_clr = cfg_.free_cell_surface_clearance_m;
+    const auto& centers = geo.obstacleCenters();
+    const auto& radii = geo.obstacleRadii();
+    const auto& large = geo.largeObstacles();
 
     int near_count = 0;
-    double max_near_radius = 0.0;
     bool straight_blocked = false;
     bool large_blocker = false;
     int left_count = 0, right_count = 0;
-    double narrowest_gap = std::numeric_limits<double>::infinity();
 
-    for (const auto& o : scene.obstacles) {
-        const Vec2d c(o.x, o.y);
+    // O(N) per task (N <= ~50); the O(N^2) all-pair narrow-gap search is
+    // done ONCE per scene in SceneGeometryCache.
+    for (size_t i = 0; i < centers.size(); ++i) {
+        const Vec2d& c = centers[i];
         const double d = distToSeg(c, start, goal);
         const double along =
             clamp((c - start).dot(axis) / (len * len), 0.0, 1.0) * len;
@@ -60,14 +62,16 @@ TaskGeomType TaskCandidateGenerator::classifyGeometry(
         // the proxy (behind the vehicle is irrelevant for classification).
         if (along < 0.5) continue;
 
-        const double clear = d - o.radius;
+        const double clear = d - radii[i];
         if (clear < chw) {
             ++near_count;
-            max_near_radius = std::max(max_near_radius, o.radius);
         }
         if (clear < free_clr) {
             straight_blocked = true;
-            if (o.radius >= large_r) large_blocker = true;
+            if (std::find(large.begin(), large.end(), static_cast<int>(i)) !=
+                large.end()) {
+                large_blocker = true;
+            }
         }
         // Chicane: alternate left/right obstacles around the segment.
         if (clear < chw + 1.0) {
@@ -77,19 +81,20 @@ TaskGeomType TaskCandidateGenerator::classifyGeometry(
                 ++right_count;
             }
         }
-        // Narrow passage: gap between two obstacles straddling the segment.
-        for (const auto& o2 : scene.obstacles) {
-            if (o2.id == o.id) continue;
-            const double gap =
-                (c - Vec2d(o2.x, o2.y)).norm() - o.radius - o2.radius;
-            narrowest_gap = std::min(narrowest_gap, gap);
+    }
+
+    // NARROW_BUT_PLANNABLE must be TASK-RELEVANT: the task's start-goal
+    // corridor must actually pass through a cached narrow passage (never a
+    // scene-corner gap unrelated to the path).  O(#narrow_passages).
+    bool narrow_relevant = false;
+    for (const auto& np : geo.narrowPassages()) {
+        if (distToSeg(np.center, start, goal) < chw + 1.0) {
+            narrow_relevant = true;
+            break;
         }
     }
 
     const bool is_long = len >= cfg_.path_long_min_m - 1e-9;
-    const double narrow_max = 2.0 * cfg_.plannerRequiredPassage();
-    const bool has_narrow = narrowest_gap >= cfg_.plannerRequiredPassage() - 1e-9 &&
-                            narrowest_gap <= narrow_max + 1e-9;
     const bool chicane =
         near_count >= 2 && left_count >= 1 && right_count >= 1;
 
@@ -115,7 +120,7 @@ TaskGeomType TaskCandidateGenerator::classifyGeometry(
     if (near_count == 1) {
         return TaskGeomType::OFFSET_AVOIDANCE;
     }
-    if (has_narrow) {
+    if (narrow_relevant) {
         return TaskGeomType::NARROW_BUT_PLANNABLE;
     }
     return TaskGeomType::CLEAR;
@@ -180,6 +185,44 @@ bool TaskCandidateGenerator::sample(
                            dmax - 1e-6);
     }
 
+    // ── Directional pre-pass (task twenty): for LONG_DETOUR and
+    //    NARROW_BUT_PLANNABLE, generate the pair from SCENE-LOCAL hints
+    //    (start/goal on opposite sides of a large blocker or a cached
+    //    narrow passage) instead of waiting for a lucky random pair. ──
+    if (desired_type == static_cast<int>(TaskGeomType::LONG_DETOUR) &&
+        !geo.largeObstacles().empty()) {
+        const size_t li = static_cast<size_t>(rng.uniformInt(
+            0, static_cast<int>(geo.largeObstacles().size()) - 1));
+        const Vec2d blocker =
+            geo.obstacleCenters()[static_cast<size_t>(geo.largeObstacles()[li])];
+        // Split the region by a line through the blocker; try both axes.
+        for (int k = 0; k < 2; ++k) {
+            const Vec2d normal = (k == 0) ? Vec2d(1.0, 0.0) : Vec2d(0.0, 1.0);
+            if (sampleAcrossReference(geo, blocker, normal,
+                                      std::max(band_lo, cfg_.path_long_min_m),
+                                      TaskGeomType::LONG_DETOUR, yaw_weights,
+                                      seed, rng, task_id, scene_id, out,
+                                      geom_out, yaw_error_signed_deg)) {
+                return true;
+            }
+        }
+    }
+    if (desired_type == static_cast<int>(TaskGeomType::NARROW_BUT_PLANNABLE) &&
+        !geo.narrowPassages().empty()) {
+        const NarrowPassage& np =
+            geo.narrowPassages()[static_cast<size_t>(rng.uniformInt(
+                0, static_cast<int>(geo.narrowPassages().size()) - 1))];
+        // Normal to the passage axis: start/goal land on opposite sides of
+        // the narrow gap, forcing the path through it.
+        const Vec2d normal(-np.axis.y(), np.axis.x());
+        if (sampleAcrossReference(geo, np.center, normal, dmin,
+                                  TaskGeomType::NARROW_BUT_PLANNABLE,
+                                  yaw_weights, seed, rng, task_id, scene_id,
+                                  out, geom_out, yaw_error_signed_deg)) {
+            return true;
+        }
+    }
+
     // A candidate that matches the desired proxy class (or is at least a
     // valid connected pair) is kept as a fallback when the budget runs out.
     bool have_fallback = false;
@@ -207,7 +250,7 @@ bool TaskCandidateGenerator::sample(
             if (!geo.pointFreeMain(goal, cfg_.free_cell_surface_clearance_m)) {
                 continue;
             }
-            const TaskGeomType proxy = classifyGeometry(scene, start, goal);
+            const TaskGeomType proxy = classifyGeometry(geo, start, goal);
             // Distance band of the desired class is always satisfied by
             // construction; accept an exact match or (for CLEAR) any
             // non-blocking proxy.
@@ -285,6 +328,84 @@ bool TaskCandidateGenerator::sample(
         out.audit.straight_distance_m = out.audit.goal_distance_m;
         out.geom_type = taskGeomTypeName(fallback_type);
         geom_out = fallback_type;
+        yaw_error_signed_deg = rad2deg(err);
+        return true;
+    }
+    return false;
+}
+
+bool TaskCandidateGenerator::sampleAcrossReference(
+    const SceneGeometryCache& geo, const Vec2d& ref, const Vec2d& normal,
+    double min_dist, TaskGeomType required,
+    const std::vector<double>& yaw_weights, uint64_t seed, Rng& rng,
+    uint64_t task_id, uint64_t scene_id, BlueprintTask& out,
+    TaskGeomType& geom_out, double& yaw_error_signed_deg) const {
+    const auto& cells = geo.validCells();
+    if (cells.size() < 2) return false;
+
+    // Partition the valid cells by which side of the reference line they
+    // lie on (O(#cells) once per directional attempt; cells ~ thousands).
+    std::vector<Vec2d> plus, minus;
+    plus.reserve(cells.size() / 2);
+    minus.reserve(cells.size() / 2);
+    const double side_margin = 2.0;
+    for (size_t idx : cells) {
+        const int ix = static_cast<int>(idx % static_cast<size_t>(geo.w()));
+        const int iy = static_cast<int>(idx / static_cast<size_t>(geo.w()));
+        const Vec2d p = geo.cellCenter(ix, iy);
+        const double s = (p - ref).dot(normal);
+        if (s > side_margin) {
+            plus.push_back(p);
+        } else if (s < -side_margin) {
+            minus.push_back(p);
+        }
+    }
+    if (plus.size() < 2 || minus.size() < 2) return false;
+
+    const double dmax = cfg_.max_task_distance_m;
+    const int tries = std::max(24, cfg_.task_goal_attempts);
+    for (int a = 0; a < tries; ++a) {
+        const Vec2d& start =
+            (a % 2 == 0)
+                ? plus[static_cast<size_t>(rng.uniformInt(
+                      0, static_cast<int>(plus.size()) - 1))]
+                : minus[static_cast<size_t>(rng.uniformInt(
+                      0, static_cast<int>(minus.size()) - 1))];
+        const Vec2d& goal =
+            (a % 2 == 0)
+                ? minus[static_cast<size_t>(rng.uniformInt(
+                      0, static_cast<int>(minus.size()) - 1))]
+                : plus[static_cast<size_t>(rng.uniformInt(
+                      0, static_cast<int>(plus.size()) - 1))];
+        const double d = (goal - start).norm();
+        if (d < min_dist - 1e-9 || d > dmax + 1e-9) continue;
+        if (!geo.pointFreeMain(goal, cfg_.free_cell_surface_clearance_m)) {
+            continue;
+        }
+        const TaskGeomType proxy = classifyGeometry(geo, start, goal);
+        if (proxy != required) continue;
+
+        const double goal_bearing_expert =
+            std::atan2(goal.y() - start.y(), goal.x() - start.x());
+        const double initial_yaw_fm =
+            sampleInitialYaw(goal_bearing_expert, yaw_weights, rng);
+        const double expert_yaw =
+            CoordinateAdapter::flightmareYawToExpert(initial_yaw_fm);
+        const double err = wrapAngle(goal_bearing_expert - expert_yaw);
+
+        out.scene_id = scene_id;
+        out.task_id = task_id;
+        out.seed = seed;
+        out.start_x = start.x();
+        out.start_y = start.y();
+        out.goal_x = goal.x();
+        out.goal_y = goal.y();
+        out.initial_yaw = initial_yaw_fm;
+        out.flight_height_m = cfg_.flight_height_m;
+        out.audit.goal_distance_m = d;
+        out.audit.straight_distance_m = d;
+        out.geom_type = taskGeomTypeName(proxy);
+        geom_out = proxy;
         yaw_error_signed_deg = rad2deg(err);
         return true;
     }

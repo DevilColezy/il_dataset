@@ -484,11 +484,41 @@ def _validate_config(cfg):
         perf = bp.get("performance", {}) or {}
         for pk in ("max_scene_candidates", "max_task_candidates_per_scene",
                    "max_generation_rounds", "max_total_preflight_tasks",
+                   "max_total_preflight_ticks",
                    "max_preflight_ticks_per_task",
                    "max_scene_generation_attempts",
                    "max_task_generation_attempts"):
             _positive(perf.get(pk, 1),
                       "blueprint_generation.performance.%s" % pk, errors)
+        if bool(perf.get("parallel_tasks", False)):
+            errors.append(
+                "blueprint_generation.performance.parallel_tasks is not "
+                "implemented; it must be false (set it to false or remove "
+                "the key)")
+
+        req = bp.get("requirements", {}) or {}
+        _positive(req.get("min_selected_scenes", 4),
+                  "blueprint_generation.requirements.min_selected_scenes",
+                  errors)
+        if int(req.get("min_selected_scenes", 4)) > \
+                int(req.get("min_scenes", 4)):
+            errors.append(
+                "blueprint_generation.requirements.min_selected_scenes must "
+                "be <= min_scenes")
+        _positive(req.get("min_grouped_deflection_samples", 8),
+                  "blueprint_generation.requirements."
+                  "min_grouped_deflection_samples", errors)
+        _positive(req.get("min_grouped_correction_samples", 4),
+                  "blueprint_generation.requirements."
+                  "min_grouped_correction_samples", errors)
+
+        et = bp.get("early_termination", {}) or {}
+        _positive(et.get("no_progress_window_ticks", 150),
+                  "blueprint_generation.early_termination."
+                  "no_progress_window_ticks", errors)
+        _positive(et.get("stall_window_ticks", 90),
+                  "blueprint_generation.early_termination.stall_window_ticks",
+                  errors)
 
     # ── hierarchical_expert: THE single expert parameter source ────
     he = g.get("hierarchical_expert", {}) or {}

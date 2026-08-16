@@ -222,6 +222,8 @@ void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
         b.max_generation_rounds = gi("max_generation_rounds", b.max_generation_rounds);
         b.max_total_preflight_tasks =
             gi("max_total_preflight_tasks", b.max_total_preflight_tasks);
+        b.max_total_preflight_ticks = get_u(
+            "max_total_preflight_ticks", b.max_total_preflight_ticks);
         b.max_preflight_ticks_per_task =
             gi("max_preflight_ticks_per_task", b.max_preflight_ticks_per_task);
         b.max_scene_generation_attempts =
@@ -257,6 +259,64 @@ void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
             gd("max_turn_imbalance_ratio", b.max_turn_imbalance_ratio);
         b.max_yaw_imbalance_ratio =
             gd("max_yaw_imbalance_ratio", b.max_yaw_imbalance_ratio);
+        b.min_selected_scenes =
+            gi("min_selected_scenes", b.min_selected_scenes);
+        b.min_grouped_deflection_samples = gi(
+            "min_grouped_deflection_samples",
+            b.min_grouped_deflection_samples);
+        b.min_grouped_correction_samples = gi(
+            "min_grouped_correction_samples",
+            b.min_grouped_correction_samples);
+    }
+
+    // ── synthetic observation / early termination ─────────────────
+    if (bp.contains("synthetic_observation")) {
+        const py::dict d = py::cast<py::dict>(bp["synthetic_observation"]);
+        auto gb = [&](const char* k, bool dflt) {
+            return d.contains(k) ? py::cast<bool>(d[k]) : dflt;
+        };
+        b.walls_visible_in_observation = gb(
+            "walls_visible_in_observation", b.walls_visible_in_observation);
+    }
+    if (bp.contains("early_termination")) {
+        const py::dict d = py::cast<py::dict>(bp["early_termination"]);
+        auto gi2 = [&](const char* k, int dflt) {
+            return d.contains(k) ? py::cast<int>(d[k]) : dflt;
+        };
+        auto gd2 = [&](const char* k, double dflt) {
+            return d.contains(k) ? py::cast<double>(d[k]) : dflt;
+        };
+        auto gb = [&](const char* k, bool dflt) {
+            return d.contains(k) ? py::cast<bool>(d[k]) : dflt;
+        };
+        b.no_progress_window_ticks =
+            gi2("no_progress_window_ticks", b.no_progress_window_ticks);
+        b.no_progress_min_progress_m = gd2(
+            "no_progress_min_progress_m", b.no_progress_min_progress_m);
+        b.stall_window_ticks =
+            gi2("stall_window_ticks", b.stall_window_ticks);
+        b.stall_speed_mps = gd2("stall_speed_mps", b.stall_speed_mps);
+        b.log_rounds = gb("log_rounds", b.log_rounds);
+    }
+
+    // ── explicit distribution targets (empty => buildDefaultTargets) ─
+    if (bp.contains("distribution_targets")) {
+        const auto seq = py::cast<py::sequence>(bp["distribution_targets"]);
+        b.targets.clear();
+        for (py::handle h : seq) {
+            const py::dict td = py::cast<py::dict>(h);
+            DistributionTarget t;
+            t.key = py::cast<std::string>(td["key"]);
+            t.metric = py::cast<std::string>(td["metric"]);
+            if (td.contains("target")) t.target = py::cast<double>(td["target"]);
+            if (td.contains("minimum")) t.minimum = py::cast<double>(td["minimum"]);
+            if (td.contains("maximum")) t.maximum = py::cast<double>(td["maximum"]);
+            if (td.contains("weight")) t.weight = py::cast<double>(td["weight"]);
+            if (td.contains("tolerance")) t.tolerance = py::cast<double>(td["tolerance"]);
+            if (td.contains("bin_index")) t.bin_index = py::cast<int>(td["bin_index"]);
+            if (td.contains("minimum_hard")) t.minimum_hard = py::cast<bool>(td["minimum_hard"]);
+            b.targets.push_back(t);
+        }
     }
 
     // ── legacy strata thresholds / seed ───────────────────────────
@@ -785,6 +845,20 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("summary", &BlueprintTask::summary)
         .def_readwrite("selection_score", &BlueprintTask::selection_score);
 
+    py::class_<RoundStats>(m, "RoundStats")
+        .def(py::init<>())
+        .def_readonly("round", &RoundStats::round)
+        .def_readonly("scenes_generated", &RoundStats::scenes_generated)
+        .def_readonly("scenes_valid", &RoundStats::scenes_valid)
+        .def_readonly("task_candidates", &RoundStats::task_candidates)
+        .def_readonly("cheap_rejected", &RoundStats::cheap_rejected)
+        .def_readonly("preflight_attempted", &RoundStats::preflight_attempted)
+        .def_readonly("preflight_success", &RoundStats::preflight_success)
+        .def_readonly("selected_pool", &RoundStats::selected_pool)
+        .def_readonly("elapsed_ms", &RoundStats::elapsed_ms)
+        .def_readonly("preflight_avg_ms", &RoundStats::preflight_avg_ms)
+        .def_readonly("remaining_deficits", &RoundStats::remaining_deficits);
+
     py::class_<BlueprintResult>(m, "BlueprintResult")
         .def(py::init<>())
         .def_readonly("generation_ok", &BlueprintResult::generation_ok)
@@ -832,7 +906,28 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readonly("timing_ms", &BlueprintResult::timing_ms)
         .def_readonly("selected_scene_ids", &BlueprintResult::selected_scene_ids)
         .def_readonly("hard_minimums_met", &BlueprintResult::hard_minimums_met)
-        .def_readonly("soft_targets_met", &BlueprintResult::soft_targets_met);
+        .def_readonly("soft_targets_met", &BlueprintResult::soft_targets_met)
+        .def_readonly("preflight_attempt_count",
+                      &BlueprintResult::preflight_attempt_count)
+        .def_readonly("preflight_success_count",
+                      &BlueprintResult::preflight_success_count)
+        .def_readonly("preflight_failure_count",
+                      &BlueprintResult::preflight_failure_count)
+        .def_readonly("total_preflight_ticks",
+                      &BlueprintResult::total_preflight_ticks)
+        .def_readonly("full_preflight_attempted",
+                      &BlueprintResult::full_preflight_attempted)
+        .def_readonly("full_preflight_success",
+                      &BlueprintResult::full_preflight_success)
+        .def_readonly("selected_scene_count",
+                      &BlueprintResult::selected_scene_count)
+        .def_readonly("preflight_acceptance_ratio",
+                      &BlueprintResult::preflight_acceptance_ratio)
+        .def_readonly("selected_per_preflight_ratio",
+                      &BlueprintResult::selected_per_preflight_ratio)
+        .def_readonly("budget_exhausted_reason",
+                      &BlueprintResult::budget_exhausted_reason)
+        .def_readonly("round_logs", &BlueprintResult::round_logs);
 
     // ── TruthCylinderAudit (exact cylinder swept audit, judge-only) ─
     py::class_<TruthCylinderAudit>(m, "TruthCylinderAudit")

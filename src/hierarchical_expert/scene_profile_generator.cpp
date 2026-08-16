@@ -74,7 +74,9 @@ inline void fillLegacySceneClasses(BlueprintScene& scene,
 SceneProfileGenerator::SceneProfileGenerator(
     const BlueprintGenerationConfig& cfg)
     : cfg_(cfg) {
-    buildDefaultCatalog();
+    if (cfg_.use_profile_catalog) {
+        buildDefaultCatalog();
+    }
     if (!cfg_.profiles.empty()) {
         // User-provided profiles are appended / override by name.
         for (const auto& up : cfg_.profiles) {
@@ -89,6 +91,8 @@ SceneProfileGenerator::SceneProfileGenerator(
             if (!replaced) profiles_.push_back(up);
         }
     }
+    // With use_profile_catalog=false AND no explicit profiles there is
+    // nothing to generate — the controller reports a clear failure.
 }
 
 void SceneProfileGenerator::buildDefaultCatalog() {
@@ -255,10 +259,42 @@ bool SceneProfileGenerator::realizeStructured(
     BlueprintScene sc;
     sc.obstacles = out;  // seed with what we already have
 
-    int attempts = 0;
-    const int budget = std::max(1000, cfg.max_scene_generation_attempts * 40);
+    // ── FIXED scene-structure parameters (drawn ONCE per realization) ──
+    // Orientation is shared by EVERY obstacle of this scene (a corridor /
+    // bottleneck / chicane never mixes horizontal and vertical layouts).
+    const bool horizontal = rng.uniformInt(0, 1) == 0;
     const double cx = (wh.free_min_x + wh.free_max_x) * 0.5;
     const double cy = (wh.free_min_y + wh.free_max_y) * 0.5;
+    // Along / cross axis ranges for the chosen orientation.
+    const double along_lo = (horizontal ? wh.free_min_x : wh.free_min_y) + m;
+    const double along_hi = (horizontal ? wh.free_max_x : wh.free_max_y) - m;
+    const double cross_lo = (horizontal ? wh.free_min_y : wh.free_min_x) + m;
+    const double cross_hi = (horizontal ? wh.free_max_y : wh.free_max_x) - m;
+    const double cross_mid = (cross_lo + cross_hi) * 0.5;
+
+    // Fixed cluster centres (CLUSTERED): generated once, every obstacle
+    // samples around one of THEM (real clustering).
+    std::vector<Vec2d> cluster_centers;
+    if (profile.structure == SceneStructure::CLUSTERED) {
+        const int nc = std::max(1, profile.cluster_count);
+        cluster_centers.reserve(static_cast<size_t>(nc));
+        for (int i = 0; i < nc; ++i) {
+            double ccx = rng.uniform(wh.free_min_x + 5.0, wh.free_max_x - 5.0);
+            double ccy = rng.uniform(wh.free_min_y + 5.0, wh.free_max_y - 5.0);
+            cluster_centers.emplace_back(ccx, ccy);
+        }
+    }
+    // Bottleneck narrowing centre along the axis (fraction of the range).
+    const double bottleneck_frac = rng.uniform(0.35, 0.65);
+
+    // Per-side last along position (guarantees same-side surface gap by
+    // construction; opposite-side obstacles are separated by the passage).
+    double last_along[2] = {-1e18, -1e18};
+    double last_radius[2] = {0.0, 0.0};
+    auto sideIndex = [](int side) { return side > 0 ? 0 : 1; };
+
+    int attempts = 0;
+    const int budget = std::max(1500, cfg.max_scene_generation_attempts * 60);
 
     while (static_cast<int>(sc.obstacles.size()) < desired &&
            attempts < budget) {
@@ -269,69 +305,83 @@ bool SceneProfileGenerator::realizeStructured(
 
         double x = 0.0, y = 0.0;
         bool candidate = false;
+        int cand_side = -1;
+        double cand_along = 0.0;
+        bool cand_spacing_update = false;
         switch (profile.structure) {
             case SceneStructure::CLUSTERED: {
-                // Obstacles cluster around a small number of cluster
-                // centres (also recorded in the metadata).
-                const int nc = std::max(1, profile.cluster_count);
-                const int ci = rng.uniformInt(0, nc - 1);
-                const double ccx = rng.uniform(wh.free_min_x + 3.0, wh.free_max_x - 3.0);
-                const double ccy = rng.uniform(wh.free_min_y + 3.0, wh.free_max_y - 3.0);
+                const int ci = rng.uniformInt(
+                    0, static_cast<int>(cluster_centers.size()) - 1);
+                const Vec2d& cc = cluster_centers[static_cast<size_t>(ci)];
                 const double spread = std::max(1.0, profile.cluster_spread_m);
                 const double a = rng.uniform(0.0, 2.0 * M_PI);
                 const double rad = spread * std::sqrt(rng.uniform(0.0, 1.0));
-                x = ccx + rad * std::cos(a);
-                y = ccy + rad * std::sin(a);
+                x = cc.x() + rad * std::cos(a);
+                y = cc.y() + rad * std::sin(a);
                 candidate = true;
                 break;
             }
             case SceneStructure::CORRIDOR:
             case SceneStructure::BOTTLENECK: {
-                // Vertical or horizontal corridor: obstacles live in the two
-                // side bands; the central passage of width `passage` is kept
-                // obstacle-free.
-                const bool horizontal = (rng() & 1) == 0;
+                // Obstacles live in the two side bands; the central passage
+                // of width `passage` is kept obstacle-free.  BOTTLENECK
+                // pinches the cross offset near `bottleneck_frac`.
+                const int side = rng.uniformInt(0, 1) == 0 ? -1 : 1;
+                const double along = rng.uniform(along_lo + r, along_hi - r);
+                const int si = sideIndex(side);
+                if (last_along[si] > -1e17 &&
+                    along - last_along[si] < gap + last_radius[si] + r) {
+                    continue;  // same-side spacing violated: retry
+                }
+                // Cross offset from the axis (positive magnitude).
+                double cross_off = passage * 0.5 + r + 0.4;  // wide band
+                if (profile.structure == SceneStructure::BOTTLENECK) {
+                    const double frac = (along - along_lo) /
+                                        std::max(1.0, along_hi - along_lo);
+                    // Gaussian pinch near bottleneck_frac: narrowest there.
+                    const double d = (frac - bottleneck_frac) / 0.20;
+                    const double closeness = std::exp(-d * d);
+                    cross_off = passage * 0.5 + r +
+                                (0.4 - 0.55 * closeness);  // pinch -> +0.4-0.55
+                }
+                const double cross = cross_mid + static_cast<double>(side) * cross_off;
                 if (horizontal) {
-                    const double x_band = rng.uniform(0.0, 1.0) < 0.5
-                                              ? wh.free_min_x + m
-                                              : wh.free_max_x - m;
-                    x = x_band < cx ? rng.uniform(wh.free_min_x + m + r,
-                                                  cx - passage * 0.5 - r)
-                                    : rng.uniform(cx + passage * 0.5 + r,
-                                                  wh.free_max_x - m - r);
-                    y = rng.uniform(wh.free_min_y + m + r, wh.free_max_y - m - r);
+                    x = along;
+                    y = cross;
                 } else {
-                    const double y_band = rng.uniform(0.0, 1.0) < 0.5
-                                              ? wh.free_min_y + m
-                                              : wh.free_max_y - m;
-                    y = y_band < cy ? rng.uniform(wh.free_min_y + m + r,
-                                                  cy - passage * 0.5 - r)
-                                    : rng.uniform(cy + passage * 0.5 + r,
-                                                  wh.free_max_y - m - r);
-                    x = rng.uniform(wh.free_min_x + m + r, wh.free_max_x - m - r);
+                    y = along;
+                    x = cross;
                 }
                 candidate = true;
+                cand_side = si;
+                cand_along = along;
+                cand_spacing_update = true;
                 break;
             }
             case SceneStructure::CHICANE: {
-                // Zig-zag around a centre line: alternate lateral offsets.
-                const bool horizontal = (rng() & 1) == 0;
-                const double along = rng.uniform(wh.free_min_x + m + 1.0,
-                                                 wh.free_max_x - m - 1.0);
-                const double off = (static_cast<int>(sc.obstacles.size()) % 2 == 0)
-                                       ? -1.0
-                                       : 1.0;
+                // Zig-zag: monotonic along progress + deterministic side
+                // alternation (+/-/+/-) around the cross centre.
+                const double along_lo_use =
+                    sc.obstacles.empty()
+                        ? along_lo + r
+                        : std::max(along_lo + r,
+                                   last_along[0] + gap + last_radius[0] + r);
+                if (along_lo_use > along_hi - r - 1e-9) break;  // exhausted
+                const double along = rng.uniform(along_lo_use, along_hi - r);
+                const double off =
+                    (static_cast<int>(sc.obstacles.size()) % 2 == 0) ? -1.0 : 1.0;
                 const double lat = off * (passage * 0.5 + r + 0.4);
                 if (horizontal) {
                     x = along;
-                    y = clamp(cy + lat, wh.free_min_y + m + r,
-                              wh.free_max_y - m - r);
+                    y = clamp(cross_mid + lat, cross_lo + r, cross_hi - r);
                 } else {
                     y = along;
-                    x = clamp(cx + lat, wh.free_min_x + m + r,
-                              wh.free_max_x - m - r);
+                    x = clamp(cross_mid + lat, cross_lo + r, cross_hi - r);
                 }
                 candidate = true;
+                cand_side = 0;
+                cand_along = along;
+                cand_spacing_update = true;
                 break;
             }
             case SceneStructure::CENTRAL_BLOCKER: {
@@ -372,6 +422,12 @@ bool SceneProfileGenerator::realizeStructured(
         if (!candidate || !std::isfinite(x) || !std::isfinite(y)) continue;
         if (!placementValid(sc, x, y, r, cfg)) continue;
         addObstacle(sc, x, y, r, cfg.obstacle_height_m);
+        // Update the per-side spacing hint only AFTER a successful
+        // placement (failed candidates never pollute the spacing state).
+        if (cand_spacing_update) {
+            last_along[cand_side] = cand_along;
+            last_radius[cand_side] = r;
+        }
     }
 
     if (static_cast<int>(sc.obstacles.size()) != desired) {
@@ -381,6 +437,130 @@ bool SceneProfileGenerator::realizeStructured(
     out = std::move(sc.obstacles);
     placed = desired;
     return true;
+}
+
+bool SceneProfileGenerator::validateProfileStructure(
+    const SceneProfile& profile, const BlueprintGenerationConfig& cfg,
+    const BlueprintScene& scene, std::string& reason) const {
+    const WarehouseGeometry& wh = cfg.warehouse;
+    const double cx = (wh.free_min_x + wh.free_max_x) * 0.5;
+    const double cy = (wh.free_min_y + wh.free_max_y) * 0.5;
+    const double free_clr = cfg.free_cell_surface_clearance_m;
+
+    switch (profile.structure) {
+        case SceneStructure::CLUSTERED: {
+            // A single cluster centre is not a "clustered" profile.
+            if (profile.cluster_count < 2) {
+                reason = "clustered profile needs >= 2 cluster centres";
+                return false;
+            }
+            // Realized obstacle count must make clustering meaningful.
+            if (static_cast<int>(scene.obstacles.size()) < 4) {
+                reason = "clustered scene too small to be meaningful";
+                return false;
+            }
+            return true;
+        }
+        case SceneStructure::CORRIDOR:
+        case SceneStructure::BOTTLENECK: {
+            // The free channel along the cross centre must exist: sample
+            // points along the axis middle line and verify they clear every
+            // obstacle surface by at least the free-cell clearance.
+            // Determine orientation from the realized obstacle spread.
+            double minx = std::numeric_limits<double>::infinity(),
+                   maxx = -std::numeric_limits<double>::infinity();
+            double miny = std::numeric_limits<double>::infinity(),
+                   maxy = -std::numeric_limits<double>::infinity();
+            for (const auto& o : scene.obstacles) {
+                minx = std::min(minx, o.x);
+                maxx = std::max(maxx, o.x);
+                miny = std::min(miny, o.y);
+                maxy = std::max(maxy, o.y);
+            }
+            // Dominant axis = the one with larger extent.
+            const bool horiz = (maxx - minx) >= (maxy - miny);
+            const double lo = horiz ? wh.free_min_x : wh.free_min_y;
+            const double hi = horiz ? wh.free_max_x : wh.free_max_y;
+            const int n = 24;
+            for (int i = 0; i <= n; ++i) {
+                const double t = static_cast<double>(i) / n;
+                const double along = lo + 0.5 + t * (hi - lo - 1.0);
+                double px = horiz ? along : cx;
+                double py = horiz ? cy : along;
+                for (const auto& o : scene.obstacles) {
+                    if (std::hypot(px - o.x, py - o.y) <
+                        o.radius + free_clr + 1e-6) {
+                        reason = "corridor centre-line blocked";
+                        return false;
+                    }
+                }
+            }
+            if (profile.structure == SceneStructure::BOTTLENECK) {
+                // The narrowest obstacle-pair gap must still satisfy the
+                // planner-required passage (never degenerate).
+                double narrowest = std::numeric_limits<double>::infinity();
+                double widest = 0.0;
+                for (size_t i = 0; i < scene.obstacles.size(); ++i) {
+                    for (size_t j = i + 1; j < scene.obstacles.size(); ++j) {
+                        const double g =
+                            std::hypot(scene.obstacles[i].x - scene.obstacles[j].x,
+                                       scene.obstacles[i].y - scene.obstacles[j].y) -
+                            scene.obstacles[i].radius - scene.obstacles[j].radius;
+                        narrowest = std::min(narrowest, g);
+                        widest = std::max(widest, g);
+                    }
+                }
+                if (narrowest < cfg.plannerRequiredPassage() - 1e-6) {
+                    reason = "bottleneck narrower than planner passage";
+                    return false;
+                }
+                // A real bottleneck must be locally narrower than the rest.
+                if (widest - narrowest < 0.3) {
+                    reason = "bottleneck lacks local narrowing";
+                    return false;
+                }
+            }
+            return true;
+        }
+        case SceneStructure::CHICANE: {
+            // Obstacle lateral offsets (cross sign) must alternate at least
+            // twice along the monotonic axis (a real S-path).
+            if (scene.obstacles.size() < 4) {
+                reason = "chicane needs >= 4 obstacles";
+                return false;
+            }
+            int flips = 0;
+            double prev_signed = 0.0;
+            for (size_t i = 0; i < scene.obstacles.size(); ++i) {
+                const double signed_off = scene.obstacles[i].y - cy;
+                if (i == 0) {
+                    prev_signed = signed_off;
+                    continue;
+                }
+                if (prev_signed * signed_off < 0.0) ++flips;
+                prev_signed = signed_off;
+            }
+            if (flips < 2) {
+                reason = "chicane lacks left/right alternation (flips=" +
+                         std::to_string(flips) + ")";
+                return false;
+            }
+            return true;
+        }
+        case SceneStructure::CENTRAL_BLOCKER: {
+            // A large blocker must not fully seal the region: keep at least
+            // min_main_component_area_m2 of free space (checked later by
+            // SceneGeometryCache), and require the blocker to be inside the
+            // generation bounds (already guaranteed by placement).
+            if (scene.obstacles.empty()) {
+                reason = "central_blocker realized empty";
+                return false;
+            }
+            return true;
+        }
+        default:
+            return true;
+    }
 }
 
 SceneMetadata SceneProfileGenerator::computeMetadata(
@@ -509,6 +689,18 @@ SceneGenerationOutcome SceneProfileGenerator::generate(
                     }
                 }
                 if (!valid) break;
+            }
+            if (valid) {
+                // ── profile-structure sanity check: a realization must
+                //    actually look like its own profile (corridor free
+                //    channel, bottleneck narrowing, chicane alternation).
+                //    Reject non-conforming realizations and retry. ──
+                std::string s_reason;
+                if (!validateProfileStructure(profile, cfg_, out.scene,
+                                              s_reason)) {
+                    valid = false;
+                    reason = "structure_sanity:" + s_reason;
+                }
             }
             if (valid) {
                 out.scene.generation_valid = true;

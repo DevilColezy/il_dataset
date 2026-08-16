@@ -1,5 +1,7 @@
 #include "il_dataset/hierarchical_expert/depth_proxy_evaluator.hpp"
 
+#include "il_dataset/hierarchical_expert/ray_cast_2d.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -7,31 +9,10 @@
 namespace il_dataset {
 namespace expert {
 
-namespace {
-
-/// Analytic ray-circle intersection: nearest positive t along the ray
-/// (origin o, unit direction d) to a circle (centre c, radius r).
-/// Returns +inf when the ray misses the circle.
-inline double rayCircleHit(const Vec2d& o, const Vec2d& d, const Vec2d& c,
-                           double r) {
-    const Vec2d oc = o - c;
-    const double b = 2.0 * d.dot(oc);
-    const double cc = oc.squaredNorm() - r * r;
-    const double disc = b * b - 4.0 * cc;
-    if (disc < 0.0) return std::numeric_limits<double>::infinity();
-    const double sq = std::sqrt(disc);
-    const double t0 = (-b - sq) * 0.5;
-    const double t1 = (-b + sq) * 0.5;
-    if (t0 > 1e-9) return t0;
-    if (t1 > 1e-9) return t1;
-    return std::numeric_limits<double>::infinity();
-}
-
-}  // namespace
-
 DepthProxySample DepthProxyEvaluator::castAt(
     const Vec2d& pos_expert, double yaw_expert,
-    const std::vector<BlueprintObstacle>& obstacles) const {
+    const std::vector<BlueprintObstacle>& obstacles, bool has_wall,
+    const Vec2d& wall_min, const Vec2d& wall_max) const {
     DepthProxySample s;
     const double range = cfg_.depth_far_max_m;
     const double near_max = cfg_.depth_near_max_m;
@@ -46,6 +27,16 @@ DepthProxySample DepthProxyEvaluator::castAt(
     CameraRig2D rig(p_, pos, q);
     const Vec2d cam(rig.worldX(), rig.worldY());
 
+    // Pre-extract circle geometry for the shared analytic ray helper.
+    std::vector<Vec2d> centers;
+    std::vector<double> radii;
+    centers.reserve(obstacles.size());
+    radii.reserve(obstacles.size());
+    for (const auto& o : obstacles) {
+        centers.emplace_back(o.x, o.y);
+        radii.push_back(o.radius);
+    }
+
     s.total_rays = static_cast<uint64_t>(n_rays);
     int consecutive = 0, max_consecutive = 0;
 
@@ -58,11 +49,8 @@ DepthProxySample DepthProxyEvaluator::castAt(
         rig.rayWorldDirXY(bearing, dir_world);
         const Vec2d d(dir_world[0], dir_world[1]);
 
-        double hit = std::numeric_limits<double>::infinity();
-        for (const auto& o : obstacles) {
-            const double t = rayCircleHit(cam, d, Vec2d(o.x, o.y), o.radius);
-            hit = std::min(hit, t);
-        }
+        const double hit = rayNearestObstacleHit(
+            cam, d, centers, radii, has_wall, wall_min, wall_max);
         if (hit > range) {
             ++s.free_count;
             consecutive = 0;
