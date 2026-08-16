@@ -90,6 +90,13 @@ struct ExpertStepOutput {
     double target_bearing_error_deg = 0.0;
     uint32_t consecutive_failures_30hz = 0;
     uint32_t unknown_recovery_ticks = 0;
+    // ── 30 Hz candidate-rejection breakdown (diagnostic) ───────────
+    uint32_t reject_not_known_free = 0;
+    uint32_t reject_outside_current_fov = 0;
+    uint32_t reject_observed_clearance_too_small = 0;
+    uint32_t reject_no_progress = 0;
+    uint32_t reject_insufficient_braking_clearance = 0;
+    uint32_t reject_other = 0;
 
     // ── 5 Hz labels (valid on macro_update_mask == 1; zero-order held
     //    on the other frames) ───────────────────────────────────────

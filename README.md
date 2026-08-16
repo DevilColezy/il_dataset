@@ -246,9 +246,17 @@ MULTI_OBSTACLE > LOCAL_AVOIDANCE > OFFSET_AVOIDANCE > CLEAR**, where
   (>= `min_chicane_alternations` flips; a `+ - + -` sequence is a chicane,
   a `+ + - -` sequence is not, even though both left and right obstacles
   exist);
-- NARROW_BUT_PLANNABLE = an ACCEPTED qualified route actually traverses a
+- NARROW_BUT_PLANNABLE = an ACCEPTED route actually traverses a
   planner-compatible narrow passage (`route_traverses_narrow` +
-  `narrow_passage_id`), never mere proximity of the straight segment;
+  `narrow_passage_id`), never mere proximity of the straight segment.  The
+  evidence covers BOTH the direct start->goal path of a straight-clear task
+  (gap just above the planner minimum, centreline clearance ~0.65..0.70 m:
+  the fast path records the traversal without running any side A*) and the
+  LEFT/RIGHT route of a blocked task.  `straight_corridor_clear=true` and
+  NARROW are NOT contradictory — the former says "no detour needed", the
+  latter "the passage clearance is near the planner minimum" — and NARROW
+  is decided BEFORE the straight-clear CLEAR return (priority rule), so a
+  planner-compatible bottleneck is never downgraded to CLEAR;
 - LONG_DETOUR = the CORE criterion is `privileged_min_route_stretch >=
   min_route_stretch_for_long_detour` (min feasible route / straight
   distance), independent of the straight distance itself;

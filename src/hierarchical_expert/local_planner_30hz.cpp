@@ -899,7 +899,9 @@ bool LocalPlanner30Hz::evaluateCandidate(LocalPlannerCandidate& c,
     // ── NOMINAL rollout (v5): limit at target capture / target-plane
     //    crossing / closest-approach-then-recede.  Obstacles behind a near
     //    target must never enter the prediction. ─────────────────────
-    auto limitTrajectoryAtTarget = [&](const Trajectory2D& full) {
+    auto limitTrajectoryAtTarget = [&](const Trajectory2D& full,
+                                       bool* captured_at_goal) {
+        if (captured_at_goal) *captured_at_goal = false;
         if (!full.valid || full.points.size() < 2) return full;
 
         const double goal_tol = std::max(1e-6, p_.task_goal_tolerance);
@@ -940,6 +942,7 @@ bool LocalPlanner30Hz::evaluateCandidate(LocalPlannerCandidate& c,
                 stop_index = closest_index;
             }
         }
+        if (captured_at_goal) *captured_at_goal = explicit_stop;
         if (stop_index + 1 >= full.points.size()) return full;
 
         Trajectory2D limited;
@@ -955,7 +958,8 @@ bool LocalPlanner30Hz::evaluateCandidate(LocalPlannerCandidate& c,
         return limited;
     };
 
-    c.traj = limitTrajectoryAtTarget(c.traj);
+    bool captured_at_goal = false;
+    c.traj = limitTrajectoryAtTarget(c.traj, &captured_at_goal);
     c.nominal_traj = c.traj;
     std::vector<Vec2d> occ_cells;
     collectOccupiedCells(c.traj, obs, occ_cells);
@@ -1093,7 +1097,14 @@ bool LocalPlanner30Hz::evaluateCandidate(LocalPlannerCandidate& c,
     const size_t min_prefix_steps = std::max<size_t>(
         1, static_cast<size_t>(std::ceil(
                p_.lp_min_executable_prefix_s / std::max(1e-6, p_.lp_dt))));
-    if (prefix_last < min_prefix_steps) {
+    // A candidate truncated by GOAL CAPTURE (the trajectory reaches the
+    // goal-tolerance sphere) legitimately has a short prefix: the drone is
+    // converging onto the target.  Without this exemption every forward
+    // candidate near the goal collapses to one segment and is rejected as
+    // "no_usable_prefix", leaving only the stationary candidate -> the
+    // drone stalls a few cm short of the goal (blueprint stall=52 at
+    // dgoal=0.41 vs goal_tolerance=0.40).
+    if (prefix_last < min_prefix_steps && !captured_at_goal) {
         reject_reason = first_fail.empty() ? "no_usable_prefix" : first_fail;
         reject_enum = first_fail.empty() ? CandidateRejectReason::OTHER
                                          : first_fail_enum;

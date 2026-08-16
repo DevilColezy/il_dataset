@@ -118,6 +118,16 @@ class Flightmare2DObservation {
 public:
     explicit Flightmare2DObservation(const Params2D& p) : p_(p) {}
 
+    /// Default-constructible: `HierarchicalExpert` (pybind `py::init<>()`
+    /// + `configure(...)`) and `PreflightSimulator::expert_()` both use
+    /// the "default-construct, then configure(params)" lifecycle, which
+    /// REQUIRES this default ctor (HierarchicalExpert() is otherwise
+    /// implicitly deleted because p_ cannot be default-initialised).
+    /// Holds a default Params2D until configure() assigns the real one;
+    /// build()/buildFromRays() must not be called before that (the
+    /// configured_ guard in HierarchicalExpert enforces this).
+    Flightmare2DObservation() = default;
+
     /// Build a three-state current-patch LocalObservation from a depth
     /// frame (HxW, float32, metres — 0 / NaN / inf treated as no return).
     ///

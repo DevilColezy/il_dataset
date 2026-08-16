@@ -132,9 +132,16 @@ void SceneProfileGenerator::buildDefaultCatalog() {
     add("mixed_small_large", 4,  10,  0.30, 5.00, "log_uniform", 2.0, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.0, {"mixed", "blocker"});
     add("mixed_all",         8,  18,  0.10, 5.00, "log_uniform", 2.0, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.0, {"mixed", "blocker"});
     add("clustered",        10,  20,  0.20, 0.80, "log_uniform", 0.4, SceneStructure::CLUSTERED, 3, 4.0, 0.0, 1.0, {"clustered"});
-    add("corridor",          6,  12,  0.50, 1.50, "log_uniform", 1.0, SceneStructure::CORRIDOR, 0, 0.0, 2.2, 1.0, {"corridor", "narrow"});
+    // corridor/chicane counts are GEOMETRICALLY feasible: every obstacle
+    // sits on one of the two corridor side bands (or a single monotonic
+    // chicane line) with at least min_surface_gap (1.4 m) surface spacing
+    // inside a ~13 m along window.  Corridor uses TWO interleaved side
+    // bands so 4-8 fit; a chicane is a SINGLE line whose consecutive
+    // obstacles must be >= 1.4 + r_prev + r apart along the axis, so only
+    // 4-5 are robustly placeable (6 would need every radius ~0.4).
+    add("corridor",          4,   8,  0.50, 1.50, "log_uniform", 1.0, SceneStructure::CORRIDOR, 0, 0.0, 2.2, 1.0, {"corridor", "narrow"});
     add("bottleneck",        4,   8,  0.80, 2.50, "log_uniform", 1.6, SceneStructure::BOTTLENECK, 0, 0.0, 1.8, 1.0, {"narrow", "blocker"});
-    add("chicane",           6,  12,  0.40, 1.20, "log_uniform", 0.8, SceneStructure::CHICANE, 0, 0.0, 2.4, 1.0, {"narrow", "chicane"});
+    add("chicane",           4,   5,  0.40, 1.20, "log_uniform", 0.8, SceneStructure::CHICANE, 0, 0.0, 2.4, 1.0, {"narrow", "chicane"});
     add("central_blocker",   1,   4,  2.50, 6.00, "log_uniform", 4.0, SceneStructure::CENTRAL_BLOCKER, 0, 0.0, 0.0, 1.0, {"blocker", "large"});
     add("edge_clutter",      8,  16,  0.30, 1.20, "log_uniform", 0.7, SceneStructure::EDGE_CLUTTER, 0, 0.0, 0.0, 1.0, {"edge"});
 }
@@ -261,11 +268,20 @@ bool SceneProfileGenerator::realizeStructured(
     orientation_out = StructureOrientation::NONE;
 
     // ── FIXED scene-structure parameters (drawn ONCE per realization) ──
-    // Orientation is shared by EVERY obstacle of this scene (a corridor /
-    // bottleneck / chicane never mixes horizontal and vertical layouts).
-    const bool horizontal = rng.uniformInt(0, 1) == 0;
-    orientation_out = horizontal ? StructureOrientation::HORIZONTAL
-                                 : StructureOrientation::VERTICAL;
+    // Orientation is shared by EVERY obstacle of a DIRECTIONAL scene (a
+    // corridor / bottleneck / chicane never mixes horizontal and vertical
+    // layouts).  Non-directional structures (central blocker / clusters /
+    // edge clutter) record NONE — an H/V label would be meaningless and
+    // the metadata must not claim a direction that was never realised.
+    const bool directional =
+        profile.structure == SceneStructure::CORRIDOR ||
+        profile.structure == SceneStructure::BOTTLENECK ||
+        profile.structure == SceneStructure::CHICANE;
+    const bool horizontal = directional ? (rng.uniformInt(0, 1) == 0) : true;
+    if (directional) {
+        orientation_out = horizontal ? StructureOrientation::HORIZONTAL
+                                     : StructureOrientation::VERTICAL;
+    }
     const double cx = (wh.free_min_x + wh.free_max_x) * 0.5;
     const double cy = (wh.free_min_y + wh.free_max_y) * 0.5;
     // Along / cross axis ranges for the chosen orientation.

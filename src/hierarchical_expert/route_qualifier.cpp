@@ -19,13 +19,11 @@ const int kDj[8] = {0, 1, 1, 1, 0, -1, -1, -1};
 const double kW[8] = {1.0, M_SQRT2, 1.0, M_SQRT2,
                       1.0, M_SQRT2, 1.0, M_SQRT2};
 
-inline double cross2(const Vec2d& a, const Vec2d& b) {
-    return a.x() * b.y() - a.y() * b.x();
-}
-inline Vec2d rot2(const Vec2d& v, double a) {
-    const double c = std::cos(a), s = std::sin(a);
-    return Vec2d(c * v.x() - s * v.y(), s * v.x() + c * v.y());
-}
+// NOTE: cross2()/rot2() are NOT redefined here — the canonical versions
+// live in types.hpp (namespace il_dataset::expert) and are already visible
+// through route_qualifier.hpp.  Duplicating them in this anonymous
+// namespace makes every call ambiguous under GCC (two identical overloads
+// found by unqualified lookup).
 
 }  // namespace
 
@@ -35,6 +33,7 @@ inline Vec2d rot2(const Vec2d& v, double a) {
 void TaskRouteQualifier::configure(const BlueprintScene& scene,
                                    const SceneGeometryCache& geo,
                                    const BlueprintGenerationConfig& cfg) {
+    (void)scene;  // all geometry is read from the cache (geo)
     cfg_ = cfg;
     min_ = cfg.warehouse.freeMin();
     max_ = cfg.warehouse.freeMax();
@@ -432,6 +431,7 @@ bool TaskRouteQualifier::passesBlockerOnSide(
     const Vec2d& side_axis, const Vec2d& side_center,
     const Vec2d& blocker_center, double blocker_radius, bool left_side,
     const std::vector<Vec2d>& path) const {
+    (void)blocker_center;  // the reference centre is side_center (same value)
     if (path.empty()) return true;
     const double axis_len = std::max(1e-6, side_axis.norm());
     const double tol = cfg_.qualification.homotopy_side_tolerance_m;
@@ -834,8 +834,24 @@ void TaskRouteQualifier::qualify(const Vec2d& start, const Vec2d& goal,
                             blocker_radius, blocking_ids);
     out.straight_corridor_clear = !blocked;
     if (!blocked) {
-        // Direct route-clear corridor: no side search needed.
+        // Direct route-clear corridor: NO side search (fast path).  The
+        // direct start->goal path may still thread a REGISTERED narrow
+        // passage whose gap is just above the planner minimum (clearance
+        // ~0.65..0.70 m): record that evidence so the realized class is
+        // NARROW_BUT_PLANNABLE instead of CLEAR.  This is a cheap
+        // O(#passages) polyline check — NO A*, NO side A*, NO budget.
         out.qualification_class = "clear";
+        if (!narrow_passages_.empty()) {
+            const std::vector<Vec2d> direct_path = {start, goal};
+            for (size_t pi = 0; pi < narrow_passages_.size(); ++pi) {
+                if (routeTraversesNarrowPassage(direct_path,
+                                                narrow_passages_[pi])) {
+                    out.route_traverses_narrow = true;
+                    out.narrow_passage_id = static_cast<int>(pi);
+                    break;
+                }
+            }
+        }
         out.accepted = true;
         ++counters.straight_clear;
         ++counters.accepted;

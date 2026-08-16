@@ -710,7 +710,9 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                      throw std::invalid_argument(
                          "min_bounds/max_bounds need 2 elements");
                  }
-                 self.configure(Vec2d(min_bounds[0], min_bounds[1]),
+                 // configure(params, min_bounds, max_bounds) — the params
+                 // are required (they drive the FSM / observation builder).
+                 self.configure(p, Vec2d(min_bounds[0], min_bounds[1]),
                                 Vec2d(max_bounds[0], max_bounds[1]));
              },
              py::arg("params"), py::arg("min_bounds"), py::arg("max_bounds"))

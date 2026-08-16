@@ -111,8 +111,10 @@ LocalObservation PreflightSimulator::synthesizePatch(uint64_t tick) {
         ray_seen_[static_cast<size_t>(i)] = true;  // valid return
     }
 
-    return obs_builder_.buildFromRays(ray_hit_, ray_seen_, pos, q,
-                                      min_bounds_, tick);
+    LocalObservation patch = obs_builder_.buildFromRays(
+        ray_hit_, ray_seen_, pos, q, min_bounds_, tick);
+
+    return patch;
 }
 
 bool PreflightSimulator::segmentCrossesBounds(double x0, double y0, double x1,

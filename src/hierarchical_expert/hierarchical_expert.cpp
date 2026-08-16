@@ -167,6 +167,16 @@ void HierarchicalExpert::fillOutput(ExpertStepOutput& out,
     out.target_bearing_error_deg = fsm_out.local.target_bearing_error_deg;
     out.consecutive_failures_30hz = fsm_out.consecutive_failures_30hz;
     out.unknown_recovery_ticks = fsm_out.unknown_recovery_ticks;
+    // ── 30 Hz candidate-rejection breakdown (diagnostic) ───────────
+    out.reject_not_known_free = fsm_out.local.reject_not_known_free;
+    out.reject_outside_current_fov =
+        fsm_out.local.reject_outside_current_fov;
+    out.reject_observed_clearance_too_small =
+        fsm_out.local.reject_observed_clearance_too_small;
+    out.reject_no_progress = fsm_out.local.reject_no_progress;
+    out.reject_insufficient_braking_clearance =
+        fsm_out.local.reject_insufficient_braking_clearance;
+    out.reject_other = fsm_out.local.reject_other;
 
     // ── 5 Hz labels (ZOH between 5 Hz boundaries) ──────────────────
     if (out.macro_update_mask) {
@@ -284,6 +294,7 @@ ExpertStepOutput HierarchicalExpert::stepFromPatch(
     double flight_z, uint64_t tick, bool collision) {
     flight_z_ = flight_z;
     history_.integrate(current_patch, tick);
+
     FsmInput in{task_, expert_state, current_patch, history_.observation(),
                 tick, collision};
     const FsmStepOutput fsm_out = fsm_.step(in);

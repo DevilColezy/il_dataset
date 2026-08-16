@@ -154,6 +154,7 @@ TaskGeomType TaskCandidateGenerator::classifyQualified(
     const SceneGeometryCache& geo, const BlueprintScene& scene,
     const Vec2d& start, const Vec2d& goal,
     const TaskQualificationSummary& q) const {
+    (void)scene;  // classification is task-geometry driven, never profile
     const Vec2d axis = goal - start;
     const double len = std::max(1e-6, axis.norm());
     const double chw = corridorHalfWidth();
@@ -186,6 +187,29 @@ TaskGeomType TaskCandidateGenerator::classifyQualified(
     // not, even though both left and right obstacles exist.
     const int chicane_flips = countTaskChicaneAlternations(centers, radii,
                                                            start, goal);
+    const double stretch = q.privileged_min_route_stretch;
+    const bool blocker_large =
+        q.primary_blocker_radius >= largeRadiusThreshold();
+
+    // ── Classification priority is EXPLICIT (documented + tested, not an
+    //    implicit if-order side effect):
+    //    CHICANE > NARROW_BUT_PLANNABLE > LONG_DETOUR > LARGE_OCCLUSION >
+    //    MULTI_OBSTACLE > LOCAL_AVOIDANCE > OFFSET_AVOIDANCE > CLEAR ─────
+    // CHICANE and NARROW are decided BEFORE the straight-corridor check:
+    // a direct-clear path that threads a registered narrow passage is
+    // NARROW_BUT_PLANNABLE (the clearance is near the planner minimum),
+    // never CLEAR, and never downgraded to OFFSET/MULTI by nearby count.
+    if (chicane_flips >= std::max(1, cfg_.min_chicane_alternations)) {
+        return TaskGeomType::CHICANE;
+    }
+    // NARROW requires PROOF that an accepted route (direct OR side)
+    // actually traverses a cached narrow passage (set by
+    // TaskRouteQualifier).  Priority NARROW > LARGE_OCCLUSION: a route
+    // squeezed through a narrow gap is NARROW even when the flanking
+    // obstacles are large.
+    if (q.route_traverses_narrow && q.narrow_passage_id >= 0) {
+        return TaskGeomType::NARROW_BUT_PLANNABLE;
+    }
 
     // ── Straight corridor clear at the route qualification clearance ──
     if (q.straight_corridor_clear) {
@@ -199,24 +223,7 @@ TaskGeomType TaskCandidateGenerator::classifyQualified(
         return TaskGeomType::CLEAR;
     }
 
-    // ── Blocked: classification priority is EXPLICIT (documented + tested,
-    //    not an implicit if-order side effect):
-    //    CHICANE > NARROW_BUT_PLANNABLE > LONG_DETOUR > LARGE_OCCLUSION >
-    //    MULTI_OBSTACLE > LOCAL_AVOIDANCE > OFFSET_AVOIDANCE > CLEAR ─────
-    const double stretch = q.privileged_min_route_stretch;
-    const bool blocker_large =
-        q.primary_blocker_radius >= largeRadiusThreshold();
-
-    if (chicane_flips >= std::max(1, cfg_.min_chicane_alternations)) {
-        return TaskGeomType::CHICANE;
-    }
-    // NARROW requires PROOF that an accepted qualified route actually
-    // traverses a cached narrow passage (set by TaskRouteQualifier).
-    // Priority NARROW > LARGE_OCCLUSION: a route squeezed through a narrow
-    // gap is NARROW even when the flanking obstacles are large.
-    if (q.route_traverses_narrow && q.narrow_passage_id >= 0) {
-        return TaskGeomType::NARROW_BUT_PLANNABLE;
-    }
+    // ── Blocked tasks: the remaining priority chain ───────────────────
     // LONG_DETOUR: the CORE criterion is the privileged route stretch
     // (min feasible route / straight distance), independent of whether the
     // straight distance itself is "long".  A 12 m straight with a 20 m
@@ -308,6 +315,7 @@ bool TaskCandidateGenerator::sample(
     const std::vector<double>& yaw_weights, uint64_t seed, uint64_t task_id,
     uint64_t scene_id, BlueprintTask& out, TaskGeomType& geom_out,
     double& yaw_error_signed_deg) const {
+    (void)scene;  // sampling uses the cached geometry (geo) only
     const auto& cells = geo.validCells();
     if (cells.size() < 2) return false;
     Rng rng(seed);

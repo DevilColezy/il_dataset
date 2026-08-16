@@ -46,6 +46,7 @@ double runAnalytic(const std::vector<Vec2d>& centers,
                    const std::vector<double>& radii, const Vec2d& wmin,
                    const Vec2d& wmax, int n_rays, double range,
                    const std::vector<Vec2d>& dirs, const Vec2d& origin) {
+    (void)range;  // analytic ray-circle hit uses the full scene, not a range cap
     const auto t0 = Clock::now();
     for (int i = 0; i < n_rays; ++i) {
         const double hit = rayNearestObstacleHit(origin, dirs[i], centers,
@@ -60,6 +61,8 @@ double runMarch(const std::vector<Vec2d>& centers,
                 const std::vector<double>& radii, const Vec2d& wmin,
                 const Vec2d& wmax, int n_rays, double range,
                 const std::vector<Vec2d>& dirs, const Vec2d& origin) {
+    (void)wmin;
+    (void)wmax;  // marching ray hit is bounded by `range`, not by the walls
     const double step = 0.05;  // obs_resolution * 0.5 (preflight default)
     const auto t0 = Clock::now();
     for (int i = 0; i < n_rays; ++i) {

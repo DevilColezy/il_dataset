@@ -263,9 +263,19 @@ std::vector<DistributionDeficit> computeDeficits(
         d.target = t.target;
         d.minimum = t.minimum;
         d.maximum = t.maximum;
-        d.deficit = std::max(0.0, t.target - achieved);
+        // Balance metrics ("balance:a/b") are IMBALANCE RATIOS
+        // |a-b|/(a+b+1): LOWER is better (0 = perfectly balanced), and
+        // target/minimum are the allowed UPPER bounds.  Treating them as
+        // ordinary "higher is better" counts inverted the deficit: a
+        // perfectly balanced run (e.g. balance:yaw=0.000) was flagged
+        // BELOW_MINIMUM with a large deficit, failing generation_ok even
+        // though every hard quota and the structural balance check passed.
+        const bool is_balance = t.metric.rfind("balance:", 0) == 0;
+        d.deficit = is_balance ? std::max(0.0, achieved - t.target)
+                               : std::max(0.0, t.target - achieved);
         d.excess = std::max(0.0, achieved - t.maximum);
-        d.below_minimum = achieved < t.minimum - 1e-9;
+        d.below_minimum = is_balance ? (achieved > t.minimum + 1e-9)
+                                     : (achieved < t.minimum - 1e-9);
         out.push_back(d);
     }
     return out;

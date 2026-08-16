@@ -57,7 +57,10 @@ def _parse_t_bc(value, errors, name="depth.t_bc"):
     (translation [tx, ty, tz], rotation 3x3 row-major [9 floats]).
 
     Row-major 4x4: translation = column 3 = [m3, m7, m11]; the rotation
-    is the leading 3x3 = m[0:9].  Defaults to the identity rotation +
+    is the leading 3x3 spanning rows 0..2, which SKIPS the 4th column:
+    [m0,m1,m2, m4,m5,m6, m8,m9,m10].  (m[0:9] would wrongly include the
+    4th-column elements m3/m7 and drop m9/m10, turning even the identity
+    matrix into a singular one.)  Defaults to the identity rotation +
     [0, 0, 0.3] forward offset, which MUST match the camera actually sent
     to Unity (il_common.make_depth_vehicle).
     """
@@ -71,7 +74,9 @@ def _parse_t_bc(value, errors, name="depth.t_bc"):
         return [0.0, 0.0, 0.3], [1, 0, 0, 0, 1, 0, 0, 0, 1]
     m = [float(v) for v in value]
     translation = [m[3], m[7], m[11]]
-    rotation = m[0:9]
+    rotation = [m[0], m[1], m[2],
+                m[4], m[5], m[6],
+                m[8], m[9], m[10]]
     return translation, rotation
 
 
@@ -139,6 +144,22 @@ def build_params(global_cfg, errors=None):
         depth_cfg.get("t_bc"), problems, "depth.t_bc")
     p.cam_t_bc_x, p.cam_t_bc_y, p.cam_t_bc_z = _t_bc
     p.cam_r_bc = list(_r_bc)
+    # Defensive: the C++ CameraRig2D assumes cam_r_bc is a proper rotation
+    # (orthonormal, det +1).  A singular / reflected matrix silently
+    # collapses the 2D FOV to a degenerate line (every preflight stalls).
+    # Fail loudly here instead of at runtime.
+    try:
+        ra, rb, rc = _r_bc[0], _r_bc[1], _r_bc[2]
+        rd, re, rf = _r_bc[3], _r_bc[4], _r_bc[5]
+        rg, rh, ri = _r_bc[6], _r_bc[7], _r_bc[8]
+        det = (ra * (re * ri - rf * rh) - rb * (rd * ri - rf * rg) +
+               rc * (rd * rh - re * rg))
+        if not math.isfinite(det) or abs(det - 1.0) > 1e-6:
+            problems.append(
+                "depth.t_bc 3x3 rotation det must be +1 (got %.6f); "
+                "camera FOV would be degenerate" % det)
+    except Exception:
+        pass
 
     # ── local planner (30 Hz) ─────────────────────────────────────
     lp = he.get("local_planner", {}) or {}

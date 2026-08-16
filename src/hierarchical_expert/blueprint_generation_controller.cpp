@@ -86,6 +86,7 @@ BlueprintGenerationController::BlueprintGenerationController(
 bool BlueprintGenerationController::cheapFilterPass(
     const BlueprintScene& scene, const SceneGeometryCache& geo,
     const BlueprintTask& task) const {
+    (void)scene;  // the filter uses the cached geometry (geo) only
     const double r = cfg_.vehicle_radius_m;
     const Vec2d start(task.start_x, task.start_y);
     const Vec2d goal(task.goal_x, task.goal_y);
@@ -193,6 +194,13 @@ bool BlueprintGenerationController::preflightOne(
     uint64_t max_consecutive_active = 0, cur_consecutive_active = 0;
     uint64_t turn_update_frames = 0, normal_update_frames = 0;
     bool saw_turn_left = false, saw_turn_right = false;
+    // P0 stall-fix regression: `prev` (previous-position latch) and
+    // `path_len` (accumulated preflight path length) must be declared
+    // BEFORE the tick loop.  `prev` starts at the task start so the FIRST
+    // step displacement is start->firstState (the stall detector and the
+    // swept collision audit both rely on it).
+    double path_len = 0.0;
+    Vec2d prev = sim.state().position;
 
     // Early-termination bookkeeping (blueprint-only; never changes expert
     // labels): no-progress over a rolling window (OFF by default; when
@@ -773,7 +781,6 @@ BlueprintResult BlueprintGenerationController::generate() {
             const int task_target =
                 std::min(max_tasks_per_scene, remaining_preflight_cap);
             pool_target += static_cast<uint64_t>(task_target);
-            const auto t_task = Clock::now();
             std::vector<BlueprintTask> scene_pool;
             int attempts = 0;
             while (static_cast<int>(scene_pool.size()) < task_target &&
@@ -870,9 +877,10 @@ BlueprintResult BlueprintGenerationController::generate() {
                         continue;  // try another candidate (never the scene)
                     }
                     // Realized geometric class from the qualification
-                    // geometry (not the scene profile alone).
+                    // geometry (not the scene profile alone).  Argument
+                    // order: (geo, scene, start, goal, q).
                     const TaskGeomType realized = task_gen_.classifyQualified(
-                        out.scene, geo, t_start, t_goal, q);
+                        geo, out.scene, t_start, t_goal, q);
                     task.geom_type = taskGeomTypeName(realized);
                     task.qualification.realized_geom_type = task.geom_type;
                     task.qualification.qualification_class =

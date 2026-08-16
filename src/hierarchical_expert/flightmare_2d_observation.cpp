@@ -283,6 +283,32 @@ LocalObservation Flightmare2DObservation::buildFromRays(
         patch.age_ticks[vid] = 0;
     }
 
+    // ── Vehicle's own body volume is trivially known-free. ─────────
+    // The camera is mounted AHEAD of the vehicle centre (T_BC forward
+    // offset, default 0.3 m), so the vehicle's own cells and the blind
+    // region up to the camera lie OUTSIDE the FOV wedge.  Candidate
+    // trajectories start at the vehicle centre; without marking these
+    // cells FREE the planner rejects every candidate (the trajectory
+    // starts in the camera blind spot) and the preflight stalls at
+    // spawn.  Only UNKNOWN cells are upgraded (never an OCCUPIED cell).
+    const double blind_r = std::hypot(p_.cam_t_bc_x, p_.cam_t_bc_z) +
+                           1.5 * res;
+    const GridIndex2D vc = worldToGrid(Vec2d(cam_pos[0], cam_pos[1]),
+                                       patch.origin, res);
+    for (int iy = vc.iy - 4; iy <= vc.iy + 4; ++iy) {
+        for (int ix = vc.ix - 4; ix <= vc.ix + 4; ++ix) {
+            if (!patch.inGrid(ix, iy)) continue;
+            const Vec2d cc = gridCellCenter(ix, iy, patch.origin, res);
+            if ((cc - Vec2d(cam_pos[0], cam_pos[1])).norm() <= blind_r) {
+                const size_t bid = patch.idx(ix, iy);
+                if (patch.cells[bid] == CellState::UNKNOWN) {
+                    patch.cells[bid] = CellState::FREE;
+                    patch.age_ticks[bid] = 0;
+                }
+            }
+        }
+    }
+
     return patch;
 }
 
