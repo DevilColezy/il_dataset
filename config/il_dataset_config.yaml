@@ -104,15 +104,20 @@ global:
     # Hard gate: generation_ok=false unless every stratum has a valid scene.
     require_full_strata_coverage: true
     geometry:
-      # 2 * (vehicle radius 0.30 m + navigation clearance 0.30 m) = 1.20 m.
-      minimum_surface_gap_m: 1.20
+      # Planner-required traversable passage (surface gap between two
+      # obstacles): 2 * (vehicle radius 0.30 + navigation clearance 0.30 +
+      # discretisation margin 0.05) + 2 * generation margin 0.05 = 1.40 m.
+      # A narrower gap would pass the physical check but fail the local
+      # planner's clearance / grid discretisation, so 1.20 is no longer
+      # sufficient for planner-compatible scenes.
+      minimum_surface_gap_m: 1.40
       boundary_margin_m:     1.20
       # Full-height cylinders (2.5D horizontal avoidance): a task keeps one
-      # flight height and the obstacles cover it.  radius range 0.10..2.00
-      # is the ACTUAL generated range (strata over it).
+      # flight height and the obstacles cover it.  radius range 0.10..6.00
+      # covers tiny r≈0.1 m clutter up to a single r≈6 m large cylinder.
       radius_min_m: 0.10
-      radius_max_m: 2.00
-      max_obstacles: 20
+      radius_max_m: 6.00
+      max_obstacles: 30
       height_m: 8.0
       # ESDF free-cell semantics: drone CENTRE → obstacle SURFACE distance;
       # must be >= vehicle.radius_m (validated).  Body-edge clearance of a
@@ -125,7 +130,10 @@ global:
     enabled: true
     flight_height_m: 2.0
     min_task_distance_m: 4.0
-    max_task_distance_m: 20.0
+    # The free region [-7,10] x [0,30] allows start-goal distances up to
+    # ~34 m; 28 m gives a real long-path band without edge-sampling
+    # pathologies.
+    max_task_distance_m: 28.0
     # Initial yaw: aim at the goal (Flightmare convention B) plus a
     # LEFT/RIGHT symmetric random bias (degrees).
     initial_yaw_bias_deg: 15.0
@@ -163,6 +171,106 @@ global:
       density_sparse_max: 7.0
       density_dense_min: 14.0
       long_takeover_min_ticks: 30
+
+  # ── Blueprint generation (deficit-driven offline pipeline) ────────
+  # Runs BEFORE Flightmare is connected.  It is a pure C++17 offline
+  # preparation (scene profiles -> geometry cache -> task candidates ->
+  # cheap filter -> C++ preflight with the SAME expert -> distribution
+  # summaries -> deficit-driven rounds -> greedy selection).  NO Unity /
+  # ROS / Flightmare is started here.
+  #
+  # WAREHOUSE SINGLE SOURCE: the free region below MUST equal
+  # hierarchical_expert.region (validated).  The outer 1 m shell is the
+  # non-traversable wall envelope; no other static structure exists.
+  blueprint_generation:
+    enabled: true
+    base_seed: 260812
+    warehouse:
+      free_region: [-7.0, 10.0, 0.0, 30.0]
+      wall_extension_m: 1.0
+    scene_generation:
+      # Empty list -> the built-in default profile catalog
+      # (empty / sparse_tiny / dense_tiny / sparse_small / dense_small /
+      #  sparse_medium / dense_medium / large_single / large_sparse /
+      #  mixed_tiny_small / mixed_small_medium / mixed_small_large /
+      #  mixed_all / clustered / corridor / bottleneck / chicane /
+      #  central_blocker / edge_clutter).
+      use_profile_catalog: true
+      profiles: []
+      profile_sequence: []
+      vehicle_radius_m: 0.30
+      navigation_clearance_m: 0.30
+      clearance_discretization_margin_m: 0.05
+      generation_margin_m: 0.05
+      # Planner-required passage (see scene_generation.geometry above).
+      min_surface_gap_m: 1.40
+      boundary_margin_m: 1.20
+      free_cell_surface_clearance_m: 0.50
+      esdf_resolution_m: 0.10
+      min_main_component_area_m2: 60.0
+    task_generation:
+      flight_height_m: 2.0
+      obstacle_height_m: 8.0
+      min_task_distance_m: 4.0
+      max_task_distance_m: 28.0
+      task_sample_attempts: 300
+      task_goal_attempts: 120
+      # Layered initial yaw (absolute goal-bearing error, degrees).  The
+      # 35-55 deg bin is deliberately weighted up: with a 90 deg FOV
+      # (+/-45 deg) it is exactly the "still in FOV <-> just left FOV"
+      # decision boundary; the 90-180 deg bins keep out-of-FOV / rear-goal
+      # TURN training.  Sign is mirrored left/right.
+      initial_yaw:
+        edges_deg: [0.0, 15.0, 35.0, 55.0, 90.0, 150.0, 180.0]
+        weights:   [0.8, 1.2, 2.2, 1.6, 1.0, 0.9]
+      # Cheap 2D synthetic raycast depth proxy (NOT a student input, NOT a
+      # Unity render): fixed ray count + temporal stride along the
+      # preflight trajectory.  Thresholds: near 0-1.5, mid 1.5-3.0,
+      # far 3.0-5.0, free = no hit within far_max_m.
+      depth_proxy:
+        num_rays: 96
+        sample_stride_ticks: 6
+        near_max_m: 1.5
+        mid_max_m: 3.0
+        far_max_m: 5.0
+      histograms:
+        correction_angle_edges_deg: [-90.0, -60.0, -45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0, 60.0, 90.0]
+        correction_distance_edges: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        deflection_edges_deg: [-90.0, -60.0, -30.0, -10.0, 10.0, 30.0, 60.0, 90.0]
+        yaw_rate_edges: [-2.0, -1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0, 2.0]
+        speed_edges: [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+        min_deflection_speed_mps: 0.10
+      # short/medium/long use the ACTUAL preflight path length (not the
+      # start-goal Euclidean distance).
+      path:
+        short_max_m: 12.0
+        long_min_m: 20.0
+    performance:
+      max_scene_candidates: 64
+      max_task_candidates_per_scene: 40
+      max_generation_rounds: 6
+      max_total_preflight_tasks: 1800
+      max_preflight_ticks_per_task: 900
+      max_scene_generation_attempts: 96
+      max_task_generation_attempts: 600
+      parallel_tasks: false
+      scene_switch_penalty: 0.25
+    requirements:
+      min_scenes: 4
+      min_tasks: 24
+      min_tasks_per_scene: 4
+      max_tasks_per_scene: 12
+      min_macro_ticks_per_class: 24
+      min_depth_samples_per_band: 40
+      min_yaw_samples_per_bin: 3
+      min_path_samples_per_class: 4
+      max_turn_imbalance_ratio: 0.66
+      max_yaw_imbalance_ratio: 0.66
+    legacy:
+      density_sparse_max: 7.0
+      density_dense_min: 14.0
+      radius_small_max_m: 0.6
+      radius_large_min_m: 1.4
 
   # ── Recording rate ─────────────────────────────────────────────────
   control:

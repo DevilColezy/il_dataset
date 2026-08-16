@@ -113,7 +113,14 @@ set(HIERARCHICAL_EXPERT_SOURCES
   src/hierarchical_expert/flightmare_2d_observation.cpp
   src/hierarchical_expert/hierarchical_expert.cpp
   src/hierarchical_expert/preflight_simulator.cpp
+  # ── offline Scene/Task Blueprint pipeline (il_dataset-feature-v4) ─
   src/hierarchical_expert/scene_task_blueprint.cpp
+  src/hierarchical_expert/scene_profile_generator.cpp
+  src/hierarchical_expert/scene_geometry_cache.cpp
+  src/hierarchical_expert/task_candidate_generator.cpp
+  src/hierarchical_expert/depth_proxy_evaluator.cpp
+  src/hierarchical_expert/distribution_analyzer.cpp
+  src/hierarchical_expert/blueprint_generation_controller.cpp
 )
 
 add_library(il_hierarchical_expert_lib STATIC ${HIERARCHICAL_EXPERT_SOURCES})

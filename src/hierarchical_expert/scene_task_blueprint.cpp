@@ -1,36 +1,16 @@
 #include "il_dataset/hierarchical_expert/scene_task_blueprint.hpp"
 
+#include "il_dataset/hierarchical_expert/blueprint_generation_controller.hpp"
 #include "il_dataset/hierarchical_expert/coordinate_adapter.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <map>
-#include <queue>
-#include <random>
-#include <set>
 
 namespace il_dataset {
 namespace expert {
 
 namespace {
-
-/// Deterministic per-scene / per-task RNG (mt19937_64, one seed).
-class Rng {
-public:
-    explicit Rng(uint64_t seed) : gen_(seed) {}
-    double uniform(double lo, double hi) {
-        std::uniform_real_distribution<double> d(lo, hi);
-        return d(gen_);
-    }
-    int uniformInt(int lo, int hi) {
-        std::uniform_int_distribution<int> d(lo, hi);
-        return d(gen_);
-    }
-
-private:
-    std::mt19937_64 gen_;
-};
 
 /// Distance from a point to a finite segment (exact, for swept audit).
 inline double distToSegment(const Vec2d& p, const Vec2d& a, const Vec2d& b) {
@@ -40,26 +20,6 @@ inline double distToSegment(const Vec2d& p, const Vec2d& a, const Vec2d& b) {
     const double t = clamp((p - a).dot(ab) / len2, 0.0, 1.0);
     return (p - (a + ab * t)).norm();
 }
-
-/// Planned density class name from the count stratum (0=sparse, 1=medium,
-/// 2=dense).
-inline const char* densityStratumName(int count_stratum) {
-    return count_stratum == 0 ? "sparse"
-                              : (count_stratum == 2 ? "dense" : "medium");
-}
-
-/// Planned radius class name from the radius stratum (0=small, 1=medium,
-/// 2=large).
-inline const char* radiusStratumName(int radius_stratum) {
-    return radius_stratum == 0 ? "small"
-                               : (radius_stratum == 2 ? "large" : "medium");
-}
-
-/// Required behavior classes for the per-behavior quota (the primary
-/// classes the dataset contract must cover).
-const char* const kRequiredBehaviors[] = {
-    "clear", "local_avoidance", "normal", "turn_left", "turn_right",
-    "turn_normal"};
 
 }  // namespace
 
@@ -202,7 +162,7 @@ void TruthCylinderAudit::brakeRisk(double x, double y, double vx, double vy,
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  SceneTaskBlueprintGenerator
+//  SceneTaskBlueprintGenerator (facade over BlueprintGenerationController)
 // ═══════════════════════════════════════════════════════════════════
 void SceneTaskBlueprintGenerator::configure(const Params2D& params,
                                             const Config& cfg) {
@@ -211,124 +171,68 @@ void SceneTaskBlueprintGenerator::configure(const Params2D& params,
     configured_ = true;
 }
 
-// ── ESDF over the FULL configured region (0.1 m truth, analytic) ──
-//    VALUE SEMANTICS: dist[id] = drone CENTRE → obstacle SURFACE distance.
-//    A free cell (start/goal/connectivity) requires dist > 
-//    free_cell_surface_clearance_m AND boundary clearance.
-SceneTaskBlueprintGenerator::EsdfGrid SceneTaskBlueprintGenerator::buildEsdf(
-    const BlueprintScene& scene) const {
-    EsdfGrid g;
-    g.res = cfg_.esdf_resolution_m;
-    g.min_bounds = Vec2d(p_.region_min_x, p_.region_min_y);
-    const Vec2d max_bounds(p_.region_max_x, p_.region_max_y);
-    g.w = std::max(1, static_cast<int>(std::ceil(
-        (max_bounds.x() - p_.region_min_x) / g.res)));
-    g.h = std::max(1, static_cast<int>(std::ceil(
-        (max_bounds.y() - p_.region_min_y) / g.res)));
-    g.dist.assign(static_cast<size_t>(g.w) * g.h,
-                  std::numeric_limits<double>::infinity());
-    g.comp.assign(static_cast<size_t>(g.w) * g.h, -1);
-
-    const double margin = cfg_.boundary_margin_m;
-    const double free_min = cfg_.free_cell_surface_clearance_m;
-    for (int iy = 0; iy < g.h; ++iy) {
-        for (int ix = 0; ix < g.w; ++ix) {
-            const size_t id = static_cast<size_t>(iy) * g.w + ix;
-            const Vec2d cw = gridCellCenter(ix, iy, g.min_bounds, g.res);
-            if (cw.x() < p_.region_min_x + margin ||
-                cw.x() > p_.region_max_x - margin ||
-                cw.y() < p_.region_min_y + margin ||
-                cw.y() > p_.region_max_y - margin) {
-                g.dist[id] = -1.0;  // not a candidate cell
-                continue;
-            }
-            double best = std::numeric_limits<double>::infinity();
-            for (const auto& o : scene.obstacles) {
-                const double d = (cw - Vec2d(o.x, o.y)).norm() - o.radius;
-                best = std::min(best, d);
-            }
-            g.dist[id] = best;
-            if (best > free_min + 1e-9) {
-                g.comp[id] = 0;  // free-unassigned placeholder
-            } else {
-                g.comp[id] = -1;
-            }
+BlueprintGenerationConfig SceneTaskBlueprintGenerator::makeBlueprintConfig() const {
+    BlueprintGenerationConfig b = cfg_.blueprint;
+    if (!cfg_.blueprint_explicit) {
+        // ── Backward-compatible fallback: derive the new-style config
+        //    from the legacy Config fields (no blueprint_generation YAML
+        //    section was provided). ─────────────────────────────────
+        b.warehouse = WarehouseGeometry{
+            p_.region_min_x, p_.region_max_x, p_.region_min_y,
+            p_.region_max_y, 1.0};
+        b.vehicle_radius_m = cfg_.vehicle_radius_m;
+        b.navigation_clearance_m = cfg_.navigation_clearance_m;
+        b.min_surface_gap_m = std::max(
+            cfg_.min_surface_gap_m, b.plannerRequiredPassage());
+        b.boundary_margin_m = cfg_.boundary_margin_m;
+        b.free_cell_surface_clearance_m = cfg_.free_cell_surface_clearance_m;
+        b.esdf_resolution_m = cfg_.esdf_resolution_m;
+        b.min_task_distance_m = cfg_.min_task_distance_m;
+        b.max_task_distance_m = cfg_.max_task_distance_m;
+        b.flight_height_m = cfg_.flight_height_m;
+        b.obstacle_height_m = cfg_.obstacle_height_m;
+        b.task_sample_attempts = cfg_.task_sample_attempts;
+        b.max_task_generation_attempts = std::max(
+            1, static_cast<int>(cfg_.qualification_attempt_budget));
+        b.max_preflight_ticks_per_task = static_cast<int>(
+            cfg_.preflight_qualification_max_ticks);
+        b.max_tasks_per_scene = std::max(1, cfg_.tasks_per_scene);
+        b.min_tasks_per_scene = std::max(1, cfg_.minimum_tasks_per_scene);
+        b.max_task_candidates_per_scene = std::max(
+            1, cfg_.tasks_per_scene * std::max(1, cfg_.candidate_pool_multiplier));
+        b.min_scenes = std::max(1, cfg_.scene_count);
+        b.min_tasks = std::max(1, cfg_.scene_count * cfg_.tasks_per_scene);
+        b.base_seed = cfg_.base_seed;
+        b.density_sparse_max = cfg_.density_sparse_max;
+        b.density_dense_min = cfg_.density_dense_min;
+        b.radius_small_max_m = cfg_.radius_small_max_m;
+        b.radius_large_min_m = cfg_.radius_large_min_m;
+        // Legacy yaw bias becomes a coarse two-bin approximation of the
+        // layered distribution: [-bias, +bias] plus a wide tail.
+        if (cfg_.initial_yaw_bias_deg > 0.0) {
+            b.yaw_edges_deg = {0.0, cfg_.initial_yaw_bias_deg, 180.0};
+            b.yaw_weights = {2.0, 1.0};
         }
     }
-    return g;
-}
-
-// ── 8-connected free-space components with NO diagonal corner-cutting ──
-//    A diagonal move (nx,ny) from (cx,cy) is allowed ONLY when both
-//    orthogonal neighbours (nx,cy) and (cx,ny) are free as well.
-void SceneTaskBlueprintGenerator::labelComponents(EsdfGrid& g) const {
-    const int dx[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
-    const int dy[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
-    auto isFree = [&](int ix, int iy) -> bool {
-        if (ix < 0 || iy < 0 || ix >= g.w || iy >= g.h) return false;
-        return g.comp[static_cast<size_t>(iy) * g.w + ix] != -1;
-    };
-    int next = 1;
-    for (int iy = 0; iy < g.h; ++iy) {
-        for (int ix = 0; ix < g.w; ++ix) {
-            const size_t id = static_cast<size_t>(iy) * g.w + ix;
-            if (g.comp[id] != 0) continue;
-            std::queue<int> qx, qy;
-            qx.push(ix);
-            qy.push(iy);
-            g.comp[id] = next;
-            while (!qx.empty()) {
-                const int cx = qx.front();
-                const int cy = qy.front();
-                qx.pop();
-                qy.pop();
-                for (int k = 0; k < 8; ++k) {
-                    const int nx = cx + dx[k], ny = cy + dy[k];
-                    if (nx < 0 || ny < 0 || nx >= g.w || ny >= g.h) continue;
-                    // Diagonal move: require BOTH orthogonal neighbours free.
-                    if (dx[k] != 0 && dy[k] != 0 &&
-                        (!isFree(nx, cy) || !isFree(cx, ny))) {
-                        continue;
-                    }
-                    const size_t nid = static_cast<size_t>(ny) * g.w + nx;
-                    if (g.comp[nid] != 0) continue;
-                    g.comp[nid] = next;
-                    qx.push(nx);
-                    qy.push(ny);
-                }
-            }
-            ++next;
-        }
+    // ── Planner-compatibility guarantee (never below the required
+    //    traversable passage for the configured vehicle/clearance). ──
+    b.min_surface_gap_m = std::max(b.min_surface_gap_m,
+                                   b.plannerRequiredPassage());
+    // ── Single warehouse source for the whole pipeline ─────────────
+    if (b.warehouse.area() <= 0.0) {
+        b.warehouse = WarehouseGeometry{-7.0, 10.0, 0.0, 30.0, 1.0};
     }
+    return b;
 }
 
-// ── Actual geometry classes from the REAL obstacle set (items 九) ──
-std::string SceneTaskBlueprintGenerator::densityClassOf(double count) const {
-    if (count <= cfg_.density_sparse_max) return "sparse";
-    if (count >= cfg_.density_dense_min) return "dense";
-    return "medium";
-}
-
-std::string SceneTaskBlueprintGenerator::radiusClassOf(double max_radius,
-                                                       bool is_empty) const {
-    // An empty scene has NO obstacle radius and is ALWAYS "none" — it can
-    // never cover a small/medium/large radius stratum and its tasks never
-    // contribute to the radius quotas.
-    if (is_empty || max_radius <= 0.0) return "none";
-    if (max_radius <= cfg_.radius_small_max_m) return "small";
-    if (max_radius >= cfg_.radius_large_min_m) return "large";
-    return "medium";
-}
+// The legacy stratum schedule / ESDF / sampling / quota methods were
+// REPLACED by BlueprintGenerationController (see blueprint_generation_*
+// and the scene_profile_* / task_candidate_* / distribution_analyzer_*
+// components).  Only the facade below remains.
 
 // ── One scene with an explicit stratum schedule + REAL geometry ─────
-//    scene 0 = explicit EMPTY / CLEAR scene (0 obstacles).
-//    scenes 1..9 = non-empty 3x3 {sparse,medium,dense} ×
-//    {small,medium,large} with count/radius bands aligned to the CONFIGURED
-//    classification thresholds, so planned == actual on success.
-//    Item 八: the requested obstacle count is sampled ONCE from the SCENE
-//    BASE SEED; every whole-scene retry keeps the SAME count / count stratum
-//    / radius stratum and only re-samples positions / per-obstacle radii
-//    (retries never lower the task difficulty).
+//    (REMOVED — replaced by SceneProfileGenerator)
+#if 0
 BlueprintScene SceneTaskBlueprintGenerator::makeScene(uint64_t scene_id,
                                                       uint64_t seed) const {
     BlueprintScene scene;
@@ -1069,141 +973,18 @@ std::vector<BlueprintTask> SceneTaskBlueprintGenerator::applyQuotas(
     return accepted;
 }
 
-// ── generate(): full blueprint FIRST (both normal + blueprint_only) ─
+#endif  // legacy generation engine (replaced by BlueprintGenerationController)
+
+// ── generate(): delegate to the deficit-driven controller ─────────
 BlueprintResult SceneTaskBlueprintGenerator::generate() {
     BlueprintResult result;
     if (!configured_) {
         result.failure_reason = "generator not configured";
         return result;
     }
-    result.base_seed = cfg_.base_seed;
-    result.requested_scenes = std::max(1, cfg_.scene_count);
-    result.requested_tasks_per_scene = std::max(1, cfg_.tasks_per_scene);
-    const int n_scenes = static_cast<int>(result.requested_scenes);
-    const int tasks_per_scene = static_cast<int>(result.requested_tasks_per_scene);
-    const uint64_t attempts_budget =
-        std::max<uint64_t>(1, cfg_.qualification_attempt_budget);
-
-    result.strata_required = 9;  // non-empty 3x3 joint coverage
-    result.strata_covered_flags.assign(9, 0);
-
-    uint64_t global_task_id = 0;
-    for (int s = 0; s < n_scenes; ++s) {
-        const uint64_t scene_seed = cfg_.base_seed +
-            static_cast<uint64_t>(s) * 0x9E3779B97F4A7C15ull;
-        BlueprintScene scene = makeScene(static_cast<uint64_t>(s), scene_seed);
-        result.scenes.push_back(scene);
-        ++result.scenes_generated;
-        if (scene.generation_valid) {
-            ++result.scenes_valid;
-            if (!scene.is_empty) {
-                // Coverage reflects the ACTUAL geometry (item 九): the
-                // obstacle set must classify into the PLANNED density AND
-                // radius class — never merely generation_valid.
-                const int sid = scene.stratum_id;
-                if (sid >= 0 && sid < 9 &&
-                    scene.actual_density_class == scene.planned_density_class &&
-                    scene.actual_radius_class == scene.planned_radius_class) {
-                    result.strata_covered_flags[sid] = 1;
-                }
-            }
-        }
-
-        if (!scene.generation_valid) {
-            result.failure_reason =
-                "scene " + std::to_string(s) + " invalid: " +
-                scene.failure_reason;
-            break;  // explicit failure, never a partial disguised scene
-        }
-
-        // Truth ESDF over the FULL configured region.
-        EsdfGrid grid = buildEsdf(scene);
-        labelComponents(grid);
-
-        // Oversample until the per-scene candidate pool target, or the
-        // finite qualification_attempt_budget is exhausted (item 四).
-        const int candidate_target = tasks_per_scene *
-            std::max(1, cfg_.candidate_pool_multiplier);
-        result.tasks_pool_target +=
-            static_cast<uint64_t>(candidate_target);
-        std::vector<BlueprintTask> scene_pool;
-        uint64_t attempts = 0;
-        while (static_cast<int>(scene_pool.size()) < candidate_target &&
-               attempts < attempts_budget) {
-            ++attempts;
-            const uint64_t task_seed =
-                scene_seed + attempts * 0x9E3779B97F4A7C15ull;
-            const int distance_stratum =
-                static_cast<int>((scene_pool.size() + attempts) % 3);
-            BlueprintTask task;
-            if (!sampleOneTask(grid, scene, task_seed, global_task_id,
-                               distance_stratum, task)) {
-                continue;
-            }
-            ++result.tasks_sampled;
-            const uint64_t tick_base = global_task_id * 600000ull;
-            preflightTask(task, scene, tick_base);
-            ++result.tasks_preflighted;
-            if (task.audit.accepted) {
-                scene_pool.push_back(task);
-            }
-            ++global_task_id;
-        }
-        result.tasks_pool_accepted +=
-            static_cast<uint64_t>(scene_pool.size());
-
-        if (static_cast<int>(scene_pool.size()) < candidate_target) {
-            // Budget exhausted below the oversample target is an EXPLICIT
-            // failure: the quota selector would be forced to fill classes
-            // from a too-small pool, so it is NEVER reported as
-            // "oversampled" (item 四).
-            result.pool_budget_exhausted = true;
-            const std::string reason =
-                "scene " + std::to_string(s) +
-                " qualification_attempt_budget=" +
-                std::to_string(attempts_budget) + " exhausted with pool=" +
-                std::to_string(scene_pool.size()) +
-                " < candidate_target=" + std::to_string(candidate_target);
-            if (static_cast<int>(scene_pool.size()) <
-                cfg_.minimum_tasks_per_scene) {
-                result.failure_reason = reason +
-                    " < minimum_tasks_per_scene=" +
-                    std::to_string(cfg_.minimum_tasks_per_scene);
-                break;
-            }
-            result.failure_reason = reason;
-            break;
-        }
-        for (auto& t : scene_pool) {
-            result.preflighted.push_back(t);
-        }
-    }
-
-    if (result.failure_reason.empty() &&
-        cfg_.require_full_strata_coverage) {
-        uint64_t covered = 0;
-        for (uint64_t f : result.strata_covered_flags) covered += f;
-        result.strata_covered = covered;
-        if (covered < 9) {
-            result.failure_reason =
-                "strata coverage " + std::to_string(covered) + "/9 required";
-        }
-    } else {
-        uint64_t covered = 0;
-        for (uint64_t f : result.strata_covered_flags) covered += f;
-        result.strata_covered = covered;
-    }
-
-    result.tasks = applyQuotas(result.preflighted, result.unmet_quotas,
-                               result.category_counts,
-                               result.per_scene_accepted);
-    result.tasks_quota_accepted = result.tasks.size();
-
-    if (result.failure_reason.empty() && !result.unmet_quotas.empty()) {
-        result.failure_reason = "unmet quotas: " + result.unmet_quotas.front();
-    }
-    result.generation_ok = result.failure_reason.empty() &&
-                           !result.scenes.empty() && !result.tasks.empty();
+    const BlueprintGenerationConfig b = makeBlueprintConfig();
+    BlueprintGenerationController controller(p_, b);
+    result = controller.generate();
     return result;
 }
 

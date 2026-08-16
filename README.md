@@ -80,90 +80,93 @@ matrix: `il_common.make_depth_vehicle` reads the SAME validated 16-element
 hierarchical_expert.observation.fov_deg` and that `depth.max_m >=
 observation.range_m`.  The writer metadata records the actual `depth.t_bc`.
 
-## Scene generation (no silent degradation)
+## Blueprint generation (deficit-driven, offline, C++17)
 
-`SceneTaskBlueprintGenerator` (C++):
+`SceneTaskBlueprintGenerator` is now a thin facade over
+`BlueprintGenerationController` (the old fixed strata schedule + hard
+`applyQuotas` path was REMOVED — there is exactly ONE selection path).
 
-- **Explicit strata schedule of 10 scenes**: scene 0 = explicit EMPTY /
-  CLEAR scene (0 obstacles, radius class `none`); scenes 1..9 = non-empty
-  `sparse/medium/dense` × `small/medium/large` with count/radius bands
-  ALIGNED to the configured classification thresholds
-  (`density_sparse_max`/`density_dense_min`/`radius_small_max`/
-  `radius_large_min`) so planned == actual class on success.
-  `scene_count < 10` never claims full coverage.
-- **Coverage reflects the ACTUAL geometry, never `scene_id`**: a stratum
-  is covered only when the REAL obstacle set classifies into the planned
-  density AND radius class.  An empty scene is never counted as `small`
-  radius and its tasks never contribute to the radius quotas.
-- **Item 八**: the requested obstacle count is sampled ONCE from the scene
-  base seed; every whole-scene retry keeps the SAME count / count stratum /
-  radius stratum and only re-samples positions / radii (retries never
-  lower the task difficulty).  `actual != requested` ⇒ `generation_valid
-  = false`.
-- Every scene records `requested_obstacle_count` and
-  `actual_obstacle_count`, `generation_valid` and `failure_reason`.
-  A whole scene is **retried with a fresh placement seed** up to
-  `max_generation_attempts`; a still-failed scene fails generation
-  explicitly (never a silently degraded scene).
-- Every cylinder is verified to keep the minimum surface gap and the
-  boundary margin (analytic).
-- **ESDF semantics (documented in the header)**: `dist[id]` = drone
-  CENTRE → obstacle SURFACE distance.  A free cell (start/goal/connectivity)
-  requires `dist > free_cell_surface_clearance_m` (must be ≥
-  `vehicle.radius_m`, validated) AND boundary clearance.  Body-edge
-  clearance of a free cell = `free_cell_surface_clearance_m − vehicle_radius`.
-- `labelComponents` flood-fill is 8-connected with **no diagonal
-  corner-cutting**: a diagonal move is allowed only when BOTH orthogonal
-  neighbours are free.
-- Start/goal are picked from free-cell CENTRES of the **same connected
-  component** with distance in the task stratum, then analytically
-  re-checked by `verifyEndpointPair` (surface clearance, boundary margin,
-  distance band).
+**Warehouse (single source)**: the only free region is
+`blueprint_generation.warehouse.free_region` = `[-7,10] x [0,30]` (must
+equal `hierarchical_expert.region`, validated).  The outer
+`wall_extension_m` (1 m) is the non-traversable envelope.  No fake
+internal static structure is ever constructed.
 
-## Task generation (oversampling + hard quotas)
+**Scene Profiles (scene generation)**: `SceneProfileGenerator` realizes
+random scenes from a profile catalog — `empty`, `sparse_tiny`,
+`dense_tiny` (20-30 cylinders of r≈0.1 m), `sparse_small`, `dense_small`,
+`sparse_medium`, `dense_medium`, `large_single` (r up to ≈6 m),
+`large_sparse`, `mixed_tiny_small`, `mixed_small_medium`,
+`mixed_small_large`, `mixed_all`, `clustered`, `corridor`, `bottleneck`,
+`chicane`, `central_blocker`, `edge_clutter`.  Every placement keeps:
+  * boundary margin inside the free region;
+  * pairwise surface gap ≥ `min_surface_gap_m`, which is validated to be
+    ≥ `plannerRequiredPassage() = 2·(vehicle_radius + navigation_clearance
+    + discretisation_margin) + 2·generation_margin` — a passage that
+    satisfies the physical drone radius but NOT the local planner's
+    clearance / grid discretisation is never generated;
+  * structured profiles (corridor / bottleneck / chicane) keep a central
+    passage of width ≥ planner-required passage.
+A whole scene is retried with a fresh placement seed up to
+`max_scene_generation_attempts`; a still-failed scene is recorded with
+`generation_valid=false` and skipped (never silently degraded).  Each
+`BlueprintScene` carries `profile` + `metadata` (radius bands, density
+proxy, cluster count, free-space ratio, corridor-width proxy,
+geometry/planning validity) plus the legacy strata fields (report-only).
 
-- **candidate_pool_multiplier is actually used** (item 四): each scene
-  samples + preflights until its candidate pool reaches
-  `tasks_per_scene * max(1, candidate_pool_multiplier)` or the finite
-  `qualification_attempt_budget` is exhausted.  A budget shortfall below
-  the candidate target is an EXPLICIT `generation_ok=false` failure
-  (`pool_budget_exhausted`, reason includes pool vs target) — it is never
-  reported as "oversampled".  The manifest records the three counts
-  separately: `tasks_sampled` (candidates), `tasks_pool_accepted`
-  (preflight-accepted pool) vs `tasks_pool_target`, and
-  `tasks_quota_accepted` (final quota-selected tasks).
-- `applyQuotas` (item 五) first establishes a per-scene floor for EVERY
-  scene_id 0..scene_count-1 (a scene absent from the pool counts as 0),
-  then the global required-behavior + TURN side quotas, then the
-  density/radius/distance level floors, then fills to capacity
-  (per-scene cap `tasks_per_scene`, total cap scene_count×tasks_per_scene).
-- **TURN left/right quotas are real TURN statistics (item 六)**: only
-  tasks that ACTUALLY issued TURN_LEFT / TURN_RIGHT directives contribute
-  to `min_turn_per_side` / left-right balance.  A NORMAL_CORRECTION
-  direction-token laterality is never a TURN.  `BlueprintTask` records
-  `saw_turn_left`/`saw_turn_right`/`saw_normal_correction`/`turn_update_count`/
-  `normal_update_count`.  Phase B `need_behavior` applies ONLY to the
-  hard-required `kRequiredBehaviors` — turn_both / multi_correction /
-  long_takeover never fill capacity ahead of the required classes.
-- Any unmet quota is recorded in `BlueprintResult.unmet_quotas` and sets
-  `generation_ok = false`.
-- `BlueprintResult` carries `generation_ok`, `failure_reason`,
-  `unmet_quotas`, `requested_scenes`, `requested_tasks_per_scene`,
-  `scenes_valid`, `strata_required/covered/flags`,
-  `per_scene_accepted` (fixed length scene_count),
-  `category_counts`, `tasks_sampled`/`tasks_preflighted`/
-  `tasks_pool_target`/`tasks_pool_accepted`/`tasks_quota_accepted`,
-  `pool_budget_exhausted`; each `BlueprintScene` carries `stratum_id`,
-  planned/actual density+radius classes, actual min/max radius,
-  requested/actual obstacle counts, `generation_valid`, `failure_reason`;
-  each `BlueprintTaskAudit` carries `out_of_bounds`,
-  `qualification_exceeded`.
-- **Gate (item 十一)**: `il_manager.py` always writes the manifest, then
-  checks `generation_ok` BEFORE any blueprint_only/dry_run early return:
-  `generation_ok == false` ⇒ `logerr` + `RuntimeError` in ALL modes
-  (normal mode never connects Flightmare; no mode prints a success line);
-  only after `generation_ok == true` do blueprint_only / dry_run end
-  normally.
+**Geometry cache (per scene, built ONCE)**: `SceneGeometryCache` builds
+the truth ESDF over the free region, 8-connected components (no diagonal
+corner-cutting), the main-component area and the list of VALID task cells
+— reused by every task candidate of the scene (never rebuilt per task).
+
+**Task candidates**: `TaskCandidateGenerator` samples start/goal from the
+cached valid cells, classifies a cheap geometric PROXY (CLEAR /
+LOCAL_AVOIDANCE / OFFSET_AVOIDANCE / LARGE_OCCLUSION / MULTI_OBSTACLE /
+CHICANE / NARROW_BUT_PLANNABLE / LONG_DETOUR) to bias the goal, and
+samples the INITIAL YAW from a layered distribution over the absolute
+goal-bearing error (`0-15 / 15-35 / 35-55 / 55-90 / 90-150 / 150-180 deg`,
+weights emphasise 35-55 — the ±45° FOV decision boundary — while the wide
+bins keep out-of-FOV / rear-goal turns), with mirror-balanced signs.
+The initial yaw is no longer limited to goal-heading ±15°.
+
+**Preflight + distribution summary**: every candidate first passes a
+CHEAP staged filter (bounds / clearance / distance / main component /
+straight swept segment) and only then runs the closed-loop
+`PreflightSimulator` (the SAME expert).  Each preflight produces a
+`TaskDistributionSummary`: actual path length + stretch ratio,
+5 Hz tick-level PASS/NORMAL/TURN_LEFT/TURN_RIGHT counts + correction-angle
+and correction-distance histograms, 30 Hz deflection / yaw-rate / speed
+histograms (deflection skipped below `min_deflection_speed_mps` to avoid
+NaN), min/mean observed clearance, and a 2D synthetic raycast DEPTH
+PROXY (near/mid/far/free counts at a temporal stride).
+
+**Distribution targets + deficits (quotas replaced)**: the global
+`DistributionAnalyzer` accumulates the summaries and computes per-target
+deficits (5 Hz coverage, 30 Hz deflection, depth bands, yaw bins, path
+length classes, left/right balance).  Missing types steer the next
+generation round (weighted profile / task-type / yaw-stratum sampling);
+soft shortfalls only produce warnings.  The final `select()` is a
+deterministic greedy scorer (contribution to deficient targets minus
+over-supply penalties) with a `scene_switch_penalty`, so the manifest
+prefers FEWER scenes with multiple complementary tasks per scene.
+
+**Budgets**: `max_scene_candidates`, `max_task_candidates_per_scene`,
+`max_generation_rounds`, `max_total_preflight_tasks`,
+`max_preflight_ticks_per_task`, `max_scene_generation_attempts`,
+`max_task_generation_attempts`.  Reaching a budget ends the run normally
+with the achieved distribution + remaining deficits.
+
+**generation_ok (new semantics)**: false ONLY when a HARD minimum
+coverage / structural balance / scene / task-count gate fails; soft
+target shortfalls are reported in `remaining_deficits` / `warnings` with
+`generation_ok = true`.
+
+**Gate**: `il_manager.py` always writes the manifest, then checks
+`generation_ok` BEFORE any blueprint_only/dry_run early return:
+`generation_ok == false` ⇒ `logerr` + `RuntimeError` in ALL modes
+(normal mode never connects Flightmare; no mode prints a success line);
+only after `generation_ok == true` do blueprint_only / dry_run end
+normally.
 
 ## Preflight continuous audit
 

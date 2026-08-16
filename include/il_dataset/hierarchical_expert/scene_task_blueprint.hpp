@@ -1,7 +1,7 @@
 #pragma once
 /// @file   scene_task_blueprint.hpp
 /// @brief  FULL C++ scene / truth-ESDF / task / blueprint generation +
-///         C++ behavior classifier + dataset quota selection.
+///         C++ behavior classifier + distribution-driven selection.
 ///
 /// This replaces the Python TruthAudit / _generate_scene / _sample_task /
 /// JointV2BehaviorClassifier.  Python (il_manager.py) only:
@@ -9,6 +9,11 @@
 ///   * calls generate() once (BOTH normal collection and blueprint_only),
 ///   * writes the manifest,
 ///   * then (normal mode only) collects strictly per the manifest.
+///
+/// The generation engine is BlueprintGenerationController (deficit-driven,
+/// budgeted, deterministic).  The class below is the stable public entry
+/// point; its structs are the manifest contract (backward compatible —
+/// fields are added, never removed).
 ///
 /// ═══════════════════════════════════════════════════════════════════
 ///  ESDF / free-cell semantics (single, never mixed)
@@ -22,40 +27,33 @@
 ///   All connectivity / start / goal / analytic re-checks use THIS
 ///   centre-to-surface convention — never the body-edge distance.
 ///
-///  STRATA SCHEDULE (explicit, recorded):
-///   scene 0 = explicit EMPTY / CLEAR scene (0 obstacles, radius "none").
-///   scenes 1..9 = the non-empty 3×3 joint coverage; for scene_id >= 1,
-///   stratum_id = (scene_id-1) % 9; count_stratum = stratum_id % 3;
-///   radius_stratum = stratum_id / 3.  The non-empty count/radius bands are
-///   aligned to the CONFIGURED classification thresholds
-///   (density_sparse_max / density_dense_min / radius_small_max /
-///   radius_large_min), so planned == actual class on success.  A stratum
-///   is COVERED only when the ACTUAL obstacle set classifies into the
-///   planned density AND radius class (never merely scene.generation_valid).
-///   scene_count < 10 NEVER claims full joint coverage.
+///  WAREHOUSE (single source): the only free region is
+///  [-7,10] x [0,30] (BluePrintGenerationConfig::warehouse); the 1 m outer
+///  shell is the wall envelope.  Scene generator, task generator, cheap
+///  filter, preflight and truth audit all read the SAME WarehouseGeometry.
 ///
-///  CONNECTIVITY (no corner-cutting): 8-connected flood fill where a
-///   diagonal move (dx,dy both nonzero) is allowed ONLY when the two
-///   orthogonal neighbours (cx+dx, cy) and (cx, cy+dy) are also free.
+///  SCENES (profiles, not strata): scenes are random realizations of
+///  SceneProfile entries (empty / sparse_tiny ... mixed_all / clustered /
+///  corridor / bottleneck / chicane / central_blocker / edge_clutter).
 ///
-///  TASKS (oversampling): tasks_per_scene is the FINAL expected accepted
-///   count per scene.  Each scene samples + preflights candidates until its
-///   candidate pool reaches tasks_per_scene * max(1, candidate_pool_multiplier)
-///   OR the finite qualification_attempt_budget is exhausted.  A budget
-///   shortfall below the candidate target is an EXPLICIT failure (the
-///   quota selector would be forced to fill classes from a too-small pool;
-///   it is never reported as "oversampled").  start and goal are sampled
-///   from free-cell CENTRES of the SAME connected component and are
-///   analytically re-verified (surface clearance + boundary + distance
-///   stratum) before being written into BlueprintTask.
+///  TASKS (fast candidates): start/goal are sampled from the pre-computed
+///  VALID task cells of the main connected component (SceneGeometryCache
+///  built ONCE per scene — never rebuilt per task), classified by a cheap
+///  geometric PROXY (CLEAR ... LONG_DETOUR) and preflighted with the SAME
+///  expert.  Each preflight produces a TaskDistributionSummary (path /
+///  depth proxy / 5 Hz tick-level macro / 30 Hz deflection / yaw / stretch)
+///  that flows into the global DistributionAnalyzer.
 ///
-///  HARD QUOTAS: applyQuotas() verifies every configured quota and returns
-///   unmet_quotas; generate() sets generation_ok=false if any hard quota or
-///   any scene is invalid.  The manager MUST abort before connecting
-///   Flightmare when generation_ok == false.
+///  SELECTION (distribution targets, not hard quotas): a deterministic
+///  greedy selector scores each candidate by its contribution to the
+///  currently-deficient histogram/count targets (minus over-supply
+///  penalties), with a scene_switch_penalty so the final blueprint prefers
+///  fewer scenes with more complementary tasks each.  generation_ok is
+///  false ONLY when a hard minimum coverage / structural balance check
+///  fails; unmet SOFT targets are warnings + remaining_deficits.
 
+#include "il_dataset/hierarchical_expert/blueprint_types.hpp"
 #include "il_dataset/hierarchical_expert/types.hpp"
-#include "il_dataset/hierarchical_expert/preflight_simulator.hpp"
 
 #include <cstdint>
 #include <map>
@@ -78,20 +76,21 @@ struct BlueprintObstacle {
 struct BlueprintScene {
     uint64_t scene_id = 0;
     uint64_t seed = 0;
-    int stratum_id = 0;  // 0..8 for non-empty scenes; -1 for the empty scene
-    int count_stratum = 0;  // 0=sparse 1=medium 2=dense; -1 for empty
-    int radius_stratum = 0;  // 0=small 1=medium 2=large; -1 for empty
+    // ── new: scene profile + full metadata ─────────────────────────
+    std::string profile = "empty";
+    SceneMetadata metadata;
+    // ── legacy fields (report-only, manifest compatibility) ────────
+    int stratum_id = -1;   // legacy 3x3 stratum id; -1 for empty
+    int count_stratum = -1;  // legacy density stratum
+    int radius_stratum = -1; // legacy radius stratum
     bool is_empty = false;   // explicit CLEAR scene with 0 obstacles
     int requested_obstacle_count = 0;
     int actual_obstacle_count = 0;
     bool generation_valid = true;
     std::string failure_reason = "";
     std::vector<BlueprintObstacle> obstacles;
-    // ── strata (actual geometry, never the scene_id schedule) ──────
-    // planned_* is the schedule target; actual_* is computed from the REAL
-    // obstacle set.  A stratum is covered ONLY when actual == planned.
-    std::string planned_density_class = "";  // sparse / medium / dense
-    std::string planned_radius_class = "";   // small / medium / large / none
+    std::string planned_density_class = "";  // legacy (== actual for profiles)
+    std::string planned_radius_class = "";   // legacy
     std::string density_class = "medium";    // == actual_density_class
     std::string actual_density_class = "medium";
     std::string actual_radius_class = "none";
@@ -110,6 +109,11 @@ struct BlueprintTaskAudit {
     double min_truth_clearance_m = 1e9;
     double goal_distance_m = 0.0;
     std::string preflight_status = "";
+    // ── new: actual path statistics (replaces Euclidean-only length) ─
+    double straight_distance_m = 0.0;
+    double path_length_m = 0.0;
+    double path_stretch_ratio = 1.0;
+    double preflight_duration_s = 0.0;
 };
 
 struct BlueprintTask {
@@ -123,18 +127,19 @@ struct BlueprintTask {
     std::string behavior_class = "clear";
     std::string density_class = "medium";
     std::string radius_class = "medium";  // "none" for empty-scene tasks
-    std::string distance_class = "medium";
+    std::string distance_class = "medium";  // short/medium/long (path-based)
     std::string side_class = "none";  // left / right / both / none
     // ── REAL macro-directive statistics (item 六) ──────────────────
-    // The TURN left/right quota counts ONLY tasks that actually saw a
-    // TURN_LEFT / TURN_RIGHT directive.  NORMAL_CORRECTION direction-token
-    // laterality is never a TURN and never contributes to min_turn_per_side.
     bool saw_turn_left = false;
     bool saw_turn_right = false;
     bool saw_normal_correction = false;
     uint64_t turn_update_count = 0;    // TURN_LEFT/RIGHT update frames
     uint64_t normal_update_count = 0;  // NORMAL_CORRECTION update frames
     BlueprintTaskAudit audit;
+    // ── new: geometric proxy class + full distribution summary ─────
+    std::string geom_type = "CLEAR";
+    TaskDistributionSummary summary;
+    double selection_score = 0.0;  // final greedy selection score
 };
 
 struct BlueprintResult {
@@ -142,9 +147,9 @@ struct BlueprintResult {
     std::string failure_reason = "";
     std::vector<std::string> unmet_quotas;
     std::vector<BlueprintScene> scenes;
-    /// quota-accepted tasks (normal collection iterates EXACTLY these)
+    /// selected tasks (normal collection iterates EXACTLY these)
     std::vector<BlueprintTask> tasks;
-    /// all preflight-accepted tasks (the oversampled candidate pool)
+    /// all preflight-accepted tasks (the candidate pool)
     std::vector<BlueprintTask> preflighted;
     uint64_t requested_scenes = 0;
     uint64_t requested_tasks_per_scene = 0;
@@ -152,18 +157,31 @@ struct BlueprintResult {
     uint64_t scenes_valid = 0;
     uint64_t tasks_sampled = 0;      // sampled start/goal candidates
     uint64_t tasks_preflighted = 0;  // candidates actually preflighted
-    uint64_t tasks_pool_target = 0;  // sum of per-scene oversample targets
+    uint64_t tasks_pool_target = 0;  // sum of per-scene pool targets
     uint64_t tasks_pool_accepted = 0;  // preflight-accepted candidate pool
-    uint64_t tasks_quota_accepted = 0;  // final quota-selected tasks
-    bool pool_budget_exhausted = false;  // a scene hit the budget below target
-    uint64_t strata_required = 0;
-    uint64_t strata_covered = 0;
-    std::vector<uint64_t> strata_covered_flags;  // 1 if stratum i covered by ACTUAL geometry
-    /// per-scene accepted-task counts (indexed by scene_id)
+    uint64_t tasks_quota_accepted = 0;  // final selected tasks
+    uint64_t total_task_candidates = 0;  // preflight-accepted per scene, summed
+    uint64_t preflight_success_tasks = 0;
+    uint64_t cheap_filter_rejected = 0;
+    bool pool_budget_exhausted = false;
+    uint64_t strata_required = 0;   // legacy report
+    uint64_t strata_covered = 0;    // legacy report
+    std::vector<uint64_t> strata_covered_flags;  // legacy report
+    /// per-scene selected-task counts (indexed by scene_id)
     std::vector<uint64_t> per_scene_accepted;
     /// final per-category counts: "behavior:clear", "density:sparse", ...
     std::map<std::string, uint64_t> category_counts;
     uint64_t base_seed = 0;
+    // ── new: distribution report (manifest) ────────────────────────
+    std::map<std::string, uint64_t> distribution_counts;
+    std::map<std::string, std::vector<uint64_t>> distribution_histograms;
+    std::vector<std::string> remaining_deficits;
+    std::vector<std::string> warnings;
+    uint64_t generation_rounds = 0;
+    std::map<std::string, double> timing_ms;
+    std::vector<uint64_t> selected_scene_ids;
+    bool hard_minimums_met = false;
+    bool soft_targets_met = false;
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -220,55 +238,58 @@ private:
 };
 
 // ═══════════════════════════════════════════════════════════════════
-//  Scene / ESDF / task / blueprint generator + classifier + quotas
+//  Scene / ESDF / task / blueprint generator + classifier + selection
 // ═══════════════════════════════════════════════════════════════════
+//  Public entry point (pybind / il_manager).  The heavy pipeline lives in
+//  BlueprintGenerationController; this class is a thin configured facade
+//  that keeps the pybind + manifest contract stable.
 class SceneTaskBlueprintGenerator {
 public:
+    // ── legacy Config fields (backward compatible; the NEW pipeline is
+    //    driven by `blueprint` below, with these as the fallback) ───
     struct Config {
-        // ── scenes ────────────────────────────────────────────────
-        int scene_count = 10;       // scene 0 = explicit EMPTY/CLEAR scene
-                                    // + 9 non-empty sparse/medium/dense ×
-                                    //     small/medium/large coverage
-        int tasks_per_scene = 8;    // FINAL expected accepted tasks/scene
+        int scene_count = 10;
+        int tasks_per_scene = 8;
         int minimum_tasks_per_scene = 6;
         uint64_t base_seed = 260812;
         double flight_height_m = 2.0;
         double obstacle_height_m = 8.0;
         bool require_full_strata_coverage = true;
-        // ── geometry ──────────────────────────────────────────────
-        double min_surface_gap_m = 1.20;
+        double min_surface_gap_m = 1.40;
         double boundary_margin_m = 1.20;
         double radius_min_m = 0.10;
-        double radius_max_m = 2.00;
-        int max_obstacles = 20;
+        double radius_max_m = 6.00;
+        int max_obstacles = 30;
         double vehicle_radius_m = 0.30;
         double navigation_clearance_m = 0.30;
-        double free_cell_surface_clearance_m = 0.50;  // centre→surface, ≥ vehicle_radius
+        double free_cell_surface_clearance_m = 0.50;
         double esdf_resolution_m = 0.10;
-        int max_generation_attempts = 24;   // whole-scene regeneration attempts
-        // ── tasks (oversampling) ──────────────────────────────────
+        int max_generation_attempts = 96;
         double min_task_distance_m = 4.0;
-        double max_task_distance_m = 20.0;
-        double initial_yaw_bias_deg = 15.0;  // left/right symmetric
-        int task_sample_attempts = 200;      // per-candidate start/goal attempts
-        int candidate_pool_multiplier = 4;   // oversample preflighted pool
-        uint64_t qualification_attempt_budget = 400;  // per-scene preflight attempts
-        // ── preflight (named, finite qualification budget) ────────
-        uint64_t preflight_qualification_max_ticks = 1800;  // 60 s @ 30 Hz
-        // ── dataset quotas (hard) ─────────────────────────────────
-        int min_per_behavior = 2;      // each required behavior class
-        int min_turn_per_side = 2;     // turn_left / turn_right tasks
+        double max_task_distance_m = 28.0;
+        double initial_yaw_bias_deg = 15.0;   // legacy; replaced by yaw strata
+        int task_sample_attempts = 300;
+        int candidate_pool_multiplier = 4;
+        uint64_t qualification_attempt_budget = 600;
+        uint64_t preflight_qualification_max_ticks = 900;
+        int min_per_behavior = 2;      // legacy (informational)
+        int min_turn_per_side = 2;
         int max_left_right_imbalance = 2;
-        int min_per_density_level = 4;   // sparse / medium / dense
-        int min_per_radius_level = 4;    // small / medium / large
-        int min_per_distance_level = 4;  // short / medium / long
+        int min_per_density_level = 4;
+        int min_per_radius_level = 4;
+        int min_per_distance_level = 4;
         double distance_short_max_m = 9.0;
         double distance_long_min_m = 15.0;
         double radius_small_max_m = 0.6;
         double radius_large_min_m = 1.4;
         double density_sparse_max = 7.0;
         double density_dense_min = 14.0;
-        uint64_t long_takeover_min_ticks = 30;  // >= 1.0 s @ 30 Hz
+        uint64_t long_takeover_min_ticks = 30;
+        // ── new: the full blueprint-generation config (YAML
+        //    blueprint_generation section); when left at defaults the
+        //    controller falls back to the legacy fields above ───────
+        BlueprintGenerationConfig blueprint;
+        bool blueprint_explicit = false;
     };
 
     void configure(const Params2D& params, const Config& cfg);
@@ -277,46 +298,9 @@ public:
     const Config& config() const { return cfg_; }
 
 private:
-    struct EsdfGrid {
-        double res = 0.1;
-        Vec2d min_bounds{-20.0, -20.0};
-        int w = 0, h = 0;
-        std::vector<double> dist;  // drone-centre→surface distance per cell
-        std::vector<int> comp;     // free component id (-1 = not free)
-    };
-
-    EsdfGrid buildEsdf(const BlueprintScene& scene) const;
-    void labelComponents(EsdfGrid& grid) const;
-    /// Generate ONE scene, retrying the whole scene with a fresh attempt
-    /// seed until the requested count is met (or attempts are exhausted).
-    BlueprintScene makeScene(uint64_t scene_id, uint64_t seed) const;
-    /// Analytically re-verify a start/goal pair (surface clearance +
-    /// boundary + distance stratum).  Returns false on ANY violation.
-    bool verifyEndpointPair(const BlueprintScene& scene, double sx, double sy,
-                            double gx, double gy, int distance_stratum) const;
-    /// Sample one connected task: start AND goal from free-cell CENTRES of
-    /// the SAME component, with the distance in the requested stratum.
-    bool sampleOneTask(const EsdfGrid& g, const BlueprintScene& scene,
-                       uint64_t seed, uint64_t task_id, int distance_stratum,
-                       BlueprintTask& out) const;
-    void preflightTask(BlueprintTask& task, const BlueprintScene& scene,
-                       uint64_t tick_base) const;
-    void assignGeometryClasses(BlueprintTask& task,
-                               const BlueprintScene& scene) const;
-    /// Actual density class from the REAL obstacle count (sparse/medium/dense)
-    /// using the configured classification thresholds.
-    std::string densityClassOf(double count) const;
-    /// Actual radius class from the REAL maximum obstacle radius; empty
-    /// scenes are ALWAYS "none" (never "small").
-    std::string radiusClassOf(double max_radius, bool is_empty) const;
-    /// Greedy deterministic quota selector.  Returns the accepted tasks,
-    /// fills `unmet_quotas`, `category_counts` and `per_scene_accepted`.
-    std::vector<BlueprintTask> applyQuotas(
-        std::vector<BlueprintTask> preflighted,
-        std::vector<std::string>& unmet_quotas,
-        std::map<std::string, uint64_t>& category_counts,
-        std::vector<uint64_t>& per_scene_accepted) const;
-
+    /// Build the effective BlueprintGenerationConfig (from the explicit
+    /// blueprint section, or from the legacy fields when not provided).
+    BlueprintGenerationConfig makeBlueprintConfig() const;
     Params2D p_;
     Config cfg_;
     bool configured_ = false;

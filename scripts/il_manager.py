@@ -270,15 +270,27 @@ class JointV2Manager(object):
         self._truth = expert_mod.TruthCylinderAudit()
 
     # ═══════════════════════════════════════════════════════════════
-    #  Full C++ blueprint generation (items 四 / 五 / 六)
+    #  Full C++ blueprint generation (deficit-driven pipeline)
     # ═══════════════════════════════════════════════════════════════
     def _blueprint_config_dict(self):
-        """Build the C++ SceneTaskBlueprintGenerator.Config from YAML."""
+        """Build the C++ SceneTaskBlueprintGenerator.Config from YAML.
+
+        Legacy top-level keys (scene_generation / task_generation / quotas)
+        stay for backward compatibility; the NEW `blueprint_generation`
+        section (when enabled) provides the full deficit-driven pipeline
+        config under the `blueprint` sub-dict (warehouse single source,
+        profiles, layered initial yaw, depth proxy, distribution targets,
+        budgets).  When `blueprint_generation.enabled` is false only the
+        legacy keys are sent (C++ falls back).
+        """
         sg = self._g.get("scene_generation", {}) or {}
         tg = self._g.get("task_generation", {}) or {}
         geo = sg.get("geometry", {}) or {}
         q = tg.get("quotas", {}) or {}
-        return {
+        bp = self._g.get("blueprint_generation", {}) or {}
+        bp_enabled = bool(bp.get("enabled", True))
+
+        legacy = {
             "scene_count": int(sg.get("scene_count", 10)),
             "tasks_per_scene": int(sg.get("tasks_per_scene", 8)),
             "minimum_tasks_per_scene": int(
@@ -289,30 +301,30 @@ class JointV2Manager(object):
             "require_full_strata_coverage": bool(
                 sg.get("require_full_strata_coverage", True)),
             "min_surface_gap_m": float(
-                geo.get("minimum_surface_gap_m", 1.2)),
+                geo.get("minimum_surface_gap_m", 1.40)),
             "boundary_margin_m": float(geo.get("boundary_margin_m", 1.2)),
             "radius_min_m": float(geo.get("radius_min_m", 0.10)),
-            "radius_max_m": float(geo.get("radius_max_m", 2.0)),
-            "max_obstacles": int(geo.get("max_obstacles", 20)),
+            "radius_max_m": float(geo.get("radius_max_m", 6.0)),
+            "max_obstacles": int(geo.get("max_obstacles", 30)),
             "vehicle_radius_m": float(self._vehicle_radius),
             "navigation_clearance_m": float(self._clearance),
             "free_cell_surface_clearance_m": float(
                 geo.get("free_cell_surface_clearance_m", 0.5)),
             "esdf_resolution_m": float(geo.get("esdf_resolution_m", 0.1)),
             "max_generation_attempts": int(
-                sg.get("max_generation_attempts", 24)),
+                sg.get("max_generation_attempts", 96)),
             "min_task_distance_m": float(tg.get("min_task_distance_m", 4.0)),
             "max_task_distance_m": float(tg.get("max_task_distance_m", 20.0)),
             "initial_yaw_bias_deg": float(
                 tg.get("initial_yaw_bias_deg", 15.0)),
             "task_sample_attempts": int(
-                tg.get("task_sample_attempts", 200)),
+                tg.get("task_sample_attempts", 300)),
             "candidate_pool_multiplier": int(
                 tg.get("candidate_pool_multiplier", 4)),
             "qualification_attempt_budget": int(
-                tg.get("qualification_attempt_budget", 400)),
+                tg.get("qualification_attempt_budget", 600)),
             "preflight_qualification_max_ticks": int(
-                tg.get("preflight_qualification_max_ticks", 1800)),
+                tg.get("preflight_qualification_max_ticks", 900)),
             "min_per_behavior": int(q.get("min_per_behavior", 2)),
             "min_turn_per_side": int(q.get("min_turn_per_side", 2)),
             "max_left_right_imbalance": int(
@@ -333,6 +345,83 @@ class JointV2Manager(object):
             "long_takeover_min_ticks": int(
                 q.get("long_takeover_min_ticks", 30)),
         }
+        if not bp_enabled:
+            return legacy
+
+        # ── NEW: blueprint_generation section (deficit-driven) ─────
+        bsg = bp.get("scene_generation", {}) or {}
+        btg = bp.get("task_generation", {}) or {}
+        perf = bp.get("performance", {}) or {}
+        req = bp.get("requirements", {}) or {}
+        leg = bp.get("legacy", {}) or {}
+        wh = bp.get("warehouse", {}) or {}
+        fr = wh.get("free_region", []) or []
+        if not fr or len(fr) < 4:
+            # Single-source fallback: hierarchical_expert.region IS the
+            # warehouse free region ([-7,10] x [0,30]).
+            he_region = self._g.get("hierarchical_expert", {}).get(
+                "region", {}) or {}
+            fr = [float(he_region.get("min_x", -7.0)),
+                  float(he_region.get("max_x", 10.0)),
+                  float(he_region.get("min_y", 0.0)),
+                  float(he_region.get("max_y", 30.0))]
+        else:
+            fr = [float(v) for v in fr]
+
+        blueprint = {
+            "base_seed": int(bp.get("base_seed", sg.get("seed", 260812))),
+            "warehouse": {
+                "free_region": fr,
+                "wall_extension_m": float(wh.get("wall_extension_m", 1.0)),
+            },
+            "vehicle_radius_m": float(self._vehicle_radius),
+            "navigation_clearance_m": float(self._clearance),
+            "clearance_discretization_margin_m": float(
+                bsg.get("clearance_discretization_margin_m", 0.05)),
+            "generation_margin_m": float(
+                bsg.get("generation_margin_m", 0.05)),
+            "min_surface_gap_m": float(
+                bsg.get("min_surface_gap_m",
+                        geo.get("minimum_surface_gap_m", 1.40))),
+            "boundary_margin_m": float(
+                bsg.get("boundary_margin_m",
+                        geo.get("boundary_margin_m", 1.20))),
+            "free_cell_surface_clearance_m": float(
+                bsg.get("free_cell_surface_clearance_m",
+                        geo.get("free_cell_surface_clearance_m", 0.5))),
+            "esdf_resolution_m": float(
+                bsg.get("esdf_resolution_m",
+                        geo.get("esdf_resolution_m", 0.1))),
+            "min_main_component_area_m2": float(
+                bsg.get("min_main_component_area_m2", 60.0)),
+            "use_profile_catalog": bool(
+                bsg.get("use_profile_catalog", True)),
+            "profiles": list(bsg.get("profiles", []) or []),
+            "profile_sequence": list(bsg.get("profile_sequence", []) or []),
+            "min_task_distance_m": float(
+                btg.get("min_task_distance_m",
+                        tg.get("min_task_distance_m", 4.0))),
+            "max_task_distance_m": float(
+                btg.get("max_task_distance_m",
+                        tg.get("max_task_distance_m", 20.0))),
+            "flight_height_m": float(
+                btg.get("flight_height_m", tg.get("flight_height_m", 2.0))),
+            "obstacle_height_m": float(
+                btg.get("obstacle_height_m", geo.get("height_m", 8.0))),
+            "task_sample_attempts": int(
+                btg.get("task_sample_attempts",
+                        tg.get("task_sample_attempts", 300))),
+            "task_goal_attempts": int(btg.get("task_goal_attempts", 120)),
+            "initial_yaw": dict(btg.get("initial_yaw", {}) or {}),
+            "depth_proxy": dict(btg.get("depth_proxy", {}) or {}),
+            "histograms": dict(btg.get("histograms", {}) or {}),
+            "path": dict(btg.get("path", {}) or {}),
+            "performance": dict(perf),
+            "requirements": dict(req),
+            "legacy": dict(leg),
+        }
+        legacy["blueprint"] = blueprint
+        return legacy
 
     def _generate_blueprint(self):
         """ONE C++ call that returns the FULL blueprint (both modes)."""
@@ -358,9 +447,34 @@ class JointV2Manager(object):
 
         scenes = []
         for s in result.scenes:
+            md = s.metadata
             scenes.append({
                 "scene_id": int(s.scene_id),
                 "seed": int(s.seed),
+                "profile": str(s.profile),
+                "metadata": {
+                    "obstacle_count": int(md.obstacle_count),
+                    "radius_min": float(md.radius_min),
+                    "radius_max": float(md.radius_max),
+                    "radius_mean": float(md.radius_mean),
+                    "tiny_count": int(md.tiny_count),
+                    "small_count": int(md.small_count),
+                    "medium_count": int(md.medium_count),
+                    "large_count": int(md.large_count),
+                    "local_density_proxy": float(md.local_density_proxy),
+                    "largest_obstacle_radius":
+                        float(md.largest_obstacle_radius),
+                    "cluster_count": int(md.cluster_count),
+                    "free_space_ratio": float(md.free_space_ratio),
+                    "estimated_corridor_width":
+                        float(md.estimated_corridor_width),
+                    "geometry_valid": bool(md.geometry_valid),
+                    "geometry_failure_reason":
+                        str(md.geometry_failure_reason),
+                    "planning_valid": bool(md.planning_valid),
+                    "planning_failure_reason":
+                        str(md.planning_failure_reason),
+                },
                 "stratum_id": int(s.stratum_id),
                 "is_empty": bool(s.is_empty),
                 "planned_density_class": str(s.planned_density_class),
@@ -379,6 +493,76 @@ class JointV2Manager(object):
                      "radius": float(o.radius), "height_m": float(o.height_m)}
                     for o in s.obstacles],
             })
+
+        def _fin(x):
+            """Finite-only JSON sanitizer (inf/NaN -> 0.0)."""
+            try:
+                v = float(x)
+            except (TypeError, ValueError):
+                return 0.0
+            if not math.isfinite(v):
+                return 0.0
+            return v
+
+        def _summary_dict(sm):
+            return {
+                "straight_distance_m": float(sm.straight_distance_m),
+                "preflight_path_length_m": float(sm.preflight_path_length_m),
+                "path_stretch_ratio": float(sm.path_stretch_ratio),
+                "preflight_duration_s": float(sm.preflight_duration_s),
+                "preflight_ticks": int(sm.preflight_ticks),
+                "initial_yaw_error_signed_deg":
+                    float(sm.initial_yaw_error_signed_deg),
+                "initial_yaw_error_abs_deg":
+                    float(sm.initial_yaw_error_abs_deg),
+                "depth": {
+                    "samples": int(sm.depth_samples),
+                    "near_count": int(sm.depth_near_count),
+                    "mid_count": int(sm.depth_mid_count),
+                    "far_count": int(sm.depth_far_count),
+                    "free_count": int(sm.depth_free_count),
+                    "near_ratio": float(sm.near_depth_ratio()),
+                    "mid_ratio": float(sm.mid_depth_ratio()),
+                    "far_ratio": float(sm.far_depth_ratio()),
+                    "free_ratio": float(sm.free_depth_ratio()),
+                    "min_visible_m": _fin(sm.depth_min_visible_m),
+                    "mean_visible_m": _fin(sm.depth_mean_visible_m),
+                    "max_angular_occlusion_deg":
+                        float(sm.depth_max_angular_occlusion_deg),
+                    "occupied_ray_ratio": float(sm.depth_occupied_ray_ratio),
+                },
+                "macro5hz": {
+                    "tick_total": int(sm.macro_tick_total),
+                    "pass_count": int(sm.macro_pass_count),
+                    "normal_count": int(sm.macro_normal_count),
+                    "turn_left_count": int(sm.macro_turn_left_count),
+                    "turn_right_count": int(sm.macro_turn_right_count),
+                    "correction_angle_hist": list(
+                        sm.macro_correction_angle_hist.counts),
+                    "correction_angle_edges": list(
+                        sm.macro_correction_angle_hist.edges),
+                    "correction_distance_hist": list(
+                        sm.macro_correction_distance_hist.counts),
+                },
+                "local30hz": {
+                    "direct_count": int(sm.local_direct_count),
+                    "avoidance_count": int(sm.local_avoidance_count),
+                    "deflection_hist": list(sm.local_deflection_hist.counts),
+                    "deflection_edges": list(sm.local_deflection_hist.edges),
+                    "yaw_rate_hist": list(sm.local_yaw_rate_hist.counts),
+                    "speed_hist": list(sm.local_speed_hist.counts),
+                    "min_observed_clearance_m":
+                        _fin(sm.min_observed_clearance_m),
+                    "mean_observed_clearance_m":
+                        _fin(sm.mean_observed_clearance_m),
+                },
+                "quality": {
+                    "reached_goal": bool(sm.reached_goal),
+                    "collision": bool(sm.collision),
+                    "out_of_bounds": bool(sm.out_of_bounds),
+                    "minimum_clearance_m": _fin(sm.minimum_clearance_m),
+                },
+            }
 
         def _task_dict(t):
             return {
@@ -399,6 +583,8 @@ class JointV2Manager(object):
                 "saw_normal_correction": bool(t.saw_normal_correction),
                 "turn_update_count": int(t.turn_update_count),
                 "normal_update_count": int(t.normal_update_count),
+                "geom_type": str(t.geom_type),
+                "selection_score": float(t.selection_score),
                 "audit": {
                     "accepted": bool(t.audit.accepted),
                     "reached_goal": bool(t.audit.reached_goal),
@@ -409,10 +595,15 @@ class JointV2Manager(object):
                         bool(t.audit.qualification_exceeded),
                     "preflight_ticks": int(t.audit.preflight_ticks),
                     "min_truth_clearance_m":
-                        float(t.audit.min_truth_clearance_m),
+                        _fin(t.audit.min_truth_clearance_m),
                     "goal_distance_m": float(t.audit.goal_distance_m),
+                    "straight_distance_m": float(t.audit.straight_distance_m),
+                    "path_length_m": float(t.audit.path_length_m),
+                    "path_stretch_ratio": float(t.audit.path_stretch_ratio),
+                    "preflight_duration_s": float(t.audit.preflight_duration_s),
                     "preflight_status": str(t.audit.preflight_status),
                 },
+                "summary": _summary_dict(t.summary),
             }
 
         payload = {
@@ -438,16 +629,34 @@ class JointV2Manager(object):
             "tasks_pool_target": int(result.tasks_pool_target),
             "tasks_pool_accepted": int(result.tasks_pool_accepted),
             "tasks_quota_accepted": int(result.tasks_quota_accepted),
+            "total_task_candidates": int(result.total_task_candidates),
+            "preflight_success_tasks": int(result.preflight_success_tasks),
+            "cheap_filter_rejected": int(result.cheap_filter_rejected),
             "pool_budget_exhausted": bool(result.pool_budget_exhausted),
+            # ── NEW: distribution report + iteration summary ───────
+            "generation_rounds": int(result.generation_rounds),
+            "hard_minimums_met": bool(result.hard_minimums_met),
+            "soft_targets_met": bool(result.soft_targets_met),
+            "distribution_counts": {
+                str(k): int(v) for k, v in result.distribution_counts.items()},
+            "distribution_histograms": {
+                str(k): [int(v) for v in hist]
+                for k, hist in result.distribution_histograms.items()},
+            "remaining_deficits": [str(d) for d in result.remaining_deficits],
+            "warnings": [str(w) for w in result.warnings],
+            "timing_ms": {str(k): float(v) for k, v in result.timing_ms.items()},
+            "selected_scene_ids": [int(s) for s in result.selected_scene_ids],
             "scenes": scenes,
             "tasks": [_task_dict(t) for t in result.tasks],
             "note": (
                 "Manifest stores ONLY original start/goal/initial_yaw, scene "
-                "obstacles, seed, C++ behavior classification and the "
-                "judge-only preflight audit.  NO future 5 Hz correction "
-                "sequence and NO local-target stream is stored.  The "
-                "generation_ok flag must be true before any Flightmare "
-                "collection starts."),
+                "obstacles, seed, C++ behavior classification, the "
+                "judge-only preflight audit and the per-task distribution "
+                "summary (depth proxy / 5 Hz / 30 Hz histograms).  NO "
+                "future 5 Hz correction sequence and NO local-target "
+                "stream is stored.  generation_ok is false only when a "
+                "HARD distribution minimum is unmet; soft-target shortfalls "
+                "appear in remaining_deficits / warnings."),
         }
         with open(manifest, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -1181,23 +1390,27 @@ class JointV2Manager(object):
         #    C++ generator), recording ACTUAL counts / quota status.
         manifest = self._write_blueprint_manifest(blueprint)
         rospy.loginfo(
-            "[Manager] blueprint: generation_ok=%s scenes=%d/%d valid "
-            "sampled=%d preflight=%d pool=%d/%d quota=%d strata=%d/%d "
-            "unmet=%d -> %s",
-            blueprint.generation_ok, blueprint.scenes_valid,
-            blueprint.scenes_generated, blueprint.tasks_sampled,
-            blueprint.tasks_preflighted, blueprint.tasks_pool_accepted,
-            blueprint.tasks_pool_target, blueprint.tasks_quota_accepted,
-            blueprint.strata_covered, blueprint.strata_required,
-            len(blueprint.unmet_quotas), manifest)
+            "[Manager] blueprint: generation_ok=%s (hard=%s soft=%s) "
+            "rounds=%d scenes=%d/%d sampled=%d preflight=%d pool=%d/%d "
+            "selected=%d strata=%d/%d cheap_rej=%d deficits=%d -> %s",
+            blueprint.generation_ok, blueprint.hard_minimums_met,
+            blueprint.soft_targets_met, blueprint.generation_rounds,
+            blueprint.scenes_valid, blueprint.scenes_generated,
+            blueprint.tasks_sampled, blueprint.tasks_preflighted,
+            blueprint.tasks_pool_accepted, blueprint.tasks_pool_target,
+            blueprint.tasks_quota_accepted, blueprint.strata_covered,
+            blueprint.strata_required, blueprint.cheap_filter_rejected,
+            len(blueprint.remaining_deficits), manifest)
         # 3. HARD GATE for ALL modes: a broken blueprint never prints a
         # success line, and normal mode never connects Flightmare.  The
         # gate runs BEFORE any blueprint_only/dry_run early-return.
         if not blueprint.generation_ok:
             rospy.logerr(
                 "[Manager] blueprint generation FAILED (%s); NOT connecting "
-                "Flightmare.  unmet_quotas=%s pool_budget_exhausted=%s",
-                blueprint.failure_reason, list(blueprint.unmet_quotas),
+                "Flightmare.  hard_minimums_met=%s deficits=%s "
+                "pool_budget_exhausted=%s",
+                blueprint.failure_reason, blueprint.hard_minimums_met,
+                list(blueprint.remaining_deficits),
                 blueprint.pool_budget_exhausted)
             raise RuntimeError(
                 "blueprint generation failed: %s" % blueprint.failure_reason)
@@ -1260,7 +1473,9 @@ class JointV2Manager(object):
                     "accepted": bool(task.audit.accepted),
                     "preflight_ticks": int(task.audit.preflight_ticks),
                     "min_truth_clearance_m":
-                        float(task.audit.min_truth_clearance_m),
+                        float(task.audit.min_truth_clearance_m)
+                        if math.isfinite(float(task.audit.min_truth_clearance_m))
+                        else 0.0,
                     "goal_distance_m": float(task.audit.goal_distance_m),
                     "preflight_status": str(task.audit.preflight_status),
                 },

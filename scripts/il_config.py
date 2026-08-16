@@ -387,6 +387,109 @@ def _validate_config(cfg):
         errors.append("task_generation.quotas.density_sparse_max must "
                       "be < density_dense_min")
 
+    # ── blueprint_generation: deficit-driven offline pipeline ──────
+    bp = g.get("blueprint_generation", {}) or {}
+    if bool(bp.get("enabled", True)):
+        # Warehouse free region is THE single source: when present it must
+        # equal hierarchical_expert.region (the expert grid anchor) so the
+        # blueprint, preflight and runtime never disagree on coordinates.
+        bp_wh = bp.get("warehouse", {}) or {}
+        fr = bp_wh.get("free_region", None)
+        he_region = (g.get("hierarchical_expert", {}) or {}).get(
+            "region", {}) or {}
+        if fr is not None:
+            if not isinstance(fr, (list, tuple)) or len(fr) < 4 or \
+                    not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                            for v in fr):
+                errors.append(
+                    "blueprint_generation.warehouse.free_region must be "
+                    "[min_x, max_x, min_y, max_y]")
+            else:
+                if abs(float(fr[0]) - float(he_region.get("min_x", 0.0))) > 1e-6 or \
+                        abs(float(fr[1]) - float(he_region.get("max_x", 0.0))) > 1e-6 or \
+                        abs(float(fr[2]) - float(he_region.get("min_y", 0.0))) > 1e-6 or \
+                        abs(float(fr[3]) - float(he_region.get("max_y", 0.0))) > 1e-6:
+                    errors.append(
+                        "blueprint_generation.warehouse.free_region must "
+                        "equal hierarchical_expert.region (single source "
+                        "of the warehouse free region)")
+        _bounded(bp_wh.get("wall_extension_m", 1.0),
+                 "blueprint_generation.warehouse.wall_extension_m",
+                 0.0, 100.0, errors)
+
+        bsg = bp.get("scene_generation", {}) or {}
+        _positive(bsg.get("min_surface_gap_m", 1.40),
+                  "blueprint_generation.scene_generation.min_surface_gap_m",
+                  errors)
+        _positive(bsg.get("free_cell_surface_clearance_m", 0.5),
+                  "blueprint_generation.scene_generation."
+                  "free_cell_surface_clearance_m", errors)
+        # planner-required traversable passage:
+        #   2 * (vehicle radius + navigation clearance + discretisation
+        #   margin) + 2 * generation margin
+        req_passage = 2.0 * (
+            float(veh.get("radius_m", 0.30)) +
+            float(nav.get("clearance_m", 0.30)) +
+            float(bsg.get("clearance_discretization_margin_m", 0.05)) +
+            float(bsg.get("generation_margin_m", 0.05)))
+        if float(bsg.get("min_surface_gap_m", 1.40)) < req_passage - 1e-9:
+            errors.append(
+                "blueprint_generation.scene_generation.min_surface_gap_m "
+                "must be >= %.3f m (planner-required traversable passage)"
+                % req_passage)
+
+        btg = bp.get("task_generation", {}) or {}
+        _positive(btg.get("min_task_distance_m", 4.0),
+                  "blueprint_generation.task_generation.min_task_distance_m",
+                  errors)
+        _positive(btg.get("max_task_distance_m", 20.0),
+                  "blueprint_generation.task_generation.max_task_distance_m",
+                  errors)
+        if float(btg.get("min_task_distance_m", 4.0)) > \
+                float(btg.get("max_task_distance_m", 20.0)):
+            errors.append("blueprint_generation.task_generation."
+                          "min_task_distance_m must be <= max_task_distance_m")
+
+        # layered initial yaw: strictly increasing edges, non-negative
+        # weights, same bin count.
+        yaw = btg.get("initial_yaw", {}) or {}
+        yedges = yaw.get("edges_deg", [0.0, 15.0, 35.0, 55.0, 90.0, 150.0, 180.0])
+        yw = yaw.get("weights", [0.8, 1.2, 2.2, 1.6, 1.0, 0.9])
+        if isinstance(yedges, (list, tuple)) and len(yedges) >= 2 and \
+                all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                    for v in yedges):
+            if any(yedges[i] >= yedges[i + 1] for i in range(len(yedges) - 1)):
+                errors.append("blueprint_generation.task_generation."
+                              "initial_yaw.edges_deg must be strictly "
+                              "increasing")
+            if isinstance(yw, (list, tuple)) and len(yw) != len(yedges) - 1:
+                errors.append("blueprint_generation.task_generation."
+                              "initial_yaw.weights must have length "
+                              "len(edges_deg) - 1")
+        if isinstance(yw, (list, tuple)) and \
+                any(not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or float(v) < 0.0 for v in yw):
+            errors.append("blueprint_generation.task_generation."
+                          "initial_yaw.weights must be non-negative numbers")
+
+        dp = btg.get("depth_proxy", {}) or {}
+        near_m = float(dp.get("near_max_m", 1.5))
+        mid_m = float(dp.get("mid_max_m", 3.0))
+        far_m = float(dp.get("far_max_m", 5.0))
+        if not (0.0 < near_m < mid_m < far_m):
+            errors.append("blueprint_generation.task_generation.depth_proxy "
+                          "thresholds must satisfy 0 < near_max_m < "
+                          "mid_max_m < far_max_m")
+
+        perf = bp.get("performance", {}) or {}
+        for pk in ("max_scene_candidates", "max_task_candidates_per_scene",
+                   "max_generation_rounds", "max_total_preflight_tasks",
+                   "max_preflight_ticks_per_task",
+                   "max_scene_generation_attempts",
+                   "max_task_generation_attempts"):
+            _positive(perf.get(pk, 1),
+                      "blueprint_generation.performance.%s" % pk, errors)
+
     # ── hierarchical_expert: THE single expert parameter source ────
     he = g.get("hierarchical_expert", {}) or {}
     control_hz = float(he.get("control_hz", 30.0))

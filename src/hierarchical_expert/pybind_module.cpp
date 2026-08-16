@@ -49,6 +49,227 @@ double* toArray4(const py::object& obj, double out[4]) {
     return out;
 }
 
+/// Parse a numeric-list key of a dict (used by the blueprint config).
+void parseDoubleList(const py::dict& d, const char* key,
+                     std::vector<double>& out) {
+    if (!d.contains(key)) return;
+    const auto seq = py::cast<py::sequence>(d[key]);
+    out.clear();
+    out.reserve(static_cast<size_t>(py::len(seq)));
+    for (py::handle h : seq) out.push_back(py::cast<double>(h));
+}
+
+void parseStringList(const py::dict& d, const char* key,
+                     std::vector<std::string>& out) {
+    if (!d.contains(key)) return;
+    const auto seq = py::cast<py::sequence>(d[key]);
+    out.clear();
+    out.reserve(static_cast<size_t>(py::len(seq)));
+    for (py::handle h : seq) out.push_back(py::cast<std::string>(h));
+}
+
+/// Parse the YAML `blueprint_generation` dict into the C++
+/// BlueprintGenerationConfig (single source for the new pipeline).
+void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
+    auto get_d = [&](const char* k, double dflt) {
+        return bp.contains(k) ? py::cast<double>(bp[k]) : dflt;
+    };
+    auto get_i = [&](const char* k, int dflt) {
+        return bp.contains(k) ? py::cast<int>(bp[k]) : dflt;
+    };
+    auto get_u = [&](const char* k, uint64_t dflt) {
+        return bp.contains(k) ? py::cast<uint64_t>(bp[k]) : dflt;
+    };
+    auto get_b = [&](const char* k, bool dflt) {
+        return bp.contains(k) ? py::cast<bool>(bp[k]) : dflt;
+    };
+
+    // ── warehouse (THE single coordinate source) ──────────────────
+    if (bp.contains("warehouse")) {
+        const py::dict wh = py::cast<py::dict>(bp["warehouse"]);
+        if (wh.contains("free_region")) {
+            const auto fr = py::cast<py::sequence>(wh["free_region"]);
+            if (py::len(fr) >= 4) {
+                b.warehouse.free_min_x = py::cast<double>(fr[0]);
+                b.warehouse.free_max_x = py::cast<double>(fr[1]);
+                b.warehouse.free_min_y = py::cast<double>(fr[2]);
+                b.warehouse.free_max_y = py::cast<double>(fr[3]);
+            }
+        }
+        if (wh.contains("wall_extension_m")) {
+            b.warehouse.wall_extension_m = py::cast<double>(wh["wall_extension_m"]);
+        }
+    }
+
+    // ── planner compatibility ─────────────────────────────────────
+    b.vehicle_radius_m = get_d("vehicle_radius_m", b.vehicle_radius_m);
+    b.navigation_clearance_m =
+        get_d("navigation_clearance_m", b.navigation_clearance_m);
+    b.clearance_discretization_margin_m = get_d(
+        "clearance_discretization_margin_m", b.clearance_discretization_margin_m);
+    b.generation_margin_m = get_d("generation_margin_m", b.generation_margin_m);
+    b.min_surface_gap_m = get_d("min_surface_gap_m", b.min_surface_gap_m);
+    b.boundary_margin_m = get_d("boundary_margin_m", b.boundary_margin_m);
+    b.free_cell_surface_clearance_m =
+        get_d("free_cell_surface_clearance_m", b.free_cell_surface_clearance_m);
+    b.esdf_resolution_m = get_d("esdf_resolution_m", b.esdf_resolution_m);
+    b.min_main_component_area_m2 =
+        get_d("min_main_component_area_m2", b.min_main_component_area_m2);
+
+    // ── profiles / sequence ───────────────────────────────────────
+    if (bp.contains("profiles")) {
+        std::vector<SceneProfile> profiles;
+        for (py::handle h : py::cast<py::sequence>(bp["profiles"])) {
+            const py::dict pd = py::cast<py::dict>(h);
+            SceneProfile p;
+            auto pg = [&](const char* k, auto dflt) {
+                return pd.contains(k) ? py::cast<decltype(dflt)>(pd[k]) : dflt;
+            };
+            p.name = pg("name", std::string("profile"));
+            p.count_min = pg("count_min", 0);
+            p.count_max = pg("count_max", 0);
+            p.radius_min = pg("radius_min", 0.1);
+            p.radius_max = pg("radius_max", 1.0);
+            p.radius_mode = pg("radius_mode", std::string("log_uniform"));
+            p.fixed_radius = pg("fixed_radius", 0.1);
+            const std::string st = pg("structure", std::string("uniform"));
+            if (st == "clustered") p.structure = SceneStructure::CLUSTERED;
+            else if (st == "corridor") p.structure = SceneStructure::CORRIDOR;
+            else if (st == "bottleneck") p.structure = SceneStructure::BOTTLENECK;
+            else if (st == "chicane") p.structure = SceneStructure::CHICANE;
+            else if (st == "central_blocker") p.structure = SceneStructure::CENTRAL_BLOCKER;
+            else if (st == "edge_clutter") p.structure = SceneStructure::EDGE_CLUTTER;
+            else if (st == "empty") p.structure = SceneStructure::EMPTY;
+            p.cluster_count = pg("cluster_count", 0);
+            p.cluster_spread_m = pg("cluster_spread_m", 0.0);
+            p.passage_width_m = pg("passage_width_m", 0.0);
+            p.weight = pg("weight", 1.0);
+            if (pd.contains("tags")) {
+                for (py::handle th : py::cast<py::sequence>(pd["tags"])) {
+                    p.tags.push_back(py::cast<std::string>(th));
+                }
+            }
+            profiles.push_back(p);
+        }
+        b.profiles = std::move(profiles);
+    }
+    parseStringList(bp, "profile_sequence", b.profile_sequence);
+
+    // ── tasks ─────────────────────────────────────────────────────
+    b.min_task_distance_m = get_d("min_task_distance_m", b.min_task_distance_m);
+    b.max_task_distance_m = get_d("max_task_distance_m", b.max_task_distance_m);
+    b.flight_height_m = get_d("flight_height_m", b.flight_height_m);
+    b.obstacle_height_m = get_d("obstacle_height_m", b.obstacle_height_m);
+    b.task_sample_attempts = get_i("task_sample_attempts", b.task_sample_attempts);
+    b.task_goal_attempts = get_i("task_goal_attempts", b.task_goal_attempts);
+
+    // ── initial yaw (layered) ─────────────────────────────────────
+    if (bp.contains("initial_yaw")) {
+        const py::dict y = py::cast<py::dict>(bp["initial_yaw"]);
+        parseDoubleList(y, "edges_deg", b.yaw_edges_deg);
+        parseDoubleList(y, "weights", b.yaw_weights);
+    }
+
+    // ── depth proxy ───────────────────────────────────────────────
+    if (bp.contains("depth_proxy")) {
+        const py::dict d = py::cast<py::dict>(bp["depth_proxy"]);
+        auto gd = [&](const char* k, double dflt) {
+            return d.contains(k) ? py::cast<double>(d[k]) : dflt;
+        };
+        auto gi = [&](const char* k, int dflt) {
+            return d.contains(k) ? py::cast<int>(d[k]) : dflt;
+        };
+        b.depth_proxy_num_rays = gi("num_rays", b.depth_proxy_num_rays);
+        b.depth_proxy_sample_stride_ticks =
+            gi("sample_stride_ticks", b.depth_proxy_sample_stride_ticks);
+        b.depth_near_max_m = gd("near_max_m", b.depth_near_max_m);
+        b.depth_mid_max_m = gd("mid_max_m", b.depth_mid_max_m);
+        b.depth_far_max_m = gd("far_max_m", b.depth_far_max_m);
+    }
+
+    // ── behaviour histograms ──────────────────────────────────────
+    if (bp.contains("histograms")) {
+        const py::dict d = py::cast<py::dict>(bp["histograms"]);
+        parseDoubleList(d, "correction_angle_edges_deg",
+                        b.correction_angle_edges_deg);
+        parseDoubleList(d, "correction_distance_edges",
+                        b.correction_distance_edges);
+        parseDoubleList(d, "deflection_edges_deg", b.deflection_edges_deg);
+        parseDoubleList(d, "yaw_rate_edges", b.yaw_rate_edges);
+        parseDoubleList(d, "speed_edges", b.speed_edges);
+        if (d.contains("min_deflection_speed_mps")) {
+            b.min_deflection_speed_mps =
+                py::cast<double>(d["min_deflection_speed_mps"]);
+        }
+    }
+
+    // ── path classes ──────────────────────────────────────────────
+    if (bp.contains("path")) {
+        const py::dict d = py::cast<py::dict>(bp["path"]);
+        if (d.contains("short_max_m")) b.path_short_max_m = py::cast<double>(d["short_max_m"]);
+        if (d.contains("long_min_m")) b.path_long_min_m = py::cast<double>(d["long_min_m"]);
+    }
+
+    // ── performance budgets ───────────────────────────────────────
+    if (bp.contains("performance")) {
+        const py::dict d = py::cast<py::dict>(bp["performance"]);
+        auto gi = [&](const char* k, int dflt) {
+            return d.contains(k) ? py::cast<int>(d[k]) : dflt;
+        };
+        b.max_scene_candidates = gi("max_scene_candidates", b.max_scene_candidates);
+        b.max_task_candidates_per_scene =
+            gi("max_task_candidates_per_scene", b.max_task_candidates_per_scene);
+        b.max_generation_rounds = gi("max_generation_rounds", b.max_generation_rounds);
+        b.max_total_preflight_tasks =
+            gi("max_total_preflight_tasks", b.max_total_preflight_tasks);
+        b.max_preflight_ticks_per_task =
+            gi("max_preflight_ticks_per_task", b.max_preflight_ticks_per_task);
+        b.max_scene_generation_attempts =
+            gi("max_scene_generation_attempts", b.max_scene_generation_attempts);
+        b.max_task_generation_attempts =
+            gi("max_task_generation_attempts", b.max_task_generation_attempts);
+        if (d.contains("parallel_tasks")) b.parallel_tasks = py::cast<bool>(d["parallel_tasks"]);
+        if (d.contains("scene_switch_penalty")) b.scene_switch_penalty = py::cast<double>(d["scene_switch_penalty"]);
+    }
+
+    // ── result requirements ───────────────────────────────────────
+    if (bp.contains("requirements")) {
+        const py::dict d = py::cast<py::dict>(bp["requirements"]);
+        auto gi = [&](const char* k, int dflt) {
+            return d.contains(k) ? py::cast<int>(d[k]) : dflt;
+        };
+        auto gd = [&](const char* k, double dflt) {
+            return d.contains(k) ? py::cast<double>(d[k]) : dflt;
+        };
+        b.min_scenes = gi("min_scenes", b.min_scenes);
+        b.min_tasks = gi("min_tasks", b.min_tasks);
+        b.min_tasks_per_scene = gi("min_tasks_per_scene", b.min_tasks_per_scene);
+        b.max_tasks_per_scene = gi("max_tasks_per_scene", b.max_tasks_per_scene);
+        b.min_macro_ticks_per_class =
+            gi("min_macro_ticks_per_class", b.min_macro_ticks_per_class);
+        b.min_depth_samples_per_band =
+            gi("min_depth_samples_per_band", b.min_depth_samples_per_band);
+        b.min_yaw_samples_per_bin =
+            gi("min_yaw_samples_per_bin", b.min_yaw_samples_per_bin);
+        b.min_path_samples_per_class =
+            gi("min_path_samples_per_class", b.min_path_samples_per_class);
+        b.max_turn_imbalance_ratio =
+            gd("max_turn_imbalance_ratio", b.max_turn_imbalance_ratio);
+        b.max_yaw_imbalance_ratio =
+            gd("max_yaw_imbalance_ratio", b.max_yaw_imbalance_ratio);
+    }
+
+    // ── legacy strata thresholds / seed ───────────────────────────
+    if (bp.contains("legacy")) {
+        const py::dict d = py::cast<py::dict>(bp["legacy"]);
+        if (d.contains("density_sparse_max")) b.density_sparse_max = py::cast<double>(d["density_sparse_max"]);
+        if (d.contains("density_dense_min")) b.density_dense_min = py::cast<double>(d["density_dense_min"]);
+        if (d.contains("radius_small_max_m")) b.radius_small_max_m = py::cast<double>(d["radius_small_max_m"]);
+        if (d.contains("radius_large_min_m")) b.radius_large_min_m = py::cast<double>(d["radius_large_min_m"]);
+    }
+    b.base_seed = get_u("base_seed", b.base_seed);
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_il_hierarchical_expert, m) {
@@ -487,6 +708,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def(py::init<>())
         .def_readwrite("scene_id", &BlueprintScene::scene_id)
         .def_readwrite("seed", &BlueprintScene::seed)
+        .def_readwrite("profile", &BlueprintScene::profile)
+        .def_readwrite("metadata", &BlueprintScene::metadata)
         .def_readwrite("stratum_id", &BlueprintScene::stratum_id)
         .def_readwrite("count_stratum", &BlueprintScene::count_stratum)
         .def_readwrite("radius_stratum", &BlueprintScene::radius_stratum)
@@ -525,7 +748,14 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("min_truth_clearance_m",
                        &BlueprintTaskAudit::min_truth_clearance_m)
         .def_readwrite("goal_distance_m", &BlueprintTaskAudit::goal_distance_m)
-        .def_readwrite("preflight_status", &BlueprintTaskAudit::preflight_status);
+        .def_readwrite("preflight_status", &BlueprintTaskAudit::preflight_status)
+        .def_readwrite("straight_distance_m",
+                       &BlueprintTaskAudit::straight_distance_m)
+        .def_readwrite("path_length_m", &BlueprintTaskAudit::path_length_m)
+        .def_readwrite("path_stretch_ratio",
+                       &BlueprintTaskAudit::path_stretch_ratio)
+        .def_readwrite("preflight_duration_s",
+                       &BlueprintTaskAudit::preflight_duration_s);
 
     py::class_<BlueprintTask>(m, "BlueprintTask")
         .def(py::init<>())
@@ -550,7 +780,10 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("turn_update_count", &BlueprintTask::turn_update_count)
         .def_readwrite("normal_update_count",
                        &BlueprintTask::normal_update_count)
-        .def_readwrite("audit", &BlueprintTask::audit);
+        .def_readwrite("audit", &BlueprintTask::audit)
+        .def_readwrite("geom_type", &BlueprintTask::geom_type)
+        .def_readwrite("summary", &BlueprintTask::summary)
+        .def_readwrite("selection_score", &BlueprintTask::selection_score);
 
     py::class_<BlueprintResult>(m, "BlueprintResult")
         .def(py::init<>())
@@ -581,7 +814,25 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readonly("per_scene_accepted",
                       &BlueprintResult::per_scene_accepted)
         .def_readonly("category_counts", &BlueprintResult::category_counts)
-        .def_readonly("base_seed", &BlueprintResult::base_seed);
+        .def_readonly("base_seed", &BlueprintResult::base_seed)
+        .def_readonly("total_task_candidates",
+                      &BlueprintResult::total_task_candidates)
+        .def_readonly("preflight_success_tasks",
+                      &BlueprintResult::preflight_success_tasks)
+        .def_readonly("cheap_filter_rejected",
+                      &BlueprintResult::cheap_filter_rejected)
+        .def_readonly("distribution_counts",
+                      &BlueprintResult::distribution_counts)
+        .def_readonly("distribution_histograms",
+                      &BlueprintResult::distribution_histograms)
+        .def_readonly("remaining_deficits",
+                      &BlueprintResult::remaining_deficits)
+        .def_readonly("warnings", &BlueprintResult::warnings)
+        .def_readonly("generation_rounds", &BlueprintResult::generation_rounds)
+        .def_readonly("timing_ms", &BlueprintResult::timing_ms)
+        .def_readonly("selected_scene_ids", &BlueprintResult::selected_scene_ids)
+        .def_readonly("hard_minimums_met", &BlueprintResult::hard_minimums_met)
+        .def_readonly("soft_targets_met", &BlueprintResult::soft_targets_met);
 
     // ── TruthCylinderAudit (exact cylinder swept audit, judge-only) ─
     py::class_<TruthCylinderAudit>(m, "TruthCylinderAudit")
@@ -710,8 +961,117 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                  c.density_dense_min = get_dbl("density_dense_min", 14.0);
                  c.long_takeover_min_ticks =
                      get_uint("long_takeover_min_ticks", 30);
+                 // ── NEW: the `blueprint_generation` section drives the
+                 //    deficit-driven pipeline (optional; legacy keys above
+                 //    remain the fallback when it is absent) ─────────
+                 if (cfg.contains("blueprint")) {
+                     const py::dict bp = py::cast<py::dict>(cfg["blueprint"]);
+                     parseBlueprintConfig(bp, c.blueprint);
+                     c.blueprint_explicit = true;
+                 }
                  self.configure(params, c);
              },
              py::arg("params"), py::arg("config"))
         .def("generate", &SceneTaskBlueprintGenerator::generate);
+
+    // ── NEW: SceneMetadata / Histogram1D / TaskDistributionSummary ─
+    py::class_<SceneMetadata>(m, "SceneMetadata")
+        .def(py::init<>())
+        .def_readwrite("profile", &SceneMetadata::profile)
+        .def_readwrite("obstacle_count", &SceneMetadata::obstacle_count)
+        .def_readwrite("radius_min", &SceneMetadata::radius_min)
+        .def_readwrite("radius_max", &SceneMetadata::radius_max)
+        .def_readwrite("radius_mean", &SceneMetadata::radius_mean)
+        .def_readwrite("tiny_count", &SceneMetadata::tiny_count)
+        .def_readwrite("small_count", &SceneMetadata::small_count)
+        .def_readwrite("medium_count", &SceneMetadata::medium_count)
+        .def_readwrite("large_count", &SceneMetadata::large_count)
+        .def_readwrite("local_density_proxy", &SceneMetadata::local_density_proxy)
+        .def_readwrite("largest_obstacle_radius",
+                       &SceneMetadata::largest_obstacle_radius)
+        .def_readwrite("scene_seed", &SceneMetadata::scene_seed)
+        .def_readwrite("generation_attempt", &SceneMetadata::generation_attempt)
+        .def_readwrite("cluster_count", &SceneMetadata::cluster_count)
+        .def_readwrite("free_space_ratio", &SceneMetadata::free_space_ratio)
+        .def_readwrite("estimated_corridor_width",
+                       &SceneMetadata::estimated_corridor_width)
+        .def_readwrite("geometry_valid", &SceneMetadata::geometry_valid)
+        .def_readwrite("geometry_failure_reason",
+                       &SceneMetadata::geometry_failure_reason)
+        .def_readwrite("planning_valid", &SceneMetadata::planning_valid)
+        .def_readwrite("planning_failure_reason",
+                       &SceneMetadata::planning_failure_reason);
+
+    py::class_<Histogram1D>(m, "Histogram1D")
+        .def(py::init<>())
+        .def_readwrite("edges", &Histogram1D::edges)
+        .def_readwrite("counts", &Histogram1D::counts)
+        .def("total", &Histogram1D::total);
+
+    py::class_<TaskDistributionSummary>(m, "TaskDistributionSummary")
+        .def(py::init<>())
+        .def_readwrite("task_id", &TaskDistributionSummary::task_id)
+        .def_readwrite("scene_id", &TaskDistributionSummary::scene_id)
+        .def_readwrite("scene_profile", &TaskDistributionSummary::scene_profile)
+        .def_readwrite("task_geom_type", &TaskDistributionSummary::task_geom_type)
+        .def_readwrite("straight_distance_m",
+                       &TaskDistributionSummary::straight_distance_m)
+        .def_readwrite("preflight_path_length_m",
+                       &TaskDistributionSummary::preflight_path_length_m)
+        .def_readwrite("path_stretch_ratio",
+                       &TaskDistributionSummary::path_stretch_ratio)
+        .def_readwrite("preflight_duration_s",
+                       &TaskDistributionSummary::preflight_duration_s)
+        .def_readwrite("preflight_ticks", &TaskDistributionSummary::preflight_ticks)
+        .def_readwrite("initial_yaw_error_signed_deg",
+                       &TaskDistributionSummary::initial_yaw_error_signed_deg)
+        .def_readwrite("initial_yaw_error_abs_deg",
+                       &TaskDistributionSummary::initial_yaw_error_abs_deg)
+        .def_readwrite("depth_samples", &TaskDistributionSummary::depth_samples)
+        .def_readwrite("depth_near_count", &TaskDistributionSummary::depth_near_count)
+        .def_readwrite("depth_mid_count", &TaskDistributionSummary::depth_mid_count)
+        .def_readwrite("depth_far_count", &TaskDistributionSummary::depth_far_count)
+        .def_readwrite("depth_free_count", &TaskDistributionSummary::depth_free_count)
+        .def_readwrite("depth_visible_count",
+                       &TaskDistributionSummary::depth_visible_count)
+        .def_readwrite("depth_min_visible_m",
+                       &TaskDistributionSummary::depth_min_visible_m)
+        .def_readwrite("depth_mean_visible_m",
+                       &TaskDistributionSummary::depth_mean_visible_m)
+        .def_readwrite("depth_max_angular_occlusion_deg",
+                       &TaskDistributionSummary::depth_max_angular_occlusion_deg)
+        .def_readwrite("depth_occupied_ray_ratio",
+                       &TaskDistributionSummary::depth_occupied_ray_ratio)
+        .def_readwrite("macro_tick_total", &TaskDistributionSummary::macro_tick_total)
+        .def_readwrite("macro_pass_count", &TaskDistributionSummary::macro_pass_count)
+        .def_readwrite("macro_normal_count", &TaskDistributionSummary::macro_normal_count)
+        .def_readwrite("macro_turn_left_count",
+                       &TaskDistributionSummary::macro_turn_left_count)
+        .def_readwrite("macro_turn_right_count",
+                       &TaskDistributionSummary::macro_turn_right_count)
+        .def_readwrite("macro_correction_angle_hist",
+                       &TaskDistributionSummary::macro_correction_angle_hist)
+        .def_readwrite("macro_correction_distance_hist",
+                       &TaskDistributionSummary::macro_correction_distance_hist)
+        .def_readwrite("local_direct_count", &TaskDistributionSummary::local_direct_count)
+        .def_readwrite("local_avoidance_count",
+                       &TaskDistributionSummary::local_avoidance_count)
+        .def_readwrite("local_deflection_hist",
+                       &TaskDistributionSummary::local_deflection_hist)
+        .def_readwrite("local_yaw_rate_hist",
+                       &TaskDistributionSummary::local_yaw_rate_hist)
+        .def_readwrite("local_speed_hist", &TaskDistributionSummary::local_speed_hist)
+        .def_readwrite("min_observed_clearance_m",
+                       &TaskDistributionSummary::min_observed_clearance_m)
+        .def_readwrite("mean_observed_clearance_m",
+                       &TaskDistributionSummary::mean_observed_clearance_m)
+        .def_readwrite("reached_goal", &TaskDistributionSummary::reached_goal)
+        .def_readwrite("collision", &TaskDistributionSummary::collision)
+        .def_readwrite("out_of_bounds", &TaskDistributionSummary::out_of_bounds)
+        .def_readwrite("minimum_clearance_m",
+                       &TaskDistributionSummary::minimum_clearance_m)
+        .def("near_depth_ratio", &TaskDistributionSummary::nearDepthRatio)
+        .def("mid_depth_ratio", &TaskDistributionSummary::midDepthRatio)
+        .def("far_depth_ratio", &TaskDistributionSummary::farDepthRatio)
+        .def("free_depth_ratio", &TaskDistributionSummary::freeDepthRatio);
 }

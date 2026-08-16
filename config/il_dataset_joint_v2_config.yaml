@@ -49,11 +49,13 @@ global:
     minimum_tasks_per_scene: 6
     require_full_strata_coverage: true
     geometry:
-      minimum_surface_gap_m: 1.20
+      # Planner-required traversable passage (see il_dataset_config.yaml):
+      # 2 * (0.30 + 0.30 + 0.05) + 2 * 0.05 = 1.40 m.
+      minimum_surface_gap_m: 1.40
       boundary_margin_m: 1.20
       radius_min_m: 0.10
-      radius_max_m: 2.00
-      max_obstacles: 20
+      radius_max_m: 6.00
+      max_obstacles: 30
       height_m: 8.0
       free_cell_surface_clearance_m: 0.50
       esdf_resolution_m: 0.10
@@ -61,7 +63,7 @@ global:
   task_generation:
     flight_height_m: 2.0
     min_task_distance_m: 4.0
-    max_task_distance_m: 20.0
+    max_task_distance_m: 28.0
     # Initial yaw: aim at the goal + left/right symmetric random bias.
     initial_yaw_bias_deg: 15.0
     # Oversampling (blueprint-only, never a Flightmare flight timeout).
@@ -91,6 +93,14 @@ global:
       density_sparse_max: 7.0
       density_dense_min: 14.0
       long_takeover_min_ticks: 30
+
+  # ── Blueprint generation (inherits the full section from
+  #    il_dataset_config.yaml; only the seed is re-stated here to match
+  #    scene_generation.seed).  The warehouse free region is inherited
+  #    ([-7,10] x [0,30]) and equals hierarchical_expert.region below. ──
+  blueprint_generation:
+    enabled: true
+    base_seed: 260812
 
   # ── Hierarchical local expert (production path) ───────────────────
   # Overrides the public defaults in il_dataset_config.yaml.  R = 5.0 m
