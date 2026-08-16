@@ -308,6 +308,53 @@ void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
     // duration time base.  Defaults to 30.0 (the preflight tick grid).
     b.control_rate_hz = get_d("control_rate_hz", b.control_rate_hz);
 
+    // ── privileged task qualification (2D causal-qualification port) ─
+    if (bp.contains("task_qualification")) {
+        const py::dict d = py::cast<py::dict>(bp["task_qualification"]);
+        auto gb = [&](const char* k, bool dflt) {
+            return d.contains(k) ? py::cast<bool>(d[k]) : dflt;
+        };
+        auto gi = [&](const char* k, int dflt) {
+            return d.contains(k) ? py::cast<int>(d[k]) : dflt;
+        };
+        auto gd = [&](const char* k, double dflt) {
+            return d.contains(k) ? py::cast<double>(d[k]) : dflt;
+        };
+        b.qualification.enabled =
+            gb("enabled", b.qualification.enabled);
+        b.qualification.require_both_sides_feasible =
+            gb("require_both_sides_feasible",
+               b.qualification.require_both_sides_feasible);
+        b.qualification.run_astar_confirmation =
+            gb("run_astar_confirmation",
+               b.qualification.run_astar_confirmation);
+        b.qualification.max_astar_expansions =
+            gi("max_astar_expansions", b.qualification.max_astar_expansions);
+        b.qualification.max_side_route_expansions = gi(
+            "max_side_route_expansions",
+            b.qualification.max_side_route_expansions);
+        b.qualification.max_total_side_route_expansions = gi(
+            "max_total_side_route_expansions",
+            b.qualification.max_total_side_route_expansions);
+        b.qualification.side_bias =
+            gd("side_bias", b.qualification.side_bias);
+        b.qualification.homotopy_side_tolerance_m = gd(
+            "homotopy_side_tolerance_m",
+            b.qualification.homotopy_side_tolerance_m);
+        b.qualification.gateway_projection_radius_m = gd(
+            "gateway_projection_radius_m",
+            b.qualification.gateway_projection_radius_m);
+        b.qualification.min_route_stretch_for_long_detour = gd(
+            "min_route_stretch_for_long_detour",
+            b.qualification.min_route_stretch_for_long_detour);
+        b.qualification.log_qualification_stats = gb(
+            "log_qualification_stats",
+            b.qualification.log_qualification_stats);
+    }
+    // Route-clearance margin (m) on top of the endpoint clearance.
+    b.route_clearance_margin_m =
+        get_d("route_clearance_margin_m", b.route_clearance_margin_m);
+
     // ── explicit distribution targets (empty => buildDefaultTargets) ─
     if (bp.contains("distribution_targets")) {
         const auto seq = py::cast<py::sequence>(bp["distribution_targets"]);
@@ -834,6 +881,70 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("preflight_duration_s",
                        &BlueprintTaskAudit::preflight_duration_s);
 
+    py::class_<SideRouteResult>(m, "SideRouteResult")
+        .def(py::init<>())
+        .def_readwrite("checked", &SideRouteResult::checked)
+        .def_readwrite("feasible", &SideRouteResult::feasible)
+        .def_readwrite("path_length_m", &SideRouteResult::path_length_m)
+        .def_readwrite("min_clearance_m", &SideRouteResult::min_clearance_m)
+        .def_readwrite("expanded_nodes", &SideRouteResult::expanded_nodes)
+        .def_readwrite("reject_reason", &SideRouteResult::reject_reason);
+
+    py::class_<TaskQualificationSummary>(m, "TaskQualificationSummary")
+        .def(py::init<>())
+        .def_readwrite("endpoint_valid",
+                       &TaskQualificationSummary::endpoint_valid)
+        .def_readwrite("connectivity_valid",
+                       &TaskQualificationSummary::connectivity_valid)
+        .def_readwrite("straight_corridor_clear",
+                       &TaskQualificationSummary::straight_corridor_clear)
+        .def_readwrite("primary_blocker_id",
+                       &TaskQualificationSummary::primary_blocker_id)
+        .def_readwrite("primary_blocker_x",
+                       &TaskQualificationSummary::primary_blocker_x)
+        .def_readwrite("primary_blocker_y",
+                       &TaskQualificationSummary::primary_blocker_y)
+        .def_readwrite("primary_blocker_radius",
+                       &TaskQualificationSummary::primary_blocker_radius)
+        .def_readwrite("blocking_obstacle_ids",
+                       &TaskQualificationSummary::blocking_obstacle_ids)
+        .def_readwrite("left", &TaskQualificationSummary::left)
+        .def_readwrite("right", &TaskQualificationSummary::right)
+        .def_readwrite("privileged_min_route_stretch",
+                       &TaskQualificationSummary::privileged_min_route_stretch)
+        .def_readwrite("realized_geom_type",
+                       &TaskQualificationSummary::realized_geom_type)
+        .def_readwrite("qualification_class",
+                       &TaskQualificationSummary::qualification_class)
+        .def_readwrite("reject_reason", &TaskQualificationSummary::reject_reason)
+        .def_readwrite("accepted", &TaskQualificationSummary::accepted);
+
+    py::class_<QualificationCounters>(m, "QualificationCounters")
+        .def(py::init<>())
+        .def_readonly("candidates_checked", &QualificationCounters::candidates_checked)
+        .def_readonly("endpoint_pass", &QualificationCounters::endpoint_pass)
+        .def_readonly("connectivity_pass", &QualificationCounters::connectivity_pass)
+        .def_readonly("straight_clear", &QualificationCounters::straight_clear)
+        .def_readonly("blocked", &QualificationCounters::blocked)
+        .def_readonly("side_qualification_attempt",
+                      &QualificationCounters::side_qualification_attempt)
+        .def_readonly("both_sides_feasible", &QualificationCounters::both_sides_feasible)
+        .def_readonly("accepted", &QualificationCounters::accepted)
+        .def_readonly("reject_endpoint", &QualificationCounters::reject_endpoint)
+        .def_readonly("reject_clearance", &QualificationCounters::reject_clearance)
+        .def_readonly("reject_different_component",
+                      &QualificationCounters::reject_different_component)
+        .def_readonly("reject_global_route", &QualificationCounters::reject_global_route)
+        .def_readonly("reject_left_infeasible", &QualificationCounters::reject_left_infeasible)
+        .def_readonly("reject_right_infeasible", &QualificationCounters::reject_right_infeasible)
+        .def_readonly("reject_both_sides_required",
+                      &QualificationCounters::reject_both_sides_required)
+        .def_readonly("reject_side_search_budget",
+                      &QualificationCounters::reject_side_search_budget)
+        .def_readonly("reject_geom_mismatch", &QualificationCounters::reject_geom_mismatch)
+        .def_readonly("total_astar_expansions",
+                      &QualificationCounters::total_astar_expansions);
+
     py::class_<BlueprintTask>(m, "BlueprintTask")
         .def(py::init<>())
         .def_readwrite("scene_id", &BlueprintTask::scene_id)
@@ -860,7 +971,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("audit", &BlueprintTask::audit)
         .def_readwrite("geom_type", &BlueprintTask::geom_type)
         .def_readwrite("summary", &BlueprintTask::summary)
-        .def_readwrite("selection_score", &BlueprintTask::selection_score);
+        .def_readwrite("selection_score", &BlueprintTask::selection_score)
+        .def_readwrite("qualification", &BlueprintTask::qualification);
 
     py::class_<RoundStats>(m, "RoundStats")
         .def(py::init<>())
@@ -875,6 +987,7 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readonly("elapsed_ms", &RoundStats::elapsed_ms)
         .def_readonly("preflight_avg_ms", &RoundStats::preflight_avg_ms)
         .def_readonly("failure_breakdown", &RoundStats::failure_breakdown)
+        .def_readonly("qualification", &RoundStats::qualification)
         .def_readonly("remaining_deficits", &RoundStats::remaining_deficits);
 
     py::class_<BlueprintResult>(m, "BlueprintResult")
@@ -945,7 +1058,31 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                       &BlueprintResult::selected_per_preflight_ratio)
         .def_readonly("budget_exhausted_reason",
                       &BlueprintResult::budget_exhausted_reason)
-        .def_readonly("round_logs", &BlueprintResult::round_logs);
+        .def_readonly("round_logs", &BlueprintResult::round_logs)
+        .def_readonly("qualification_rejected",
+                      &BlueprintResult::qualification_rejected)
+        .def_readonly("task_candidates_generated",
+                      &BlueprintResult::task_candidates_generated)
+        .def_readonly("endpoint_pass_count",
+                      &BlueprintResult::endpoint_pass_count)
+        .def_readonly("connectivity_pass_count",
+                      &BlueprintResult::connectivity_pass_count)
+        .def_readonly("straight_clear_count",
+                      &BlueprintResult::straight_clear_count)
+        .def_readonly("blocked_count", &BlueprintResult::blocked_count)
+        .def_readonly("side_qualification_attempt_count",
+                      &BlueprintResult::side_qualification_attempt_count)
+        .def_readonly("both_sides_feasible_count",
+                      &BlueprintResult::both_sides_feasible_count)
+        .def_readonly("qualification_accept_count",
+                      &BlueprintResult::qualification_accept_count)
+        .def_readonly("total_astar_expansions",
+                      &BlueprintResult::total_astar_expansions)
+        .def_readonly("qualification_pass_ratio",
+                      &BlueprintResult::qualification_pass_ratio)
+        .def_readonly("full_preflight_success_after_qualification_ratio",
+                      &BlueprintResult::full_preflight_success_after_qualification_ratio)
+        .def_readonly("qualification", &BlueprintResult::qualification);
 
     // ── TruthCylinderAudit (exact cylinder swept audit, judge-only) ─
     py::class_<TruthCylinderAudit>(m, "TruthCylinderAudit")

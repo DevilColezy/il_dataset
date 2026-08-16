@@ -39,6 +39,15 @@ public:
                                   const Vec2d& start,
                                   const Vec2d& goal) const;
 
+    /// FINAL geometric classification using the PRIVILEGED qualification
+    /// result (straight-corridor status, primary blocker, side-route
+    /// stretch, narrow-passage relevance, chicane geometry).  Decided from
+    /// the actual task geometry, never from the scene profile alone.
+    TaskGeomType classifyQualified(const SceneGeometryCache& geo,
+                                   const BlueprintScene& scene,
+                                   const Vec2d& start, const Vec2d& goal,
+                                   const TaskQualificationSummary& q) const;
+
     /// Scene-level feasibility mask for the geometric proxy classes.  A
     /// class is marked feasible only when the SCENE can actually produce
     /// it (large obstacle => LARGE_OCCLUSION / LONG_DETOUR, cached narrow

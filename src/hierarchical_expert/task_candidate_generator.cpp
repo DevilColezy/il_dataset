@@ -150,6 +150,99 @@ TaskGeomType TaskCandidateGenerator::classifyGeometry(
     return TaskGeomType::CLEAR;
 }
 
+TaskGeomType TaskCandidateGenerator::classifyQualified(
+    const SceneGeometryCache& geo, const BlueprintScene& scene,
+    const Vec2d& start, const Vec2d& goal,
+    const TaskQualificationSummary& q) const {
+    const Vec2d axis = goal - start;
+    const double len = std::max(1e-6, axis.norm());
+    const double chw = corridorHalfWidth();
+    const double free_clr = cfg_.free_cell_surface_clearance_m;
+    const auto& centers = geo.obstacleCenters();
+    const auto& radii = geo.obstacleRadii();
+    const auto& large = geo.largeObstacles();
+
+    // Recompute the O(N) segment-relative statistics (also used by
+    // classifyGeometry); cheap and scene-cached.
+    int near_count = 0;
+    bool large_blocker = false;
+    int left_count = 0, right_count = 0;
+    for (size_t i = 0; i < centers.size(); ++i) {
+        const Vec2d& c = centers[i];
+        const double d = distToSeg(c, start, goal);
+        const double along = clamp((c - start).dot(axis) / (len * len),
+                                   0.0, 1.0) * len;
+        if (along < 0.5) continue;  // only obstacles ahead of the start
+        const double clear = d - radii[i];
+        if (clear < chw) ++near_count;
+        if (clear < free_clr) {
+            if (std::find(large.begin(), large.end(), static_cast<int>(i)) !=
+                large.end()) {
+                large_blocker = true;
+            }
+        }
+        if (clear < chw + 1.0) {
+            if (signedDistToSeg(c, start, goal) >= 0.0) {
+                ++left_count;
+            } else {
+                ++right_count;
+            }
+        }
+    }
+    // Narrow-passage relevance (the task corridor must pass through a
+    // cached narrow passage).
+    bool narrow_relevant = false;
+    for (const auto& np : geo.narrowPassages()) {
+        if (distToSeg(np.center, start, goal) < chw + 1.0) {
+            narrow_relevant = true;
+            break;
+        }
+    }
+
+    const bool is_long = len >= cfg_.path_long_min_m - 1e-9;
+
+    // ── Straight corridor clear at the route qualification clearance ──
+    if (q.straight_corridor_clear) {
+        // A grazing single obstacle may still cause a local deflection.
+        if (near_count == 1 && !large_blocker) {
+            return TaskGeomType::OFFSET_AVOIDANCE;
+        }
+        if (near_count >= 2) {
+            return TaskGeomType::MULTI_OBSTACLE;
+        }
+        return TaskGeomType::CLEAR;
+    }
+
+    // ── Blocked: use the qualification geometry, not the scene profile. ─
+    const double stretch = q.privileged_min_route_stretch;
+    const bool blocker_large =
+        q.primary_blocker_radius >= largeRadiusThreshold();
+    if (is_long && (blocker_large || stretch >=
+                    cfg_.qualification.min_route_stretch_for_long_detour)) {
+        return TaskGeomType::LONG_DETOUR;
+    }
+    if (blocker_large) {
+        return TaskGeomType::LARGE_OCCLUSION;
+    }
+    // Chicane: the scene is a chicane AND the segment spans it with true
+    // left/right alternation (never "all chicane tasks are CHICANE").
+    const bool chicane_scene =
+        scene.profile == "chicane" &&
+        (scene.structure_orientation == StructureOrientation::HORIZONTAL ||
+         scene.structure_orientation == StructureOrientation::VERTICAL);
+    if (chicane_scene && near_count >= 2 && left_count >= 1 &&
+        right_count >= 1) {
+        return TaskGeomType::CHICANE;
+    }
+    if (narrow_relevant && !blocker_large) {
+        return TaskGeomType::NARROW_BUT_PLANNABLE;
+    }
+    if (q.blocking_obstacle_ids.size() >= 2) {
+        return TaskGeomType::MULTI_OBSTACLE;
+    }
+    return TaskGeomType::LOCAL_AVOIDANCE;
+}
+
 double TaskCandidateGenerator::sampleInitialYaw(
     double goal_bearing_expert, const std::vector<double>& yaw_weights,
     Rng& rng) const {

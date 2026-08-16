@@ -461,6 +461,43 @@ struct BlueprintGenerationConfig {
                2.0 * generation_margin_m;
     }
 
+    // ── Clearance hierarchy (port of the 2D reference semantics).  Every
+    //    component (SceneGenerator / SceneGeometryCache / TaskSampler /
+    //    RouteQualifier / LocalPlanner) MUST use these accessors instead of
+    //    scattering magic numbers.  The 2D reference uses:
+    //      scene_safety_clearance 0.5  -> endpoint/connectivity
+    //      route clearance = safety + macro_route_clearance_margin(0.1)
+    //                        + clearance_discretization_margin(0.05) = 0.65
+    //    Mapped to the 2.5D parameters below (same values, formula kept).
+    /// Endpoint (start/goal centre->surface) clearance: the drone centre
+    /// must sit on a cell strictly beyond this from any obstacle surface.
+    double endpointRequiredClearance() const {
+        return free_cell_surface_clearance_m;
+    }
+    /// Connectivity / traversable-component clearance: the same base
+    /// safety clearance as endpoints (strict `>`).
+    double connectivityRequiredClearance() const {
+        return free_cell_surface_clearance_m;
+    }
+    /// LocalPlanner-required clearance from an obstacle surface to the
+    /// drone centre (per side): vehicle radius + navigation clearance +
+    /// grid discretisation margin.  A corridor narrower than twice this is
+    /// not traversable by the current planner.
+    double plannerRequiredClearance() const {
+        return vehicle_radius_m + navigation_clearance_m +
+               clearance_discretization_margin_m;
+    }
+    /// Required passage width (obstacle-surface to obstacle-surface) for
+    /// the current planner — the planner-required traversable passage.
+    double requiredPassageWidth() const { return plannerRequiredPassage(); }
+    /// Route-qualification clearance (side A* / causal qualification): the
+    /// privileged global-route search keeps this much centre->surface
+    /// clearance so the local planner actually has room to execute.
+    double routeQualificationClearance() const {
+        return free_cell_surface_clearance_m + route_clearance_margin_m +
+               clearance_discretization_margin_m;
+    }
+
     // ── scene profiles ─────────────────────────────────────────────
     std::vector<SceneProfile> profiles;   // default catalog (see .cpp)
     bool use_profile_catalog = true;
@@ -475,6 +512,12 @@ struct BlueprintGenerationConfig {
     double obstacle_height_m = 8.0;
     int task_sample_attempts = 300;     // per candidate start/goal draws
     int task_goal_attempts = 120;       // per candidate goal draws
+    // Extra route margin (m) on top of the endpoint clearance used by the
+    // privileged route qualification (mirrors the 2D macro_route_clearance
+    // _margin=0.1).  routeQualificationClearance() =
+    // endpointRequiredClearance() + route_clearance_margin_m +
+    // clearance_discretization_margin_m.
+    double route_clearance_margin_m = 0.10;
 
     // ── initial yaw (layered sampling) ─────────────────────────────
     std::vector<double> yaw_edges_deg{0.0, 15.0, 35.0, 55.0, 90.0, 150.0, 180.0};
@@ -536,8 +579,18 @@ struct BlueprintGenerationConfig {
     //    no_progress_min_progress_m over no_progress_window_ticks;
     //  * stall: |velocity| < stall_speed_mps for stall_window_ticks while
     //    not in a legitimate TURN.
-    int    no_progress_window_ticks = 150;      // 5 s @ 30 Hz
+    // DEFAULT OFF: a pure "goal distance must shrink by X over the window"
+    // rule wrongly kills legitimate long detours that need lateral movement
+    // or a temporary distance increase.  Only when enabled (>0) does the
+    // controller use the COMBINED criterion (goal shrink AND window motion
+    // below thresholds); the stall + global tick budget remain the primary
+    // guards.  See blueprint_generation_controller.cpp.
+    int    no_progress_window_ticks = 0;        // 0 = disabled
     double no_progress_min_progress_m = 1.0;
+    // Combined-criterion motion floor (m): when no-progress is enabled the
+    // drone must ALSO have travelled less than this over the window, so a
+    // long detour that is actually moving is never killed.
+    double no_progress_window_min_motion_m = 2.0;
     int    stall_window_ticks = 90;             // 3 s @ 30 Hz
     double stall_speed_mps = 0.02;
     // Minimum required sign alternations of a chicane realisation along
@@ -545,6 +598,45 @@ struct BlueprintGenerationConfig {
     int min_chicane_alternations = 2;
     // Per-round sanity log to stderr (one line per round).
     bool log_rounds = true;
+
+    // ── privileged task qualification (port of the 2D causal
+    //    qualification; see route_qualifier.*) ──────────────────────
+    // Runs BEFORE the full HierarchicalExpert preflight: endpoint safety,
+    // global connectivity, straight-corridor blocker analysis, and (only
+    // for blocked tasks) LEFT / RIGHT side-constrained A* around the
+    // primary blocker.  The A* / side routes are PRIVILEGED truth — they
+    // are used ONLY to decide task fairness, never fed to the expert.
+    struct TaskQualificationConfig {
+        bool enabled = true;
+        // Blocked tasks must have BOTH homotopy branches globally feasible
+        // (a local-causal expert cannot know a hidden one-sided dead end).
+        bool require_both_sides_feasible = true;
+        // Global A* connectivity confirmation (in addition to the cached
+        // component lookup).  Cheap and bounded; only run when a scene has
+        // many components / large obstacles.
+        bool run_astar_confirmation = true;
+        // Node-expansion caps (hard; a search that hits the cap is a
+        // reject reason, never an unbounded search).
+        int max_astar_expansions = 30000;        // global connectivity A*
+        int max_side_route_expansions = 20000;   // per side A*
+        int max_total_side_route_expansions = 120000;  // per task, both sides
+        // Side-A* lateral bias (0 = side-neutral).  Mirrors the 2D
+        // macro_route_side_bias=0.4; the SAME fixed axis (start->goal) and
+        // blocker centre define LEFT/RIGHT for the whole qualification.
+        double side_bias = 0.4;
+        // Homotopy check tolerance (m): the continuous route must pass the
+        // blocker with this much lateral margin on the requested side.
+        double homotopy_side_tolerance_m = 0.05;
+        // Bounded radius used to project a tangent gateway into a STRICTLY
+        // legal cell (mirrors 2D macro_gateway_projection_radius_m).
+        double gateway_projection_radius_m = 0.8;
+        // Route-stretch threshold: a blocked task whose shortest qualified
+        // route is >= this many times the straight distance is LONG_DETOUR.
+        double min_route_stretch_for_long_detour = 1.5;
+        // Diagnostic counters gate (aggregate only).
+        bool log_qualification_stats = true;
+    };
+    TaskQualificationConfig qualification;
 
     // ── result requirements ────────────────────────────────────────
     int min_scenes = 4;              // must be met by the SELECTED scenes
@@ -578,6 +670,71 @@ struct BlueprintGenerationConfig {
 
     // ── base seed ──────────────────────────────────────────────────
     uint64_t base_seed = 260812;
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  Privileged task qualification results (port of the 2D causal
+//  qualification).  ALL fields are PRIVILEGED truth / diagnostics: they
+//  may go to the Blueprint manifest and generation statistics but MUST
+//  NEVER be fed to the 5 Hz / 30 Hz expert or the DatasetWriter student
+//  inputs.
+// ═══════════════════════════════════════════════════════════════════
+struct SideRouteResult {
+    bool checked = false;
+    bool feasible = false;
+    double path_length_m = 0.0;
+    double min_clearance_m = 0.0;   // min route-clearance along the path
+    uint32_t expanded_nodes = 0;    // A* node expansions for this side
+    std::string reject_reason;      // "" when feasible
+};
+
+struct TaskQualificationSummary {
+    bool endpoint_valid = false;        // both endpoints >= endpoint clearance
+    bool connectivity_valid = false;    // same main traversable component
+    bool straight_corridor_clear = false;  // direct route-clear corridor
+    // Primary straight-corridor blocker (0 when clear).  PRIVILEGED truth.
+    int primary_blocker_id = -1;
+    double primary_blocker_x = 0.0, primary_blocker_y = 0.0;
+    double primary_blocker_radius = 0.0;
+    std::vector<int> blocking_obstacle_ids;
+    // LEFT / RIGHT detour routes (only filled when the corridor is blocked
+    // and qualification runs).
+    SideRouteResult left;
+    SideRouteResult right;
+    // min(left.length, right.length) / straight_distance (0 when clear or
+    // no feasible side).
+    double privileged_min_route_stretch = 0.0;
+    // Realized geometric class (CLEAR / LOCAL_AVOIDANCE / ... ) decided
+    // from the qualification geometry, NOT from the scene profile alone.
+    std::string realized_geom_type = "CLEAR";
+    // "clear" / "blocked_both_feasible" / "blocked_single_side" /
+    // "blocked_no_side" / "endpoint_invalid" / "different_component".
+    std::string qualification_class = "clear";
+    std::string reject_reason = "";   // "" when accepted
+    bool accepted = false;            // passes the qualification gate
+};
+
+/// Aggregate per-round qualification counters (only aggregate, never
+/// per-task logs).
+struct QualificationCounters {
+    uint64_t candidates_checked = 0;
+    uint64_t endpoint_pass = 0;
+    uint64_t connectivity_pass = 0;
+    uint64_t straight_clear = 0;
+    uint64_t blocked = 0;
+    uint64_t side_qualification_attempt = 0;
+    uint64_t both_sides_feasible = 0;
+    uint64_t accepted = 0;                  // passes the qualification gate
+    uint64_t reject_endpoint = 0;
+    uint64_t reject_clearance = 0;
+    uint64_t reject_different_component = 0;
+    uint64_t reject_global_route = 0;
+    uint64_t reject_left_infeasible = 0;
+    uint64_t reject_right_infeasible = 0;
+    uint64_t reject_both_sides_required = 0;
+    uint64_t reject_side_search_budget = 0;
+    uint64_t reject_geom_mismatch = 0;
+    uint64_t total_astar_expansions = 0;
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -616,6 +773,7 @@ struct GenerationTiming {
     double scene_geometry_cache_ms = 0.0;
     double task_candidate_generation_ms = 0.0;
     double cheap_filter_ms = 0.0;
+    double task_qualification_ms = 0.0;
     double preflight_total_ms = 0.0;
     double preflight_average_ms = 0.0;
     uint64_t preflight_count = 0;          // attempts (success + failure)
@@ -633,6 +791,7 @@ struct GenerationTiming {
                 {"scene_geometry_cache_ms", scene_geometry_cache_ms},
                 {"task_candidate_generation_ms", task_candidate_generation_ms},
                 {"cheap_filter_ms", cheap_filter_ms},
+                {"task_qualification_ms", task_qualification_ms},
                 {"preflight_total_ms", preflight_total_ms},
                 {"preflight_average_ms", preflight_average_ms},
                 {"depth_proxy_total_ms", depth_proxy_total_ms},
@@ -658,6 +817,8 @@ struct RoundStats {
     /// accepted / collision / timeout / no_progress / stall /
     /// out_of_bounds / macro_label / goal_not_reached.
     std::map<std::string, uint64_t> failure_breakdown;
+    /// Aggregate privileged task-qualification counters for this round.
+    QualificationCounters qualification;
     std::vector<std::string> remaining_deficits;
 };
 

@@ -67,7 +67,7 @@ void PreflightSimulator::resetTask(const Vec2d& start, const Vec2d& goal,
     expert_.resetTask(start, goal, initial_yaw_fm, tick, flight_z);
 }
 
-LocalObservation PreflightSimulator::synthesizePatch(uint64_t tick) const {
+LocalObservation PreflightSimulator::synthesizePatch(uint64_t tick) {
     // ── The SAME camera rig as the runtime path. ────────────────────
     const double pos[3] = {state_.position.x(), state_.position.y(),
                            flight_z_};

@@ -421,6 +421,8 @@ class JointV2Manager(object):
             "synthetic_observation": dict(
                 bp.get("synthetic_observation", {}) or {}),
             "early_termination": dict(bp.get("early_termination", {}) or {}),
+            "task_qualification": dict(
+                bp.get("task_qualification", {}) or {}),
             "distribution_targets": list(
                 bp.get("distribution_targets", []) or []),
             # Preflight control rate (Hz); dt = 1/control_rate_hz is the
@@ -598,6 +600,57 @@ class JointV2Manager(object):
                 "normal_update_count": int(t.normal_update_count),
                 "geom_type": str(t.geom_type),
                 "selection_score": float(t.selection_score),
+                # ── privileged task-qualification diagnostics (manifest /
+                #    generation statistics ONLY; never student inputs) ──
+                "qualification": {
+                    "endpoint_valid": bool(t.qualification.endpoint_valid),
+                    "connectivity_valid": bool(
+                        t.qualification.connectivity_valid),
+                    "straight_corridor_clear": bool(
+                        t.qualification.straight_corridor_clear),
+                    "primary_blocker_id":
+                        int(t.qualification.primary_blocker_id),
+                    "primary_blocker_x":
+                        float(t.qualification.primary_blocker_x),
+                    "primary_blocker_y":
+                        float(t.qualification.primary_blocker_y),
+                    "primary_blocker_radius":
+                        float(t.qualification.primary_blocker_radius),
+                    "blocking_obstacle_ids":
+                        [int(i) for i in t.qualification.blocking_obstacle_ids],
+                    "left": {
+                        "checked": bool(t.qualification.left.checked),
+                        "feasible": bool(t.qualification.left.feasible),
+                        "path_length_m":
+                            _fin(t.qualification.left.path_length_m),
+                        "min_clearance_m":
+                            _fin(t.qualification.left.min_clearance_m),
+                        "expanded_nodes":
+                            int(t.qualification.left.expanded_nodes),
+                        "reject_reason":
+                            str(t.qualification.left.reject_reason),
+                    },
+                    "right": {
+                        "checked": bool(t.qualification.right.checked),
+                        "feasible": bool(t.qualification.right.feasible),
+                        "path_length_m":
+                            _fin(t.qualification.right.path_length_m),
+                        "min_clearance_m":
+                            _fin(t.qualification.right.min_clearance_m),
+                        "expanded_nodes":
+                            int(t.qualification.right.expanded_nodes),
+                        "reject_reason":
+                            str(t.qualification.right.reject_reason),
+                    },
+                    "privileged_min_route_stretch":
+                        _fin(t.qualification.privileged_min_route_stretch),
+                    "realized_geom_type":
+                        str(t.qualification.realized_geom_type),
+                    "qualification_class":
+                        str(t.qualification.qualification_class),
+                    "reject_reason": str(t.qualification.reject_reason),
+                    "accepted": bool(t.qualification.accepted),
+                },
                 "audit": {
                     "accepted": bool(t.audit.accepted),
                     "reached_goal": bool(t.audit.reached_goal),
@@ -659,6 +712,53 @@ class JointV2Manager(object):
             "selected_per_preflight_ratio":
                 float(result.selected_per_preflight_ratio),
             "budget_exhausted_reason": str(result.budget_exhausted_reason),
+            # ── privileged task-qualification efficiency (aggregate) ──
+            "qualification_rejected": int(result.qualification_rejected),
+            "task_candidates_generated": int(result.task_candidates_generated),
+            "endpoint_pass_count": int(result.endpoint_pass_count),
+            "connectivity_pass_count": int(result.connectivity_pass_count),
+            "straight_clear_count": int(result.straight_clear_count),
+            "blocked_count": int(result.blocked_count),
+            "side_qualification_attempt_count":
+                int(result.side_qualification_attempt_count),
+            "both_sides_feasible_count": int(result.both_sides_feasible_count),
+            "qualification_accept_count": int(result.qualification_accept_count),
+            "total_astar_expansions": int(result.total_astar_expansions),
+            "qualification_pass_ratio": float(result.qualification_pass_ratio),
+            "full_preflight_success_after_qualification_ratio":
+                float(result.full_preflight_success_after_qualification_ratio),
+            "qualification": {
+                "candidates_checked":
+                    int(result.qualification.candidates_checked),
+                "endpoint_pass": int(result.qualification.endpoint_pass),
+                "connectivity_pass":
+                    int(result.qualification.connectivity_pass),
+                "straight_clear": int(result.qualification.straight_clear),
+                "blocked": int(result.qualification.blocked),
+                "side_qualification_attempt":
+                    int(result.qualification.side_qualification_attempt),
+                "both_sides_feasible":
+                    int(result.qualification.both_sides_feasible),
+                "accepted": int(result.qualification.accepted),
+                "reject_endpoint": int(result.qualification.reject_endpoint),
+                "reject_clearance": int(result.qualification.reject_clearance),
+                "reject_different_component":
+                    int(result.qualification.reject_different_component),
+                "reject_global_route":
+                    int(result.qualification.reject_global_route),
+                "reject_left_infeasible":
+                    int(result.qualification.reject_left_infeasible),
+                "reject_right_infeasible":
+                    int(result.qualification.reject_right_infeasible),
+                "reject_both_sides_required":
+                    int(result.qualification.reject_both_sides_required),
+                "reject_side_search_budget":
+                    int(result.qualification.reject_side_search_budget),
+                "reject_geom_mismatch":
+                    int(result.qualification.reject_geom_mismatch),
+                "total_astar_expansions":
+                    int(result.qualification.total_astar_expansions),
+            },
             "round_logs": [
                 {
                     "round": int(r.round),
@@ -674,6 +774,30 @@ class JointV2Manager(object):
                     "failure_breakdown": {
                         str(k): int(v)
                         for k, v in r.failure_breakdown.items()
+                    },
+                    "qualification": {
+                        "candidates_checked":
+                            int(r.qualification.candidates_checked),
+                        "endpoint_pass": int(r.qualification.endpoint_pass),
+                        "connectivity_pass":
+                            int(r.qualification.connectivity_pass),
+                        "straight_clear": int(r.qualification.straight_clear),
+                        "blocked": int(r.qualification.blocked),
+                        "side_qualification_attempt":
+                            int(r.qualification.side_qualification_attempt),
+                        "both_sides_feasible":
+                            int(r.qualification.both_sides_feasible),
+                        "accepted": int(r.qualification.accepted),
+                        "reject_endpoint":
+                            int(r.qualification.reject_endpoint),
+                        "reject_different_component":
+                            int(r.qualification.reject_different_component),
+                        "reject_global_route":
+                            int(r.qualification.reject_global_route),
+                        "reject_both_sides_required":
+                            int(r.qualification.reject_both_sides_required),
+                        "total_astar_expansions":
+                            int(r.qualification.total_astar_expansions),
                     },
                     "remaining_deficits": [str(d) for d in r.remaining_deficits],
                 }

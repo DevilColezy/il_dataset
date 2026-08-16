@@ -34,6 +34,7 @@
 #include "il_dataset/hierarchical_expert/blueprint_generation_controller.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -736,6 +737,354 @@ static void testProfileCatalogConfig() {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  11. Privileged task qualification (2D causal-qualification port)
+// ═══════════════════════════════════════════════════════════════════
+namespace {
+
+/// Build a BlueprintScene with the given obstacles (x, y, r).
+BlueprintScene makeScene(const std::vector<std::array<double, 3>>& obs) {
+    BlueprintScene s;
+    int id = 0;
+    for (const auto& o : obs) {
+        BlueprintObstacle ob;
+        ob.x = o[0];
+        ob.y = o[1];
+        ob.radius = o[2];
+        ob.id = id++;
+        s.obstacles.push_back(ob);
+    }
+    s.actual_obstacle_count = id;
+    return s;
+}
+
+/// Build a vertical chain of circles at x=0 spanning y from y_lo to y_hi
+/// (solid barrier, r=1.5 spacing 3.0 => surface gaps 0), optionally with a
+/// single gap of `gap_w` centered at `gap_cy`.
+BlueprintScene makeChainScene(double y_lo, double y_hi, bool with_gap,
+                              double gap_cy = 15.0, double gap_w = 0.0) {
+    const double r = 1.5;
+    std::vector<std::array<double, 3>> obs;
+    const double gap_lo = gap_cy - gap_w * 0.5;
+    const double gap_hi = gap_cy + gap_w * 0.5;
+    double y = y_lo + r;
+    while (y + r <= y_hi + 1e-9) {
+        const double c_top = y + r;
+        const double c_bot = y - r;
+        if (with_gap && c_top > gap_lo - 1e-9 && c_bot < gap_hi + 1e-9) {
+            y += 3.0;  // skip the gap band (circle would overlap it)
+            continue;
+        }
+        obs.push_back({0.0, y, r});
+        y += 3.0;
+    }
+    return makeScene(obs);
+}
+
+struct QualFixture {
+    BlueprintScene scene;
+    BlueprintGenerationConfig cfg;
+    SceneGeometryCache geo;
+    SceneMetadata meta;
+    TaskRouteQualifier qual;
+    TaskCandidateGenerator gen;
+
+    QualFixture(std::vector<std::array<double, 3>> obs,
+                bool require_both = true) {
+        scene = makeScene(std::move(obs));
+        cfg = makeCfg();
+        cfg.qualification.require_both_sides_feasible = require_both;
+        meta = SceneMetadata{};
+        geo.build(scene, cfg, meta);
+        qual.configure(scene, geo, cfg);
+        gen = TaskCandidateGenerator(cfg);
+    }
+
+    /// Run the qualification for start/goal, return the summary.
+    TaskQualificationSummary qualify(double sx, double sy, double gx,
+                                     double gy) {
+        TaskQualificationSummary q;
+        QualificationCounters c;
+        qual.qualify(Vec2d(sx, sy), Vec2d(gx, gy), q, c);
+        return q;
+    }
+    TaskGeomType classify(double sx, double sy, double gx, double gy,
+                          const TaskQualificationSummary& q) {
+        return gen.classifyQualified(geo, scene, Vec2d(sx, sy), Vec2d(gx, gy),
+                                     q);
+    }
+};
+
+}  // namespace
+
+static void testQualification() {
+    std::fprintf(stderr, "test: privileged task qualification\n");
+
+    // ── empty scene: straight clear, accepted, NO side search ─────
+    {
+        QualFixture f({});
+        TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
+        check(q.endpoint_valid, "empty: endpoints valid");
+        check(q.connectivity_valid, "empty: connectivity valid");
+        check(q.straight_corridor_clear, "empty: straight corridor clear");
+        check(q.accepted, "empty: accepted");
+        check(!q.left.checked && !q.right.checked,
+              "empty: no side search for a clear task");
+        check(f.classify(-5, 15, 5, 15, q) == TaskGeomType::CLEAR,
+              "empty: realized geometry CLEAR");
+    }
+
+    // ── single symmetric blocker: both sides feasible ─────────────
+    {
+        QualFixture f({{0.0, 15.0, 1.0}});
+        TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
+        check(!q.straight_corridor_clear, "small blocker: corridor blocked");
+        check(q.left.checked && q.left.feasible,
+              "small blocker: LEFT feasible");
+        check(q.right.checked && q.right.feasible,
+              "small blocker: RIGHT feasible");
+        check(q.accepted, "small blocker: accepted (both sides)");
+        check(f.classify(-5, 15, 5, 15, q) == TaskGeomType::LOCAL_AVOIDANCE,
+              "small blocker: realized LOCAL_AVOIDANCE");
+    }
+
+    // ── large symmetric blocker: LARGE_OCCLUSION ──────────────────
+    {
+        QualFixture f({{0.0, 15.0, 5.0}});
+        TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
+        check(!q.straight_corridor_clear, "large blocker: corridor blocked");
+        check(q.left.feasible && q.right.feasible,
+              "large blocker: both sides feasible");
+        check(q.accepted, "large blocker: accepted");
+        check(q.primary_blocker_radius >= 5.0 - 1e-9,
+              "large blocker: primary blocker radius recorded");
+        const TaskGeomType cls = f.classify(-5, 15, 5, 15, q);
+        check(cls == TaskGeomType::LARGE_OCCLUSION,
+              "large blocker: realized LARGE_OCCLUSION");
+    }
+
+    // ── LEFT-only (barrier below blocks the RIGHT/down route) ─────
+    {
+        // Chain at x=0 spanning y[0,16.5] (solid below the corridor).
+        QualFixture f({{0.0, 15.0, 1.5}, {0.0, 11.5, 1.5}, {0.0, 8.0, 1.5},
+                       {0.0, 4.5, 1.5}, {0.0, 1.0, 1.5}});
+        TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
+        check(!q.straight_corridor_clear, "left-only: corridor blocked");
+        check(q.left.feasible, "left-only: LEFT (up) feasible");
+        check(!q.right.feasible, "left-only: RIGHT (down) infeasible");
+        check(!q.accepted,
+              "left-only: rejected under require_both_sides_feasible");
+    }
+
+    // ── RIGHT-only (barrier above blocks the LEFT/up route) ───────
+    {
+        QualFixture f({{0.0, 15.0, 1.5}, {0.0, 18.5, 1.5}, {0.0, 22.0, 1.5},
+                       {0.0, 25.5, 1.5}, {0.0, 29.0, 1.5}});
+        TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
+        check(!q.straight_corridor_clear, "right-only: corridor blocked");
+        check(!q.left.feasible, "right-only: LEFT (up) infeasible");
+        check(q.right.feasible, "right-only: RIGHT (down) feasible");
+        check(!q.accepted,
+              "right-only: rejected under require_both_sides_feasible");
+    }
+
+    // ── neither-side (full vertical barrier) ───────────────────────
+    {
+        // Chain spanning the whole height: no side can route around.
+        QualFixture f({{0.0, 15.0, 1.5}, {0.0, 12.0, 1.5}, {0.0, 9.0, 1.5},
+                       {0.0, 6.0, 1.5}, {0.0, 3.0, 1.5}, {0.0, 18.0, 1.5},
+                       {0.0, 21.0, 1.5}, {0.0, 24.0, 1.5}, {0.0, 27.0, 1.5}});
+        TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
+        check(!q.straight_corridor_clear, "neither: corridor blocked");
+        check(!q.left.feasible, "neither: LEFT infeasible");
+        check(!q.right.feasible, "neither: RIGHT infeasible");
+        check(!q.accepted, "neither: rejected (no side route)");
+    }
+
+    // ── both-sides acceptance rules (D): relaxed mode accepts single ─
+    {
+        // LEFT-only scene but with require_both=false: accepted (right by
+        // the deterministic default) — here LEFT is feasible so accepted.
+        QualFixture f({{0.0, 15.0, 1.5}, {0.0, 11.5, 1.5}, {0.0, 8.0, 1.5},
+                       {0.0, 4.5, 1.5}, {0.0, 1.0, 1.5}},
+                      false);
+        TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
+        check(q.left.feasible && !q.right.feasible,
+              "relaxed left-only: single side");
+        check(q.accepted, "relaxed left-only: accepted");
+    }
+
+    // ── endpoint near the region boundary must still be valid ──────
+    {
+        QualFixture f({});
+        // endpoint with clearance 0.5 exactly from the boundary at x=-7.
+        TaskQualificationSummary q = f.qualify(-6.4, 15.0, 5.0, 15.0);
+        check(q.endpoint_valid && q.accepted,
+              "endpoint 0.6m from the boundary is valid");
+        TaskQualificationSummary q2 = f.qualify(-6.9, 15.0, 5.0, 15.0);
+        check(!q2.endpoint_valid, "endpoint 0.1m from the boundary invalid");
+    }
+
+    // ── different components: a full barrier splits the region ────
+    {
+        // Vertical barrier spanning the whole height at x=0 (no gap):
+        // start/goal on opposite sides => different components.
+        QualFixture f(makeChainScene(1.0, 29.0, false).obstacles);
+        TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
+        check(!q.connectivity_valid,
+              "full barrier: start/goal in different components");
+        check(!q.accepted, "full barrier: rejected (different component)");
+    }
+}
+
+// ── 12. rotation invariance ────────────────────────────────────────
+static void testQualificationRotationInvariance() {
+    std::fprintf(stderr, "test: qualification rotation invariance\n");
+    // Asymmetric fixture: two obstacles so LEFT/RIGHT are distinguishable
+    // but rotation must preserve the outcome.
+    const std::vector<std::array<double, 3>> obs = {
+        {-2.0, 15.0, 1.2}, {1.0, 18.0, 0.8}};
+    const double sx = -5.0, sy = 15.0, gx = 5.0, gy = 15.0;
+
+    auto run = [&](const std::vector<std::array<double, 3>>& ob,
+                   double ax, double ay, double bx, double by) {
+        QualFixture f(ob);
+        TaskQualificationSummary q =
+            f.qualify(ax, ay, bx, by);
+        return q;
+    };
+
+    const TaskQualificationSummary q0 = run(obs, sx, sy, gx, gy);
+    check(!q0.straight_corridor_clear, "rot0: corridor blocked");
+    const bool l0 = q0.left.feasible;
+    const bool r0 = q0.right.feasible;
+    const bool a0 = q0.accepted;
+
+    // Rotate start/goal/obstacles by 90° CCW about the region centre.
+    const double cx = 1.5, cy = 15.0;
+    auto rot = [&](double x, double y) {
+        return std::array<double, 2>{cx - (y - cy), cy + (x - cx)};
+    };
+    std::vector<std::array<double, 3>> obs1;
+    for (const auto& o : obs) {
+        const auto p = rot(o[0], o[1]);
+        obs1.push_back({p[0], p[1], o[2]});
+    }
+    const auto s1 = rot(sx, sy);
+    const auto g1 = rot(gx, gy);
+    const TaskQualificationSummary q1 = run(obs1, s1[0], s1[1], g1[0], g1[1]);
+    check(!q1.straight_corridor_clear, "rot90: corridor blocked");
+    check(q1.left.feasible == l0, "rot90: LEFT feasibility invariant");
+    check(q1.right.feasible == r0, "rot90: RIGHT feasibility invariant");
+    check(q1.accepted == a0, "rot90: acceptance invariant");
+    check(std::fabs(q1.privileged_min_route_stretch -
+                    q0.privileged_min_route_stretch) < 0.05,
+          "rot90: route stretch invariant");
+}
+
+// ── 13. narrow passage valid / invalid ─────────────────────────────
+static void testQualificationNarrow() {
+    std::fprintf(stderr, "test: narrow passage qualification\n");
+    // Valid: two obstacles with a planner-compatible gap (2.2 m in
+    // [1.4,2.8]).  The straight corridor is blocked by both; the side
+    // routes pass through the gap; realized NARROW_BUT_PLANNABLE.
+    {
+        QualFixture f({{-2.1, 15.0, 1.0}, {2.1, 15.0, 1.0}});
+        TaskQualificationSummary q = f.qualify(-6.0, 15.0, 6.0, 15.0);
+        check(!q.straight_corridor_clear, "narrow valid: corridor blocked");
+        check(q.left.feasible && q.right.feasible,
+              "narrow valid: both sides feasible");
+        check(q.accepted, "narrow valid: accepted");
+        const TaskGeomType cls = f.classify(-6, 15, 6, 15, q);
+        check(cls == TaskGeomType::NARROW_BUT_PLANNABLE,
+              "narrow valid: realized NARROW_BUT_PLANNABLE");
+    }
+    // Invalid: the only passage through a solid barrier is 0.8 m wide
+    // (< planner-required 1.4) => both side routes infeasible => reject.
+    {
+        // Chain solid except a single 0.8 m gap at y=15.
+        const double gap_w = 0.8;
+        const double gap_cy = 15.0;
+        const double r = 1.5;
+        std::vector<std::array<double, 3>> obs;
+        for (double y = 2.0; y + r <= 28.0; y += 3.0) {
+            const double top = y + r, bot = y - r;
+            if (top > gap_cy - gap_w * 0.5 - 1e-9 &&
+                bot < gap_cy + gap_w * 0.5 + 1e-9) {
+                continue;
+            }
+            obs.push_back({0.0, y, r});
+        }
+        QualFixture f(obs);
+        TaskQualificationSummary q = f.qualify(-5.0, 15.0, 5.0, 15.0);
+        check(!q.straight_corridor_clear, "narrow invalid: corridor blocked");
+        check(!q.left.feasible && !q.right.feasible,
+              "narrow invalid: no feasible side route (gap too narrow)");
+        check(!q.accepted,
+              "narrow invalid: rejected (sub-planner passage)");
+    }
+}
+
+// ── 14. chicane task geometry (not scene-profile driven) ───────────
+static void testQualificationChicaneTasks() {
+    std::fprintf(stderr, "test: chicane task geometry\n");
+    // Build a real chicane scene via the profile generator (must include a
+    // horizontal/vertical chicane), then check two tasks:
+    //   task A spans the structure (start/goal at opposite ends) => CHICANE
+    //   task B sits outside the structure => NOT CHICANE
+    BlueprintGenerationConfig cfg = makeCfg();
+    SceneProfileGenerator gen(cfg);
+    const SceneProfile* p = gen.findProfile("chicane");
+    check(p != nullptr, "chicane profile exists");
+    if (!p) return;
+    SceneGenerationOutcome out;
+    for (uint64_t seed = 1; seed < 400; ++seed) {
+        out = gen.generate(*p, 0, seed);
+        if (out.success) break;
+    }
+    if (!out.success) return;
+    QualFixture f({});
+    f.scene = out.scene;
+    f.meta = SceneMetadata{};
+    f.geo.build(f.scene, f.cfg, f.meta);
+    f.qual.configure(f.scene, f.geo, f.cfg);
+    f.gen = TaskCandidateGenerator(f.cfg);
+
+    // Task A: start and goal at opposite ends along the structure axis.
+    // The chicane spans most of the free region; pick far-apart endpoints
+    // in the main component.
+    bool saw_chicane = false;
+    bool saw_non_chicane = false;
+    const auto& cells = f.geo.validCells();
+    if (cells.size() >= 2) {
+        // Try several pairs: at least one should classify CHICANE (along
+        // the structure) and one not.
+        for (size_t i = 0; i < 60 && cells.size() >= 2; ++i) {
+            const size_t a = cells[(i * 7) % cells.size()];
+            const size_t b = cells[(i * 13 + 5) % cells.size()];
+            const int ax = static_cast<int>(a % static_cast<size_t>(f.geo.w()));
+            const int ay = static_cast<int>(a / static_cast<size_t>(f.geo.w()));
+            const int bx = static_cast<int>(b % static_cast<size_t>(f.geo.w()));
+            const int by = static_cast<int>(b / static_cast<size_t>(f.geo.w()));
+            const Vec2d sa = f.geo.cellCenter(ax, ay);
+            const Vec2d gb = f.geo.cellCenter(bx, by);
+            if ((gb - sa).norm() < 4.0) continue;
+            TaskQualificationSummary q;
+            QualificationCounters c;
+            f.qual.qualify(sa, gb, q, c);
+            if (!q.accepted) continue;
+            const TaskGeomType cls = f.gen.classifyQualified(
+                f.geo, f.scene, sa, gb, q);
+            if (cls == TaskGeomType::CHICANE) saw_chicane = true;
+            else saw_non_chicane = true;
+        }
+    }
+    check(saw_chicane, "chicane scene yields at least one CHICANE task");
+    check(saw_non_chicane,
+          "chicane scene also yields NON-chicane tasks (not all tasks are "
+          "CHICANE)");
+}
+
 int main() {
     std::fprintf(stderr, "test_blueprint_geometry: starting\n");
     testRayHelpers();
@@ -748,6 +1097,10 @@ int main() {
     testCorrectionHistogram();
     testHardTickBudget();
     testProfileCatalogConfig();
+    testQualification();
+    testQualificationRotationInvariance();
+    testQualificationNarrow();
+    testQualificationChicaneTasks();
     std::fprintf(stderr, "checks=%d failures=%d\n", g_checks, g_failures);
     return g_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

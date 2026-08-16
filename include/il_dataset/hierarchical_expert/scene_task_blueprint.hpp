@@ -143,6 +143,10 @@ struct BlueprintTask {
     std::string geom_type = "CLEAR";
     TaskDistributionSummary summary;
     double selection_score = 0.0;  // final greedy selection score
+    // ── privileged task-qualification diagnostics (manifest only; never
+    //    a student input).  Side routes / blocker / stretch are PRIVILEGED
+    //    truth and are NEVER fed to the expert. ──────────────────────
+    TaskQualificationSummary qualification;
 };
 
 struct BlueprintResult {
@@ -166,6 +170,7 @@ struct BlueprintResult {
     uint64_t total_task_candidates = 0;  // preflight-accepted per scene, summed
     uint64_t preflight_success_tasks = 0;
     uint64_t cheap_filter_rejected = 0;
+    uint64_t qualification_rejected = 0;  // rejected by the privileged gate
     bool pool_budget_exhausted = false;
     uint64_t strata_required = 0;   // legacy report
     uint64_t strata_covered = 0;    // legacy report
@@ -197,6 +202,19 @@ struct BlueprintResult {
     double selected_per_preflight_ratio = 0.0;  // selected / attempts
     std::string budget_exhausted_reason = "none";
     std::vector<RoundStats> round_logs;
+    // ── privileged task-qualification efficiency (aggregate) ───────
+    uint64_t task_candidates_generated = 0;
+    uint64_t endpoint_pass_count = 0;
+    uint64_t connectivity_pass_count = 0;
+    uint64_t straight_clear_count = 0;
+    uint64_t blocked_count = 0;
+    uint64_t side_qualification_attempt_count = 0;
+    uint64_t both_sides_feasible_count = 0;
+    uint64_t qualification_accept_count = 0;
+    uint64_t total_astar_expansions = 0;
+    double qualification_pass_ratio = 0.0;
+    double full_preflight_success_after_qualification_ratio = 0.0;
+    QualificationCounters qualification;
 };
 
 // ═══════════════════════════════════════════════════════════════════

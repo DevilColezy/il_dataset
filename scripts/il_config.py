@@ -523,6 +523,24 @@ def _validate_config(cfg):
                   "blueprint_generation.early_termination."
                   "min_chicane_alternations", errors)
 
+        # ── privileged task qualification (2D causal-qualification port) ─
+        tq = bp.get("task_qualification", {}) or {}
+        _positive(tq.get("max_astar_expansions", 30000),
+                  "blueprint_generation.task_qualification."
+                  "max_astar_expansions", errors)
+        _positive(tq.get("max_side_route_expansions", 20000),
+                  "blueprint_generation.task_qualification."
+                  "max_side_route_expansions", errors)
+        _positive(tq.get("max_total_side_route_expansions", 120000),
+                  "blueprint_generation.task_qualification."
+                  "max_total_side_route_expansions", errors)
+        if float(tq.get("side_bias", 0.4)) < 0.0:
+            errors.append("blueprint_generation.task_qualification.side_bias "
+                          "must be >= 0")
+        if float(tq.get("min_route_stretch_for_long_detour", 1.5)) < 1.0:
+            errors.append("blueprint_generation.task_qualification."
+                          "min_route_stretch_for_long_detour must be >= 1.0")
+
         # Preflight control rate (Hz) must be positive; it should match the
         # expert control rate (the preflight tick grid).
         bp_rate = float(bp.get("control_rate_hz", 30.0))
@@ -536,14 +554,16 @@ def _validate_config(cfg):
 
         # use_profile_catalog=false must NOT silently produce zero scenes:
         # it requires explicit user profiles (the C++ controller also fails
-        # fast; this surfaces the error at config-load time too).
+        # fast; this surfaces the error at config-load time too).  Profiles
+        # live under blueprint_generation.scene_generation.profiles.
         bsg2 = bp.get("scene_generation", {}) or {}
         if not bool(bsg2.get("use_profile_catalog", True)) and \
-                not (bp.get("profiles") or []):
+                not (bsg2.get("profiles") or []):
             errors.append(
-                "blueprint_generation.use_profile_catalog is false but no "
-                "explicit profiles are provided; either set it to true or "
-                "provide a non-empty profiles list")
+                "blueprint_generation.scene_generation.use_profile_catalog "
+                "is false but scene_generation.profiles is empty; either "
+                "set use_profile_catalog to true or provide a non-empty "
+                "profiles list")
 
     # ── hierarchical_expert: THE single expert parameter source ────
     he = g.get("hierarchical_expert", {}) or {}

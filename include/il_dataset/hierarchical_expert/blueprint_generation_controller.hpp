@@ -24,6 +24,7 @@
 #include "il_dataset/hierarchical_expert/blueprint_types.hpp"
 #include "il_dataset/hierarchical_expert/distribution_analyzer.hpp"
 #include "il_dataset/hierarchical_expert/depth_proxy_evaluator.hpp"
+#include "il_dataset/hierarchical_expert/route_qualifier.hpp"
 #include "il_dataset/hierarchical_expert/scene_geometry_cache.hpp"
 #include "il_dataset/hierarchical_expert/scene_profile_generator.hpp"
 #include "il_dataset/hierarchical_expert/task_candidate_generator.hpp"
@@ -86,6 +87,7 @@ private:
     SceneProfileGenerator profile_gen_;
     DistributionAnalyzer analyzer_;
     TaskCandidateGenerator task_gen_;
+    TaskRouteQualifier qualifier_;  // per-scene configure(); PRIVILEGED
 };
 
 }  // namespace expert

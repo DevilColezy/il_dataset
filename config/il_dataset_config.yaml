@@ -274,8 +274,15 @@ global:
     # stall_speed_mps * dt with dt = 1/control_rate_hz (below), so the
     # threshold is speed-correct regardless of the control rate.
     early_termination:
-      no_progress_window_ticks: 150
+      # DEFAULT OFF: a pure "goal distance must shrink by X over the
+      # window" rule wrongly kills legitimate long detours that need
+      # lateral movement or a temporary distance increase.  When enabled
+      # (>0) the controller uses a COMBINED criterion (goal shrink AND
+      # window motion below thresholds).  The stall detector + global tick
+      # budget remain the primary guards.
+      no_progress_window_ticks: 0
       no_progress_min_progress_m: 1.0
+      no_progress_window_min_motion_m: 2.0
       stall_window_ticks: 90
       stall_speed_mps: 0.02
       # Minimum required sign alternations of a chicane realization along
@@ -285,6 +292,36 @@ global:
     # Preflight control rate (Hz) — the preflight tick grid is 30 Hz; dt is
     # derived from this (no magic 30.0 in the C++).
     control_rate_hz: 30.0
+    # ── Privileged task qualification (port of the 2D causal
+    #    qualification).  Runs BEFORE the full HierarchicalExpert preflight:
+    #    endpoint safety -> global connectivity -> straight-corridor blocker
+    #    -> (blocked tasks only) LEFT/RIGHT side-constrained A*.  Clear
+    #    tasks skip the side search.  All route / blocker data is
+    #    PRIVILEGED truth (manifest diagnostics only, never expert inputs).
+    task_qualification:
+      enabled: true
+      # Blocked tasks must have BOTH homotopy branches globally feasible:
+      # a local-causal expert cannot know a hidden one-sided dead end.
+      require_both_sides_feasible: true
+      # Bounded global A* confirmation at the ROUTE clearance (same
+      # component at the base clearance does not guarantee a
+      # planner-compatible route).
+      run_astar_confirmation: true
+      max_astar_expansions: 30000
+      max_side_route_expansions: 20000
+      max_total_side_route_expansions: 120000
+      # Lateral bias of the side A* (0 = side-neutral).  LEFT/RIGHT are
+      # defined relative to the FIXED start->goal axis (rotation
+      # invariant), never world axes.
+      side_bias: 0.4
+      homotopy_side_tolerance_m: 0.05
+      gateway_projection_radius_m: 0.8
+      min_route_stretch_for_long_detour: 1.5
+      log_qualification_stats: true
+    # Extra route margin (m) on top of the endpoint clearance used by the
+    # privileged route qualification (mirrors the 2D macro_route_clearance
+    # _margin = 0.1).
+    route_clearance_margin_m: 0.10
     # Explicit distribution targets.  Empty -> built-in defaults (see
     # distribution_analyzer.cpp buildDefaultTargets).
     distribution_targets: []

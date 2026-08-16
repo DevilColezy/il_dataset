@@ -199,6 +199,39 @@ their realized orientation (`horizontal` / `vertical`) ONCE in
 span-based heuristic re-guess.  A vertical chicane is sorted by Y and its
 X-offset signs must alternate at least `min_chicane_alternations` times.
 
+**Privileged task qualification** (`route_qualifier.*`, port of the 2D
+causal qualification): every candidate passes a cheap gate BEFORE the full
+expert preflight —
+  1. *endpoint safety*: both endpoints have >= `endpointRequiredClearance()`
+     and lie on the main traversable component;
+  2. *global connectivity*: same component (exact 8-conn flood fill on the
+     qualifier's analytic truth-ESDF, no diagonal corner-cutting);
+  3. *straight-corridor blocker analysis*: the direct corridor is blocked
+     when an obstacle surface comes within `routeQualificationClearance()`
+     of the start→goal segment; the nearest forward blocker (ties by
+     penetration then id) is recorded;
+  4. *causal LEFT / RIGHT routes* (only for blocked tasks): side-constrained
+     A* routes are planned around the primary blocker via tangent gateways
+     + a lateral side-bias potential + LOS shortcut + homotopy check, with
+     a per-side node-expansion budget and reusable generation-marked A*
+     buffers.  LEFT/RIGHT are relative to the FIXED start→goal axis
+     (rotation invariant); with `require_both_sides_feasible=true` a
+     blocked task is accepted only when BOTH branches are globally
+     feasible (a local-causal expert cannot know a hidden one-sided dead
+     end).  Clear tasks skip the side search entirely.
+All route / blocker / stretch data is PRIVILEGED truth: it is written to
+the Blueprint manifest and generation statistics but is NEVER fed to the
+5 Hz / 30 Hz expert or to the DatasetWriter student inputs.  The realized
+geometric class is then decided from the qualification geometry
+(`classifyQualified`: CLEAR / LOCAL_AVOIDANCE / LARGE_OCCLUSION /
+LONG_DETOUR via `privileged_min_route_stretch` / NARROW_BUT_PLANNABLE
+when the qualified corridor passes a planner-compatible narrow passage /
+CHICANE only for real chicane tasks), never from the scene profile alone.
+Per-round aggregate qualification counters (endpoint / connectivity /
+straight-clear / blocked / side attempts / both-sides / rejects) and the
+efficiency ratios (`qualification_pass_ratio`,
+`full_preflight_success_after_qualification_ratio`) are reported.
+
 **Budgets**: `max_scene_candidates`, `max_task_candidates_per_scene`,
 `max_generation_rounds`, `max_total_preflight_tasks`,
 `max_total_preflight_ticks`, `max_preflight_ticks_per_task`,

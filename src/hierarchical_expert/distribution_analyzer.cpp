@@ -364,7 +364,9 @@ CoverageResult evaluateCoverage(const DistributionAccumulator& acc,
     // ── Grouped macro-correction coverage (the same anti-degeneracy
     // requirement for the 5 Hz steering-correction distribution). ──
     // correction_angle_edges: [-90,-60,-45,-30,-15,0,15,30,45,60,90] ->
-    // 10 bins; groups: right=bins0-4, near=bins4-5, left=bins5-9.
+    // 10 bins.  Groups are MUTUALLY EXCLUSIVE (never double-count a
+    // sample): RIGHT = bins0-3 = [-90,-15), NEAR = bins4-5 = [-15,+15),
+    // LEFT = bins6-9 = [+15,+90].
     const Histogram1D* corr_h = acc.histogram("macro_correction_angle");
     if (corr_h && corr_h->valid()) {
         auto group = [&](int lo, int hi) {
@@ -375,11 +377,11 @@ CoverageResult evaluateCoverage(const DistributionAccumulator& acc,
             return total;
         };
         struct { const char* name; int lo; int hi; uint64_t min; } corr_groups[] = {
-            {"correction_group:right", 0, 4,
+            {"correction_group:right", 0, 3,
              static_cast<uint64_t>(cfg.min_grouped_correction_samples)},
             {"correction_group:near", 4, 5,
              static_cast<uint64_t>(cfg.min_grouped_correction_samples)},
-            {"correction_group:left", 5, 9,
+            {"correction_group:left", 6, 9,
              static_cast<uint64_t>(cfg.min_grouped_correction_samples)},
         };
         for (const auto& g : corr_groups) {

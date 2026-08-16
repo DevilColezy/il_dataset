@@ -49,6 +49,29 @@ inline const char* legacyRadiusClass(double max_radius, bool is_empty,
     return "medium";
 }
 
+/// Merge a per-candidate / per-round QualificationCounters into a total.
+inline void accumulateQual(QualificationCounters& dst,
+                           const QualificationCounters& src) {
+    dst.candidates_checked += src.candidates_checked;
+    dst.endpoint_pass += src.endpoint_pass;
+    dst.connectivity_pass += src.connectivity_pass;
+    dst.straight_clear += src.straight_clear;
+    dst.blocked += src.blocked;
+    dst.side_qualification_attempt += src.side_qualification_attempt;
+    dst.both_sides_feasible += src.both_sides_feasible;
+    dst.accepted += src.accepted;
+    dst.reject_endpoint += src.reject_endpoint;
+    dst.reject_clearance += src.reject_clearance;
+    dst.reject_different_component += src.reject_different_component;
+    dst.reject_global_route += src.reject_global_route;
+    dst.reject_left_infeasible += src.reject_left_infeasible;
+    dst.reject_right_infeasible += src.reject_right_infeasible;
+    dst.reject_both_sides_required += src.reject_both_sides_required;
+    dst.reject_side_search_budget += src.reject_side_search_budget;
+    dst.reject_geom_mismatch += src.reject_geom_mismatch;
+    dst.total_astar_expansions += src.total_astar_expansions;
+}
+
 }  // namespace
 
 BlueprintGenerationController::BlueprintGenerationController(
@@ -171,10 +194,17 @@ bool BlueprintGenerationController::preflightOne(
     bool saw_turn_left = false, saw_turn_right = false;
 
     // Early-termination bookkeeping (blueprint-only; never changes expert
-    // labels): no-progress over a rolling window, and a stall detector.
+    // labels): no-progress over a rolling window (OFF by default; when
+    // enabled uses a COMBINED criterion — see the loop) and a stall
+    // detector.
     const Vec2d orig_goal(task.goal_x, task.goal_y);
     std::deque<double> goal_dist_window;
-    const int no_prog_win = std::max(1, cfg_.no_progress_window_ticks);
+    std::deque<double> motion_window;
+    // Raw window (0 = no-progress disabled).  A pure "must approach the
+    // goal" rule would kill legitimate long detours, so we only use it
+    // when the user explicitly enables it and combine it with the window
+    // motion floor.
+    const int no_prog_win = cfg_.no_progress_window_ticks;
     bool no_progress_triggered = false;
     bool stall_triggered = false;
     // PURE stall detector (shared with the regression tests).  Threshold:
@@ -319,20 +349,30 @@ bool BlueprintGenerationController::preflightOne(
         }
 
         // ── Early termination (budget-only, no label impact) ───────
-        // No-progress: over a rolling window of `no_progress_window_ticks`
-        // the distance to the ORIGINAL goal must have shrunk by at least
-        // `no_progress_min_progress_m`.  Stalled / circling drones burn
-        // the whole preflight budget for nothing; cut them short.
-        {
+        // No-progress (ONLY when explicitly enabled, no_prog_win > 0):
+        // over a rolling window BOTH conditions must hold —
+        //   (a) the distance to the ORIGINAL goal shrunk by less than
+        //       `no_progress_min_progress_m`, AND
+        //   (b) the drone actually travelled less than
+        //       `no_progress_window_min_motion_m` over the window.
+        // The motion floor protects legitimate long detours that move
+        // laterally or briefly away from the goal.  When disabled, only
+        // the stall detector + global tick budget guard the preflight.
+        if (no_prog_win > 0) {
             const double d_to_goal = (orig_goal - res.state.position).norm();
             goal_dist_window.push_back(d_to_goal);
+            motion_window.push_back(step_disp);
             if (static_cast<int>(goal_dist_window.size()) > no_prog_win + 1) {
                 goal_dist_window.pop_front();
+                motion_window.pop_front();
             }
             if (static_cast<int>(goal_dist_window.size()) == no_prog_win + 1) {
                 const double shrink =
                     goal_dist_window.front() - goal_dist_window.back();
-                if (shrink < cfg_.no_progress_min_progress_m) {
+                double motion = 0.0;
+                for (const double d : motion_window) motion += d;
+                if (shrink < cfg_.no_progress_min_progress_m &&
+                    motion < cfg_.no_progress_window_min_motion_m) {
                     no_progress_triggered = true;
                     early_terminated = true;
                     break;
@@ -603,6 +643,15 @@ BlueprintResult BlueprintGenerationController::generate() {
     uint64_t total_preflight_ticks = 0;
     uint64_t full_preflight_attempted = 0;  // not early-terminated
     uint64_t full_preflight_success = 0;    // accepted AND ran to completion
+    // max_scene_candidates limits actual SCENE GENERATION ATTEMPTS (each
+    // scene-loop iteration is one attempt, success OR failure), never just
+    // the number of successfully stored scenes.
+    uint64_t scene_generation_attempts = 0;
+    // Privileged task-qualification aggregates + preflight-after-qual
+    // efficiency counters.
+    QualificationCounters qual_total;
+    uint64_t full_preflight_after_qual = 0;
+    uint64_t full_preflight_success_after_qual = 0;
     BudgetExhaustion budget_exhausted = BudgetExhaustion::NONE;
     std::vector<RoundStats> round_logs;
 
@@ -627,6 +676,7 @@ BlueprintResult BlueprintGenerationController::generate() {
         const auto t_round = Clock::now();
         RoundStats rs;
         rs.round = static_cast<uint64_t>(round);
+        QualificationCounters qc_round;  // per-round qualification counts
 
         const int scene_budget = max_scene_candidates - static_cast<int>(scenes.size());
         const int rounds_left = max_rounds - round + 1;
@@ -639,7 +689,8 @@ BlueprintResult BlueprintGenerationController::generate() {
 
         for (int s = 0; s < round_scenes; ++s) {
             if (budgetExceeded()) break;
-            if (scenes.size() >= static_cast<size_t>(max_scene_candidates)) {
+            if (scene_generation_attempts >=
+                static_cast<uint64_t>(max_scene_candidates)) {
                 budget_exhausted = BudgetExhaustion::SCENE_BUDGET;
                 break;
             }
@@ -657,7 +708,8 @@ BlueprintResult BlueprintGenerationController::generate() {
             }
             if (!prof) break;
 
-            // ── scene realization ───────────────────────────────────
+            // ── scene realization (one ATTEMPT, success or failure) ──
+            ++scene_generation_attempts;
             const uint64_t scene_id = scene_counter++;
             const uint64_t scene_seed = mixSeed(cfg_.base_seed, scene_id + 1);
             const auto t_scene = Clock::now();
@@ -689,6 +741,12 @@ BlueprintResult BlueprintGenerationController::generate() {
                 // manifest (metadata says why) but generate no tasks.
                 continue;
             }
+
+            // ── privileged task qualifier: one-time truth-ESDF grid for
+            //    this scene (endpoint / connectivity / straight blocker /
+            //    LEFT-RIGHT side routes).  Scene-static, never rebuilt per
+            //    task. ───────────────────────────────────────────────
+            qualifier_.configure(out.scene, geo, cfg_);
 
             // ── task candidates for this scene ──────────────────────
             const uint64_t remaining_attempts =
@@ -757,7 +815,37 @@ BlueprintResult BlueprintGenerationController::generate() {
                 timing.cheap_filter_ms += msSince(t_filter);
                 ++rs.task_candidates;
 
+                // ── PRIVILEGED task qualification (port of the 2D causal
+                //    qualification): endpoint safety -> connectivity ->
+                //    straight-corridor blocker -> (blocked only) LEFT /
+                //    RIGHT side-constrained A*.  Clear tasks skip the side
+                //    search.  Rejects here are CHEAP (no full preflight);
+                //    only geometrically fair, both-sides-feasible tasks
+                //    reach the expensive expert. ─────────────────────
+                if (cfg_.qualification.enabled) {
+                    const Vec2d t_start(task.start_x, task.start_y);
+                    const Vec2d t_goal(task.goal_x, task.goal_y);
+                    TaskQualificationSummary q;
+                    const auto t_qual = Clock::now();
+                    qualifier_.qualify(t_start, t_goal, q, qc_round);
+                    timing.task_qualification_ms += msSince(t_qual);
+                    task.qualification = q;
+                    if (!q.accepted) {
+                        ++result.qualification_rejected;
+                        continue;  // try another candidate (never the scene)
+                    }
+                    // Realized geometric class from the qualification
+                    // geometry (not the scene profile alone).
+                    const TaskGeomType realized = task_gen_.classifyQualified(
+                        out.scene, geo, t_start, t_goal, q);
+                    task.geom_type = taskGeomTypeName(realized);
+                    task.qualification.realized_geom_type = task.geom_type;
+                    task.qualification.qualification_class =
+                        q.qualification_class;
+                }
+
                 // ── full preflight + distribution summary ───────────
+                ++full_preflight_after_qual;
                 // P2 HARD tick budget: the effective per-task budget is
                 // capped by the REMAINING global tick budget, so
                 // total_preflight_ticks can never exceed
@@ -808,6 +896,7 @@ BlueprintResult BlueprintGenerationController::generate() {
                     ++result.preflight_success_tasks;
                     ++rs.preflight_success;
                     if (!early_terminated) ++full_preflight_success;
+                    ++full_preflight_success_after_qual;
                     scene_pool.push_back(task);
                     global_pool.push_back(task);
                     analyzer_.addTask(summary);
@@ -841,6 +930,33 @@ BlueprintResult BlueprintGenerationController::generate() {
             if (d.deficit > 1e-9 || d.excess > 1e-9 || d.below_minimum) {
                 rs.remaining_deficits.push_back(d.summary());
             }
+        }
+        // Aggregate this round's privileged qualification counters.
+        rs.qualification = qc_round;
+        accumulateQual(qual_total, qc_round);
+        if (cfg_.qualification.log_qualification_stats && cfg_.log_rounds) {
+            const auto& q = rs.qualification;
+            std::fprintf(stderr,
+                         "[blueprint]   round %llu qualification: checked=%llu "
+                         "endpoint=%llu conn=%llu straight_clear=%llu "
+                         "blocked=%llu side_attempt=%llu both=%llu "
+                         "accept=%llu reject[endpoint=%llu comp=%llu "
+                         "global_route=%llu both_required=%llu] "
+                         "astar_exp=%llu\n",
+                         static_cast<unsigned long long>(round),
+                         static_cast<unsigned long long>(q.candidates_checked),
+                         static_cast<unsigned long long>(q.endpoint_pass),
+                         static_cast<unsigned long long>(q.connectivity_pass),
+                         static_cast<unsigned long long>(q.straight_clear),
+                         static_cast<unsigned long long>(q.blocked),
+                         static_cast<unsigned long long>(q.side_qualification_attempt),
+                         static_cast<unsigned long long>(q.both_sides_feasible),
+                         static_cast<unsigned long long>(q.accepted),
+                         static_cast<unsigned long long>(q.reject_endpoint),
+                         static_cast<unsigned long long>(q.reject_different_component),
+                         static_cast<unsigned long long>(q.reject_global_route),
+                         static_cast<unsigned long long>(q.reject_both_sides_required),
+                         static_cast<unsigned long long>(q.total_astar_expansions));
         }
         if (cfg_.log_rounds) {
             std::fprintf(stderr,
@@ -924,6 +1040,29 @@ BlueprintResult BlueprintGenerationController::generate() {
             : 0.0;
     result.budget_exhausted_reason = budgetExhaustionName(budget_exhausted);
     result.round_logs = round_logs;
+
+    // ── privileged task-qualification efficiency (aggregate) ───────
+    result.qualification = qual_total;
+    result.task_candidates_generated = result.tasks_sampled;
+    result.endpoint_pass_count = qual_total.endpoint_pass;
+    result.connectivity_pass_count = qual_total.connectivity_pass;
+    result.straight_clear_count = qual_total.straight_clear;
+    result.blocked_count = qual_total.blocked;
+    result.side_qualification_attempt_count =
+        qual_total.side_qualification_attempt;
+    result.both_sides_feasible_count = qual_total.both_sides_feasible;
+    result.qualification_accept_count = qual_total.accepted;
+    result.total_astar_expansions = qual_total.total_astar_expansions;
+    result.qualification_pass_ratio =
+        qual_total.candidates_checked > 0
+            ? static_cast<double>(qual_total.accepted) /
+                  static_cast<double>(qual_total.candidates_checked)
+            : 0.0;
+    result.full_preflight_success_after_qualification_ratio =
+        full_preflight_after_qual > 0
+            ? static_cast<double>(full_preflight_success_after_qual) /
+                  static_cast<double>(full_preflight_after_qual)
+            : 0.0;
 
     // per-scene selected counts (indexed by scene_id, like the old quota
     // selector) + selected scene ids in order of first appearance.

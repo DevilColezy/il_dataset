@@ -115,6 +115,15 @@ global:
       stall_speed_mps: 0.02
       min_chicane_alternations: 2
     control_rate_hz: 30.0
+    task_qualification:
+      enabled: true
+      require_both_sides_feasible: true
+      run_astar_confirmation: true
+      max_astar_expansions: 30000
+      max_side_route_expansions: 20000
+      max_total_side_route_expansions: 120000
+      side_bias: 0.4
+      min_route_stretch_for_long_detour: 1.5
     distribution_targets: []
     requirements:
       min_selected_scenes: 4

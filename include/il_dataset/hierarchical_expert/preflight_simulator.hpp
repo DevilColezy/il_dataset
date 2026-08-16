@@ -75,8 +75,9 @@ private:
     /// Synthesize the instantaneous FOV patch by ray casting from the
     /// CAMERA (CameraRig2D at the vehicle pose) against the truth scene,
     /// then feed the same ray arrays through Flightmare2DObservation::
-    /// buildFromRays (the identical runtime patch code path).
-    LocalObservation synthesizePatch(uint64_t tick) const;
+    /// buildFromRays (the identical runtime patch code path).  NOT const:
+    /// it reuses the non-mutable per-tick ray buffers (ray_hit_/ray_seen_).
+    LocalObservation synthesizePatch(uint64_t tick);
 
     /// True if the drone disk (radius r) swept along segment P0→P1 crosses
     /// the region boundary rectangle.
