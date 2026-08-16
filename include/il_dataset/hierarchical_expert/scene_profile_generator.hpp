@@ -40,6 +40,15 @@ public:
     /// Look up a profile by name (nullptr when absent).
     const SceneProfile* findProfile(const std::string& name) const;
 
+    /// Count the sign alternations of the chicane cross offsets along the
+    /// RECORDED orientation (horizontal: sorted by X, sign of (y-cy);
+    /// vertical: sorted by Y, sign of (x-cx)).  `wh` is the warehouse
+    /// (single source of the cross-axis centre).  Shared by the profile
+    /// validation and the regression tests.
+    static int countChicaneFlips(const BlueprintScene& scene,
+                                 const WarehouseGeometry& wh,
+                                 StructureOrientation orientation);
+
     /// Weighted profile pick from the catalog (weights are the product of
     /// the base profile weight and the deficit multipliers).
     const SceneProfile* pickProfile(std::mt19937_64& rng,
@@ -63,17 +72,24 @@ private:
     /// central_blocker / edge_clutter).  Orientation and cluster centres
     /// are drawn ONCE per scene realization and reused for every obstacle;
     /// per-side along-spacing is enforced so the pairwise surface gap is
-    /// guaranteed by construction (rejection rarely triggers).
-    bool realizeStructured(const SceneProfile& profile, const BlueprintGenerationConfig& cfg,
-                           Rng& rng, int desired, std::vector<BlueprintObstacle>& out,
-                           int& placed) const;
+    /// guaranteed by construction (rejection rarely triggers).  The chosen
+    /// orientation is written to `orientation_out` (the single source for
+    /// validation / manifest — never re-derived by a heuristic later).
+    bool realizeStructured(const SceneProfile& profile,
+                           const BlueprintGenerationConfig& cfg, Rng& rng,
+                           int desired, std::vector<BlueprintObstacle>& out,
+                           int& placed,
+                           StructureOrientation& orientation_out) const;
     /// Post-realization sanity validation: a realization must actually
     /// match its own profile structure (clustered groups, corridor free
-    /// channel, bottleneck narrowing, chicane alternation).  Returns false
-    /// (with reason) when the realization should be rejected and retried.
+    /// channel, bottleneck narrowing, chicane alternation).  Uses the
+    /// orientation recorded at realization time (NOT a span heuristic).
+    /// Returns false (with reason) when the realization should be rejected
+    /// and retried.
     bool validateProfileStructure(const SceneProfile& profile,
                                   const BlueprintGenerationConfig& cfg,
                                   const BlueprintScene& scene,
+                                  StructureOrientation orientation,
                                   std::string& reason) const;
     /// Compute the geometric metadata (radius bands, density proxy) from
     /// the realized obstacle set.

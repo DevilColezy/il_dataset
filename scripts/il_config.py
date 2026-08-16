@@ -519,6 +519,31 @@ def _validate_config(cfg):
         _positive(et.get("stall_window_ticks", 90),
                   "blueprint_generation.early_termination.stall_window_ticks",
                   errors)
+        _positive(et.get("min_chicane_alternations", 2),
+                  "blueprint_generation.early_termination."
+                  "min_chicane_alternations", errors)
+
+        # Preflight control rate (Hz) must be positive; it should match the
+        # expert control rate (the preflight tick grid).
+        bp_rate = float(bp.get("control_rate_hz", 30.0))
+        _positive(bp_rate, "blueprint_generation.control_rate_hz", errors)
+        he_rate = float((g.get("hierarchical_expert", {}) or {}).get(
+            "control_hz", 30.0))
+        if abs(bp_rate - he_rate) > 1e-6:
+            errors.append(
+                "blueprint_generation.control_rate_hz must equal "
+                "hierarchical_expert.control_hz (%g)" % he_rate)
+
+        # use_profile_catalog=false must NOT silently produce zero scenes:
+        # it requires explicit user profiles (the C++ controller also fails
+        # fast; this surfaces the error at config-load time too).
+        bsg2 = bp.get("scene_generation", {}) or {}
+        if not bool(bsg2.get("use_profile_catalog", True)) and \
+                not (bp.get("profiles") or []):
+            errors.append(
+                "blueprint_generation.use_profile_catalog is false but no "
+                "explicit profiles are provided; either set it to true or "
+                "provide a non-empty profiles list")
 
     # ── hierarchical_expert: THE single expert parameter source ────
     he = g.get("hierarchical_expert", {}) or {}

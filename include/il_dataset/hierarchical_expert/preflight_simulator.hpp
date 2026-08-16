@@ -90,6 +90,13 @@ private:
     bool has_wall_ = false;
     Vec2d wall_min_{-20.0, -20.0};
     Vec2d wall_max_{20.0, 20.0};
+    // Scene-static raycast geometry: extracted ONCE in configure() so
+    // synthesizePatch() never rebuilds the vectors every 30 Hz tick.
+    std::vector<Vec2d> obstacle_centers_;
+    std::vector<double> obstacle_radii_;
+    // Reusable per-tick ray buffers (avoid per-tick heap allocation).
+    std::vector<double> ray_hit_;
+    std::vector<bool> ray_seen_;
     HierarchicalExpert expert_;
     Flightmare2DObservation obs_builder_;
     VehicleState2D state_;

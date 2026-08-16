@@ -423,6 +423,12 @@ class JointV2Manager(object):
             "early_termination": dict(bp.get("early_termination", {}) or {}),
             "distribution_targets": list(
                 bp.get("distribution_targets", []) or []),
+            # Preflight control rate (Hz); dt = 1/control_rate_hz is the
+            # stall-displacement / duration time base (no magic 30.0).
+            "control_rate_hz": float(
+                bp.get("control_rate_hz",
+                       (self._g.get("hierarchical_expert", {}) or {}).get(
+                           "control_hz", 30.0))),
             "legacy": dict(leg),
         }
         legacy["blueprint"] = blueprint
@@ -457,7 +463,9 @@ class JointV2Manager(object):
                 "scene_id": int(s.scene_id),
                 "seed": int(s.seed),
                 "profile": str(s.profile),
+                "structure_orientation": str(s.structure_orientation),
                 "metadata": {
+                    "structure_orientation": str(md.structure_orientation),
                     "obstacle_count": int(md.obstacle_count),
                     "radius_min": float(md.radius_min),
                     "radius_max": float(md.radius_max),
@@ -663,6 +671,10 @@ class JointV2Manager(object):
                     "selected_pool": int(r.selected_pool),
                     "elapsed_ms": _fin(r.elapsed_ms),
                     "preflight_avg_ms": _fin(r.preflight_avg_ms),
+                    "failure_breakdown": {
+                        str(k): int(v)
+                        for k, v in r.failure_breakdown.items()
+                    },
                     "remaining_deficits": [str(d) for d in r.remaining_deficits],
                 }
                 for r in result.round_logs

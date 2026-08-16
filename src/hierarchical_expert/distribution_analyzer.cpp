@@ -850,9 +850,37 @@ std::vector<BlueprintTask> DistributionAnalyzer::select(
                   });
 
         std::vector<bool> removed(selected.size(), false);
+        // Count DISTINCT scenes whose every task has been removed.
+        auto removed_scene_count = [&](const std::vector<bool>& rem) {
+            size_t count = 0;
+            for (const auto& kv : sel_by_scene) {
+                bool all_removed = true;
+                for (size_t i : kv.second) {
+                    if (!rem[i]) {
+                        all_removed = false;
+                        break;
+                    }
+                }
+                if (all_removed) ++count;
+            }
+            return count;
+        };
         for (const uint64_t sid : scene_order) {
+            // P1 FIX: never consolidate below min_selected_scenes.  A
+            // scene may only be dropped when at least `min_selected_scenes`
+            // DISTINCT scenes would remain (otherwise the consolidation
+            // would delete itself into a generation_ok=false state).
+            const size_t remaining_scenes =
+                scene_order.size() - removed_scene_count(removed);
+            if (remaining_scenes <=
+                static_cast<size_t>(std::max(1, cfg_.min_selected_scenes))) {
+                break;
+            }
             // Rebuild the accumulator from every kept task except this
-            // scene's; if the hard minimums still hold, drop the scene.
+            // scene's; drop the scene ONLY if the FULL acceptance gate
+            // still holds — evaluateCoverage() covers the hard distribution
+            // minimums, the turn/yaw structural balance and the grouped
+            // deflection / correction coverage in ONE shared judgement.
             DistributionAccumulator trial;
             trial.configure(cfg_);
             for (size_t i = 0; i < selected.size(); ++i) {

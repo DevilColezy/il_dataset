@@ -117,6 +117,10 @@ void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
         get_d("min_main_component_area_m2", b.min_main_component_area_m2);
 
     // ── profiles / sequence ───────────────────────────────────────
+    // use_profile_catalog MUST reach C++: false disables the built-in
+    // default catalog (only user-provided `profiles` remain).
+    b.use_profile_catalog =
+        get_b("use_profile_catalog", b.use_profile_catalog);
     if (bp.contains("profiles")) {
         std::vector<SceneProfile> profiles;
         for (py::handle h : py::cast<py::sequence>(bp["profiles"])) {
@@ -297,7 +301,12 @@ void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
             gi2("stall_window_ticks", b.stall_window_ticks);
         b.stall_speed_mps = gd2("stall_speed_mps", b.stall_speed_mps);
         b.log_rounds = gb("log_rounds", b.log_rounds);
+        b.min_chicane_alternations =
+            gi2("min_chicane_alternations", b.min_chicane_alternations);
     }
+    // Preflight control rate (Hz) — dt = 1/control_rate_hz is the stall /
+    // duration time base.  Defaults to 30.0 (the preflight tick grid).
+    b.control_rate_hz = get_d("control_rate_hz", b.control_rate_hz);
 
     // ── explicit distribution targets (empty => buildDefaultTargets) ─
     if (bp.contains("distribution_targets")) {
@@ -769,6 +778,14 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("scene_id", &BlueprintScene::scene_id)
         .def_readwrite("seed", &BlueprintScene::seed)
         .def_readwrite("profile", &BlueprintScene::profile)
+        // Exposed as a STRING ("horizontal"/"vertical"/"none") — the raw
+        // scoped enum is internal; the manifest consumes the name.
+        .def_property_readonly(
+            "structure_orientation",
+            [](const BlueprintScene& s) {
+                return std::string(
+                    structureOrientationName(s.structure_orientation));
+            })
         .def_readwrite("metadata", &BlueprintScene::metadata)
         .def_readwrite("stratum_id", &BlueprintScene::stratum_id)
         .def_readwrite("count_stratum", &BlueprintScene::count_stratum)
@@ -857,6 +874,7 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readonly("selected_pool", &RoundStats::selected_pool)
         .def_readonly("elapsed_ms", &RoundStats::elapsed_ms)
         .def_readonly("preflight_avg_ms", &RoundStats::preflight_avg_ms)
+        .def_readonly("failure_breakdown", &RoundStats::failure_breakdown)
         .def_readonly("remaining_deficits", &RoundStats::remaining_deficits);
 
     py::class_<BlueprintResult>(m, "BlueprintResult")
@@ -1073,6 +1091,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
     py::class_<SceneMetadata>(m, "SceneMetadata")
         .def(py::init<>())
         .def_readwrite("profile", &SceneMetadata::profile)
+        .def_readwrite("structure_orientation",
+                       &SceneMetadata::structure_orientation)
         .def_readwrite("obstacle_count", &SceneMetadata::obstacle_count)
         .def_readwrite("radius_min", &SceneMetadata::radius_min)
         .def_readwrite("radius_max", &SceneMetadata::radius_max)

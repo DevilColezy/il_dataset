@@ -110,6 +110,11 @@ global:
       max_total_preflight_ticks: 500000
     synthetic_observation:
       walls_visible_in_observation: true
+    early_termination:
+      stall_window_ticks: 90
+      stall_speed_mps: 0.02
+      min_chicane_alternations: 2
+    control_rate_hz: 30.0
     distribution_targets: []
     requirements:
       min_selected_scenes: 4

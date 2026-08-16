@@ -37,6 +37,16 @@ void PreflightSimulator::configure(const Scene2D& scene,
         wall_min_ = *wall_min;
         wall_max_ = *wall_max;
     }
+    // P2: cache the scene-static circle geometry ONCE here so every
+    // synthesizePatch() tick reuses it (no per-tick vector rebuild).
+    obstacle_centers_.clear();
+    obstacle_radii_.clear();
+    obstacle_centers_.reserve(scene_.obstacles.size());
+    obstacle_radii_.reserve(scene_.obstacles.size());
+    for (const auto& o : scene_.obstacles) {
+        obstacle_centers_.push_back(o.center);
+        obstacle_radii_.push_back(o.radius);
+    }
     expert_.configure(p_, min_bounds_, max_bounds_);
     configured_ = true;
 }
@@ -71,19 +81,19 @@ LocalObservation PreflightSimulator::synthesizePatch(uint64_t tick) const {
     const int n_rays = std::max(
         1, static_cast<int>(std::ceil(fov / std::max(1e-9, ray_da))));
 
-    // Pre-extract the circle geometry (avoid per-ray Scene2D dereferences).
-    std::vector<Vec2d> centers;
-    std::vector<double> radii;
-    centers.reserve(scene_.obstacles.size());
-    radii.reserve(scene_.obstacles.size());
-    for (const auto& o : scene_.obstacles) {
-        centers.push_back(o.center);
-        radii.push_back(o.radius);
+    // P2: reuse the scene-static circle geometry (cached in configure())
+    // and the preallocated ray buffers (no per-tick heap allocation).
+    // Resize only when the ray count changed (it never does within a
+    // configured scene, but the guard keeps it safe).
+    const size_t n_rays_sz = static_cast<size_t>(n_rays) + 1;
+    if (ray_hit_.size() != n_rays_sz) {
+        ray_hit_.assign(n_rays_sz,
+                        std::numeric_limits<double>::infinity());
+        ray_seen_.assign(n_rays_sz, false);
     }
-
-    std::vector<double> ray_hit(n_rays + 1,
-                                std::numeric_limits<double>::infinity());
-    std::vector<bool> ray_seen(n_rays + 1, false);
+    std::fill(ray_hit_.begin(), ray_hit_.end(),
+              std::numeric_limits<double>::infinity());
+    std::fill(ray_seen_.begin(), ray_seen_.end(), false);
 
     const Vec2d cam2(rig.worldX(), rig.worldY());
     for (int i = 0; i <= n_rays; ++i) {
@@ -94,15 +104,15 @@ LocalObservation PreflightSimulator::synthesizePatch(uint64_t tick) const {
         // ANALYTIC ray-circle + ray-wall intersection: O(obstacles) per
         // ray, no spatial marching (was O(range/steps x obstacles)).
         const double hit = rayNearestObstacleHit(
-            cam2, Vec2d(dir[0], dir[1]), centers, radii, has_wall_,
-            wall_min_, wall_max_);
-        ray_hit[i] = (hit > range) ? std::numeric_limits<double>::infinity()
-                                   : hit;
-        ray_seen[i] = true;  // valid return (hit or no-hit to R)
+            cam2, Vec2d(dir[0], dir[1]), obstacle_centers_, obstacle_radii_,
+            has_wall_, wall_min_, wall_max_);
+        ray_hit_[static_cast<size_t>(i)] =
+            (hit > range) ? std::numeric_limits<double>::infinity() : hit;
+        ray_seen_[static_cast<size_t>(i)] = true;  // valid return
     }
 
-    return obs_builder_.buildFromRays(ray_hit, ray_seen, pos, q, min_bounds_,
-                                      tick);
+    return obs_builder_.buildFromRays(ray_hit_, ray_seen_, pos, q,
+                                      min_bounds_, tick);
 }
 
 bool PreflightSimulator::segmentCrossesBounds(double x0, double y0, double x1,

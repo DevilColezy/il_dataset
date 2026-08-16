@@ -269,13 +269,22 @@ global:
       walls_visible_in_observation: true
     # Blueprint-only early termination (never changes expert labels): cut
     # preflights that are stalled or not progressing toward the goal so
-    # the preflight budgets are spent on viable candidates.
+    # the preflight budgets are spent on viable candidates.  The stall
+    # detector compares the per-tick displacement against
+    # stall_speed_mps * dt with dt = 1/control_rate_hz (below), so the
+    # threshold is speed-correct regardless of the control rate.
     early_termination:
       no_progress_window_ticks: 150
       no_progress_min_progress_m: 1.0
       stall_window_ticks: 90
       stall_speed_mps: 0.02
+      # Minimum required sign alternations of a chicane realization along
+      # its recorded orientation (4 obstacles => at least 2 flips).
+      min_chicane_alternations: 2
       log_rounds: true
+    # Preflight control rate (Hz) — the preflight tick grid is 30 Hz; dt is
+    # derived from this (no magic 30.0 in the C++).
+    control_rate_hz: 30.0
     # Explicit distribution targets.  Empty -> built-in defaults (see
     # distribution_analyzer.cpp buildDefaultTargets).
     distribution_targets: []

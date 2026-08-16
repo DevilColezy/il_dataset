@@ -249,8 +249,8 @@ inline void addObstacle(BlueprintScene& scene, double x, double y, double r,
 
 bool SceneProfileGenerator::realizeStructured(
     const SceneProfile& profile, const BlueprintGenerationConfig& cfg,
-    Rng& rng, int desired, std::vector<BlueprintObstacle>& out,
-    int& placed) const {
+    Rng& rng, int desired, std::vector<BlueprintObstacle>& out, int& placed,
+    StructureOrientation& orientation_out) const {
     const WarehouseGeometry& wh = cfg.warehouse;
     const double m = cfg.boundary_margin_m + cfg.free_cell_surface_clearance_m;
     const double gap = cfg.min_surface_gap_m;
@@ -258,11 +258,14 @@ bool SceneProfileGenerator::realizeStructured(
         profile.passage_width_m, cfg.plannerRequiredPassage());
     BlueprintScene sc;
     sc.obstacles = out;  // seed with what we already have
+    orientation_out = StructureOrientation::NONE;
 
     // ── FIXED scene-structure parameters (drawn ONCE per realization) ──
     // Orientation is shared by EVERY obstacle of this scene (a corridor /
     // bottleneck / chicane never mixes horizontal and vertical layouts).
     const bool horizontal = rng.uniformInt(0, 1) == 0;
+    orientation_out = horizontal ? StructureOrientation::HORIZONTAL
+                                 : StructureOrientation::VERTICAL;
     const double cx = (wh.free_min_x + wh.free_max_x) * 0.5;
     const double cy = (wh.free_min_y + wh.free_max_y) * 0.5;
     // Along / cross axis ranges for the chosen orientation.
@@ -439,13 +442,58 @@ bool SceneProfileGenerator::realizeStructured(
     return true;
 }
 
+int SceneProfileGenerator::countChicaneFlips(
+    const BlueprintScene& scene, const WarehouseGeometry& wh,
+    StructureOrientation orientation) {
+    if (scene.obstacles.empty()) return 0;
+    const bool horiz = orientation == StructureOrientation::HORIZONTAL;
+    // Copy and sort by the along coordinate (monotonic order).
+    std::vector<const BlueprintObstacle*> ord;
+    ord.reserve(scene.obstacles.size());
+    for (const auto& o : scene.obstacles) ord.push_back(&o);
+    std::sort(ord.begin(), ord.end(),
+              [horiz](const BlueprintObstacle* a, const BlueprintObstacle* b) {
+                  return horiz ? a->x < b->x : a->y < b->y;
+              });
+    // Centre of the cross axis (single source for the sign).
+    const double cx = (wh.free_min_x + wh.free_max_x) * 0.5;
+    const double cy = (wh.free_min_y + wh.free_max_y) * 0.5;
+    int flips = 0;
+    double prev_signed = 0.0;
+    bool first = true;
+    for (const BlueprintObstacle* o : ord) {
+        const double signed_off = horiz ? (o->y - cy) : (o->x - cx);
+        if (first) {
+            prev_signed = signed_off;
+            first = false;
+            continue;
+        }
+        if (prev_signed * signed_off < 0.0) ++flips;
+        prev_signed = signed_off;
+    }
+    return flips;
+}
+
 bool SceneProfileGenerator::validateProfileStructure(
     const SceneProfile& profile, const BlueprintGenerationConfig& cfg,
-    const BlueprintScene& scene, std::string& reason) const {
+    const BlueprintScene& scene, StructureOrientation orientation,
+    std::string& reason) const {
     const WarehouseGeometry& wh = cfg.warehouse;
     const double cx = (wh.free_min_x + wh.free_max_x) * 0.5;
     const double cy = (wh.free_min_y + wh.free_max_y) * 0.5;
     const double free_clr = cfg.free_cell_surface_clearance_m;
+
+    // Directional structures must carry the orientation recorded at
+    // realization time.  If it is missing (defensive fallback for a scene
+    // that bypassed realizeStructured), fail loudly rather than guess.
+    const bool needs_orientation =
+        profile.structure == SceneStructure::CORRIDOR ||
+        profile.structure == SceneStructure::BOTTLENECK ||
+        profile.structure == SceneStructure::CHICANE;
+    if (needs_orientation && orientation == StructureOrientation::NONE) {
+        reason = "structured scene missing recorded orientation";
+        return false;
+    }
 
     switch (profile.structure) {
         case SceneStructure::CLUSTERED: {
@@ -466,19 +514,9 @@ bool SceneProfileGenerator::validateProfileStructure(
             // The free channel along the cross centre must exist: sample
             // points along the axis middle line and verify they clear every
             // obstacle surface by at least the free-cell clearance.
-            // Determine orientation from the realized obstacle spread.
-            double minx = std::numeric_limits<double>::infinity(),
-                   maxx = -std::numeric_limits<double>::infinity();
-            double miny = std::numeric_limits<double>::infinity(),
-                   maxy = -std::numeric_limits<double>::infinity();
-            for (const auto& o : scene.obstacles) {
-                minx = std::min(minx, o.x);
-                maxx = std::max(maxx, o.x);
-                miny = std::min(miny, o.y);
-                maxy = std::max(maxy, o.y);
-            }
-            // Dominant axis = the one with larger extent.
-            const bool horiz = (maxx - minx) >= (maxy - miny);
+            // Orientation comes from the RECORDED realization orientation
+            // (never re-guessed from the obstacle spread).
+            const bool horiz = orientation == StructureOrientation::HORIZONTAL;
             const double lo = horiz ? wh.free_min_x : wh.free_min_y;
             const double hi = horiz ? wh.free_max_x : wh.free_max_y;
             const int n = 24;
@@ -523,26 +561,27 @@ bool SceneProfileGenerator::validateProfileStructure(
             return true;
         }
         case SceneStructure::CHICANE: {
-            // Obstacle lateral offsets (cross sign) must alternate at least
-            // twice along the monotonic axis (a real S-path).
+            // Obstacle lateral offsets (cross sign) must alternate at
+            // least `min_chicane_alternations` times along the monotonic
+            // axis (a real S-path).  A "left and right both exist" check
+            // is NOT enough — the offsets must actually switch sign along
+            // the path.  countChicaneFlips uses the RECORDED orientation
+            // (never a span heuristic).
             if (scene.obstacles.size() < 4) {
                 reason = "chicane needs >= 4 obstacles";
                 return false;
             }
-            int flips = 0;
-            double prev_signed = 0.0;
-            for (size_t i = 0; i < scene.obstacles.size(); ++i) {
-                const double signed_off = scene.obstacles[i].y - cy;
-                if (i == 0) {
-                    prev_signed = signed_off;
-                    continue;
-                }
-                if (prev_signed * signed_off < 0.0) ++flips;
-                prev_signed = signed_off;
-            }
-            if (flips < 2) {
-                reason = "chicane lacks left/right alternation (flips=" +
-                         std::to_string(flips) + ")";
+            const int flips = countChicaneFlips(scene, wh, orientation);
+            const int min_flips =
+                std::max(1, cfg.min_chicane_alternations);
+            if (flips < min_flips) {
+                reason =
+                    "chicane lacks true left/right alternation along " +
+                    std::string(orientation == StructureOrientation::HORIZONTAL
+                                    ? "x"
+                                    : "y") +
+                    " (flips=" + std::to_string(flips) + " < " +
+                    std::to_string(min_flips) + ")";
                 return false;
             }
             return true;
@@ -643,12 +682,15 @@ SceneGenerationOutcome SceneProfileGenerator::generate(
         Rng rng(attempt_seed);
         out.scene.obstacles.clear();
         bool ok = true;
+        // Orientation recorded at realization time (single source for
+        // validation + manifest).  NONE for non-directional structures.
+        StructureOrientation orientation = StructureOrientation::NONE;
 
         if (profile.structure != SceneStructure::UNIFORM &&
             profile.structure != SceneStructure::EMPTY) {
             int placed = 0;
             ok = realizeStructured(profile, cfg_, rng, desired,
-                                   out.scene.obstacles, placed);
+                                   out.scene.obstacles, placed, orientation);
         } else {
             const int max_attempts =
                 std::max(64, cfg_.max_scene_generation_attempts * 64 *
@@ -697,7 +739,7 @@ SceneGenerationOutcome SceneProfileGenerator::generate(
                 //    Reject non-conforming realizations and retry. ──
                 std::string s_reason;
                 if (!validateProfileStructure(profile, cfg_, out.scene,
-                                              s_reason)) {
+                                              orientation, s_reason)) {
                     valid = false;
                     reason = "structure_sanity:" + s_reason;
                 }
@@ -705,9 +747,12 @@ SceneGenerationOutcome SceneProfileGenerator::generate(
             if (valid) {
                 out.scene.generation_valid = true;
                 out.scene.failure_reason = "";
+                out.scene.structure_orientation = orientation;
                 out.metadata = computeMetadata(profile, out.scene, seed,
                                                attempt);
                 out.metadata.geometry_valid = true;
+                out.metadata.structure_orientation =
+                    structureOrientationName(orientation);
                 fillLegacySceneClasses(out.scene, cfg_);
                 out.success = true;
                 out.reason = "ok";

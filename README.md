@@ -141,19 +141,38 @@ CHEAP staged filter (bounds / clearance / distance / main component /
 straight swept segment) and only then runs the closed-loop
 `PreflightSimulator` (the SAME expert).  The synthetic observation is an
 ANALYTIC ray cast (closed-form ray-circle + ray-rectangle slab, no
-spatial marching); when `synthetic_observation.walls_visible_in_observation`
+spatial marching); the scene-static circle geometry is cached once in
+`configure()` and the per-tick ray buffers are reused (no per-tick heap
+allocation).  When `synthetic_observation.walls_visible_in_observation`
 is true the warehouse wall envelope appears in the synthetic depth, but
 it NEVER changes the out-of-bounds audit (that stays the FREE region
 `[-7,10] x [0,30]`, matching the real Flightmare truth audit).  Each
 preflight produces a `TaskDistributionSummary`: actual path length +
 stretch ratio, 5 Hz tick-level PASS/NORMAL/TURN_LEFT/TURN_RIGHT counts +
-correction-angle and correction-distance histograms, 30 Hz deflection /
-yaw-rate / speed histograms (deflection skipped below
+correction-angle and correction-distance histograms (ONLY NORMAL_CORRECTION
+samples — TURN_LEFT/TURN_RIGHT never pollute the correction coverage),
+30 Hz deflection / yaw-rate / speed histograms (deflection skipped below
 `min_deflection_speed_mps` to avoid NaN), min/mean observed clearance, and
 a 2D synthetic raycast DEPTH PROXY (near/mid/far/free counts at a
-temporal stride).  Preflights that stall or make no progress are cut
-short by the `early_termination` detector (blueprint-only, never changes
-expert labels) so the budgets are spent on viable candidates.
+temporal stride, scene-static geometry cached per preflight).  Preflights
+that stall or make no progress are cut short by the `early_termination`
+detector (blueprint-only, never changes expert labels): the stall
+counter compares the ACTUAL per-tick displacement (captured BEFORE the
+previous-position bookkeeping — the P0 bug made it always 0 and killed
+normal long tasks) against `stall_speed_mps * dt` with
+`dt = 1/control_rate_hz`; a pure TURN is exempt and a moving drone resets
+the counter every tick.
+
+**Task-type feasibility mask**: `TaskCandidateGenerator::feasibilityFor`
+derives which geometric proxy classes the CURRENT scene can actually
+produce (large obstacle => LARGE_OCCLUSION / LONG_DETOUR, cached narrow
+passage => NARROW_BUT_PLANNABLE, obstacle count, ...) and the controller
+multiplies the global deficit weights by this mask before sampling — the
+sampler never burns attempt budgets requesting an impossible class (e.g.
+LARGE_OCCLUSION in an EMPTY scene).  The mask only gates GEOMETRIC proxy
+sampling; the expert's final behaviour label (TURN etc.) is never
+constrained (an empty scene can still produce TURN_LEFT via a rear goal
++ large initial yaw error).
 
 **Distribution targets + deficits (quotas replaced)**: the global
 `DistributionAnalyzer` accumulates the summaries and computes per-target
@@ -168,21 +187,41 @@ final `select()` is a deterministic greedy scorer (contribution to
 deficient targets minus over-supply penalties) with a balance-aware
 marginal bonus for the minority turn / yaw side, and a TWO-STAGE flow:
 greedy coverage first, then a scene-consolidation pass that drops entire
-scenes whose tasks are not needed for hard coverage (fewer scenes, more
-complementary tasks per scene).  `selection_score` is written per task.
+scenes whose tasks are not needed for hard coverage — but NEVER below
+`min_selected_scenes` (the consolidation reuses the SAME `evaluateCoverage`
+gate, covering hard minimums + balance + grouped checks, plus the
+selected-scene-count floor).  `selection_score` is written per task.
+
+**Scene structure orientation**: corridor / bottleneck / chicane record
+their realized orientation (`horizontal` / `vertical`) ONCE in
+`SceneProfileGenerator::realizeStructured`; validation (`validateProfileStructure`,
+`countChicaneFlips`) and the manifest use that recorded value — never a
+span-based heuristic re-guess.  A vertical chicane is sorted by Y and its
+X-offset signs must alternate at least `min_chicane_alternations` times.
 
 **Budgets**: `max_scene_candidates`, `max_task_candidates_per_scene`,
 `max_generation_rounds`, `max_total_preflight_tasks`,
 `max_total_preflight_ticks`, `max_preflight_ticks_per_task`,
 `max_scene_generation_attempts`, `max_task_generation_attempts`.
 The preflight budgets are enforced on ATTEMPTS and TICKS (success +
-failure) — never on the accepted pool size alone.  Reaching a budget ends
+failure) — never on the accepted pool size alone.  `max_total_preflight_ticks`
+is a TRUE hard budget: before every preflight the controller computes the
+REMAINING global ticks and caps the task's effective budget to
+`min(max_preflight_ticks_per_task, remaining)`, so a 900-tick task is
+never started with only a few ticks left and `total_preflight_ticks`
+never exceeds the cap.  A task cut by the global remaining cap is
+reported separately (`preflight_rejected:global_tick_budget`) and stops
+the generation with `budget_exhausted_reason = preflight_tick_budget` —
+never conflated with a normal task timeout.  Reaching a budget ends
 the run normally with the achieved distribution + remaining deficits and
-a `budget_exhausted_reason`.  The result reports efficiency diagnostics:
+a `budget_exhausted_reason` (satisfying coverage early leaves it `none`).
+The result reports efficiency diagnostics:
 `preflight_attempt_count / preflight_success_count / preflight_failure_count`,
 `total_preflight_ticks`, `full_preflight_attempted/success`,
 `preflight_acceptance_ratio`, `selected_per_preflight_ratio`, and per-round
-`round_logs` (also logged to stderr with `early_termination.log_rounds`).
+`round_logs` (also logged to stderr with `early_termination.log_rounds`),
+including a per-round rejection breakdown (collision / timeout /
+no_progress / stall / out_of_bounds / macro_label / goal_not_reached).
 
 **generation_ok (new semantics)**: false ONLY when a HARD minimum
 coverage / structural balance / scene / task-count gate fails; soft

@@ -9,6 +9,19 @@
 namespace il_dataset {
 namespace expert {
 
+void DepthProxyEvaluator::configure(
+    const std::vector<BlueprintObstacle>& obstacles) {
+    centers_.clear();
+    radii_.clear();
+    centers_.reserve(obstacles.size());
+    radii_.reserve(obstacles.size());
+    for (const auto& o : obstacles) {
+        centers_.emplace_back(o.x, o.y);
+        radii_.push_back(o.radius);
+    }
+    geometry_cached_ = true;
+}
+
 DepthProxySample DepthProxyEvaluator::castAt(
     const Vec2d& pos_expert, double yaw_expert,
     const std::vector<BlueprintObstacle>& obstacles, bool has_wall,
@@ -27,15 +40,28 @@ DepthProxySample DepthProxyEvaluator::castAt(
     CameraRig2D rig(p_, pos, q);
     const Vec2d cam(rig.worldX(), rig.worldY());
 
-    // Pre-extract circle geometry for the shared analytic ray helper.
-    std::vector<Vec2d> centers;
-    std::vector<double> radii;
-    centers.reserve(obstacles.size());
-    radii.reserve(obstacles.size());
-    for (const auto& o : obstacles) {
-        centers.emplace_back(o.x, o.y);
-        radii.push_back(o.radius);
+    // Use the scene-static geometry cached by configure() when available
+    // (avoids rebuilding centres/radii on EVERY stride sample); otherwise
+    // fall back to building from the caller-provided obstacle list.
+    const std::vector<Vec2d>* centers_ptr = nullptr;
+    const std::vector<double>* radii_ptr = nullptr;
+    std::vector<Vec2d> fallback_centers;
+    std::vector<double> fallback_radii;
+    if (geometry_cached_) {
+        centers_ptr = &centers_;
+        radii_ptr = &radii_;
+    } else {
+        fallback_centers.reserve(obstacles.size());
+        fallback_radii.reserve(obstacles.size());
+        for (const auto& o : obstacles) {
+            fallback_centers.emplace_back(o.x, o.y);
+            fallback_radii.push_back(o.radius);
+        }
+        centers_ptr = &fallback_centers;
+        radii_ptr = &fallback_radii;
     }
+    const std::vector<Vec2d>& centers = *centers_ptr;
+    const std::vector<double>& radii = *radii_ptr;
 
     s.total_rays = static_cast<uint64_t>(n_rays);
     int consecutive = 0, max_consecutive = 0;

@@ -20,6 +20,7 @@
 #include "il_dataset/hierarchical_expert/scene_geometry_cache.hpp"
 #include "il_dataset/hierarchical_expert/scene_task_blueprint.hpp"
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,19 @@ public:
     TaskGeomType classifyGeometry(const SceneGeometryCache& geo,
                                   const Vec2d& start,
                                   const Vec2d& goal) const;
+
+    /// Scene-level feasibility mask for the geometric proxy classes.  A
+    /// class is marked feasible only when the SCENE can actually produce
+    /// it (large obstacle => LARGE_OCCLUSION / LONG_DETOUR, cached narrow
+    /// passage => NARROW_BUT_PLANNABLE, obstacle count, ...).  The caller
+    /// multiplies this mask by the global deficit weights so the sampler
+    /// never burns attempt budgets requesting an impossible class (e.g.
+    /// LARGE_OCCLUSION in an EMPTY scene).  It only gates GEOMETRIC proxy
+    /// SAMPLING — the expert's final behaviour label (TURN etc.) is never
+    /// constrained by it (an empty scene can still produce TURN_LEFT via a
+    /// rear goal + large initial yaw error).
+    std::array<bool, kNumTaskGeomTypes> feasibilityFor(
+        const BlueprintScene& scene, const SceneGeometryCache& geo) const;
 
     /// Sample one task candidate.  `task_type_weights` biases the desired
     /// proxy class (length == kNumTaskGeomTypes), `yaw_weights` biases the

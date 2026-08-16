@@ -2,6 +2,7 @@
 
 #include "il_dataset/hierarchical_expert/coordinate_adapter.hpp"
 #include "il_dataset/hierarchical_expert/preflight_simulator.hpp"
+#include "il_dataset/hierarchical_expert/stall_detector.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -94,8 +95,9 @@ bool BlueprintGenerationController::cheapFilterPass(
 bool BlueprintGenerationController::preflightOne(
     BlueprintTask& task, const BlueprintScene& scene, uint64_t tick_base,
     TaskDistributionSummary& summary, double yaw_error_signed_deg,
-    uint64_t& total_preflight_ticks, bool& early_terminated,
-    double& depth_proxy_ms) const {
+    uint64_t task_tick_budget, uint64_t& total_preflight_ticks,
+    bool& early_terminated, bool& global_tick_truncated,
+    std::string& reject_reason, double& depth_proxy_ms) const {
     PreflightSimulator sim(p_);
     Scene2D s2d;
     s2d.min_bounds = cfg_.warehouse.freeMin();
@@ -109,6 +111,8 @@ bool BlueprintGenerationController::preflightOne(
         s2d.obstacles.push_back(ob);
     }
     early_terminated = false;
+    global_tick_truncated = false;
+    reject_reason = "accepted";
     const Vec2d wall_envelope_min = cfg_.warehouse.envelopeMin();
     const Vec2d wall_envelope_max = cfg_.warehouse.envelopeMax();
     const Vec2d* wall_min = nullptr;
@@ -142,12 +146,19 @@ bool BlueprintGenerationController::preflightOne(
     summary.local_speed_hist.configure(cfg_.speed_edges);
 
     DepthProxyEvaluator depth_proxy(cfg_, p_);
+    // P2: cache the scene-static circle geometry once per preflight so the
+    // stride samples never rebuild centres/radii (150+ samples per task).
+    depth_proxy.configure(scene.obstacles);
     const bool depth_walls = cfg_.walls_visible_in_observation;
 
     // ── closed-loop preflight ──────────────────────────────────────
-    Vec2d prev(task.start_x, task.start_y);
-    double path_len = 0.0;
-    const uint64_t budget = std::max<uint64_t>(1, cfg_.max_preflight_ticks_per_task);
+    // The EFFECTIVE per-task budget is passed in (already capped by the
+    // remaining GLOBAL tick budget — see generate()).  `per_task_budget`
+    // is the raw per-task cap, kept to detect global-cap truncation.
+    const uint64_t budget = std::max<uint64_t>(1, task_tick_budget);
+    const uint64_t per_task_budget =
+        std::max<uint64_t>(1, cfg_.max_preflight_ticks_per_task);
+    const double dt = 1.0 / std::max(1e-6, cfg_.control_rate_hz);
     const uint64_t stride = std::max<uint64_t>(1, cfg_.depth_proxy_sample_stride_ticks);
     uint64_t ticks = 0;
     bool reached = false, collision = false, out_of_bounds = false;
@@ -164,8 +175,14 @@ bool BlueprintGenerationController::preflightOne(
     const Vec2d orig_goal(task.goal_x, task.goal_y);
     std::deque<double> goal_dist_window;
     const int no_prog_win = std::max(1, cfg_.no_progress_window_ticks);
-    int stall_consecutive = 0;
-    const int stall_win = std::max(1, cfg_.stall_window_ticks);
+    bool no_progress_triggered = false;
+    bool stall_triggered = false;
+    // PURE stall detector (shared with the regression tests).  Threshold:
+    // speed [m/s] * dt [s/tick] = m/tick — derived from the explicit
+    // control rate (no magic 30.0).
+    StallDetector stall;
+    stall.disp_threshold = cfg_.stall_speed_mps * dt;
+    stall.window_ticks = std::max(1, cfg_.stall_window_ticks);
 
     for (uint64_t t = 0; t < budget; ++t) {
         // Depth proxy at stride BEFORE the step (matches runtime: the
@@ -183,30 +200,39 @@ bool BlueprintGenerationController::preflightOne(
         ticks = t + 1;
         const ExpertStepOutput& out = res.output;
 
+        // ── P0 FIX: capture the step displacement BEFORE updating `prev`.
+        //    The old code updated `prev` first, so the stall detector's
+        //    `(position - prev)` was ALWAYS 0 and every non-TURN tick
+        //    accumulated a stall count — systematically killing normal
+        //    long / detour / chicane tasks after ~stall_window_ticks. ──
+        const double step_disp =
+            (res.state.position - prev).norm();  // m per tick
+        const double prev_x = prev.x(), prev_y = prev.y();
+
         // Continuous swept truth clearance / collision over prev->new.
         const double seg_clr = truth.segmentMinClearance(
-            prev.x(), prev.y(), res.state.position.x(), res.state.position.y());
+            prev_x, prev_y, res.state.position.x(), res.state.position.y());
         min_clearance = std::min(min_clearance, seg_clr);
         if (std::isfinite(seg_clr)) {
             clear_sum += seg_clr;
             clear_count += 1.0;
         }
         if (res.truth_collision ||
-            truth.segmentCollision(prev.x(), prev.y(),
+            truth.segmentCollision(prev_x, prev_y,
                                    res.state.position.x(),
                                    res.state.position.y())) {
             collision = true;
             break;
         }
         if (res.out_of_bounds ||
-            truth.segmentCrossesBounds(prev.x(), prev.y(),
+            truth.segmentCrossesBounds(prev_x, prev_y,
                                        res.state.position.x(),
                                        res.state.position.y(),
                                        p_.drone_radius)) {
             out_of_bounds = true;
             break;
         }
-        path_len += (res.state.position - prev).norm();
+        path_len += step_disp;
         prev = res.state.position;
 
         // ── 30 Hz behaviour stats ──────────────────────────────────
@@ -254,9 +280,15 @@ bool BlueprintGenerationController::preflightOne(
                 macro_label_invalid = true;
                 break;
             }
-            // Correction-angle / distance histograms when the corrector
-            // is actively redirecting (NORMAL / TURN).
-            if (out.target_correction_active) {
+            // ── P1 FIX: the correction-angle / correction-distance
+            //    histograms must ONLY accumulate NORMAL_CORRECTION.
+            //    The training definition of "correction angle" is the
+            //    LOCAL effective-target direction relative to the ORIGINAL
+            //    navigation-goal direction while the 5 Hz corrector is
+            //    doing a NORMAL correction.  TURN_LEFT / TURN_RIGHT have
+            //    their own counts (macro_turn_left/right_count) and must
+            //    NOT pollute the NORMAL-correction grouped coverage. ──
+            if (ct == "NORMAL_CORRECTION" && out.target_correction_active) {
                 const double gx = out.navigation_goal_direction_flu_x,
                              gy = out.navigation_goal_direction_flu_y;
                 const double ex = out.goal_direction_flu_x,
@@ -301,26 +333,25 @@ bool BlueprintGenerationController::preflightOne(
                 const double shrink =
                     goal_dist_window.front() - goal_dist_window.back();
                 if (shrink < cfg_.no_progress_min_progress_m) {
+                    no_progress_triggered = true;
                     early_terminated = true;
                     break;
                 }
             }
         }
-        // Stall: |velocity| (per-tick displacement proxy) below the stall
-        // threshold for `stall_window_ticks` while not in a legitimate
-        // TURN update.
+        // Stall: the drone is physically stationary (per-tick displacement
+        // below `stall_speed_mps * dt`) for `stall_window_ticks` while NOT
+        // in a legitimate TURN update.  `step_disp` is the displacement of
+        // THIS tick (captured before `prev` was updated above — the P0
+        // fix); a pure TURN keeps position ~constant but is exempt via
+        // `in_turn`.  A moving drone (step_disp >= threshold) resets the
+        // counter every tick, so normal tasks can never accumulate a stall.
         {
-            const double disp =
-                (res.state.position - prev).norm();  // per 1/30 s step
             const bool in_turn =
                 out.macro_correction_type == "TURN_LEFT" ||
                 out.macro_correction_type == "TURN_RIGHT";
-            if (!in_turn && disp < cfg_.stall_speed_mps / 30.0) {
-                ++stall_consecutive;
-            } else {
-                stall_consecutive = 0;
-            }
-            if (stall_consecutive >= stall_win) {
+            if (stall.update(step_disp, in_turn)) {
+                stall_triggered = true;
                 early_terminated = true;
                 break;
             }
@@ -331,10 +362,19 @@ bool BlueprintGenerationController::preflightOne(
         qual_exceeded = false;
     }
     if (ticks >= budget && !reached && !early_terminated) qual_exceeded = true;
+    // Global-cap truncation: the task consumed its ENTIRE effective budget
+    // and that budget was SMALLER than the raw per-task cap => it was cut
+    // by the remaining GLOBAL tick budget, not by a normal task timeout.
+    // This only drives diagnostics (budget_exhausted_reason), never the
+    // training labels.
+    if (!reached && !early_terminated && ticks >= budget &&
+        budget < per_task_budget) {
+        global_tick_truncated = true;
+    }
 
     // ── summary quality fields ─────────────────────────────────────
     summary.preflight_ticks = ticks;
-    summary.preflight_duration_s = static_cast<double>(ticks) / 30.0;
+    summary.preflight_duration_s = static_cast<double>(ticks) / cfg_.control_rate_hz;
     summary.preflight_path_length_m = path_len;
     summary.path_stretch_ratio =
         summary.straight_distance_m > 1e-6
@@ -370,15 +410,36 @@ bool BlueprintGenerationController::preflightOne(
     if (!task.audit.accepted) {
         task.behavior_class = "rejected";
         task.side_class = "none";
+        // Rejection category for the per-round breakdown (also reflected
+        // in the detailed preflight_status string).
+        if (no_progress_triggered) {
+            reject_reason = "no_progress";
+        } else if (stall_triggered) {
+            reject_reason = "stall";
+        } else if (collision) {
+            reject_reason = "collision";
+        } else if (out_of_bounds) {
+            reject_reason = "out_of_bounds";
+        } else if (qual_exceeded) {
+            reject_reason = "timeout";
+        } else if (!reached) {
+            reject_reason = "goal_not_reached";
+        } else {
+            reject_reason = "macro_label";
+        }
         task.audit.preflight_status =
             early_terminated
-                ? "preflight_rejected:early_termination"
+                ? (no_progress_triggered
+                       ? "preflight_rejected:early_termination:no_progress"
+                       : "preflight_rejected:early_termination:stall")
                 : (collision
                        ? "preflight_rejected:truth_collision"
                        : (out_of_bounds
                               ? "preflight_rejected:out_of_bounds"
                               : (qual_exceeded
-                                     ? "preflight_rejected:qualification_budget"
+                                     ? (global_tick_truncated
+                                            ? "preflight_rejected:global_tick_budget"
+                                            : "preflight_rejected:qualification_budget")
                                      : (!reached
                                             ? "preflight_rejected:goal_not_reached"
                                             : "preflight_rejected:macro_label_invalid"))));
@@ -515,6 +576,15 @@ BlueprintResult BlueprintGenerationController::generate() {
             "parallel_tasks is not implemented (must be false)";
         return result;
     }
+    // use_profile_catalog=false with NO user-provided profiles is a config
+    // error: there would be nothing to generate and the run would silently
+    // produce zero scenes.  Fail with a clear reason instead.
+    if (!cfg_.use_profile_catalog && cfg_.profiles.empty()) {
+        result.failure_reason =
+            "use_profile_catalog=false requires explicit profiles "
+            "(profile catalog disabled with an empty profiles list)";
+        return result;
+    }
 
     const int max_rounds = std::max(1, cfg_.max_generation_rounds);
     const int max_scene_candidates = std::max(1, cfg_.max_scene_candidates);
@@ -644,11 +714,31 @@ BlueprintResult BlueprintGenerationController::generate() {
                 BlueprintTask task;
                 TaskGeomType geom = TaskGeomType::CLEAR;
                 double yaw_err = 0.0;
+                // P2: scene feasibility mask x global deficit weights.  A
+                // class the scene cannot produce (LARGE_OCCLUSION in an
+                // empty scene, ...) is zeroed BEFORE sampling, so the
+                // sampler never burns attempts on an impossible request.
+                const auto feas = task_gen_.feasibilityFor(out.scene, geo);
+                std::vector<double> type_weights =
+                    analyzer_.taskTypeWeights();
+                bool any_feasible = false;
+                for (size_t i = 0; i < type_weights.size(); ++i) {
+                    if (i < feas.size() && !feas[i]) {
+                        type_weights[i] = 0.0;
+                    } else if (type_weights[i] > 0.0) {
+                        any_feasible = true;
+                    }
+                }
+                if (!any_feasible) {
+                    // Defensive: CLEAR is always feasible by construction;
+                    // if the mask somehow zeroed everything keep CLEAR.
+                    type_weights.assign(type_weights.size(), 0.0);
+                    type_weights[static_cast<size_t>(TaskGeomType::CLEAR)] = 1.0;
+                }
                 const auto t_samp = Clock::now();
                 const bool sampled = task_gen_.sample(
-                    out.scene, geo, analyzer_.taskTypeWeights(),
-                    analyzer_.yawWeights(), task_seed, global_task_id,
-                    scene_id, task, geom, yaw_err);
+                    out.scene, geo, type_weights, analyzer_.yawWeights(),
+                    task_seed, global_task_id, scene_id, task, geom, yaw_err);
                 timing.task_candidate_generation_ms += msSince(t_samp);
                 if (!sampled) break;
                 ++result.tasks_sampled;
@@ -668,15 +758,34 @@ BlueprintResult BlueprintGenerationController::generate() {
                 ++rs.task_candidates;
 
                 // ── full preflight + distribution summary ───────────
+                // P2 HARD tick budget: the effective per-task budget is
+                // capped by the REMAINING global tick budget, so
+                // total_preflight_ticks can never exceed
+                // max_total_preflight_ticks (a 900-tick task is never
+                // started with only 10 ticks left).
+                const uint64_t remaining_global_ticks =
+                    max_preflight_ticks > total_preflight_ticks
+                        ? max_preflight_ticks - total_preflight_ticks
+                        : 0;
+                if (remaining_global_ticks == 0) {
+                    budget_exhausted = BudgetExhaustion::PREFLIGHT_TICK_BUDGET;
+                    break;
+                }
+                const uint64_t task_tick_budget = std::min<uint64_t>(
+                    static_cast<uint64_t>(std::max(1, cfg_.max_preflight_ticks_per_task)),
+                    remaining_global_ticks);
                 TaskDistributionSummary summary;
                 const uint64_t tick_base = task.task_id * 600000ull;
                 const auto t_pre = Clock::now();
                 bool early_terminated = false;
+                bool global_tick_truncated = false;
+                std::string reject_reason = "accepted";
                 double depth_proxy_ms = 0.0;
                 const uint64_t ticks_before = total_preflight_ticks;
                 const bool accepted = preflightOne(
                     task, out.scene, tick_base, summary, yaw_err,
-                    total_preflight_ticks, early_terminated, depth_proxy_ms);
+                    task_tick_budget, total_preflight_ticks, early_terminated,
+                    global_tick_truncated, reject_reason, depth_proxy_ms);
                 timing.preflight_total_ms += msSince(t_pre);
                 timing.depth_proxy_total_ms += depth_proxy_ms;
                 ++timing.preflight_count;
@@ -684,8 +793,15 @@ BlueprintResult BlueprintGenerationController::generate() {
                 ++result.tasks_preflighted;
                 ++total_preflight_attempts;
                 ++rs.preflight_attempted;
+                ++rs.failure_breakdown[reject_reason];
                 task.summary = summary;
 
+                if (global_tick_truncated) {
+                    // The GLOBAL remaining tick budget cut this task short
+                    // (not a normal task timeout): report it and stop the
+                    // whole generation — no further preflight can run.
+                    budget_exhausted = BudgetExhaustion::PREFLIGHT_TICK_BUDGET;
+                }
                 if (!early_terminated) ++full_preflight_attempted;
                 if (accepted) {
                     ++timing.preflight_success_count;
@@ -699,6 +815,7 @@ BlueprintResult BlueprintGenerationController::generate() {
                     ++timing.preflight_failure_count;
                     ++result.preflight_failure_count;
                 }
+                if (budget_exhausted != BudgetExhaustion::NONE) break;
             }
             if (timing.preflight_count > 0) {
                 timing.preflight_average_ms =
@@ -741,13 +858,33 @@ BlueprintResult BlueprintGenerationController::generate() {
                          static_cast<unsigned long long>(rs.selected_pool),
                          cov.hard_minimums_met ? "1" : "0",
                          cov.soft_targets_met ? "1" : "0", rs.elapsed_ms);
+            // Failure breakdown (stall / no_progress are the key signals to
+            // watch after the stall-displacement fix).
+            if (!rs.failure_breakdown.empty()) {
+                std::string breakdown;
+                for (const auto& kv : rs.failure_breakdown) {
+                    if (!breakdown.empty()) breakdown += " ";
+                    breakdown += kv.first + "=" +
+                                 std::to_string(kv.second);
+                }
+                std::fprintf(stderr, "[blueprint]   round %llu rejections: %s\n",
+                             static_cast<unsigned long long>(round),
+                             breakdown.c_str());
+            }
         }
         round_logs.push_back(rs);
         if (cov.hard_minimums_met && cov.soft_targets_met) {
+            // Normal early satisfaction — NOT a budget exhaustion.
             budget_exhausted = BudgetExhaustion::NONE;
             break;
         }
         if (budgetExceeded()) break;
+        // Exhausted the generation-round budget while coverage is unmet
+        // (only if no more specific budget already stopped us).
+        if (round >= max_rounds &&
+            budget_exhausted == BudgetExhaustion::NONE) {
+            budget_exhausted = BudgetExhaustion::GENERATION_ROUND_BUDGET;
+        }
     }
 
     // ── final greedy selection ─────────────────────────────────────

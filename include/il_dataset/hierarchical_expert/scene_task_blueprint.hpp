@@ -78,6 +78,9 @@ struct BlueprintScene {
     uint64_t seed = 0;
     // ── new: scene profile + full metadata ─────────────────────────
     std::string profile = "empty";
+    // Orientation recorded at realization time (NONE/HORIZONTAL/VERTICAL).
+    // Single source for validation + manifest; never re-derived.
+    StructureOrientation structure_orientation = StructureOrientation::NONE;
     SceneMetadata metadata;
     // ── legacy fields (report-only, manifest compatibility) ────────
     int stratum_id = -1;   // legacy 3x3 stratum id; -1 for empty

@@ -35,6 +35,30 @@ inline double signedDistToSeg(const Vec2d& p, const Vec2d& a, const Vec2d& b) {
 
 }  // namespace
 
+std::array<bool, kNumTaskGeomTypes> TaskCandidateGenerator::feasibilityFor(
+    const BlueprintScene& scene, const SceneGeometryCache& geo) const {
+    (void)scene;
+    std::array<bool, kNumTaskGeomTypes> m;
+    m.fill(false);
+    const size_t n_obs = geo.obstacleCenters().size();
+    const bool has_large = !geo.largeObstacles().empty();
+    const bool has_narrow = !geo.narrowPassages().empty();
+
+    // CLEAR is always feasible (empty scenes must be able to produce it).
+    m[static_cast<size_t>(TaskGeomType::CLEAR)] = true;
+    m[static_cast<size_t>(TaskGeomType::LOCAL_AVOIDANCE)] = n_obs >= 1;
+    m[static_cast<size_t>(TaskGeomType::OFFSET_AVOIDANCE)] = n_obs >= 1;
+    m[static_cast<size_t>(TaskGeomType::MULTI_OBSTACLE)] = n_obs >= 2;
+    m[static_cast<size_t>(TaskGeomType::LARGE_OCCLUSION)] = has_large;
+    // CHICANE proxy needs >= 4 obstacles with alternating sides; with fewer
+    // the sampler would only waste attempts.
+    m[static_cast<size_t>(TaskGeomType::CHICANE)] = n_obs >= 4;
+    m[static_cast<size_t>(TaskGeomType::NARROW_BUT_PLANNABLE)] = has_narrow;
+    // LONG_DETOUR requires a blocker / large obstacle on the path.
+    m[static_cast<size_t>(TaskGeomType::LONG_DETOUR)] = has_large;
+    return m;
+}
+
 TaskGeomType TaskCandidateGenerator::classifyGeometry(
     const SceneGeometryCache& geo, const Vec2d& start,
     const Vec2d& goal) const {

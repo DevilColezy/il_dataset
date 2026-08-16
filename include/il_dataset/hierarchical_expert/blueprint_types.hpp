@@ -209,6 +209,28 @@ inline const char* sceneStructureName(SceneStructure s) {
     return "uniform";
 }
 
+/// Orientation of a directional structured scene (corridor / bottleneck /
+/// chicane).  Recorded ONCE by the SceneProfileGenerator at realization
+/// time and reused by validation / manifest / debug — never re-derived
+/// from the obstacle spread by a heuristic.
+///   HORIZONTAL : the passage runs along the X axis (obstacles alternate
+///                around the X centre-line in Y)
+///   VERTICAL   : the passage runs along the Y axis (obstacles alternate
+///                around the Y centre-line in X)
+enum class StructureOrientation : uint8_t {
+    NONE = 0,
+    HORIZONTAL = 1,
+    VERTICAL = 2,
+};
+
+inline const char* structureOrientationName(StructureOrientation o) {
+    switch (o) {
+        case StructureOrientation::HORIZONTAL: return "horizontal";
+        case StructureOrientation::VERTICAL: return "vertical";
+        default: return "none";
+    }
+}
+
 struct SceneProfile {
     std::string name = "empty";
     int count_min = 0, count_max = 0;
@@ -229,6 +251,10 @@ struct SceneProfile {
 // ═══════════════════════════════════════════════════════════════════
 struct SceneMetadata {
     std::string profile = "empty";
+    // Orientation of directional structures, recorded at realization time
+    // ("horizontal" / "vertical" / "none").  Single source — validation
+    // and manifest both use it (never re-derived heuristically).
+    std::string structure_orientation = "none";
     int obstacle_count = 0;
     double radius_min = 0.0, radius_max = 0.0, radius_mean = 0.0;
     int tiny_count = 0, small_count = 0, medium_count = 0, large_count = 0;
@@ -499,6 +525,11 @@ struct BlueprintGenerationConfig {
     // observation (depth proxy + preflight patch).  NEVER changes the
     // out-of-bounds semantics (that stays the FREE region, matching the
     // real Flightmare truth audit).
+    // ── early termination / synthetic observation ──────────────────
+    // Preflight control rate (Hz) — dt = 1/control_rate_hz is used for
+    // the stall-displacement threshold and duration conversions (no magic
+    // 30.0 scattered in the code).
+    double control_rate_hz = 30.0;
     bool walls_visible_in_observation = true;
     // Early termination (blueprint-only, never changes expert labels):
     //  * no-progress: original-goal distance shrinks by less than
@@ -509,6 +540,9 @@ struct BlueprintGenerationConfig {
     double no_progress_min_progress_m = 1.0;
     int    stall_window_ticks = 90;             // 3 s @ 30 Hz
     double stall_speed_mps = 0.02;
+    // Minimum required sign alternations of a chicane realisation along
+    // its recorded orientation (4 obstacles => at least 2 flips).
+    int min_chicane_alternations = 2;
     // Per-round sanity log to stderr (one line per round).
     bool log_rounds = true;
 
@@ -620,6 +654,10 @@ struct RoundStats {
     uint64_t selected_pool = 0;       // pool size after this round
     double elapsed_ms = 0.0;
     double preflight_avg_ms = 0.0;
+    /// Per-rejection-category preflight counts for this round:
+    /// accepted / collision / timeout / no_progress / stall /
+    /// out_of_bounds / macro_label / goal_not_reached.
+    std::map<std::string, uint64_t> failure_breakdown;
     std::vector<std::string> remaining_deficits;
 };
 
