@@ -154,6 +154,15 @@ LocalObservation Flightmare2DObservation::build(
             double p_fl[3], p_world[3];
             rig.applyRbc(x_opt, y_opt, d, p_fl);
             rig.applyR(p_fl[0], p_fl[1], p_fl[2], p_world);
+            // Ground / below-flight-plane filtering: a pixel whose 3D point
+            // lies more than obs_ground_clearance_m BELOW the camera is the
+            // floor / below the flight plane (e.g. ground at z=0 seen from
+            // a ~2 m flight) — NOT a horizontal obstacle.  Without this the
+            // expert sees a near floor band as an impassable wall and keeps
+            // issuing TURNs.  Obstacles are tall cylinders, so dropping
+            // their lower half is harmless (the upper half yields the same
+            // horizontal position).
+            if (p_world[2] < -p_.obs_ground_clearance_m) continue;
             // rel = point_world - cam_world = R_WB · (R_bc_fl · p_opt).
             const double rel_x = p_world[0];
             const double rel_y = p_world[1];

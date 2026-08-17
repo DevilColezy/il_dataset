@@ -426,6 +426,11 @@ global:
       resolution: 0.10
       ray_angular_res_deg: 0.5
       history_max_age_ticks: 120
+      # Ground / below-flight-plane filtering for the runtime depth->patch
+      # projection: pixels whose 3D point is more than this far below the
+      # camera are ignored (the floor band would otherwise become a near
+      # impassable wall and stall the expert into persistent TURNs).
+      ground_clearance_m: 0.5
     local_planner:
       horizon_s: 2.5
       dt: 0.1

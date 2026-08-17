@@ -266,16 +266,16 @@ class DatasetWriter(object):
             "depth_encoding_contract": {
                 "format": "uint16_png",
                 "png_mode": "I;16",
-                "meters_per_unit": 0.01,
-                "decode_formula": "depth_m = uint16_pixel / 100.0",
+                "encoding": "normalized_16bit",
+                "decode_formula": "depth_m = uint16_pixel / 65535 * max_m",
+                "max_m": float(depth_cfg.get("max_m", 5.0)),
                 "invalid_pixel_value": 0,
                 "invalid_semantics": (
                     "pixel 0 = invalid / non-finite / <=0 depth (no "
                     "return).  Loaders MUST mask it to max range, never "
                     "treat it as a real 0-metre obstacle."),
-                "clip_range_pixels": [0, 65535],
-                "clip_range_m": [0.0, 655.35],
-                "unit": "metres",
+                "valid_range_m": [0.0, float(depth_cfg.get("max_m", 5.0))],
+                "precision_mm": 0.08,
                 "orientation": (
                     "row-major, top-left origin; the AvoidBench flipud is "
                     "applied before encoding, so decode needs no flip."),
@@ -378,13 +378,22 @@ class DatasetWriter(object):
     # ── Depth ────────────────────────────────────────────────────────
     def write_depth(self, frame_id, depth_m, raw_finite_ratio):
         """Encode and store the canonicalised single-channel depth frame
-        (16-bit PNG).  raw_finite_ratio is a pure diagnostic (the fraction
-        of finite/valid pixels in the RAW frame), never a student input."""
+        (16-bit PNG, NORMALIZED encoding — the historical scheme that
+        produced clearly visible PNGs).
+
+        The valid range [0, max_m] is mapped onto the full uint16 range:
+            u16 = round(depth_m / max_m * 65535)
+        so near pixels are bright and far pixels dark, and precision is
+        ~0.08 mm at max_m=5.  Pixel 0 is the INVALID marker (non-finite /
+        <=0 depth).  Decode: depth_m = u16 / 65535 * max_m.
+
+        raw_finite_ratio is a pure diagnostic (the fraction of finite/
+        valid pixels in the RAW frame), never a student input."""
+        max_m = max(1e-6, float(self.depth_cfg.get("max_m", 5.0)))
         valid = np.isfinite(depth_m) & (depth_m > 0)
         u16 = np.zeros(depth_m.shape, dtype=np.uint16)
-        finite = depth_m.copy()
-        finite[~valid] = 0.0
-        scaled = np.clip(finite * 100.0, 0, 65535)
+        finite = np.where(valid, depth_m, 0.0)
+        scaled = np.clip(finite / max_m * 65535.0, 0, 65535)
         u16[...] = np.round(scaled).astype(np.uint16)
         from PIL import Image
         png_path = os.path.join(self._depth_dir, "%06d.png" % frame_id)

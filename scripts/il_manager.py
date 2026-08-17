@@ -50,6 +50,7 @@ import glob
 import json
 import math
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -186,7 +187,11 @@ class JointV2Manager(object):
         self._g = self._config["global"]
         self._blueprint_only = bool(blueprint_only)
         self._dry_run = bool(dry_run)
-        self._manifest_file = manifest_file
+        # Expand `~` so a user-supplied `manifest_file:=~/...` is matched by
+        # os.path.isfile() (a literal `~` would otherwise silently fall back
+        # to blueprint regeneration, which also clears old manifests).
+        self._manifest_file = (
+            os.path.expanduser(manifest_file) if manifest_file else None)
         self._episode_id_counter = 0
         self._current_episode_id = ""
 
@@ -272,6 +277,11 @@ class JointV2Manager(object):
         # Persistent set of Unity object IDs already sent (for retiring
         # obstacles of a previous scene via build_replacing_object_update).
         self._known_object_ids = set()
+        # The current scene's Unity object list, re-sent on EVERY pose (like
+        # the v1/v3/master collection loops).  Sending objects=[] would make
+        # the AvoidBench binary drop the scene obstacles after the first
+        # pose, so the expert would fly through an empty scene.
+        self._current_unity_objects = []
         self._truth = expert_mod.TruthCylinderAudit()
 
     # ═══════════════════════════════════════════════════════════════
@@ -1052,6 +1062,8 @@ class JointV2Manager(object):
             })
         wire_objects, retired = il_common.build_replacing_object_update(
             objects, self._known_object_ids)
+        # Remember the scene objects so every following pose re-sends them.
+        self._current_unity_objects = list(wire_objects)
         self._bridge.send_pose({
             "scene_id": int(self._g.get("scene_id", 1)),
             "vehicles": [
@@ -1111,7 +1123,9 @@ class JointV2Manager(object):
             "scene_id": int(self._g.get("scene_id", 1)),
             "frame_id": int(frame_id),
             "vehicles": [vehicle],
-            "objects": [],
+            # Always re-send the current scene objects: the AvoidBench
+            # binary drops obstacles not present in a pose message.
+            "objects": list(self._current_unity_objects),
         }
 
     @staticmethod
@@ -1846,6 +1860,28 @@ class JointV2Manager(object):
             score += weight * gain
         return score
 
+    def _clear_collection_output(self, output_root):
+        """Remove every file/dir under `output_root` EXCEPT the blueprint
+        manifest(s) (`*_manifest.json`), so each real collection run starts
+        from a clean dataset and never mixes old episodes into the new one.
+        Never touches anything outside `output_root`."""
+        if not output_root or not os.path.isdir(output_root):
+            return
+        kept = set()
+        for m in glob.glob(os.path.join(output_root, "*_manifest.json")):
+            kept.add(os.path.abspath(m))
+        for name in sorted(os.listdir(output_root)):
+            p = os.path.join(output_root, name)
+            if os.path.abspath(p) in kept:
+                continue
+            try:
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.remove(p)
+            except OSError:
+                pass
+
     def _collect_task_once(self, scene, task, tick_base):
         """Run ONE real Flightmare episode for a blueprint task.
 
@@ -2241,6 +2277,11 @@ class JointV2Manager(object):
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 "dataset", "il_data")
         self._output_root = output_root
+        # Fresh collection: clear every previous dataset artifact EXCEPT the
+        # blueprint manifest(s) (the task list), so a new run never mixes
+        # old episodes / failed runs / stale in-progress dirs into the new
+        # data.  blueprint_only / dry_run already returned above.
+        self._clear_collection_output(output_root)
         self._last_scene_id = None
         self._committed_dirs = []
         self._used_task_ids = set()

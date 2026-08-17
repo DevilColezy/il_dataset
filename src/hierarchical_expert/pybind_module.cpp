@@ -426,6 +426,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                        &Params2D::obs_ray_angular_res_deg)
         .def_readwrite("obs_history_max_age_ticks",
                        &Params2D::obs_history_max_age_ticks)
+        .def_readwrite("obs_ground_clearance_m",
+                       &Params2D::obs_ground_clearance_m)
         // local planner
         .def_readwrite("lp_horizon_s", &Params2D::lp_horizon_s)
         .def_readwrite("lp_dt", &Params2D::lp_dt)

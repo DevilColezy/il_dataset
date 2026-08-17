@@ -134,6 +134,9 @@ def build_params(global_cfg, errors=None):
     p.obs_history_max_age_ticks = int(_num(
         obs.get("history_max_age_ticks"),
         "he.observation.history_max_age_ticks", problems, 120))
+    p.obs_ground_clearance_m = _num(
+        obs.get("ground_clearance_m"),
+        "he.observation.ground_clearance_m", problems, 0.5)
 
     # ── depth camera extrinsic (Unity T_BC, camera->body) ─────────
     # Single source: the same camera sent to Unity (il_common builds it

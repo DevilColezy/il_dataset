@@ -272,6 +272,12 @@ struct Params2D {
     double obs_resolution = 0.1;
     double obs_ray_angular_res_deg = 0.5;
     uint32_t obs_history_max_age_ticks = 120;
+    // Ground / below-flight-plane filtering: pixels whose 3D point lies
+    // more than this far BELOW the camera are the floor / below the flight
+    // plane (e.g. the ground at z=0 seen from a ~2 m flight) and are NOT
+    // horizontal obstacles.  Without this the expert sees a near floor band
+    // as an impassable wall and keeps issuing TURNs.
+    double obs_ground_clearance_m = 0.5;
 
     // ── local planner (30 Hz) ──────────────────────────────────────
     double lp_horizon_s = 2.5;
