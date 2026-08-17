@@ -130,6 +130,7 @@ enum class CandidateRejectReason : uint8_t {
     NO_PROGRESS = 4,
     OTHER = 5,
     INSUFFICIENT_BRAKING_CLEARANCE = 6,
+    Z_BOUNDS_VIOLATED = 7,
 };
 
 inline const char* candidateRejectReasonName(CandidateRejectReason r) {
@@ -143,6 +144,8 @@ inline const char* candidateRejectReasonName(CandidateRejectReason r) {
         case CandidateRejectReason::OTHER: return "OTHER";
         case CandidateRejectReason::INSUFFICIENT_BRAKING_CLEARANCE:
             return "INSUFFICIENT_BRAKING_CLEARANCE";
+        case CandidateRejectReason::Z_BOUNDS_VIOLATED:
+            return "Z_BOUNDS_VIOLATED";
     }
     return "UNKNOWN";
 }
@@ -294,6 +297,13 @@ struct Params2D {
     double lp_max_yaw_accel = 4.0;
     double lp_min_clearance = 0.5;
     double lp_soft_clearance_radius_m = 2.0;
+    // ── vertical channel (3D extension) ────────────────────────────
+    double lp_max_vz = 1.0;        // max vertical speed (m/s, +up)
+    double lp_max_v_accel = 2.0;   // vertical acceleration limit (m/s^2)
+    double lp_vz_kp = 1.0;         // altitude regulation gain (1/s)
+    double lp_z_min_m = 0.8;       // lower altitude bound (floor safety)
+    double lp_z_max_m = 3.0;       // upper altitude bound (ceiling safety)
+    double lp_vertical_clearance_m = 0.3;  // margin inside the band
     double lp_clearance_discretization_margin_m = 0.05;
     double lp_obstacle_reaction_time_s = 0.20;
     double lp_control_period_s = 0.0333333333;
@@ -401,8 +411,12 @@ struct Scene2D {
 struct VehicleState2D {
     Vec2d position{0.0, 0.0};
     double yaw = 0.0;
-    Vec2d velocity_world{0.0, 0.0};  // world-frame velocity
+    Vec2d velocity_world{0.0, 0.0};  // world-frame horizontal velocity
     double yaw_rate = 0.0;
+    // ── 3D extension: vertical channel (world z-up) ────────────────
+    double z = 2.0;          // world altitude (m)
+    double vz_world = 0.0;   // world vertical velocity (m/s, +up)
+    double pitch = 0.0;      // diagnostic pitch (rad)
 };
 
 struct Task2D {
@@ -530,6 +544,8 @@ struct LocalTarget {
     // targets are strictly below 1; an exact value of 1 is the reserved
     // pure-rotation command.
     double normalized_distance = 0.0;
+    // ── 3D extension: target altitude (world z, m) ─────────────────
+    double z = 2.0;
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -539,6 +555,8 @@ struct Trajectory2D {
     std::vector<Vec2d> points;
     std::vector<double> yaw;
     std::vector<double> t;  // seconds from plan start
+    // ── 3D extension: predicted altitude per point (m) ─────────────
+    std::vector<double> z;
     bool valid = false;
 };
 
@@ -552,9 +570,16 @@ struct PlannerResult {
     double vx_body = 0.0;
     double vy_body = 0.0;
     double yaw_rate = 0.0;
+    // ── 3D extension: vertical command (body FLU +up, m/s) ─────────
+    double vz_body = 0.0;
     double intent_vx_body = 0.0;
     double intent_vy_body = 0.0;
     double intent_yaw_rate = 0.0;
+    double intent_vz_body = 0.0;
+    // ── 3D extension: vertical rollout diagnostics ─────────────────
+    double selected_z_min_m = std::numeric_limits<double>::quiet_NaN();
+    double selected_z_max_m = std::numeric_limits<double>::quiet_NaN();
+    bool z_bounds_violated = false;
     PlannerStatus planner_status = PlannerStatus::NO_SAFE_CANDIDATE;
     bool candidate_progress_qualified = false;
     bool output_progress_qualified = false;
@@ -685,6 +710,10 @@ struct EncodedTargetInput {
     Vec2d effective_target_world{0.0, 0.0};
     bool effective_target_world_valid = false;
     TargetCorrectionType source_type = TargetCorrectionType::PASS_THROUGH;
+    // ── 3D extension: effective target altitude (world z, m).  TURN
+    //    targets are pure rotation ⇒ z = state.z; PASS / NORMAL carry the
+    //    mission altitude. ────────────────────────────────────────────
+    double z = 2.0;
 };
 
 }  // namespace expert

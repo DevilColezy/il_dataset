@@ -32,8 +32,10 @@ Data-collection sequence (item 五):
     never re-randomises tasks and never generates scenes while flying.
 
 There is exactly ONE HierarchicalExpert instance; it is the sole generator
-of every horizontal control command (vx/vy/yaw_rate).  The vertical vz
-comes from the altitude hold under global.hierarchical_expert.altitude_hold.
+of every control command.  3D extension: the expert outputs the full
+body-FLU velocity [vx, vy, vz] + yaw_rate (the vertical channel is
+regulated toward the mission goal z inside the planner).  The legacy
+AltitudeHold class is retained but unused.
 
 The following are NOT part of the production / preflight / blueprint /
 label paths and have been REMOVED entirely (deleted sources and tests):
@@ -1314,21 +1316,27 @@ class JointV2Manager(object):
                         % (episode_id, control_tick))
                     break
 
-                # 5. Merge altitude-hold vz; build the final command.
-                vz = self._altitude_hold.compute(
-                    flight_h, float(pos[2]), float(vel[2]), sim_t)
+                # 5. The 3D expert now commands the vertical channel itself
+                #    (altitude regulation toward the mission goal z inside
+                #    the planner).  The FINAL command is the full 3D body
+                #    FLU velocity + yaw rate — no Python-side altitude
+                #    merge.  (AltitudeHold is retained but unused.)  The
+                #    backend still clamps to its own physical limits.
                 final_vel = np.array([float(out.target_velocity_flu_x),
                                       float(out.target_velocity_flu_y),
-                                      vz], dtype=np.float64)
+                                      float(out.target_velocity_flu_z)],
+                                     dtype=np.float64)
                 final_yaw_rate = float(out.target_yaw_rate)
 
                 # 6. Non-finite input/label guard.
                 label_values = [
                     out.goal_direction_flu_x, out.goal_direction_flu_y,
-                    out.goal_distance_norm, out.target_velocity_flu_x,
-                    out.target_velocity_flu_y, out.target_yaw_rate,
+                    out.goal_direction_flu_z, out.goal_distance_norm,
+                    out.target_velocity_flu_x, out.target_velocity_flu_y,
+                    out.target_velocity_flu_z, out.target_yaw_rate,
                     out.navigation_goal_direction_flu_x,
                     out.navigation_goal_direction_flu_y,
+                    out.navigation_goal_direction_flu_z,
                     out.navigation_goal_distance_norm,
                     out.macro_distance_norm,
                 ]
@@ -2153,7 +2161,7 @@ class JointV2Manager(object):
             "navigation_goal_world_z": float(flight_h),
             "effective_target_world_x": float(out.effective_target_world_x),
             "effective_target_world_y": float(out.effective_target_world_y),
-            "effective_target_world_z": float(pos[2]),
+            "effective_target_world_z": float(out.effective_target_world_z),
             "original_navigation_goal_world_x":
                 float(out.original_navigation_goal_world_x),
             "original_navigation_goal_world_y":

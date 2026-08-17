@@ -61,15 +61,26 @@ LocalTarget HierarchicalExpertFsm::makeLocalTarget(
     t.update_event = corrector_.directiveUpdateEvent();
     t.mission_revision = mission_revision_;
     t.normalized_distance = encoded.normalized_distance;
+    // ── 3D extension: target altitude (mission z; TURN keeps state z). ─
+    t.z = encoded.z;
     return t;
 }
 
 bool HierarchicalExpertFsm::goalReached(const FsmInput& in) const {
-    const double d = (in.state.position - in.task.goal).norm();
+    // ── 3D extension: the goal tolerance is now judged on the 3D distance
+    //    (horizontal + altitude).  The vertical channel is regulated to
+    //    the mission altitude by the planner, so the drone must also be
+    //    near the goal height before the episode is committed. ─────────
+    const double dx = in.state.position.x() - in.task.goal.x();
+    const double dy = in.state.position.y() - in.task.goal.y();
+    const double dz = in.state.z - in.goal_z;
+    const double d = std::sqrt(dx * dx + dy * dy + dz * dz);
     const double v = in.state.velocity_world.norm();
+    const double vz = std::fabs(in.state.vz_world);
     const double yr = std::fabs(in.state.yaw_rate);
     return d <= p_.task_goal_tolerance &&
            v < p_.vehicle_goal_stop_speed_mps &&
+           vz < p_.vehicle_goal_stop_speed_mps &&
            yr <= p_.lp_turn_exit_max_yaw_rate;
 }
 
@@ -214,7 +225,8 @@ FsmStepOutput HierarchicalExpertFsm::step(const FsmInput& in) {
     last_delivered_event_ = directive_.update_event;
 
     // ── EffectiveTargetAdapter EVERY real 30 Hz tick. ──
-    last_encoded_ = adapter_.encode(in.state, in.task.goal, directive_);
+    last_encoded_ =
+        adapter_.encode(in.state, in.task.goal, directive_, in.goal_z);
 
     // ── LocalTarget for the 30 Hz planner. ──
     out.local_target_updated = directive_updated_;

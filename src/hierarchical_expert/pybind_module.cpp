@@ -439,6 +439,13 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("lp_max_accel", &Params2D::lp_max_accel)
         .def_readwrite("lp_max_yaw_rate", &Params2D::lp_max_yaw_rate)
         .def_readwrite("lp_max_yaw_accel", &Params2D::lp_max_yaw_accel)
+        .def_readwrite("lp_max_vz", &Params2D::lp_max_vz)
+        .def_readwrite("lp_max_v_accel", &Params2D::lp_max_v_accel)
+        .def_readwrite("lp_vz_kp", &Params2D::lp_vz_kp)
+        .def_readwrite("lp_z_min_m", &Params2D::lp_z_min_m)
+        .def_readwrite("lp_z_max_m", &Params2D::lp_z_max_m)
+        .def_readwrite("lp_vertical_clearance_m",
+                       &Params2D::lp_vertical_clearance_m)
         .def_readwrite("lp_min_clearance", &Params2D::lp_min_clearance)
         .def_readwrite("lp_soft_clearance_radius_m",
                        &Params2D::lp_soft_clearance_radius_m)
@@ -610,16 +617,21 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                       &ExpertStepOutput::effective_target_world_x)
         .def_readonly("effective_target_world_y",
                       &ExpertStepOutput::effective_target_world_y)
+        .def_readonly("effective_target_world_z",
+                      &ExpertStepOutput::effective_target_world_z)
         .def_readonly("effective_target_world_valid",
                       &ExpertStepOutput::effective_target_world_valid)
         .def_readonly("target_velocity_flu_x",
                       &ExpertStepOutput::target_velocity_flu_x)
         .def_readonly("target_velocity_flu_y",
                       &ExpertStepOutput::target_velocity_flu_y)
+        .def_readonly("target_velocity_flu_z",
+                      &ExpertStepOutput::target_velocity_flu_z)
         .def_readonly("target_yaw_rate", &ExpertStepOutput::target_yaw_rate)
         .def_readonly("intent_vx_body", &ExpertStepOutput::intent_vx_body)
         .def_readonly("intent_vy_body", &ExpertStepOutput::intent_vy_body)
         .def_readonly("intent_yaw_rate", &ExpertStepOutput::intent_yaw_rate)
+        .def_readonly("intent_vz_body", &ExpertStepOutput::intent_vz_body)
         .def_readonly("hierarchical_mode", &ExpertStepOutput::hierarchical_mode)
         .def_readonly("planner_status", &ExpertStepOutput::planner_status)
         .def_readonly("failure_reason", &ExpertStepOutput::failure_reason)

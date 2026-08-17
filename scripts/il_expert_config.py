@@ -186,6 +186,16 @@ def build_params(global_cfg, errors=None):
                              "he.lp.max_yaw_rate", problems, 2.0)
     p.lp_max_yaw_accel = _num(lp.get("max_yaw_accel"),
                               "he.lp.max_yaw_accel", problems, 4.0)
+    # ── vertical channel (3D expert extension) ────────────────────
+    p.lp_max_vz = _num(lp.get("max_vz"), "he.lp.max_vz", problems, 1.0)
+    p.lp_max_v_accel = _num(lp.get("max_v_accel"),
+                            "he.lp.max_v_accel", problems, 2.0)
+    p.lp_vz_kp = _num(lp.get("vz_kp"), "he.lp.vz_kp", problems, 1.0)
+    p.lp_z_min_m = _num(lp.get("z_min_m"), "he.lp.z_min_m", problems, 0.8)
+    p.lp_z_max_m = _num(lp.get("z_max_m"), "he.lp.z_max_m", problems, 3.0)
+    p.lp_vertical_clearance_m = _num(
+        lp.get("vertical_clearance_m"),
+        "he.lp.vertical_clearance_m", problems, 0.3)
     p.lp_min_clearance = _num(lp.get("min_clearance"),
                               "he.lp.min_clearance", problems, 0.5)
     p.lp_soft_clearance_radius_m = _num(

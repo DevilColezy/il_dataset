@@ -27,6 +27,9 @@ struct LocalPlannerCandidate {
     double vx_body = 0.0;
     double vy_body = 0.0;
     double yaw_rate = 0.0;
+    // ── 3D extension: vertical intent / output (body FLU +up, m/s) ──
+    double desired_vz_body = 0.0;
+    double vz_body = 0.0;
 
     Trajectory2D nominal_traj;
     Trajectory2D traj;
@@ -56,6 +59,10 @@ struct LocalPlannerCandidate {
     double achievable_progress_m = 0.0;
     bool progress_qualified = false;
     bool stationary = false;
+    // ── 3D extension: vertical rollout diagnostics ─────────────────
+    double z_min = std::numeric_limits<double>::infinity();
+    double z_max = -std::numeric_limits<double>::infinity();
+    bool z_bounds_ok = true;
     PlannerStatus status = PlannerStatus::NO_SAFE_CANDIDATE;
     double obstacle_risk_cost = 0.0;
     double predicted_closest_clearance = std::numeric_limits<double>::infinity();
@@ -156,10 +163,14 @@ private:
                                   const LocalObservation& obs,
                                   bool& dynamic_violation) const;
     std::vector<LocalPlannerCandidate> generateCandidates(
-        const VehicleState2D& state) const;
+        const VehicleState2D& state, const LocalTarget& target) const;
     BodyCommand2D reachableCommand(const VehicleState2D& state,
                                    const BodyCommand2D& intent) const;
     Vec2d bodyVelocity(const VehicleState2D& state) const;
+    /// ── 3D extension: deterministic altitude-regulation vertical
+    ///    intent toward the target altitude (m/s, FLU +up). ─────────
+    double verticalIntent(const VehicleState2D& state,
+                          const LocalTarget& target) const;
     bool updateMissionState(const LocalTarget& target, PlannerResult& res);
     BodyCommand2D terminalIntent(const VehicleState2D& state,
                                  const LocalTarget& target) const;

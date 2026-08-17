@@ -39,6 +39,8 @@ struct FsmInput {
     const LocalObservation& history;
     uint64_t tick;
     bool collision;
+    // ── 3D extension: mission altitude (world z) of the original goal. ─
+    double goal_z = 2.0;
 };
 
 /// Flat per-tick output consumed by the Python manager / CSV writer.

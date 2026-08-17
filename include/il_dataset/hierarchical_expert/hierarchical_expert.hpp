@@ -9,12 +9,15 @@
 ///   * drives the ROS/Flightmare lifecycle,
 ///   * synchronises depth frames + state,
 ///   * calls step() on this class,
-///   * records the flat ExpertStepOutput,
-///   * merges the altitude-hold vz into the 30 Hz command.
+///   * records the flat ExpertStepOutput.
+///
+/// 3D extension: the expert itself commands the full body-FLU velocity
+/// [vx, vy, vz] + yaw_rate; no Python-side altitude merge is performed.
 ///
 /// Coordinate convention: the wrapper accepts the Flightmare state
-/// directly (world XY + Flightmare yaw + FLU velocity + yaw rate) and
-/// converts through CoordinateAdapter (the single adaptation layer).
+/// directly (world XY + world Z + Flightmare yaw + FLU velocity + yaw
+/// rate) and converts through CoordinateAdapter (the single adaptation
+/// layer).
 
 #include "il_dataset/hierarchical_expert/types.hpp"
 #include "il_dataset/hierarchical_expert/kinematics.hpp"
@@ -58,16 +61,19 @@ struct ExpertStepOutput {
     // Effective world target (diagnostic; world-latched for NORMAL).
     double effective_target_world_x = 0.0;
     double effective_target_world_y = 0.0;
+    double effective_target_world_z = 2.0;
     bool effective_target_world_valid = false;
 
-    // ── 30 Hz executable label (body FLU; z merged by the altitude
-    //    controller in Python) ──────────────────────────────────────
+    // ── 30 Hz executable label (body FLU; the vertical channel is now
+    //    commanded by the expert itself — 3D extension) ────────────
     double target_velocity_flu_x = 0.0;
     double target_velocity_flu_y = 0.0;
+    double target_velocity_flu_z = 0.0;
     double target_yaw_rate = 0.0;
     double intent_vx_body = 0.0;
     double intent_vy_body = 0.0;
     double intent_yaw_rate = 0.0;
+    double intent_vz_body = 0.0;
 
     // ── 30 Hz diagnostics ──────────────────────────────────────────
     // hierarchical_mode: the FULL new-architecture expert state
@@ -198,6 +204,11 @@ public:
 private:
     void fillOutput(ExpertStepOutput& out, const FsmStepOutput& fsm_out,
                     uint64_t tick, double flight_z);
+    /// ── 3D extension: overwrite the 2D goal directions with the live 3D
+    ///    unit direction (effective target + original goal) projected into
+    ///    the FLU body frame, and the 3D macro direction on 5 Hz frames. ─
+    void apply3DGoalDirections(ExpertStepOutput& out,
+                               const VehicleState2D& st, double flight_z);
 
     Params2D p_;
     Vec2d min_bounds_{-20.0, -20.0};

@@ -43,7 +43,9 @@ def _wall_time_ns():
 # SUPERVISION LABELS (30 Hz):
 #   target_velocity_flu_*, target_yaw_rate — the FINAL command actually
 #   sent to the Flightmare backend (velocity/yaw-rate constrained; NOT an
-#   intent, NOT a trajectory-end velocity).
+#   intent, NOT a trajectory-end velocity).  3D extension: the expert
+#   itself commands the vertical channel (target_velocity_flu_z), so the
+#   label is the full body-FLU velocity [vx, vy, vz] + yaw_rate.
 #   (velocity_command_flu_* / yaw_rate_command are identical aliases)
 # 5 Hz SUPERVISION (two_level_expert_labels_v1):
 #   macro_update_mask / macro_label_valid / macro_correction_type /

@@ -141,15 +141,18 @@ void HierarchicalExpert::fillOutput(ExpertStepOutput& out,
                   fsm_out.target_direction_x_body));
     out.effective_target_world_x = fsm_out.effective_target_x;
     out.effective_target_world_y = fsm_out.effective_target_y;
+    out.effective_target_world_z = fsm_out.local_target.z;
     out.effective_target_world_valid = fsm_out.effective_target_world_valid;
 
-    // ── 30 Hz executable label ─────────────────────────────────────
+    // ── 30 Hz executable label (3D: vx / vy / vz / yaw_rate) ───────
     out.target_velocity_flu_x = fsm_out.local.vx_body;
     out.target_velocity_flu_y = fsm_out.local.vy_body;
+    out.target_velocity_flu_z = fsm_out.local.vz_body;
     out.target_yaw_rate = fsm_out.local.yaw_rate;
     out.intent_vx_body = fsm_out.local.intent_vx_body;
     out.intent_vy_body = fsm_out.local.intent_vy_body;
     out.intent_yaw_rate = fsm_out.local.intent_yaw_rate;
+    out.intent_vz_body = fsm_out.local.intent_vz_body;
 
     // ── 30 Hz diagnostics ──────────────────────────────────────────
     out.hierarchical_mode = mapHierarchicalMode(fsm_out);
@@ -251,6 +254,73 @@ void HierarchicalExpert::fillOutput(ExpertStepOutput& out,
 }
 
 // ────────────────────────────────────────────────────────────────────
+//  3D goal directions (3D expert extension)
+// ────────────────────────────────────────────────────────────────────
+void HierarchicalExpert::apply3DGoalDirections(ExpertStepOutput& out,
+                                               const VehicleState2D& st,
+                                               double flight_z) {
+    // ── 3D effective-target direction (30 Hz student input).  The
+    //    effective target XY comes from the adapter; its altitude is the
+    //    mission z for PASS/NORMAL and the live state z for TURN (pure
+    //    rotation).  The 3D unit direction is projected into the FLU body
+    //    frame (forward / left / up), so goal_direction_flu_z reflects the
+    //    real vertical component. ────────────────────────────────────
+    {
+        double ex = out.effective_target_world_x;
+        double ey = out.effective_target_world_y;
+        if (!out.effective_target_world_valid) {
+            ex = task_.goal.x();
+            ey = task_.goal.y();
+        }
+        const double ez = out.effective_target_world_z;
+        const Vec2d d2(ex - st.position.x(), ey - st.position.y());
+        const double dz = ez - st.z;
+        const double d3 = std::sqrt(d2.squaredNorm() + dz * dz);
+        if (d3 > 1e-9) {
+            const Vec2d xy = d2 / d3;  // normalized by the 3D distance
+            const double dn = dz / d3;
+            const Vec2d body = rot2(xy, -st.yaw);
+            out.goal_direction_flu_x = body.x();
+            out.goal_direction_flu_y = body.y();
+            out.goal_direction_flu_z = dn;
+        } else {
+            out.goal_direction_flu_x = 1.0;
+            out.goal_direction_flu_y = 0.0;
+            out.goal_direction_flu_z = 0.0;
+        }
+        // The 5 Hz macro direction is the LIVE effective-target direction
+        // at the 5 Hz boundary — record the 3D version (also into the ZOH
+        // mirror so non-macro rows stay consistent).
+        if (out.macro_update_mask) {
+            last_macro_direction_flu_x_ = out.goal_direction_flu_x;
+            last_macro_direction_flu_y_ = out.goal_direction_flu_y;
+            last_macro_direction_flu_z_ = out.goal_direction_flu_z;
+        }
+    }
+    // ── 3D original-goal direction + distance (5 Hz student input). ──
+    {
+        const Vec2d to2 = task_.goal - st.position;
+        const double dz = flight_z - st.z;
+        const double d3 = std::sqrt(to2.squaredNorm() + dz * dz);
+        Vec2d body(1.0, 0.0);
+        double dn = 0.0;
+        if (d3 > 1e-9) {
+            const Vec2d xy = to2 / d3;
+            dn = dz / d3;
+            body = rot2(xy, -st.yaw);
+        }
+        out.navigation_goal_direction_flu_x = body.x();
+        out.navigation_goal_direction_flu_y = body.y();
+        out.navigation_goal_direction_flu_z = dn;
+        const double R = std::max(1e-9, p_.obs_range_m);
+        const double reserve = std::max(0.0, p_.te_normal_distance_reserve_m);
+        const double clip = std::min(d3, R - reserve);
+        out.navigation_goal_distance_clipped_m = clip;
+        out.navigation_goal_distance_norm = clip / R;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
 //  Step (Flightmare path)
 // ────────────────────────────────────────────────────────────────────
 ExpertStepOutput HierarchicalExpert::step(
@@ -264,6 +334,10 @@ ExpertStepOutput HierarchicalExpert::step(
     st.yaw = CoordinateAdapter::flightmareYawToExpert(yaw_fm);
     st.velocity_world = Vec2d(vel_world[0], vel_world[1]);
     st.yaw_rate = yaw_rate_fm;  // left-turn positive in both frames
+    // ── 3D extension: vertical state (world z-up). ─────────────────
+    st.z = pos[2];
+    st.vz_world = vel_world[2];
+    st.pitch = 0.0;
     flight_z_ = flight_z;
 
     // Depth → current FOV patch (grid-aligned to the global grid).  The
@@ -276,29 +350,14 @@ ExpertStepOutput HierarchicalExpert::step(
     history_.integrate(current_patch, tick);
 
     FsmInput in{task_, st, current_patch, history_.observation(), tick,
-                collision};
+                collision, flight_z};
     const FsmStepOutput fsm_out = fsm_.step(in);
 
     ExpertStepOutput out;
     fillOutput(out, fsm_out, tick, flight_z);
-    // The 5 Hz student input needs the live body direction of the ORIGINAL
-    // goal.  Rebuild it here from the world goal and the expert pose.
-    {
-        const Vec2d to = task_.goal - st.position;
-        const double d = to.norm();
-        Vec2d dir_body(1.0, 0.0);
-        if (d > 1e-9) {
-            dir_body = rot2(to / d, -st.yaw);
-        }
-        out.navigation_goal_direction_flu_x = dir_body.x();
-        out.navigation_goal_direction_flu_y = dir_body.y();
-        out.navigation_goal_direction_flu_z = 0.0;
-        const double R = std::max(1e-9, p_.obs_range_m);
-        const double reserve = std::max(0.0, p_.te_normal_distance_reserve_m);
-        const double clip = std::min(d, R - reserve);
-        out.navigation_goal_distance_clipped_m = clip;
-        out.navigation_goal_distance_norm = clip / R;
-    }
+    // ── 3D extension: live 3D goal directions (effective target + the
+    //    original goal) projected into the FLU body frame. ──────────
+    apply3DGoalDirections(out, st, flight_z);
     return out;
 }
 
@@ -312,27 +371,13 @@ ExpertStepOutput HierarchicalExpert::stepFromPatch(
     history_.integrate(current_patch, tick);
 
     FsmInput in{task_, expert_state, current_patch, history_.observation(),
-                tick, collision};
+                tick, collision, flight_z};
     const FsmStepOutput fsm_out = fsm_.step(in);
 
     ExpertStepOutput out;
     fillOutput(out, fsm_out, tick, flight_z);
-    {
-        const Vec2d to = task_.goal - expert_state.position;
-        const double d = to.norm();
-        Vec2d dir_body(1.0, 0.0);
-        if (d > 1e-9) {
-            dir_body = rot2(to / d, -expert_state.yaw);
-        }
-        out.navigation_goal_direction_flu_x = dir_body.x();
-        out.navigation_goal_direction_flu_y = dir_body.y();
-        out.navigation_goal_direction_flu_z = 0.0;
-        const double R = std::max(1e-9, p_.obs_range_m);
-        const double reserve = std::max(0.0, p_.te_normal_distance_reserve_m);
-        const double clip = std::min(d, R - reserve);
-        out.navigation_goal_distance_clipped_m = clip;
-        out.navigation_goal_distance_norm = clip / R;
-    }
+    // ── 3D extension: live 3D goal directions (preflight path). ─────
+    apply3DGoalDirections(out, expert_state, flight_z);
     return out;
 }
 

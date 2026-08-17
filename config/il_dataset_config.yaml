@@ -444,6 +444,17 @@ global:
       # recorded label equals the actually executed command.
       max_yaw_rate: 1.5
       max_yaw_accel: 4.0
+      # ── vertical channel (3D expert extension) ──────────────────
+      # The expert now commands vz itself (altitude regulation toward the
+      # mission goal z); max_vz must not exceed the Flightmare backend
+      # vertical speed limit.  z_min/z_max define the safe flight band and
+      # the vertical_clearance_m margin is kept inside it.
+      max_vz: 1.0
+      max_v_accel: 2.0
+      vz_kp: 1.0
+      z_min_m: 0.8
+      z_max_m: 3.0
+      vertical_clearance_m: 0.3
       min_clearance: 0.5
       soft_clearance_radius_m: 2.0
       clearance_discretization_margin_m: 0.05

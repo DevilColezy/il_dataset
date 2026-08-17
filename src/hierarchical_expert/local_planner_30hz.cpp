@@ -23,6 +23,7 @@ static Trajectory2D simulateCandidate(const VehicleState2D& st,
     traj.points.push_back(st.position);
     traj.yaw.push_back(st.yaw);
     traj.t.push_back(0.0);
+    traj.z.push_back(st.z);
 
     VehicleState2D s = st;
     for (double t = p.lp_dt; t <= p.lp_horizon_s + 1e-6; t += p.lp_dt) {
@@ -30,6 +31,7 @@ static Trajectory2D simulateCandidate(const VehicleState2D& st,
         traj.points.push_back(s.position);
         traj.yaw.push_back(s.yaw);
         traj.t.push_back(t);
+        traj.z.push_back(s.z);
     }
     traj.valid = true;
     return traj;
@@ -77,6 +79,7 @@ BodyCommand2D LocalPlanner30Hz::reachableCommand(
                           : (1.0 / 30.0);
     const double dv = p_.lp_max_accel * dt;
     const double dyr = p_.lp_max_yaw_accel * dt;
+    const double dvz = p_.lp_max_v_accel * dt;
     BodyCommand2D out;
     out.vx_body = clamp(intent.vx_body, current_v_body.x() - dv,
                         current_v_body.x() + dv);
@@ -91,7 +94,18 @@ BodyCommand2D LocalPlanner30Hz::reachableCommand(
                          state.yaw_rate + dyr);
     out.yaw_rate = clamp(out.yaw_rate, -p_.lp_max_yaw_rate,
                          p_.lp_max_yaw_rate);
+    // ── 3D extension: vertical reachability (accel + speed limits). ─
+    out.vz_body = clamp(intent.vz_body, state.vz_world - dvz,
+                        state.vz_world + dvz);
+    out.vz_body = clamp(out.vz_body, -p_.lp_max_vz, p_.lp_max_vz);
     return out;
+}
+
+// ── 3D extension: deterministic altitude-regulation vertical intent ─
+double LocalPlanner30Hz::verticalIntent(const VehicleState2D& state,
+                                        const LocalTarget& target) const {
+    const double dz = target.z - state.z;
+    return clamp(p_.lp_vz_kp * dz, -p_.lp_max_vz, p_.lp_max_vz);
 }
 
 Vec2d LocalPlanner30Hz::bodyVelocity(const VehicleState2D& state) const {
@@ -146,6 +160,10 @@ BodyCommand2D LocalPlanner30Hz::terminalIntent(
     cmd.vx_body = c * desired_world.x() + sn * desired_world.y();
     cmd.vy_body = -sn * desired_world.x() + c * desired_world.y();
 
+    // ── 3D extension: terminal vertical regulation toward target z. ──
+    cmd.vz_body = clamp(p_.lp_vz_kp * (target.z - state.z),
+                        -p_.lp_max_vz, p_.lp_max_vz);
+
     if (dist > p_.task_goal_tolerance) {
         const double bearing =
             wrapAngle(std::atan2(to.y(), to.x()) - state.yaw);
@@ -164,9 +182,11 @@ LocalPlannerCandidate LocalPlanner30Hz::makeTerminalCandidate(
     candidate.desired_vx_body = intent.vx_body;
     candidate.desired_vy_body = intent.vy_body;
     candidate.desired_yaw_rate = intent.yaw_rate;
+    candidate.desired_vz_body = intent.vz_body;
     candidate.vx_body = first.vx_body;
     candidate.vy_body = first.vy_body;
     candidate.yaw_rate = first.yaw_rate;
+    candidate.vz_body = first.vz_body;
     candidate.stable_index = -1;
 
     // Roll out the same feedback law that will be recomputed at 30 Hz.
@@ -174,6 +194,7 @@ LocalPlannerCandidate LocalPlanner30Hz::makeTerminalCandidate(
     traj.points.push_back(state.position);
     traj.yaw.push_back(state.yaw);
     traj.t.push_back(0.0);
+    traj.z.push_back(state.z);
     VehicleState2D predicted = state;
     for (double t = p_.lp_dt; t <= p_.lp_horizon_s + 1e-6;
          t += p_.lp_dt) {
@@ -182,6 +203,7 @@ LocalPlannerCandidate LocalPlanner30Hz::makeTerminalCandidate(
         traj.points.push_back(predicted.position);
         traj.yaw.push_back(predicted.yaw);
         traj.t.push_back(t);
+        traj.z.push_back(predicted.z);
     }
     traj.valid = true;
     candidate.traj = std::move(traj);
@@ -240,16 +262,18 @@ PlannerResult LocalPlanner30Hz::computePlan(const VehicleState2D& state,
             ? clamp(p_.lp_turn_k * bearing, -p_.lp_max_yaw_rate,
                     p_.lp_max_yaw_rate)
             : 0.0;
-        const BodyCommand2D intent{0.0, 0.0, yaw_intent};
+        const BodyCommand2D intent{0.0, 0.0, yaw_intent, 0.0};
         const BodyCommand2D out = reachableCommand(state, intent);
         res.success = true;
         res.turn_mode = rotation_pending;
         res.intent_vx_body = intent.vx_body;
         res.intent_vy_body = intent.vy_body;
         res.intent_yaw_rate = intent.yaw_rate;
+        res.intent_vz_body = intent.vz_body;
         res.vx_body = out.vx_body;
         res.vy_body = out.vy_body;
         res.yaw_rate = out.yaw_rate;
+        res.vz_body = out.vz_body;  // hold altitude during pure rotation
         res.selected_output_speed_mps = std::hypot(out.vx_body, out.vy_body);
         res.planner_status = rotation_pending ? PlannerStatus::TURNING
                                               : PlannerStatus::SAFE_HOLD;
@@ -292,14 +316,17 @@ PlannerResult LocalPlanner30Hz::computePlan(const VehicleState2D& state,
         const BodyCommand2D intent{
             0.0, 0.0,
             clamp(p_.lp_turn_k * bearing, -p_.lp_max_yaw_rate,
-                  p_.lp_max_yaw_rate)};
+                  p_.lp_max_yaw_rate),
+            0.0};
         const BodyCommand2D out = reachableCommand(state, intent);
         res.intent_vx_body = intent.vx_body;
         res.intent_vy_body = intent.vy_body;
         res.intent_yaw_rate = intent.yaw_rate;
+        res.intent_vz_body = intent.vz_body;
         res.vx_body = out.vx_body;
         res.vy_body = out.vy_body;
         res.yaw_rate = out.yaw_rate;
+        res.vz_body = out.vz_body;  // hold altitude during TURN
         res.selected_output_speed_mps = std::hypot(out.vx_body, out.vy_body);
         res.planner_status = PlannerStatus::TURNING;
         res.candidate_progress_qualified = false;
@@ -374,9 +401,11 @@ PlannerResult LocalPlanner30Hz::computePlan(const VehicleState2D& state,
         res.vx_body = selected.vx_body;
         res.vy_body = selected.vy_body;
         res.yaw_rate = selected.yaw_rate;
+        res.vz_body = selected.vz_body;
         res.intent_vx_body = selected.desired_vx_body;
         res.intent_vy_body = selected.desired_vy_body;
         res.intent_yaw_rate = selected.desired_yaw_rate;
+        res.intent_vz_body = selected.desired_vz_body;
         res.selected_output_speed_mps =
             std::hypot(selected.vx_body, selected.vy_body);
         res.selected = selected.traj;
@@ -415,10 +444,15 @@ PlannerResult LocalPlanner30Hz::computePlan(const VehicleState2D& state,
         res.obstacle_risk_cost = selected.obstacle_risk_cost;
         res.avoidance_strength = selected.avoidance_strength;
         res.avoidance_active = selected.avoidance_active;
+        // ── 3D extension: vertical rollout diagnostics ──────────────
+        res.selected_z_min_m = selected.z_min;
+        res.selected_z_max_m = selected.z_max;
+        res.z_bounds_violated = !selected.z_bounds_ok;
         if (mutate) {
             current_trajectory_ = selected.traj;
             last_command_ = BodyCommand2D{selected.vx_body, selected.vy_body,
-                                          selected.yaw_rate};
+                                          selected.yaw_rate,
+                                          selected.vz_body};
             has_last_command_ = true;
         }
     };
@@ -446,8 +480,9 @@ PlannerResult LocalPlanner30Hz::computePlan(const VehicleState2D& state,
     // ── Terminal convergence region (v5/v7) ────────────────────────
     const bool terminal_region = dist <= p_.lp_terminal_control_distance;
 
-    // 2) Generate + evaluate candidates.
-    auto candidates = generateCandidates(state);
+    // 2) Generate + evaluate candidates (horizontal lattice × shared
+    //    vertical altitude-regulation intent — 3D extension).
+    auto candidates = generateCandidates(state, target);
     res.dynamic_window_candidate_count =
         static_cast<uint32_t>(candidates.size());
     const LocalPlannerCandidate* best_progressing = nullptr;
@@ -530,6 +565,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const VehicleState2D& state,
                 res.vx_body = brake.vx_body;
                 res.vy_body = brake.vy_body;
                 res.yaw_rate = brake.yaw_rate;
+                res.vz_body = brake.vz_body;
                 res.selected_output_speed_mps =
                     std::hypot(brake.vx_body, brake.vy_body);
                 res.output_progress_qualified = false;
@@ -578,9 +614,11 @@ PlannerResult LocalPlanner30Hz::computePlan(const VehicleState2D& state,
         res.vx_body = best_safe->vx_body;
         res.vy_body = best_safe->vy_body;
         res.yaw_rate = best_safe->yaw_rate;
+        res.vz_body = best_safe->vz_body;
         res.intent_vx_body = best_safe->desired_vx_body;
         res.intent_vy_body = best_safe->desired_vy_body;
         res.intent_yaw_rate = best_safe->desired_yaw_rate;
+        res.intent_vz_body = best_safe->desired_vz_body;
         res.selected_output_speed_mps =
             std::hypot(best_safe->vx_body, best_safe->vy_body);
         res.selected = best_safe->traj;
@@ -619,6 +657,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const VehicleState2D& state,
         res.vx_body = brake.vx_body;
         res.vy_body = brake.vy_body;
         res.yaw_rate = brake.yaw_rate;
+        res.vz_body = brake.vz_body;
         res.selected_output_speed_mps =
             std::hypot(brake.vx_body, brake.vy_body);
         res.stationary_candidate_selected =
@@ -635,6 +674,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const VehicleState2D& state,
         res.vx_body = brake.vx_body;
         res.vy_body = brake.vy_body;
         res.yaw_rate = brake.yaw_rate;
+        res.vz_body = brake.vz_body;
         res.selected_output_speed_mps =
             std::hypot(brake.vx_body, brake.vy_body);
         res.stationary_candidate_selected =
@@ -643,7 +683,9 @@ PlannerResult LocalPlanner30Hz::computePlan(const VehicleState2D& state,
     }
     if (mutate) {
         current_trajectory_ = best_safe ? best_safe->traj : Trajectory2D{};
-        last_command_ = BodyCommand2D{res.vx_body, res.vy_body, res.yaw_rate};
+        last_command_ =
+            BodyCommand2D{res.vx_body, res.vy_body, res.yaw_rate,
+                          res.vz_body};
         has_last_command_ = true;
         if (updateLimitCycle(res, target, state)) {
             res.local_limit_cycle_detected = true;
@@ -754,11 +796,18 @@ bool LocalPlanner30Hz::currentTrajectoryBlocked(
 }
 
 std::vector<LocalPlannerCandidate> LocalPlanner30Hz::generateCandidates(
-    const VehicleState2D& state) const {
+    const VehicleState2D& state, const LocalTarget& target) const {
     struct Raw {
         double desired_vx, desired_vy, desired_yr;  // intent
         double vx, vy, yr;                          // executable output
     };
+    // ── 3D extension: the vertical channel is a deterministic altitude
+    //    regulator shared by EVERY candidate (horizontal lattice × one
+    //    vertical intent).  The executable vz is the reachable value. ──
+    const double vz_intent = verticalIntent(state, target);
+    const BodyCommand2D vz_probe =
+        reachableCommand(state, BodyCommand2D{0.0, 0.0, 0.0, vz_intent});
+    const double vz_exec = vz_probe.vz_body;
     std::vector<Raw> raws;
     raws.reserve(p_.lp_speed_samples.size() *
                  p_.lp_lateral_ratio_samples.size() *
@@ -767,8 +816,8 @@ std::vector<LocalPlannerCandidate> LocalPlanner30Hz::generateCandidates(
         for (double lr : p_.lp_lateral_ratio_samples) {
             const double raw_vy = lr * p_.lp_max_speed;
             for (double yr : p_.lp_yaw_rate_samples) {
-                const BodyCommand2D out =
-                    reachableCommand(state, BodyCommand2D{vx, raw_vy, yr});
+                const BodyCommand2D out = reachableCommand(
+                    state, BodyCommand2D{vx, raw_vy, yr, vz_intent});
                 Raw r;
                 r.desired_vx = vx;
                 r.desired_vy = raw_vy;
@@ -809,7 +858,7 @@ std::vector<LocalPlannerCandidate> LocalPlanner30Hz::generateCandidates(
                         static_cast<double>(side_sign) * escape_yaw_rate};
                     for (double yr : yaw_options) {
                         const BodyCommand2D out_cmd = reachableCommand(
-                            state, BodyCommand2D{vx, vy, yr});
+                            state, BodyCommand2D{vx, vy, yr, vz_intent});
                         Raw r;
                         r.desired_vx = vx;
                         r.desired_vy = vy;
@@ -871,10 +920,14 @@ std::vector<LocalPlannerCandidate> LocalPlanner30Hz::generateCandidates(
         cand.vx_body = r.vx;
         cand.vy_body = r.vy;
         cand.yaw_rate = r.yr;
+        cand.desired_vz_body = vz_intent;
+        cand.vz_body = vz_exec;
         cand.stable_index = si;
         cand.tie_hash = commandTieHash(r.desired_vx, r.desired_vy, r.desired_yr);
         cand.traj = simulateCandidate(
-            state, BodyCommand2D{r.desired_vx, r.desired_vy, r.desired_yr}, p_);
+            state,
+            BodyCommand2D{r.desired_vx, r.desired_vy, r.desired_yr, vz_intent},
+            p_);
         out.push_back(std::move(cand));
     }
     return out;
@@ -950,10 +1003,12 @@ bool LocalPlanner30Hz::evaluateCandidate(LocalPlannerCandidate& c,
         limited.points.reserve(stop_index + 1);
         limited.yaw.reserve(std::min(stop_index + 1, full.yaw.size()));
         limited.t.reserve(std::min(stop_index + 1, full.t.size()));
+        limited.z.reserve(std::min(stop_index + 1, full.z.size()));
         for (size_t i = 0; i <= stop_index; ++i) {
             limited.points.push_back(full.points[i]);
             if (i < full.yaw.size()) limited.yaw.push_back(full.yaw[i]);
             if (i < full.t.size()) limited.t.push_back(full.t[i]);
+            if (i < full.z.size()) limited.z.push_back(full.z[i]);
         }
         return limited;
     };
@@ -1117,11 +1172,50 @@ bool LocalPlanner30Hz::evaluateCandidate(LocalPlannerCandidate& c,
         exec.points.push_back(c.traj.points[i]);
         if (i < c.traj.yaw.size()) exec.yaw.push_back(c.traj.yaw[i]);
         if (i < c.traj.t.size()) exec.t.push_back(c.traj.t[i]);
+        if (i < c.traj.z.size()) exec.z.push_back(c.traj.z[i]);
     }
     if (exec.points.size() < 2) {
         reject_reason = "no_usable_prefix";
         reject_enum = CandidateRejectReason::OTHER;
         return false;
+    }
+
+    // ── 3D extension: vertical-band validation.  The predicted altitude
+    //    over the executable trajectory must stay inside the configured
+    //    flight band [z_min + clearance, z_max - clearance]; a violation
+    //    rejects the whole candidate (floor / ceiling safety). ─────────
+    {
+        double zmin = std::numeric_limits<double>::infinity();
+        double zmax = -std::numeric_limits<double>::infinity();
+        bool ok = true;
+        const double z_lo = p_.lp_z_min_m;
+        const double z_hi = p_.lp_z_max_m;
+        const double z_lo_inner = p_.lp_z_min_m + p_.lp_vertical_clearance_m;
+        const double z_hi_inner = p_.lp_z_max_m - p_.lp_vertical_clearance_m;
+        // Skip the FIRST point (the vehicle's CURRENT altitude is a given
+        // state, never a rejection reason).  The WHOLE rollout must stay
+        // inside the hard band [z_min, z_max] (floor / ceiling safety);
+        // only the FINAL point must converge inside the clearance-margin
+        // inner band — a trajectory that descends back into the band from
+        // a transient overshoot is allowed (no recovery deadlock).
+        for (size_t i = 1; i < exec.z.size(); ++i) {
+            const double z = exec.z[i];
+            zmin = std::min(zmin, z);
+            zmax = std::max(zmax, z);
+            if (z < z_lo - 1e-9 || z > z_hi + 1e-9) ok = false;
+        }
+        const double z_final = exec.z.back();
+        if (z_final < z_lo_inner - 1e-9 || z_final > z_hi_inner + 1e-9) {
+            ok = false;
+        }
+        c.z_min = (std::isfinite(zmin)) ? zmin : state.z;
+        c.z_max = (std::isfinite(zmax)) ? zmax : state.z;
+        c.z_bounds_ok = ok;
+        if (!ok) {
+            reject_reason = "z_bounds_violated";
+            reject_enum = CandidateRejectReason::Z_BOUNDS_VIOLATED;
+            return false;
+        }
     }
 
     // ── Progress metrics (v5) ──────────────────────────────────────

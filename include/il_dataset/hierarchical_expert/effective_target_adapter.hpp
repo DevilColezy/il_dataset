@@ -52,7 +52,8 @@ public:
     /// forever. normalized_distance=1 keeps this a pure-rotation command.
     EncodedTargetInput encode(const VehicleState2D& state,
                               const Vec2d& original_goal,
-                              const TargetCorrectionDirective& directive) const;
+                              const TargetCorrectionDirective& directive,
+                              double goal_z) const;
 
     // ── Student-interface helpers (shared with the 5 Hz expert so the
     //    expert and the student pass through the SAME quantization /

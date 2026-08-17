@@ -148,13 +148,14 @@ PreflightSimulator::SimStepResult PreflightSimulator::step(
     result.output = expert_.stepFromPatch(
         state_, patch, flight_z_, tick, point_collision || collision_override);
 
-    // Integrate the executable command (shared kinematics).
+    // Integrate the executable command (shared kinematics, incl. vz).
     if (!result.output.terminal) {
         state_ = integrateKinematicStep(
             state_,
             BodyCommand2D{result.output.target_velocity_flu_x,
                           result.output.target_velocity_flu_y,
-                          result.output.target_yaw_rate},
+                          result.output.target_yaw_rate,
+                          result.output.target_velocity_flu_z},
             1.0 / 30.0, p_);
     }
 

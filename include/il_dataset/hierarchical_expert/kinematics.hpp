@@ -23,6 +23,10 @@ struct BodyCommand2D {
     double vx_body = 0.0;  // forward (+X body)
     double vy_body = 0.0;  // lateral  (+Y body = left, CCW)
     double yaw_rate = 0.0;
+    // ── 3D extension: vertical velocity (body FLU +up, m/s).  For a level
+    //    vehicle body-up == world-up, so the model integrates it directly
+    //    into the world z. ────────────────────────────────────────────
+    double vz_body = 0.0;
 };
 
 /// Advance the planar vehicle state by dt under the limits above.
@@ -58,10 +62,21 @@ inline VehicleState2D integrateKinematicStep(const VehicleState2D& s,
     const Vec2d v_world(c * v_body_capped.x() - sn * v_body_capped.y(),
                         sn * v_body_capped.x() + c * v_body_capped.y());
 
+    // ── 3D extension: vertical channel (level-flight model).  Body-up
+    //    equals world-up, so the commanded vz_body is integrated directly
+    //    into the world z with the vertical acceleration / speed limits. ─
+    double vz_new = s.vz_world + clamp(cmd.vz_body - s.vz_world,
+                                       -p.lp_max_v_accel * dt,
+                                       p.lp_max_v_accel * dt);
+    vz_new = clamp(vz_new, -p.lp_max_vz, p.lp_max_vz);
+
     ns.position = s.position + v_world * dt;
     ns.yaw = wrapAngle(s.yaw + yaw_rate * dt);
     ns.velocity_world = v_world;
     ns.yaw_rate = yaw_rate;
+    ns.z = s.z + vz_new * dt;
+    ns.vz_world = vz_new;
+    ns.pitch = s.pitch;
     return ns;
 }
 

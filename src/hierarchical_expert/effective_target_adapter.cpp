@@ -52,10 +52,11 @@ Vec2d EffectiveTargetAdapter::turnDirectionBody(SideSelection side) const {
 
 EncodedTargetInput EffectiveTargetAdapter::encode(
     const VehicleState2D& state, const Vec2d& original_goal,
-    const TargetCorrectionDirective& directive) const {
+    const TargetCorrectionDirective& directive, double goal_z) const {
     EncodedTargetInput out;
     out.valid = true;
     out.source_type = directive.type;
+    out.z = goal_z;  // PASS / NORMAL carry the mission altitude
     const double yaw = state.yaw;
     const double R = std::max(1e-9, p_.obs_range_m);
     const double maxd = normalMaxDistanceM();
@@ -94,7 +95,7 @@ EncodedTargetInput EffectiveTargetAdapter::encode(
                 pt.type = TargetCorrectionType::PASS_THROUGH;
                 pt.valid = true;
                 pt.update_event = directive.update_event;
-                return encode(state, original_goal, pt);
+                return encode(state, original_goal, pt, goal_z);
             }
             const Vec2d delta =
                 directive.corrected_target_world - state.position;
@@ -139,6 +140,9 @@ EncodedTargetInput EffectiveTargetAdapter::encode(
             out.normalized_distance = 1.0;
             out.effective_target_world = state.position + dir_world * R;
             out.effective_target_world_valid = true;
+            // Pure rotation: the virtual target stays at the CURRENT
+            // altitude, so the 3D effective direction is horizontal.
+            out.z = state.z;
             break;
         }
     }
