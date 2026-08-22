@@ -375,9 +375,30 @@ global:
     deterministic_time: true
     velocity_controller:
       use_existing_flightmare_controller: true
-      kp_velocity: [3.0, 3.0, 3.0]
+      # kp=36 was derived so a P-only controller would deliver the expert's
+      # assumed lp_max_accel=2.0 m/s^2 (kp >= (1+kd)/(expert step)).
+      # It worked in a 1-D lag-only sim (sim_vel_loop4) but with the real
+      # attitude loop it drives a bang-bang limit cycle: 36 * a ~0.1 m/s
+      # velocity error already saturates at maximum_acceleration, so the
+      # accel command flips +max/-max at ~0.5 Hz and the drone rocks
+      # between ~-20 deg and +20 deg roll/pitch the whole flight
+      # (seen in joint_v2 episodes, even while hovering).
+      # Fix: the velocity ramp is fed forward (VelocityYawRateController
+      # adds (d v_cmd / dt) clamped to max accel), so the P gain only has to
+      # correct tracking error and stays modest.  kp=8/kd=1.2 (closed-loop
+      # time constant (1+kd)/kp = 0.275 s, well below the attitude loop's
+      # 6 rad/s) is the verified-stable baseline.
+      # r20260819_cmd_ramp_feedforward: reachableCommand now clamps the
+      # command relative to the PREVIOUS COMMAND (command-ramp at
+      # lp_max_accel = 2 m/s^2), so the feedforward delivers the ramp and
+      # the closed loop reaches ~2 m/s^2 (steady-state P error ~0.3 m/s →
+      # P = 2.4 < 4, tilt ~11.5 deg < 35 deg).  The historical ±15 deg
+      # limit cycle (episode af4159ce) was with kp=36, where P saturated on
+      # any error > 0.11 m/s; kp=8 keeps 5× the headroom.  VALIDATE on the
+      # attitude loop (roll/pitch in the CSV) before pushing further.
+      kp_velocity: [8.0, 8.0, 8.0]
       ki_velocity: [0.0, 0.0, 0.0]
-      kd_velocity: [0.2, 0.2, 0.2]
+      kd_velocity: [1.2, 1.2, 1.2]
       maximum_acceleration_mps2: [4.0, 4.0, 2.0]
       maximum_tilt_deg: 35.0
       maximum_yaw_rate_rps: 1.5
@@ -416,7 +437,7 @@ global:
       min_y: 0.0
       max_y: 30.0
     drone_radius_m: 0.30
-    scene_safety_clearance_m: 0.30
+    scene_safety_clearance_m: 0.0   # unused: ESDF geometric envelope removed
     macro_route_clearance_margin_m: 0.0
     goal_tolerance_m: 0.40
     episode_timeout_s: 0.0
@@ -432,19 +453,53 @@ global:
       # impassable wall and stall the expert into persistent TURNs).
       ground_clearance_m: 0.5
     local_planner:
-      horizon_s: 2.5
+      # ── 1. prediction ────────────────────────────────────────────
+      horizon_s: 4.0
       dt: 0.1
-      speed_samples: [0.0, 0.3, 0.6, 1.2, 1.8, 2.5]
-      lateral_ratio_samples: [-0.5, -0.3, -0.15, -0.05, 0.0, 0.05, 0.15, 0.3, 0.5]
-      yaw_rate_samples: [-2.0, -1.0, -0.5, -0.25, -0.15, 0.0, 0.15, 0.25, 0.5, 1.0, 2.0]
+
+      # ── 3. kinematic limits ──────────────────────────────────────
       max_speed: 3.0
+      cruise_speed_mps: 2.0      # desired cruise for FOV-boundary planning
+      # Command-ramp limit for reachableCommand (m/s^2).  The executable
+      # command changes by at most max_accel*dt per tick, and with the
+      # command-ramp feedforward this is ALSO the achieved acceleration.
       max_accel: 2.0
+      # EFFECTIVE (physically achieved) closed-loop horizontal acceleration
+      # (m/s^2).  With command-ramp feedforward the drone tracks the
+      # lp_max_accel ramp, so this equals max_accel = 2.0.  Used for ALL
+      # braking / clearance / trajectory-profile calculations so the drone
+      # actually stops where it plans to.
+      eff_accel_mps2: 2.0
       # Must not exceed the Flightmare velocity-controller backend limit
       # (dynamics.velocity_controller.maximum_yaw_rate_rps = 1.5) so the
       # recorded label equals the actually executed command.
       max_yaw_rate: 1.5
       max_yaw_accel: 4.0
-      # ── vertical channel (3D expert extension) ──────────────────
+      control_period_s: 0.0333333333
+
+      # ── 3b. EGO-style optimisation B-spline (R19) ────────────────
+      # Optimization-based local path planning (structure copied from the
+      # open-source ZJU-FAST-Lab/ego-planner BsplineOptimizer + the okazaki
+      # L-BFGS solver; see ego_bspline.hpp/.cpp).  The cubic B-spline is
+      # BENT around observed obstacles (collision cost from the nearest
+      # OCCUPIED cell) instead of the old straight-ray core, which had
+      # collinear control points (zero curvature) and boxed the drone into
+      # dead-ends.  The optimised geometry is still validated with the hard
+      # clearance + dynamic envelope and falls back to the straight-line
+      # planner / escape-rotate / brake, so enabling it cannot make the
+      # drone less safe.
+      ego_enabled: true
+      ego_lambda_smooth: 0.5      # jerk elastic band
+      ego_lambda_collision: 2.0   # obstacle push (sample-based, thinner grad)
+      ego_lambda_feasibility: 0.2 # velocity / acceleration limits
+      ego_lambda_fitness: 0.8     # guidance toward the detour guide
+      ego_lambda_fov: 0.3         # soft FOV-wedge penalty
+      ego_clearance_m: 0.4        # collision distance = 4 cells (0.3 radius + 0.1 cell)
+      ego_ts: 0.4                 # initial B-spline knot span (s)
+      ego_n_segments: 8           # B-spline segments (>= 4)
+      ego_max_iter: 60            # L-BFGS iterations
+
+      # ── 5. vertical channel (3D expert extension) ────────────────
       # The expert now commands vz itself (altitude regulation toward the
       # mission goal z); max_vz must not exceed the Flightmare backend
       # vertical speed limit.  z_min/z_max define the safe flight band and
@@ -455,55 +510,39 @@ global:
       z_min_m: 0.8
       z_max_m: 3.0
       vertical_clearance_m: 0.3
-      min_clearance: 0.5
-      soft_clearance_radius_m: 2.0
-      clearance_discretization_margin_m: 0.05
+
+      # ── 6. safety / clearance envelope ───────────────────────────
+      # Unified collision distance (USER DIRECTIVE 2026-08-20): obstacle
+      # minimum collision = 4 grid cells = 0.4 m from an OCCUPIED cell
+      # centre (= vehicle radius 0.3 + cell 0.1), applied to ALL planners
+      # (EGO margin, straight-ray floor, A* inflation, corrector grid).
+      # Validation adds the discretisation buffer and a speed-dependent
+      # reaction + stopping envelope.
+      min_clearance: 0.4
+      soft_clearance_radius_m: 1.0
+      clearance_discretization_margin_m: 0.15
       obstacle_reaction_time_s: 0.20
-      control_period_s: 0.0333333333
-      max_allowed_regress_m: 0.05
-      limit_cycle_window_ticks: 15
-      limit_cycle_net_progress_m: 0.10
-      limit_cycle_min_blocked_ticks: 8
-      limit_cycle_lateral_flip_count: 2
+      nominal_clearance_m: 0.4
+      brake_stop_margin_m: 0.1    # truth-judge edge floor: 0.4 - 0.3 = 0.1 m from surface
+
+      # ── 7. progress / regression ─────────────────────────────────
+      min_progress_speed_mps: 0.03
+      target_discontinuity_reset_m: 1.5
+
+      # ── 8. turn behaviour ────────────────────────────────────────
       turn_enter_deg: 42.0
       turn_exit_deg: 8.0
       turn_exit_max_yaw_rate: 0.15
       turn_k: 2.5
       near_goal_heading_relax_distance: 1.0
       near_goal_turn_enter_deg: 75.0
-      terminal_control_distance: 1.2
       terminal_speed_gain: 1.0
       terminal_max_speed: 0.6
       terminal_max_yaw_rate: 0.5
-      min_progress_m: 0.05
-      min_progress_speed_mps: 0.03
-      min_progress_epsilon_m: 0.01
-      target_discontinuity_reset_m: 1.5
-      nominal_clearance_m: 0.65
+
+      # 9. local corridor diagnostics
       risk_corridor_half_width: 1.0
-      risk_distance_horizon_m: 5.0
-      risk_ttc_horizon_s: 2.5
-      risk_trajectory_radius_m: 1.0
-      avoidance_active_threshold: 0.10
-      brake_stop_margin_m: 0.3
-      min_executable_prefix_s: 0.2
-      scoring_horizon_s: 0.8
-      cost_tie_tolerance: 0.000001
-      cross_track_normalize_m: 2.0
-      cost_weights:
-        progress: 1.0
-        clearance: 2.0
-        smoothness: 0.5
-        speed_change: 0.3
-        yaw_rate_change: 0.3
-        terminal_heading: 1.0
-        velocity_alignment: 1.2
-        cross_track: 0.8
-        obstacle_risk: 3.0
     corrector:
-      local_failure_duration_s: 0.4
-      reentry_guard_ticks: 30
-      correction_enter_stable_ticks: 1
       observable_frontier_min_distance_m: 1.5
       observable_frontier_min_progress_m: 0.5
       observable_unknown_margin_cells: 3
@@ -511,11 +550,14 @@ global:
       evidence_ray_step_deg: 1.0
       min_evidence_ray_pairs: 4
       corridor_half_width: 1.5
+      blocking_lateral_span_ratio: 0.5
       corridor_rear_tolerance_m: 0.5
       local_recovery_prefix_m: 0.8
       local_candidate_bearing_step_deg: 5.0
       local_candidate_distance_step_m: 0.5
+      guide_horizon_m: 4.8   # maximum fixed local waypoint distance
       local_target_event_tolerance_m: 0.05
+      takeover_confirm_ticks_30hz: 6  # 0.2 s real local failure before macro takeover
       unknown_recovery_threshold_ticks: 60
     target_encoding:
       direction_bin_count: 11
@@ -557,3 +599,23 @@ global:
     # exceeded the episode is safely stopped and REJECTED (never a
     # trainable episode).  This is per-frame, not a trajectory timeout.
     max_frame_retries: 5
+    # ── R26 judge-only quality watchdogs ───────────────────────────
+    # Pathological episodes that technically reach the goal while churning
+    # (spin / stop / replan loops) must NOT be committed as high-quality
+    # expert data.  All are judge-only (reject the episode, never touch the
+    # expert):
+    #   goal_no_progress_ticks: original-goal distance decrease <
+    #     goal_no_progress_min_m for this many consecutive 30 Hz ticks
+    #     while still > goal_no_progress_floor_m (the final micro-approach
+    #     zone is exempt) -> reject.
+    #   near_goal_radius_m / near_goal_timeout_ticks: inside the radius for
+    #     longer than the window without finishing -> reject (caught the
+    #     task-65 0.48 m 36 s turn loop).
+    #   max_cumulative_yaw_rad: total |dYaw| over the episode above the
+    #     cap -> reject (task 65 reached 2458°).
+    goal_no_progress_ticks:     150    # 5 s @ 30 Hz
+    goal_no_progress_min_m:     0.15
+    goal_no_progress_floor_m:   0.5
+    near_goal_radius_m:         1.0
+    near_goal_timeout_ticks:    300    # 10 s @ 30 Hz
+    max_cumulative_yaw_rad:     12.566 # 720 deg

@@ -109,6 +109,7 @@ set(HIERARCHICAL_EXPERT_SOURCES
   src/hierarchical_expert/effective_target_adapter.cpp
   src/hierarchical_expert/macro_expert_5hz.cpp
   src/hierarchical_expert/local_planner_30hz.cpp
+  src/hierarchical_expert/ego_bspline.cpp
   src/hierarchical_expert/hierarchical_expert_fsm.cpp
   src/hierarchical_expert/flightmare_2d_observation.cpp
   src/hierarchical_expert/hierarchical_expert.cpp

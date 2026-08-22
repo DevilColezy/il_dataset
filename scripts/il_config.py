@@ -666,20 +666,7 @@ def _validate_config(cfg):
         errors.append(
             "hierarchical_expert.local_planner.max_yaw_accel must not exceed "
             "the Flightmare backend limit (%g)" % backend_yaw_accel)
-    cw = lp.get("cost_weights", {}) or {}
-    for name, default in (("progress", 1.0), ("clearance", 2.0),
-                          ("obstacle_risk", 3.0)):
-        _bounded(cw.get(name, default),
-                 "hierarchical_expert.local_planner.cost_weights.%s" % name,
-                 0.0, 100.0, errors)
-
     mc = he.get("corrector", {}) or {}
-    _positive(mc.get("reentry_guard_ticks", 30),
-              "hierarchical_expert.corrector.reentry_guard_ticks", errors,
-              allow_zero=True)
-    _positive(mc.get("correction_enter_stable_ticks", 1),
-              "hierarchical_expert.corrector."
-              "correction_enter_stable_ticks", errors, allow_zero=True)
     _positive(mc.get("observable_frontier_min_distance_m", 1.5),
               "hierarchical_expert.corrector."
               "observable_frontier_min_distance_m", errors)

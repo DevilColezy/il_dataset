@@ -14,8 +14,8 @@
 ///      { direction_body (unit), normalized_distance,
 ///        effective_target_world }
 ///      ↓
-///   LocalTarget world point  → current C++ LocalPlanner30Hz
-///   direction_body + normalized_distance → future 30 Hz student labels
+///   effective_target_world → current C++ LocalPlanner30Hz expert input
+///   direction_body + normalized_distance → 30 Hz student/data labels
 ///
 /// Encoding protocol:
 ///   R        = obs_range_m (5.0 m for joint_v2)
@@ -46,14 +46,15 @@ public:
 
     /// Encode the current (zero-order-held) directive at the live vehicle
     /// pose.  Called EVERY real 30 Hz tick.  For PASS_THROUGH /
-    /// NORMAL_CORRECTION the effective world target is a real point. For
+    /// NORMAL_CORRECTION the effective world target is the full expert
+    /// world point (not distance-clipped). For
     /// TURN_* the direction is re-derived from a world-latched anchor, so
     /// its body bearing moves into the FOV instead of remaining outside
     /// forever. normalized_distance=1 keeps this a pure-rotation command.
-    EncodedTargetInput encode(const VehicleState2D& state,
+    EncodedTargetInput encode(const PlanarState& state,
                               const Vec2d& original_goal,
                               const TargetCorrectionDirective& directive,
-                              double goal_z) const;
+                              double goal_z, double current_z) const;
 
     // ── Student-interface helpers (shared with the 5 Hz expert so the
     //    expert and the student pass through the SAME quantization /

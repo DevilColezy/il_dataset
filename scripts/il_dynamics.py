@@ -277,6 +277,13 @@ class FlightmareDynamicsBackend(DynamicsBackend):
         dt_ctrl = 1.0 / self._control_hz
         epsilon = 1e-9
 
+        # Feedforward for this command interval: the expert holds the
+        # command constant for duration_s (30 Hz), so the feedforward is the
+        # ramp rate Δcmd/duration_s applied for the whole interval (not a
+        # 1/50-per-tick pulse, which caused the 3 Hz tilt limit cycle).
+        feedforward_hold = self._controller.begin_velocity_command(
+            command, duration_s)
+
         while elapsed < duration_s - epsilon:
             ctrl_dur = min(dt_ctrl, duration_s - elapsed)
 
@@ -284,7 +291,8 @@ class FlightmareDynamicsBackend(DynamicsBackend):
             yaw = self._yaw_from_xyzw(state.quaternion_world_body)
             accel_command_flu = self._controller.update(
                 command, state.velocity_world, yaw, ctrl_dur,
-                state.quaternion_world_body)
+                state.quaternion_world_body, feedforward_hold,
+                float(state.angular_velocity_body[2]))
             target_yaw_rate = float(np.clip(
                 yaw_rate_command,
                 -self._max_yaw_rate, self._max_yaw_rate))
@@ -385,13 +393,45 @@ class VelocityYawRateController:
 
         self._integrator = np.zeros(3, dtype=np.float64)
         self._prev_velocity_world = None
+        self._prev_desired_vel_flu = None
+        self._prev_command_flu = None
 
     def reset(self):
         self._integrator = np.zeros(3, dtype=np.float64)
         self._prev_velocity_world = None
+        self._prev_desired_vel_flu = None
+        self._prev_command_flu = None
+
+    def begin_velocity_command(self, desired_vel_flu, duration_s):
+        """Feedforward for one piecewise-constant velocity command interval.
+
+        The expert updates the command at 30 Hz, so ``desired_vel_flu`` is
+        held for ``duration_s`` (~1/30 s).  The correct velocity feedforward
+        is the command ramp rate (Δcmd / duration_s) applied for the WHOLE
+        interval.  Dividing Δcmd by the per-tick control dt (1/50) instead
+        pulses the feedforward at 1.67x the true rate; combined with the P
+        term it then clips at ``maximum_acceleration`` and drives a
+        bang-bang tilt limit cycle (~3 Hz continuous "nodding", seen in the
+        joint_v2 command-ramp build).
+
+        Returns the feedforward vector to hold for this interval (already
+        clipped to ``max_accel``).  Returns zero on the first call after a
+        reset (no previous command to differentiate against).
+        """
+        desired = np.asarray(desired_vel_flu, dtype=np.float64)
+        if self._prev_command_flu is None:
+            self._prev_command_flu = desired.copy()
+            return np.zeros(3, dtype=np.float64)
+        feedforward = (desired - self._prev_command_flu) / max(
+            float(duration_s), 1e-9)
+        feedforward = np.clip(feedforward, -self._max_accel,
+                              self._max_accel)
+        self._prev_command_flu = desired.copy()
+        return feedforward
 
     def update(self, desired_vel_flu, current_vel_world, current_yaw, dt,
-               current_quaternion_xyzw=None):
+               current_quaternion_xyzw=None, feedforward_hold=None,
+               yaw_rate=None):
         """Compute acceleration command from velocity error.
 
         Args:
@@ -399,6 +439,15 @@ class VelocityYawRateController:
             current_vel_world: [vx, vy, vz] current velocity in world.
             current_yaw: current yaw angle.
             dt: control time step.
+            current_quaternion_xyzw: current attitude quaternion (xyzw).
+            feedforward_hold: optional precomputed feedforward vector to
+                hold for the whole command interval (see
+                ``begin_velocity_command``).  When provided it replaces the
+                per-tick feedforward.
+            yaw_rate: current body yaw rate (rad/s).  When provided, a
+                coordinated-turn centripetal feedforward v_fwd * yaw_rate is
+                added to the lateral acceleration so the velocity vector
+                rotates with the body during turns (see the body below).
 
         Returns:
             accel_cmd_flu: [ax, ay, az] acceleration command in FLU.
@@ -409,7 +458,26 @@ class VelocityYawRateController:
             if current_quaternion_xyzw is not None else
             world_vector_to_body_flu(current_vel_world, current_yaw))
 
-        error = np.asarray(desired_vel_flu, dtype=np.float64) - current_flu
+        desired_vel = np.asarray(desired_vel_flu, dtype=np.float64)
+        error = desired_vel - current_flu
+
+        # Velocity feedforward.  The expert updates the command at 30 Hz and
+        # begin_velocity_command() computes the correct ramp rate
+        # (Δcmd / command_period) ONCE per command interval; we hold it for
+        # the whole interval so the vehicle tracks a 2 m/s^2 ramp without a
+        # large P gain.  (The old per-tick form divided Δcmd by the 1/50
+        # control dt, pulsing the feedforward at 1.67x the true rate and
+        # clipping at max_accel -> bang-bang tilt limit cycle ~±16-20 deg.)
+        if feedforward_hold is not None:
+            feedforward = np.asarray(feedforward_hold, dtype=np.float64)
+        elif self._prev_desired_vel_flu is None:
+            feedforward = np.zeros(3, dtype=np.float64)
+        else:
+            feedforward = (desired_vel - self._prev_desired_vel_flu) / max(
+                dt, 1e-9)
+            feedforward = np.clip(feedforward, -self._max_accel,
+                                  self._max_accel)
+        self._prev_desired_vel_flu = desired_vel.copy()
 
         # Integral with anti-windup
         self._integrator += error * dt
@@ -438,10 +506,23 @@ class VelocityYawRateController:
                     measured_acceleration_world, current_yaw))
         self._prev_velocity_world = current_velocity_world.copy()
 
-        # PID
+        # PID + feedforward
         accel = (self._kp * error +
                  self._ki * self._integrator +
-                 self._kd * derivative)
+                 self._kd * derivative +
+                 feedforward)
+
+        # Coordinated-turn centripetal feedforward.  While the drone yaws at
+        # rate w with forward speed v, its velocity vector must rotate WITH
+        # the body, which requires a lateral (body-y) acceleration of v*w.
+        # Without it the turn is uncoordinated: the body-frame side-slip vy
+        # grows at rate -w*v, and the lateral velocity loop (vy_cmd = 0) then
+        # over-banks to fight it, producing a ~2.5 Hz roll oscillation (roll
+        # swings to ~19 deg in the joint_v2 episodes).  Feeding v*w (same
+        # sign: right turn -> bank right) cancels the side-slip rate and the
+        # loop only trims the residual.
+        if yaw_rate is not None:
+            accel[1] += current_flu[0] * float(yaw_rate)
 
         # Limit acceleration
         accel = np.clip(accel, -self._max_accel, self._max_accel)

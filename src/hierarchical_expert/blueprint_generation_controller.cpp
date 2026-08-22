@@ -187,6 +187,7 @@ bool BlueprintGenerationController::preflightOne(
     const uint64_t stride = std::max<uint64_t>(1, cfg_.depth_proxy_sample_stride_ticks);
     uint64_t ticks = 0;
     bool reached = false, collision = false, out_of_bounds = false;
+    bool truth_brake_triggered = false;
     bool macro_label_invalid = false, qual_exceeded = false;
     double min_clearance = std::numeric_limits<double>::infinity();
     double clear_sum = 0.0, clear_count = 0.0;
@@ -200,7 +201,7 @@ bool BlueprintGenerationController::preflightOne(
     // step displacement is start->firstState (the stall detector and the
     // swept collision audit both rely on it).
     double path_len = 0.0;
-    Vec2d prev = sim.state().position;
+    Vec2d prev = HorizontalProjection::position(sim.state().position);
 
     // Early-termination bookkeeping (blueprint-only; never changes expert
     // labels): no-progress over a rolling window (OFF by default; when
@@ -229,8 +230,9 @@ bool BlueprintGenerationController::preflightOne(
         if (t % stride == 0) {
             const auto t_depth = Clock::now();
             const auto sample = depth_proxy.castAt(
-                sim.state().position, sim.state().yaw, scene.obstacles,
-                depth_walls, wall_envelope_min, wall_envelope_max);
+                HorizontalProjection::position(sim.state().position),
+                sim.state().yaw, scene.obstacles, depth_walls,
+                wall_envelope_min, wall_envelope_max);
             depth_proxy_ms += msSince(t_depth);
             depth_proxy.accumulate(sample, summary);
         }
@@ -245,7 +247,8 @@ bool BlueprintGenerationController::preflightOne(
         //    accumulated a stall count — systematically killing normal
         //    long / detour / chicane tasks after ~stall_window_ticks. ──
         const double step_disp =
-            (res.state.position - prev).norm();  // m per tick
+            (HorizontalProjection::position(res.state.position) - prev)
+                .norm();  // m per tick
         const double prev_x = prev.x(), prev_y = prev.y();
 
         // Continuous swept truth clearance / collision over prev->new.
@@ -263,6 +266,24 @@ bool BlueprintGenerationController::preflightOne(
             collision = true;
             break;
         }
+        // Apply the same obstacle edge-clearance floor as the runtime truth
+        // judge.  Previously a preflight with 0.375 m centre-to-surface
+        // clearance was accepted, then the identical collected task failed
+        // the 0.4 m runtime floor.
+        const double truth_brake_floor =
+            p_.drone_radius + std::max(0.0, p_.lp_brake_stop_margin_m);
+        double truth_brake_risk = 0.0;
+        bool runtime_truth_would_trigger = false;
+        truth.brakeRisk(
+            res.state.position.x(), res.state.position.y(),
+            res.state.velocity_world.x(), res.state.velocity_world.y(),
+            p_.lp_eff_accel_mps2, p_.lp_brake_stop_margin_m,
+            truth_brake_risk, runtime_truth_would_trigger);
+        if ((std::isfinite(seg_clr) && seg_clr < truth_brake_floor) ||
+            runtime_truth_would_trigger) {
+            truth_brake_triggered = true;
+            break;
+        }
         if (res.out_of_bounds ||
             truth.segmentCrossesBounds(prev_x, prev_y,
                                        res.state.position.x(),
@@ -272,7 +293,7 @@ bool BlueprintGenerationController::preflightOne(
             break;
         }
         path_len += step_disp;
-        prev = res.state.position;
+        prev = HorizontalProjection::position(res.state.position);
 
         // ── 30 Hz behaviour stats ──────────────────────────────────
         if (out.hierarchical_mode == "direct") ++summary.local_direct_count;
@@ -368,7 +389,9 @@ bool BlueprintGenerationController::preflightOne(
         // laterally or briefly away from the goal.  When disabled, only
         // the stall detector + global tick budget guard the preflight.
         if (no_prog_win > 0) {
-            const double d_to_goal = (orig_goal - res.state.position).norm();
+            const double d_to_goal =
+                (orig_goal - HorizontalProjection::position(res.state.position))
+                    .norm();
             goal_dist_window.push_back(d_to_goal);
             motion_window.push_back(step_disp);
             if (static_cast<int>(goal_dist_window.size()) > no_prog_win + 1) {
@@ -396,9 +419,20 @@ bool BlueprintGenerationController::preflightOne(
         // `in_turn`.  A moving drone (step_disp >= threshold) resets the
         // counter every tick, so normal tasks can never accumulate a stall.
         {
+            // Legitimate reorientation is NOT a stall.  The new planner
+            // does yaw-first pure rotation at 30 Hz whenever the target is
+            // outside the usable FOV band (hierarchical_mode
+            // "turn_to_target" / planner_status "TURNING"), WITHOUT a 5 Hz
+            // macro TURN directive — so the old macro-only exemption would
+            // count every such rotation as a stall and reject the task
+            // after stall_window_ticks.  The FSM spin guard still bounds
+            // pathological rotation, and the tick budget catches endless
+            // turning, so exempting local turns is safe.
             const bool in_turn =
                 out.macro_correction_type == "TURN_LEFT" ||
-                out.macro_correction_type == "TURN_RIGHT";
+                out.macro_correction_type == "TURN_RIGHT" ||
+                out.hierarchical_mode == "turn_to_target" ||
+                out.planner_status == "TURNING";
             if (stall.update(step_disp, in_turn)) {
                 stall_triggered = true;
                 early_terminated = true;
@@ -445,6 +479,7 @@ bool BlueprintGenerationController::preflightOne(
     task.audit.min_truth_clearance_m = min_clearance;
     task.audit.reached_goal = reached;
     task.audit.truth_collision = collision;
+    task.audit.truth_brake_triggered = truth_brake_triggered;
     task.audit.out_of_bounds = out_of_bounds;
     task.audit.macro_label_ok = !macro_label_invalid;
     task.audit.qualification_exceeded = qual_exceeded;
@@ -452,8 +487,8 @@ bool BlueprintGenerationController::preflightOne(
     task.audit.path_stretch_ratio = summary.path_stretch_ratio;
     task.audit.preflight_duration_s = summary.preflight_duration_s;
     task.audit.accepted =
-        reached && !collision && !out_of_bounds && !macro_label_invalid &&
-        !qual_exceeded;
+        reached && !collision && !truth_brake_triggered && !out_of_bounds &&
+        !macro_label_invalid && !qual_exceeded;
 
     total_preflight_ticks += ticks;
     if (!task.audit.accepted) {
@@ -467,6 +502,8 @@ bool BlueprintGenerationController::preflightOne(
             reject_reason = "stall";
         } else if (collision) {
             reject_reason = "collision";
+        } else if (truth_brake_triggered) {
+            reject_reason = "truth_brake_would_trigger";
         } else if (out_of_bounds) {
             reject_reason = "out_of_bounds";
         } else if (qual_exceeded) {
@@ -483,15 +520,17 @@ bool BlueprintGenerationController::preflightOne(
                        : "preflight_rejected:early_termination:stall")
                 : (collision
                        ? "preflight_rejected:truth_collision"
-                       : (out_of_bounds
-                              ? "preflight_rejected:out_of_bounds"
-                              : (qual_exceeded
-                                     ? (global_tick_truncated
-                                            ? "preflight_rejected:global_tick_budget"
-                                            : "preflight_rejected:qualification_budget")
-                                     : (!reached
-                                            ? "preflight_rejected:goal_not_reached"
-                                            : "preflight_rejected:macro_label_invalid"))));
+                       : (truth_brake_triggered
+                              ? "preflight_rejected:truth_brake_would_trigger"
+                              : (out_of_bounds
+                                     ? "preflight_rejected:out_of_bounds"
+                                     : (qual_exceeded
+                                            ? (global_tick_truncated
+                                                   ? "preflight_rejected:global_tick_budget"
+                                                   : "preflight_rejected:qualification_budget")
+                                            : (!reached
+                                                   ? "preflight_rejected:goal_not_reached"
+                                                   : "preflight_rejected:macro_label_invalid")))));
         return false;
     }
     task.audit.preflight_status = "preflight_accepted";

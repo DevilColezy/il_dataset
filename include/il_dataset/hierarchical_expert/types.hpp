@@ -35,6 +35,7 @@ namespace il_dataset {
 namespace expert {
 
 using Vec2d = Eigen::Vector2d;
+using Vec3d = Eigen::Vector3d;
 
 // ═══════════════════════════════════════════════════════════════════
 //  Small math helpers
@@ -246,6 +247,37 @@ inline const char* sideName(SideSelection s) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  Enum: why the local corridor to the target was judged BLOCKED (R25)
+// ═══════════════════════════════════════════════════════════════════
+//  CURRENT_OCCUPIED  — blocking OCCUPIED cell observed THIS tick (age 0).
+//  HISTORY_OCCUPIED  — blocking OCCUPIED cell only present in the merged
+//                      short-term history (age > 0; possibly stale).
+//  TARGET_NOT_FREE   — the target cell itself is OCCUPIED in the map.
+//  UNKNOWN_TARGET    — the target cell is UNKNOWN (never observed free).
+//  START_NOT_FREE    — the vehicle's own cell is not known-free.
+//  CLEAR             — corridor free (diagnostic default).
+enum class CorridorBlockReason : uint8_t {
+    CLEAR = 0,
+    CURRENT_OCCUPIED = 1,
+    HISTORY_OCCUPIED = 2,
+    TARGET_NOT_FREE = 3,
+    UNKNOWN_TARGET = 4,
+    START_NOT_FREE = 5,
+};
+
+inline const char* corridorBlockReasonName(CorridorBlockReason r) {
+    switch (r) {
+        case CorridorBlockReason::CLEAR: return "CLEAR";
+        case CorridorBlockReason::CURRENT_OCCUPIED: return "CURRENT_OCCUPIED";
+        case CorridorBlockReason::HISTORY_OCCUPIED: return "HISTORY_OCCUPIED";
+        case CorridorBlockReason::TARGET_NOT_FREE: return "TARGET_NOT_FREE";
+        case CorridorBlockReason::UNKNOWN_TARGET: return "UNKNOWN_TARGET";
+        case CorridorBlockReason::START_NOT_FREE: return "START_NOT_FREE";
+    }
+    return "CLEAR";
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  Parameters (single authoritative source for the whole expert).
 //  Python builds this struct from config YAML via the pybind module;
 //  there is no second set of default values anywhere else.
@@ -275,6 +307,24 @@ struct Params2D {
     double obs_resolution = 0.1;
     double obs_ray_angular_res_deg = 0.5;
     uint32_t obs_history_max_age_ticks = 120;
+    // R25: a cell previously observed OCCUPIED is cleared back to FREE only
+    // after this many CONSECUTIVE current-frame FREE confirmations (a
+    // single-frame depth gap must not erase a real obstacle, but stale
+    // history must not fabricate a permanent blockage either).
+    uint32_t obs_free_clear_confirmations = 3;
+    // R26: within this distance of the ORIGINAL goal the macro layer locks
+    // terminal capture: it must never issue a locked-side search TURN; the
+    // target is handed to local (rotate toward the goal / micro-approach).
+    // Only a genuine HARD corridor block may release the capture state.
+    double macro_terminal_capture_radius_m = 1.0;
+    // R26: macro-level limit-cycle watchdog on the ORIGINAL goal.  The
+    // LOCAL detector watches the current effective target, but the macro
+    // switches goal<->TURN so each switch resets the local bearing
+    // evidence.  When the original-goal distance has not decreased by
+    // >= macro_limit_cycle_goal_progress_m for macro_limit_cycle_window_5hz
+    // consecutive 5 Hz updates, the macro forces a handoff to local.
+    double macro_limit_cycle_goal_progress_m = 0.1;
+    int    macro_limit_cycle_window_5hz = 15;   // 3 s at 5 Hz
     // Ground / below-flight-plane filtering: pixels whose 3D point lies
     // more than this far BELOW the camera are the floor / below the flight
     // plane (e.g. the ground at z=0 seen from a ~2 m flight) and are NOT
@@ -283,20 +333,49 @@ struct Params2D {
     double obs_ground_clearance_m = 0.5;
 
     // ── local planner (30 Hz) ──────────────────────────────────────
-    double lp_horizon_s = 2.5;
+    double lp_horizon_s = 4.0;
     double lp_dt = 0.1;
-    std::vector<double> lp_speed_samples{0.0, 0.3, 0.6, 1.2, 1.8, 2.5};
-    std::vector<double> lp_lateral_ratio_samples{
-        -0.5, -0.3, -0.15, -0.05, 0.0, 0.05, 0.15, 0.3, 0.5};
-    std::vector<double> lp_yaw_rate_samples{
-        -2.0, -1.0, -0.5, -0.25, -0.15, 0.0,
-         0.15, 0.25, 0.5, 1.0, 2.0};
     double lp_max_speed = 3.0;
+    // Desired cruise speed for the FOV-boundary planner (m/s).  The boundary
+    // subgoal is driven at this speed ("末点速度最高可达期望速度") and the
+    // terminal approach caps at it.  Lower than lp_max_speed for smoother,
+    // more conservative flight (user: 2 m/s).
+    double lp_cruise_speed_mps = 2.0;
+    // R26: inside this distance to a TERMINAL target (in FOV, hard-clear
+    // straight path) the planner skips the B-spline and drives the
+    // proportional terminal controller directly.  Bridges the 0.4-0.8 m
+    // dead zone where the exact-goal B-spline + pullbacks fail and the
+    // drone reported BLOCKED at 0.48 m (task 65, 36 s infinite turn loop).
+    double lp_terminal_micro_approach_m = 0.8;
+    // Command-ramp limit for reachableCommand (m/s^2): the executable
+    // command changes by at most lp_max_accel*dt per tick, and because
+    // reachableCommand ramps relative to the PREVIOUS COMMAND the command
+    // (and hence the backend feedforward) runs at this rate — this is the
+    // achieved closed-loop acceleration.
     double lp_max_accel = 2.0;
+    // The EFFECTIVE (physically achieved) horizontal acceleration of the
+    // closed loop (m/s^2).  With the command-ramp + backend feedforward
+    // (kp=8/kd=1.2, max_accel 4) the drone tracks the lp_max_accel ramp,
+    // so this equals lp_max_accel = 2.0.  All braking / clearance /
+    // trajectory-profile calculations MUST use this value.  (Historically
+    // state-pinning capped it at ~0.42 m/s^2 and made the planner believe
+    // it could stop in 1 m at 2 m/s when it actually needed ~5 m — goal
+    // overshoot collisions, sc3/tk254.)
+    double lp_eff_accel_mps2 = 2.0;
     double lp_max_yaw_rate = 2.0;
     double lp_max_yaw_accel = 4.0;
-    double lp_min_clearance = 0.5;
-    double lp_soft_clearance_radius_m = 2.0;
+    // Unified collision distance (USER DIRECTIVE 2026-08-20): obstacle
+    // minimum collision = 4 grid cells = 0.4 m from an OCCUPIED cell centre
+    // (= drone radius 0.3 + cell 0.1).  This is the shared static base;
+    // validation adds discretisation, reaction and stopping distance.
+    double lp_min_clearance = 0.4;
+    // Soft clearance radius for the early-avoidance gradient.  User
+    // directive: the drone must be able to navigate at 0.2 m from a surface
+    // (centre 0.5 m = drone radius 0.3 + safety 0.2).  A 2.0 m radius made a
+    // 1.94 m corridor gap "impassable" (every path inside it maxed the soft
+    // cost) and pushed the planner into wide detours / traps.  1.0 m keeps a
+    // gradient while leaving the 0.5..1.0 m band cheap to navigate.
+    double lp_soft_clearance_radius_m = 1.0;
     // ── vertical channel (3D extension) ────────────────────────────
     double lp_max_vz = 1.0;        // max vertical speed (m/s, +up)
     double lp_max_v_accel = 2.0;   // vertical acceleration limit (m/s^2)
@@ -304,53 +383,46 @@ struct Params2D {
     double lp_z_min_m = 0.8;       // lower altitude bound (floor safety)
     double lp_z_max_m = 3.0;       // upper altitude bound (ceiling safety)
     double lp_vertical_clearance_m = 0.3;  // margin inside the band
-    double lp_clearance_discretization_margin_m = 0.05;
+    // Robustness for grid quantisation, depth projection and one-period
+    // closed-loop tracking between occupied-cell and truth geometry.
+    double lp_clearance_discretization_margin_m = 0.15;
     double lp_obstacle_reaction_time_s = 0.20;
+    // ── EGO-style optimisation B-spline (R19) ─────────────────────
+    // Optimization-based local path planning (structure copied from the
+    // open-source ZJU-FAST-Lab/ego-planner BsplineOptimizer + the okazaki
+    // L-BFGS solver, see ego_bspline.hpp/.cpp).  Bends the cubic B-spline
+    // around OBSERVED obstacles instead of the straight-ray degeneracy of
+    // the old core (collinear control points = zero curvature = cannot
+    // detour -> boxed-in deadlocks in joint_v2).  The optimised geometry
+    // is still validated with the hard clearance + dynamic envelope and
+    // falls back to the straight-line planner / escape-rotate / brake.
+    bool ego_enabled = true;
+    double ego_lambda_smooth = 0.5;      // jerk elastic band
+    double ego_lambda_collision = 2.0;   // obstacle push (sample-based)
+    double ego_lambda_feasibility = 0.2; // velocity/accel feasibility
+    double ego_lambda_fitness = 0.8;     // guidance toward the detour guide
+    double ego_lambda_fov = 0.3;         // soft FOV-wedge penalty
+    double ego_clearance_m = 0.4;        // collision distance = 4 cells (0.3 radius + 0.1 cell)
+    double ego_ts = 0.4;                 // initial B-spline knot span (s)
+    int    ego_n_segments = 8;
+    int    ego_max_iter = 60;
     double lp_control_period_s = 0.0333333333;
-    double lp_max_allowed_regress_m = 0.05;
-    int    lp_limit_cycle_window_ticks = 15;
-    double lp_limit_cycle_net_progress_m = 0.10;
-    int    lp_limit_cycle_min_blocked_ticks = 8;
-    int    lp_limit_cycle_lateral_flip_count = 2;
     double lp_turn_enter_deg = 42.0;
     double lp_turn_exit_deg = 8.0;
     double lp_turn_exit_max_yaw_rate = 0.15;
     double lp_turn_k = 2.5;
     double lp_near_goal_heading_relax_distance = 1.0;
     double lp_near_goal_turn_enter_deg = 75.0;
-    double lp_terminal_control_distance = 1.2;
     double lp_terminal_speed_gain = 1.0;
     double lp_terminal_max_speed = 0.6;
     double lp_terminal_max_yaw_rate = 0.5;
-    double lp_min_progress_m = 0.05;       // legacy / diagnostic
     double lp_min_progress_speed_mps = 0.03;
-    double lp_min_progress_epsilon_m = 0.01;
     double lp_target_discontinuity_reset_m = 1.5;
-    double lp_nominal_clearance_m = 0.65;
+    double lp_nominal_clearance_m = 0.4;  // = 4 cells (collision distance)
     double lp_risk_corridor_half_width = 1.0;
-    double lp_risk_distance_horizon_m = 5.0;
-    double lp_risk_ttc_horizon_s = 2.5;
-    double lp_risk_trajectory_radius_m = 1.0;
-    double lp_avoidance_active_threshold = 0.10;
-    double lp_brake_stop_margin_m = 0.3;
-    double lp_min_executable_prefix_s = 0.2;
-    double lp_scoring_horizon_s = 0.8;
-    double lp_cost_tie_tolerance = 1e-6;
-    double lp_cross_track_normalize_m = 2.0;
-    double cost_w_progress = 1.0;
-    double cost_w_clearance = 2.0;
-    double cost_w_smoothness = 0.5;
-    double cost_w_speed_change = 0.3;
-    double cost_w_yaw_rate_change = 0.3;
-    double cost_w_terminal_heading = 1.0;
-    double cost_w_velocity_alignment = 1.2;
-    double cost_w_cross_track = 0.8;
-    double cost_w_obstacle_risk = 3.0;
+    double lp_brake_stop_margin_m = 0.1;  // truth-judge edge floor: 0.4 - 0.3 = 0.1 m from surface
 
     // ── 5 Hz local corrector (visibility judge + target corrector) ──
-    double macro_local_failure_duration_s = 0.4;  // legacy, unused by v9
-    int    macro_reentry_guard_ticks = 30;
-    int    macro_correction_enter_stable_ticks = 1;
     double macro_observable_frontier_min_distance_m = 1.5;
     double macro_observable_frontier_min_progress_m = 0.5;
     int    macro_observable_unknown_margin_cells = 3;
@@ -358,12 +430,33 @@ struct Params2D {
     double macro_evidence_ray_step_deg = 1.0;
     int    macro_min_evidence_ray_pairs = 4;
     double macro_corridor_half_width = 1.5;
+    // A blocker must LATERALLY SPAN >= this fraction of the corridor
+    // half-width before the corridor is declared blocked (aligned with
+    // il_2d_multiscale_debug macro/blocking_lateral_span_ratio).  A small /
+    // single obstacle that only nicks the corridor edge is left to the
+    // 30 Hz planner to weave around; the 5 Hz corrector must not take over.
+    double macro_blocking_lateral_span_ratio = 0.5;
     double macro_corridor_rear_tolerance_m = 0.5;
     double macro_local_recovery_prefix_m = 0.8;
     double macro_local_candidate_bearing_step_deg = 5.0;
     double macro_local_candidate_distance_step_m = 0.5;
+    // Maximum distance for a fixed NORMAL_CORRECTION world waypoint.  The
+    // internal fly-through bit, rather than distance inflation, separates a
+    // temporary waypoint from the original terminal goal.
+    double macro_guide_horizon_m = 4.8;
     double macro_local_target_event_tolerance_m = 0.05;
+    int    macro_takeover_confirm_ticks_30hz = 6;
     int    macro_unknown_recovery_threshold_ticks = 60;
+    // Consecutive 5 Hz updates the vehicle must remain at/below the
+    // stationary speed before a latched brake-before-search is released
+    // and the world-latched TURN step is published.  2 updates = 0.4 s.
+    int    macro_brake_confirm_ticks_5hz = 2;
+    // R25: distance at which a fixed NORMAL_CORRECTION waypoint counts as
+    // REACHED (start searching for the next target).  Deliberately
+    // SEPARATE from macro_local_recovery_prefix_m (the lookahead used to
+    // GENERATE a waypoint): a 0.8 m "reached" tolerance let the drone
+    // abandon a bypass waypoint before it actually cleared the obstacle.
+    double macro_waypoint_reached_tolerance_m = 0.3;
 
     // ── target encoding protocol (R = obs_range_m, reserve 0.5 m) ───
     int    te_direction_bin_count = 11;
@@ -408,15 +501,25 @@ struct Scene2D {
     bool valid = false;
 };
 
-struct VehicleState2D {
+/// Canonical 3D vehicle state — the ONLY 3D state the pipeline carries.
+/// World frame: X right, Y up (2D plane), Z world-up.  Yaw uses the expert
+/// frame (see the file header); pitch is diagnostic only.
+struct VehicleState3D {
+    Vec3d position{0.0, 0.0, 2.0};        // world (m)
+    Vec3d velocity_world{0.0, 0.0, 0.0};  // world-frame velocity (m/s)
+    double yaw = 0.0;                     // world heading (rad, expert frame)
+    double pitch = 0.0;                   // diagnostic pitch (rad)
+    double yaw_rate = 0.0;                // body yaw rate (rad/s)
+};
+
+/// The horizontal projection of the vehicle state — the ONLY state the
+/// planar (2D) expert layers (5 Hz corrector / adapter / 30 Hz planner)
+/// ever see.  The vertical channel lives exclusively in VehicleState3D.
+struct PlanarState {
     Vec2d position{0.0, 0.0};
     double yaw = 0.0;
     Vec2d velocity_world{0.0, 0.0};  // world-frame horizontal velocity
     double yaw_rate = 0.0;
-    // ── 3D extension: vertical channel (world z-up) ────────────────
-    double z = 2.0;          // world altitude (m)
-    double vz_world = 0.0;   // world vertical velocity (m/s, +up)
-    double pitch = 0.0;      // diagnostic pitch (rad)
 };
 
 struct Task2D {
@@ -427,6 +530,40 @@ struct Task2D {
     uint64_t scene_id = 0;
     uint64_t seed = 0;
     bool valid = false;
+};
+
+/// Canonical 3D navigation task — the ONLY task the logger / labels see.
+/// The planar (2D) layers receive Task2D (projected) + goal_z + the flight
+/// band separately.
+struct NavigationTask3D {
+    Vec3d start{0.0, 0.0, 2.0};
+    Vec3d goal{0.0, 0.0, 2.0};
+    double initial_yaw = 0.0;
+    double z_min = 0.8;  // flight band lower bound (m)
+    double z_max = 3.0;  // flight band upper bound (m)
+    uint64_t task_id = 0;
+    uint64_t scene_id = 0;
+    uint64_t seed = 0;
+    bool valid = false;
+};
+
+/// Explicit projection between the canonical 3D types and the planar (2D)
+/// types used by the 2D expert layers.  The ONLY sanctioned place to
+/// convert — keeps XY and Z frames from being mixed anywhere else.
+struct HorizontalProjection {
+    static PlanarState state(const VehicleState3D& s) {
+        PlanarState p;
+        p.position = Vec2d(s.position.x(), s.position.y());
+        p.yaw = s.yaw;
+        p.velocity_world =
+            Vec2d(s.velocity_world.x(), s.velocity_world.y());
+        p.yaw_rate = s.yaw_rate;
+        return p;
+    }
+    static Vec2d position(const Vec3d& p) { return Vec2d(p.x(), p.y()); }
+    static Vec3d lift(const Vec2d& xy, double z) {
+        return Vec3d(xy.x(), xy.y(), z);
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -528,11 +665,27 @@ struct LocalObservation {
 };
 
 // ═══════════════════════════════════════════════════════════════════
-//  Local target (the ONLY goal information the 30 Hz planner receives)
+//  Planar target — expert world point plus the body-frame training label.
+//  The target altitude travels separately.
 // ═══════════════════════════════════════════════════════════════════
-struct LocalTarget {
-    Vec2d position{0.0, 0.0};
-    bool valid = false;
+struct PlanarTarget {
+    // Expert-space target. Both expert planners may use/latch world points;
+    // only the student/data label below is constrained to the body frame.
+    Vec2d position_world{0.0, 0.0};
+    bool world_valid = false;
+
+    // Student/data-label contract: unit direction in the LIVE body FLU
+    // plane (+X forward, +Y left), re-expressed on every 30 Hz tick.
+    Vec2d direction_body{1.0, 0.0};
+    // Student/data-label distance channel:
+    //   ordinary target: min(real_distance, 4.5 m) / 5 m in [0, 0.9]
+    //   pure rotation:   exactly 1.0
+    // The exact ordinary ceiling is parameterized as
+    // (obs_range_m - te_normal_distance_reserve_m) / obs_range_m.
+    double normalized_distance = 0.0;
+    // Internal expert semantic, never persisted as a student input. A fixed
+    // macro waypoint remains fly-through inside the 4.5 m label ceiling.
+    bool flythrough = false;
     // Directive update event (5 Hz ZOH boundary).  A change alone NEVER
     // resets planner memory.
     uint64_t update_event = 0;
@@ -540,23 +693,48 @@ struct LocalTarget {
     // formally accepted final navigation-goal revision.  5 Hz correction
     // enter / refresh / exit NEVER change it.
     uint64_t mission_revision = 0;
-    // The second channel of the public 30 Hz target contract.  Ordinary
-    // targets are strictly below 1; an exact value of 1 is the reserved
-    // pure-rotation command.
-    double normalized_distance = 0.0;
-    // ── 3D extension: target altitude (world z, m) ─────────────────
+
+    bool valid() const {
+        return world_valid && position_world.allFinite() &&
+               direction_body.allFinite() &&
+               direction_body.squaredNorm() > 1e-12 &&
+               std::isfinite(normalized_distance) &&
+               normalized_distance >= 0.0 && normalized_distance <= 1.0;
+    }
+};
+
+/// FSM output consumed by the vertical controller / 3D composer: the
+/// planar target plus its altitude (world z).  PASS / NORMAL carry the
+/// mission altitude; TURN keeps the current altitude (pure rotation).
+struct LocalTarget {
+    PlanarTarget planar;
     double z = 2.0;
 };
 
 // ═══════════════════════════════════════════════════════════════════
-//  Trajectory / planner result
+//  Trajectories
 // ═══════════════════════════════════════════════════════════════════
-struct Trajectory2D {
+/// Planar (2D) trajectory — produced/consumed by the 30 Hz planar planner
+/// and the preflight simulator.
+struct PlanarTrajectory {
     std::vector<Vec2d> points;
     std::vector<double> yaw;
     std::vector<double> t;  // seconds from plan start
-    // ── 3D extension: predicted altitude per point (m) ─────────────
-    std::vector<double> z;
+    bool valid = false;
+    // The cruise level at which this trajectory was validated by the
+    // multi-cruise retry (m/s).  The EXECUTED command must never exceed it
+    // — a path only certified at 0.25 m/s (tight clearance) must not be
+    // driven at the nominal 2 m/s.
+    double cruise_mps = 0.0;
+};
+
+/// Canonical 3D trajectory (world points) for logging / diagnostics.
+/// Assembled by CommandComposer3D from a PlanarTrajectory + the vertical
+/// prediction.
+struct Trajectory3D {
+    std::vector<Vec3d> points;
+    std::vector<double> yaw;
+    std::vector<double> t;
     bool valid = false;
 };
 
@@ -565,21 +743,16 @@ struct PlannerResult {
     bool turn_mode = false;
     FailureReason failure_reason = FailureReason::NONE;
     // intent_* = the LONG-TERM rollout intent.  vx_body/vy_body/yaw_rate
-    // are the EXECUTABLE OUTPUT — the only thing sent to the backend and
-    // recorded as the 30 Hz expert label.
+    // are the EXECUTABLE OUTPUT (PLANAR, body FLU horizontal).  The full
+    // 3D BODY/FLU command is composed by CommandComposer3D (horizontal
+    // here + vertical from VerticalController) — the planner NEVER emits
+    // a vertical component.
     double vx_body = 0.0;
     double vy_body = 0.0;
     double yaw_rate = 0.0;
-    // ── 3D extension: vertical command (body FLU +up, m/s) ─────────
-    double vz_body = 0.0;
     double intent_vx_body = 0.0;
     double intent_vy_body = 0.0;
     double intent_yaw_rate = 0.0;
-    double intent_vz_body = 0.0;
-    // ── 3D extension: vertical rollout diagnostics ─────────────────
-    double selected_z_min_m = std::numeric_limits<double>::quiet_NaN();
-    double selected_z_max_m = std::numeric_limits<double>::quiet_NaN();
-    bool z_bounds_violated = false;
     PlannerStatus planner_status = PlannerStatus::NO_SAFE_CANDIDATE;
     bool candidate_progress_qualified = false;
     bool output_progress_qualified = false;
@@ -592,8 +765,15 @@ struct PlannerResult {
     std::string stationary_selection_reason;
     bool target_discontinuity_reset = false;
     uint64_t target_mission_revision = 0;
-    Trajectory2D selected;
-    std::vector<Trajectory2D> rejected_candidates;
+    PlanarTrajectory selected;
+    std::vector<PlanarTrajectory> rejected_candidates;
+    // Diagnostic: the planned trajectory's semantics (for the viewer).
+    // plan_terminal == true  → the selected spline ends in a full stop at
+    //                          the target (TERMINAL_SETTLING);
+    // plan_terminal == false → boundary waypoint, end speed = cruise.
+    bool plan_terminal = false;
+    double plan_end_speed_mps = 0.0;
+    double plan_executed_speed_mps = 0.0;
     bool blocked_observed = false;
     bool immediate_avoidance = false;
     bool emergency_brake = false;
@@ -624,8 +804,21 @@ struct PlannerResult {
     double selected_cost_terminal_heading = 0.0;
     double selected_cost_velocity_alignment = 0.0;
     double selected_cost_cross_track = 0.0;
+    double selected_cost_lateral_drift = 0.0;
     double selected_cost_obstacle_risk = 0.0;
     bool local_corridor_blocked = false;
+    // R26: the 1 m risk corridor is a SOFT proximity signal (cost / speed
+    // only), NEVER a hard topology block.  A cell 0.5-1 m from the direct
+    // path sets this flag but must not trigger macro takeover.
+    bool risk_corridor_near_obstacle = false;
+    // R25 structured corridor-block diagnostics: WHY the straight corridor
+    // to the target was judged blocked, the first blocking OCCUPIED cell
+    // (world XY) and its history age in ticks (0 = observed this tick =
+    // CURRENT frame; > 0 = stale HISTORY cell).  CLEAR / no info otherwise.
+    CorridorBlockReason corridor_block_reason = CorridorBlockReason::CLEAR;
+    double first_block_x = std::numeric_limits<double>::quiet_NaN();
+    double first_block_y = std::numeric_limits<double>::quiet_NaN();
+    uint32_t first_block_age_ticks = 0;
     double first_blocking_obstacle_distance = std::numeric_limits<double>::quiet_NaN();
     double predicted_closest_clearance = std::numeric_limits<double>::quiet_NaN();
     double time_to_collision = std::numeric_limits<double>::quiet_NaN();
@@ -672,6 +865,15 @@ struct TargetCorrectionDirective {
     // NORMAL_CORRECTION: world point locked during the 5 Hz period.
     Vec2d corrected_target_world{0.0, 0.0};
     bool corrected_target_world_valid = false;
+    // PERSISTENT terminal/brake-only semantic (R24).  When true, the
+    // corrected_target_world is a TERMINAL brake point: the 30 Hz planner
+    // must STOP at it and never fly through it.  This is decided ONCE at
+    // 5 Hz and held on the directive — it must NEVER be re-derived from
+    // the live distance every 30 Hz tick (the vehicle coasts a few cm past
+    // the point and would otherwise flip from terminal-brake back to
+    // fly-through).  Set only by the brake-before-search path; all other
+    // directives keep it false.
+    bool terminal_stop = false;
     // TURN_LEFT / TURN_RIGHT: world-frame UNIT direction captured when the
     // bounded turn step is issued.
     Vec2d turn_direction_world{1.0, 0.0};
@@ -697,12 +899,37 @@ struct AvoidanceObservability {
     bool unknown_occluded = false;
     double left_score = 0.0;
     double right_score = 0.0;
+    // Along-goal-axis distance (m) from the drone to the NEAREST surface
+    // of a corridor-blocking obstacle (from extractBlocker; +inf when no
+    // blocker is observed).  Positive = blocker still AHEAD along the
+    // goal line; <= 0 = at/behind the drone.  Used by the exit / re-entry
+    // gates so a correction is only released once the current blocker is
+    // actually bypassed (not merely because a bypass ray is visible).
+    double blocker_min_along = std::numeric_limits<double>::infinity();
     std::string reason = "NONE";
 };
 
-/// The adapter's per-30Hz-tick output — the exact information bottleneck
-/// shared by the C++ 30 Hz expert (world target) and a future 30 Hz
-/// student (body direction + normalized distance).
+/// Local-planner feedback used by the upper planner.  The cold preview uses
+/// the same local planner and local information; actual 30 Hz execution
+/// history confirms takeover so one preview miss cannot replace a working
+/// plan.  No scene truth or global route is involved.
+struct LocalPlanningAssessment {
+    bool target_outside_fov = false;
+    bool rotation_available = false;
+    bool translation_plan_valid = false;
+    bool terminal_plan_valid = false;
+    bool plan_valid = false;
+    bool progress_qualified = false;
+    bool local_corridor_blocked = false;
+    bool live_original_plan_usable = false;
+    bool takeover_confirmed = false;
+    PlannerStatus planner_status = PlannerStatus::NO_SAFE_CANDIDATE;
+    FailureReason failure_reason = FailureReason::NO_SAFE_CANDIDATE;
+};
+
+/// The adapter's per-30Hz-tick output shared by the C++ expert (full world
+/// target) and the 30 Hz student/data contract (live body direction +
+/// clipped normalized distance).
 struct EncodedTargetInput {
     bool valid = false;
     Vec2d direction_body{1.0, 0.0};

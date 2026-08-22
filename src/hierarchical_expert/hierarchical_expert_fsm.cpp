@@ -21,6 +21,7 @@ void HierarchicalExpertFsm::reset(const Task2D& task, uint64_t tick) {
     failure_start_tick_ = 0;
     unknown_recovery_ticks_ = 0;
     unknown_recovery_episode_count_ = 0;
+    progress_window_ticks_ = 0;
     goal_revision_ = 0;
     mission_revision_ = 0;
     reentry_guard_ = 0;
@@ -34,6 +35,8 @@ void HierarchicalExpertFsm::reset(const Task2D& task, uint64_t tick) {
     directive_updated_ = false;
     last_delivered_event_ = 0;
     last_original_goal_ = task.goal;
+    last_local_result_ = PlannerResult{};
+    has_last_local_result_ = false;
     local_planner_.reset();
 }
 
@@ -54,13 +57,28 @@ void HierarchicalExpertFsm::transition(FsmStepOutput& out, FsmState next,
 }
 
 LocalTarget HierarchicalExpertFsm::makeLocalTarget(
-    const EncodedTargetInput& encoded) const {
+    const EncodedTargetInput& encoded,
+    const TargetCorrectionDirective& directive) const {
     LocalTarget t;
-    t.position = encoded.effective_target_world;
-    t.valid = encoded.valid && encoded.effective_target_world_valid;
-    t.update_event = corrector_.directiveUpdateEvent();
-    t.mission_revision = mission_revision_;
-    t.normalized_distance = encoded.normalized_distance;
+    // The C++ expert may consume the world target directly.  The body
+    // direction and normalized distance travel alongside it solely as the
+    // student/data-label contract.
+    t.planar.position_world = encoded.effective_target_world;
+    t.planar.world_valid =
+        encoded.valid && encoded.effective_target_world_valid;
+    t.planar.direction_body = encoded.direction_body;
+    t.planar.normalized_distance = encoded.normalized_distance;
+    // R24: a directive flagged terminal_stop (brake-before-search) is a
+    // PERSISTENT stop semantic.  Fly-through is decided by that flag, NOT
+    // re-derived from the live distance every 30 Hz tick — otherwise a
+    // brake point the vehicle coasts a few cm past flips back to
+    // fly-through and the planner accelerates through its own brake.
+    t.planar.flythrough =
+        directive.type == TargetCorrectionType::NORMAL_CORRECTION &&
+        !directive.terminal_stop &&
+        encoded.normalized_distance > 1e-9;
+    t.planar.update_event = corrector_.directiveUpdateEvent();
+    t.planar.mission_revision = mission_revision_;
     // ── 3D extension: target altitude (mission z; TURN keeps state z). ─
     t.z = encoded.z;
     return t;
@@ -73,10 +91,10 @@ bool HierarchicalExpertFsm::goalReached(const FsmInput& in) const {
     //    near the goal height before the episode is committed. ─────────
     const double dx = in.state.position.x() - in.task.goal.x();
     const double dy = in.state.position.y() - in.task.goal.y();
-    const double dz = in.state.z - in.goal_z;
+    const double dz = in.z - in.goal_z;  // 3D altitude from FsmInput
     const double d = std::sqrt(dx * dx + dy * dy + dz * dz);
     const double v = in.state.velocity_world.norm();
-    const double vz = std::fabs(in.state.vz_world);
+    const double vz = std::fabs(in.vz_world);  // 3D vertical velocity
     const double yr = std::fabs(in.state.yaw_rate);
     return d <= p_.task_goal_tolerance &&
            v < p_.vehicle_goal_stop_speed_mps &&
@@ -84,28 +102,142 @@ bool HierarchicalExpertFsm::goalReached(const FsmInput& in) const {
            yr <= p_.lp_turn_exit_max_yaw_rate;
 }
 
+LocalPlanningAssessment HierarchicalExpertFsm::assessOriginalTarget(
+    const FsmInput& in) const {
+    TargetCorrectionDirective pass;
+    pass.type = TargetCorrectionType::PASS_THROUGH;
+    pass.valid = true;
+    return assessDirectiveTarget(in, pass);
+}
+
+LocalPlanningAssessment HierarchicalExpertFsm::assessDirectiveTarget(
+    const FsmInput& in,
+    const TargetCorrectionDirective& directive) const {
+    const EncodedTargetInput encoded =
+        adapter_.encode(in.state, in.task.goal, directive, in.goal_z, in.z);
+    const LocalTarget target = makeLocalTarget(encoded, directive);
+    const PreviewResult preview =
+        local_planner_.previewPlan(in.state, in.history, target.planar);
+
+    LocalPlanningAssessment assessment;
+    const double target_bearing = wrapAngle(
+        std::atan2(encoded.effective_target_world.y() - in.state.position.y(),
+                   encoded.effective_target_world.x() - in.state.position.x()) -
+        in.state.yaw);
+    assessment.target_outside_fov =
+        std::fabs(target_bearing) > 0.5 * deg2rad(p_.obs_fov_deg);
+
+    assessment.plan_valid = preview.plan_valid;
+    assessment.progress_qualified = preview.progress_qualified;
+    assessment.local_corridor_blocked = preview.local_corridor_blocked;
+    assessment.planner_status = preview.planner_status;
+    assessment.failure_reason = preview.failure_reason;
+
+    // Rotation and translation are deliberately separate capabilities.  A
+    // TURNING preview means the local layer can look at the target; it does
+    // not prove that a collision-free translational route exists.
+    assessment.rotation_available =
+        preview.success && !preview.emergency_brake &&
+        preview.failure_reason == FailureReason::NONE &&
+        (preview.turn_mode ||
+         (preview.planner_status == PlannerStatus::SAFE_HOLD &&
+          assessment.target_outside_fov &&
+          !preview.local_corridor_blocked));
+    const bool temporary_correction =
+        directive.type == TargetCorrectionType::NORMAL_CORRECTION;
+    // A terminal_stop brake is a genuine STOP target: its preview must be
+    // allowed to be plan_terminal (and must not require fly-through
+    // progress).  Ordinary temporary waypoints stay fly-through semantics.
+    const bool terminal_brake = temporary_correction && directive.terminal_stop;
+    const bool translation_semantics_valid =
+        temporary_correction
+            ? (terminal_brake
+                   ? (preview.progress_qualified || preview.plan_terminal)
+                   : (preview.progress_qualified && !preview.plan_terminal))
+            : (preview.progress_qualified || preview.plan_terminal);
+    assessment.translation_plan_valid =
+        preview.success && !preview.emergency_brake &&
+        preview.failure_reason == FailureReason::NONE &&
+        !preview.turn_mode && preview.plan_valid &&
+        preview.planner_status != PlannerStatus::SAFE_HOLD &&
+        preview.planner_status != PlannerStatus::TURNING &&
+        translation_semantics_valid;
+    assessment.terminal_plan_valid =
+        assessment.translation_plan_valid && preview.plan_terminal;
+    return assessment;
+}
+
 void HierarchicalExpertFsm::updateFailureBookkeeping(
     const FsmStepOutput& out, const FsmInput& in) {
-    // v9: DIAGNOSTIC ONLY — never read by the 5 Hz corrector.
+    // The 5 Hz corrector consumes this actual 30 Hz execution history.  A
+    // cold preview miss alone never authorizes macro takeover.
     const bool blocked =
         out.local.failure_reason == FailureReason::BLOCKED_BY_OBSERVED_OBSTACLE;
-    if (out.local.success || out.local.turn_mode) {
-        consecutive_failures_ = 0;
-        failure_start_tick_ = 0;
-        unknown_recovery_ticks_ = 0;
-    } else if (blocked) {
+    const bool no_safe =
+        out.local.failure_reason == FailureReason::NO_SAFE_CANDIDATE ||
+        out.local.planner_status == PlannerStatus::SAFE_HOLD;
+    const bool limit_cycle = out.local.local_limit_cycle_detected;
+
+    // R25 (Fix #4): "genuine" progress that is allowed to DECAY the
+    // failure evidence instead of hard-resetting it.  Measured
+    // (joint_v2_000004_4ab1e354): sporadic TERMINAL_SETTLING frames inside
+    // a ~50 s blocked deadlock kept resetting consecutive_failures_ 37→0,
+    // so the 5 Hz layer never took over.  Now:
+    //   * TERMINAL_SETTLING counts only when the ORIGINAL goal is genuinely
+    //     near (a real terminal approach), not a short-lived artifact of a
+    //     blocked cycle;
+    //   * turn_mode counts only when the goal is OUTSIDE the FOV (a real
+    //     re-acquisition turn); a spin in place with the goal visible is
+    //     not recovery;
+    //   * real progress subtracts 2 per frame (floor 0) and fully clears
+    //     the recovery state only after ~0.5 s of consecutive progress.
+    const double goal_dist = (in.task.goal - in.state.position).norm();
+    const bool near_goal =
+        goal_dist <= adapter_.normalMaxDistanceM() + 1e-9;
+    const bool terminal_settling_real =
+        out.local.planner_status == PlannerStatus::TERMINAL_SETTLING &&
+        near_goal;
+    const Vec2d to_goal = in.task.goal - in.state.position;
+    const double b_goal = std::fabs(wrapAngle(
+        std::atan2(to_goal.y(), to_goal.x()) - in.state.yaw));
+    const bool turning_real =
+        out.local.turn_mode &&
+        b_goal > 0.5 * deg2rad(p_.obs_fov_deg);
+    const bool genuine_progress =
+        out.local.success && !out.local.emergency_brake &&
+        (out.local.progress_qualified || terminal_settling_real ||
+         turning_real);
+
+    constexpr uint32_t kProgressClearWindowTicks = 15;  // 0.5 s at 30 Hz
+    if (blocked || no_safe || limit_cycle) {
         if (consecutive_failures_ == 0) failure_start_tick_ = in.tick;
         ++consecutive_failures_;
-        unknown_recovery_ticks_ = 0;
-    } else if (out.local.failure_reason == FailureReason::NO_SAFE_CANDIDATE) {
-        consecutive_failures_ = 0;
-        failure_start_tick_ = 0;
-        if (unknown_recovery_ticks_ == 0) ++unknown_recovery_episode_count_;
-        ++unknown_recovery_ticks_;
+        progress_window_ticks_ = 0;
+        if (no_safe) {
+            if (unknown_recovery_ticks_ == 0) ++unknown_recovery_episode_count_;
+            ++unknown_recovery_ticks_;
+        } else {
+            unknown_recovery_ticks_ = 0;
+        }
+    } else if (genuine_progress) {
+        // Decay by 2 per genuine-progress frame (never a hard reset).
+        consecutive_failures_ =
+            consecutive_failures_ >= 2 ? consecutive_failures_ - 2 : 0;
+        ++progress_window_ticks_;
+        if (progress_window_ticks_ >= kProgressClearWindowTicks) {
+            failure_start_tick_ = 0;
+            unknown_recovery_ticks_ = 0;
+        }
     } else {
-        consecutive_failures_ = 0;
-        failure_start_tick_ = 0;
-        unknown_recovery_ticks_ = 0;
+        // Neutral frame (e.g. SAFE_PROGRESSING without qualified progress):
+        // decay one step; the window still accumulates real progress.
+        consecutive_failures_ =
+            consecutive_failures_ >= 1 ? consecutive_failures_ - 1 : 0;
+        ++progress_window_ticks_;
+        if (progress_window_ticks_ >= kProgressClearWindowTicks) {
+            failure_start_tick_ = 0;
+            unknown_recovery_ticks_ = 0;
+        }
     }
 }
 
@@ -114,6 +246,7 @@ void HierarchicalExpertFsm::fillObservability(FsmStepOutput& out) const {
     out.target_correction_type_name =
         targetCorrectionTypeName(directive_.type);
     out.target_correction_active = corrector_.correctionActive();
+    out.directive_terminal_stop = directive_.terminal_stop;
     out.target_direction_token = directive_.direction_token;
     out.target_direction_x_body = last_encoded_.direction_body.x();
     out.target_direction_y_body = last_encoded_.direction_body.y();
@@ -150,9 +283,9 @@ void HierarchicalExpertFsm::fillObservability(FsmStepOutput& out) const {
     out.unknown_recovery_episode_count = unknown_recovery_episode_count_;
     out.macro_tick_event = macro_tick_event_;
     out.reentry_guard = reentry_guard_;
-    if (!out.local_target.valid) {
+    if (!out.local_target.planar.valid()) {
         out.local_target =
-            makeLocalTarget(last_encoded_);
+            makeLocalTarget(last_encoded_, directive_);
     }
 }
 
@@ -186,6 +319,12 @@ void HierarchicalExpertFsm::acceptNewGoal(const Vec2d& new_goal,
     directive_.valid = true;
     directive_.update_event = corrector_.bumpDirectiveEvent();
     directive_.reason = "NEW_FINAL_GOAL";
+    consecutive_failures_ = 0;
+    failure_start_tick_ = 0;
+    unknown_recovery_ticks_ = 0;
+    progress_window_ticks_ = 0;
+    last_local_result_ = PlannerResult{};
+    has_last_local_result_ = false;
     (void)new_goal;
 }
 
@@ -216,8 +355,71 @@ FsmStepOutput HierarchicalExpertFsm::step(const FsmInput& in) {
     if (is_5hz_tick) {
         ++macro_tick_event_;
         out.macro_tick_ran = true;
+        LocalPlanningAssessment assessment = assessOriginalTarget(in);
+        bool live_directive_usable = false;
+        if (has_last_local_result_) {
+            const PlannerResult& live = last_local_result_;
+            const bool live_rotation =
+                live.success && !live.emergency_brake && live.turn_mode;
+            const bool live_translation =
+                live.success && !live.emergency_brake && !live.turn_mode &&
+                live.failure_reason == FailureReason::NONE &&
+                (live.progress_qualified || live.plan_terminal ||
+                 live.planner_status == PlannerStatus::TERMINAL_SETTLING);
+            live_directive_usable = live_rotation || live_translation;
+        }
+        // A cold-start preview is advisory.  When PASS_THROUGH is actually
+        // executing a safe original-goal trajectory, preserve that plan and
+        // let the 30 Hz layer react to fresh observations first.
+        const bool pass_executing =
+            directive_.type == TargetCorrectionType::PASS_THROUGH &&
+            !corrector_.correctionActive();
+        if (pass_executing && has_last_local_result_) {
+            const PlannerResult& live = last_local_result_;
+            const bool live_rotation =
+                live.success && !live.emergency_brake && live.turn_mode;
+            const bool live_translation =
+                live.success && !live.emergency_brake && !live.turn_mode &&
+                live.failure_reason == FailureReason::NONE &&
+                (live.progress_qualified || live.plan_terminal ||
+                 live.planner_status == PlannerStatus::TERMINAL_SETTLING);
+            assessment.live_original_plan_usable =
+                live_rotation || live_translation;
+            if (live_rotation) assessment.rotation_available = true;
+            if (live_translation) {
+                assessment.translation_plan_valid = true;
+                assessment.terminal_plan_valid = live.plan_terminal;
+                assessment.plan_valid = true;
+            }
+        }
+        const uint32_t confirm_ticks = static_cast<uint32_t>(
+            std::max(1, p_.macro_takeover_confirm_ticks_30hz));
+        const bool persistent_failure =
+            consecutive_failures_ >= confirm_ticks ||
+            unknown_recovery_ticks_ >= confirm_ticks;
+        // A speed-dependent clearance failure means "brake/slow down",
+        // not "the topology is blocked".  It remains owned by local.
+        const bool dynamic_braking_only =
+            has_last_local_result_ &&
+            last_local_result_.dynamic_clearance_blocked &&
+            !last_local_result_.local_corridor_blocked;
+        const bool topology_evidence_ready =
+            has_last_local_result_ &&
+            (last_local_result_.local_corridor_blocked ||
+             in.state.velocity_world.norm() <=
+                 p_.vehicle_stationary_speed_mps);
+        assessment.takeover_confirmed =
+            persistent_failure && topology_evidence_ready &&
+            !dynamic_braking_only;
+        const VisibilityTargetCorrector::DirectiveAssessmentFn
+            assess_directive = [this, &in](
+                const TargetCorrectionDirective& candidate) {
+                return assessDirectiveTarget(in, candidate);
+            };
         directive_ = corrector_.update(in.state, in.task.goal,
-                                       in.current_patch, in.history, in.tick);
+                                       in.current_patch, in.history,
+                                       assessment, live_directive_usable,
+                                       assess_directive);
     } else {
         out.macro_tick_ran = false;
     }
@@ -225,16 +427,20 @@ FsmStepOutput HierarchicalExpertFsm::step(const FsmInput& in) {
     last_delivered_event_ = directive_.update_event;
 
     // ── EffectiveTargetAdapter EVERY real 30 Hz tick. ──
-    last_encoded_ =
-        adapter_.encode(in.state, in.task.goal, directive_, in.goal_z);
+    last_encoded_ = adapter_.encode(in.state, in.task.goal, directive_,
+                                    in.goal_z, in.z);
 
-    // ── LocalTarget for the 30 Hz planner. ──
+    // ── LocalTarget for the 30 Hz planner (planar part) + the vertical
+    //    controller (target altitude). ──
     out.local_target_updated = directive_updated_;
-    out.local_target = makeLocalTarget(last_encoded_);
-    out.local_target.update_event = directive_.update_event;
+    out.local_target = makeLocalTarget(last_encoded_, directive_);
+    out.local_target.planar.update_event = directive_.update_event;
 
-    // ── 30 Hz local plan (merged HISTORY map only). ──
-    out.local = local_planner_.plan(in.state, in.history, out.local_target);
+    // ── 30 Hz local plan (merged HISTORY map only; PLANAR). ──
+    out.local =
+        local_planner_.plan(in.state, in.history, out.local_target.planar);
+    last_local_result_ = out.local;
+    has_last_local_result_ = true;
 
     // ── Terminal checks (goal reached judged on the ORIGINAL goal). ──
     if (in.collision) {

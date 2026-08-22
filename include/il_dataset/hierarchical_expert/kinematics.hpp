@@ -1,15 +1,21 @@
 #pragma once
 /// @file   kinematics.hpp
-/// @brief  Shared deterministic 2D kinematic integration (pure C++).
+/// @brief  Shared deterministic kinematic integration (pure C++).
 ///
-/// The SAME function is used by:
-///   * the preflight 2D simulator step — actual execution,
+/// The SAME planar function is used by:
+///   * the preflight simulator step — actual execution,
 ///   * LocalPlanner30Hz candidate prediction,
 /// so prediction and execution can never diverge.  Every step applies:
 ///   * linear acceleration limit,
 ///   * radial speed limit (max_speed),
 ///   * yaw acceleration limit,
 ///   * yaw rate limit (max_yaw_rate).
+///
+/// Frame discipline: VelocityCommand3D is ALWAYS BODY/FLU
+/// (forward / left / up).  The planar integrator uses only the horizontal
+/// channels (vx_body / vy_body / yaw_rate); the 3D integrator additionally
+/// integrates the vertical channel (vz_body, body-up == world-up at level)
+/// into the world z.
 
 #include "il_dataset/hierarchical_expert/types.hpp"
 
@@ -18,22 +24,22 @@
 namespace il_dataset {
 namespace expert {
 
-/// Body-frame velocity + yaw-rate command.
-struct BodyCommand2D {
-    double vx_body = 0.0;  // forward (+X body)
+/// Full 3D BODY/FLU velocity + yaw-rate command — the ONLY command type
+/// that ever leaves the expert (composed by CommandComposer3D).
+struct VelocityCommand3D {
+    double vx_body = 0.0;  // forward  (+X body)
     double vy_body = 0.0;  // lateral  (+Y body = left, CCW)
+    double vz_body = 0.0;  // vertical (+Z body = up, FLU)
     double yaw_rate = 0.0;
-    // ── 3D extension: vertical velocity (body FLU +up, m/s).  For a level
-    //    vehicle body-up == world-up, so the model integrates it directly
-    //    into the world z. ────────────────────────────────────────────
-    double vz_body = 0.0;
 };
 
-/// Advance the planar vehicle state by dt under the limits above.
-inline VehicleState2D integrateKinematicStep(const VehicleState2D& s,
-                                             const BodyCommand2D& cmd,
-                                             double dt, const Params2D& p) {
-    VehicleState2D ns;
+/// Advance the PLANAR (horizontal) state by dt under the limits above.
+/// The vertical channel is ignored — it is owned by VerticalController /
+/// CommandComposer3D, never by the planar planner.
+inline PlanarState integratePlanarStep(const PlanarState& s,
+                                       const VelocityCommand3D& cmd,
+                                       double dt, const Params2D& p) {
+    PlanarState ns;
     const double c = std::cos(s.yaw), sn = std::sin(s.yaw);
 
     // world → body
@@ -62,21 +68,37 @@ inline VehicleState2D integrateKinematicStep(const VehicleState2D& s,
     const Vec2d v_world(c * v_body_capped.x() - sn * v_body_capped.y(),
                         sn * v_body_capped.x() + c * v_body_capped.y());
 
-    // ── 3D extension: vertical channel (level-flight model).  Body-up
-    //    equals world-up, so the commanded vz_body is integrated directly
-    //    into the world z with the vertical acceleration / speed limits. ─
-    double vz_new = s.vz_world + clamp(cmd.vz_body - s.vz_world,
-                                       -p.lp_max_v_accel * dt,
-                                       p.lp_max_v_accel * dt);
-    vz_new = clamp(vz_new, -p.lp_max_vz, p.lp_max_vz);
-
     ns.position = s.position + v_world * dt;
     ns.yaw = wrapAngle(s.yaw + yaw_rate * dt);
     ns.velocity_world = v_world;
     ns.yaw_rate = yaw_rate;
-    ns.z = s.z + vz_new * dt;
-    ns.vz_world = vz_new;
+    return ns;
+}
+
+/// Advance the canonical 3D state by dt (horizontal via the planar step,
+/// vertical integrated from the BODY/FLU vz command with the vertical
+/// acceleration / speed limits).  Used by the preflight simulator (and any
+/// future 3D execution prediction).
+inline VehicleState3D integrateVehicle3DStep(const VehicleState3D& s,
+                                             const VelocityCommand3D& cmd,
+                                             double dt, const Params2D& p) {
+    VehicleState3D ns;
+    const PlanarState ps = HorizontalProjection::state(s);
+    const PlanarState psn = integratePlanarStep(ps, cmd, dt, p);
+    ns.position = Vec3d(psn.position.x(), psn.position.y(), s.position.z());
+    ns.velocity_world =
+        Vec3d(psn.velocity_world.x(), psn.velocity_world.y(),
+              s.velocity_world.z());
+    ns.yaw = psn.yaw;
+    ns.yaw_rate = psn.yaw_rate;
     ns.pitch = s.pitch;
+    // vertical channel (body-up == world-up at level)
+    double vz_new = s.velocity_world.z() +
+                    clamp(cmd.vz_body - s.velocity_world.z(),
+                          -p.lp_max_v_accel * dt, p.lp_max_v_accel * dt);
+    vz_new = clamp(vz_new, -p.lp_max_vz, p.lp_max_vz);
+    ns.position.z() = s.position.z() + vz_new * dt;
+    ns.velocity_world.z() = vz_new;
     return ns;
 }
 

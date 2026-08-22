@@ -105,6 +105,7 @@ struct BlueprintTaskAudit {
     bool accepted = false;
     bool reached_goal = false;
     bool truth_collision = false;      // point OR continuous swept collision
+    bool truth_brake_triggered = false;  // runtime edge-clearance judge
     bool out_of_bounds = false;        // drone disk crossed the region boundary
     bool macro_label_ok = true;
     bool qualification_exceeded = false;  // ran out of the preflight tick budget

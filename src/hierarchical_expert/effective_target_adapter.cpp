@@ -51,8 +51,9 @@ Vec2d EffectiveTargetAdapter::turnDirectionBody(SideSelection side) const {
 }
 
 EncodedTargetInput EffectiveTargetAdapter::encode(
-    const VehicleState2D& state, const Vec2d& original_goal,
-    const TargetCorrectionDirective& directive, double goal_z) const {
+    const PlanarState& state, const Vec2d& original_goal,
+    const TargetCorrectionDirective& directive, double goal_z,
+    double current_z) const {
     EncodedTargetInput out;
     out.valid = true;
     out.source_type = directive.type;
@@ -64,8 +65,8 @@ EncodedTargetInput EffectiveTargetAdapter::encode(
 
     switch (directive.type) {
         case TargetCorrectionType::PASS_THROUGH: {
-            // A: PASS_THROUGH — the ORIGINAL goal, truncated to
-            // R - reserve along the live goal direction.
+            // A: PASS_THROUGH — keep the full ORIGINAL world goal for the
+            // expert and clip only the persisted distance label.
             const Vec2d delta = original_goal - state.position;
             const double d = delta.norm();
             if (d <= eps) {
@@ -80,7 +81,9 @@ EncodedTargetInput EffectiveTargetAdapter::encode(
             const double d_clip = std::min(d, maxd);
             out.direction_body = rot2(dir_world, -yaw);
             out.normalized_distance = d_clip / R;
-            out.effective_target_world = state.position + dir_world * d_clip;
+            // Expert planners may use the full world-coordinate goal.  Only
+            // the persisted student distance label is clipped to 4.5/5.
+            out.effective_target_world = original_goal;
             out.effective_target_world_valid = true;
             break;
         }
@@ -95,7 +98,7 @@ EncodedTargetInput EffectiveTargetAdapter::encode(
                 pt.type = TargetCorrectionType::PASS_THROUGH;
                 pt.valid = true;
                 pt.update_event = directive.update_event;
-                return encode(state, original_goal, pt, goal_z);
+                return encode(state, original_goal, pt, goal_z, current_z);
             }
             const Vec2d delta =
                 directive.corrected_target_world - state.position;
@@ -111,7 +114,8 @@ EncodedTargetInput EffectiveTargetAdapter::encode(
             const double d_clip = std::min(d, maxd);
             out.direction_body = rot2(dir_world, -yaw);
             out.normalized_distance = d_clip / R;
-            out.effective_target_world = state.position + dir_world * d_clip;
+            out.effective_target_world =
+                directive.corrected_target_world;
             out.effective_target_world_valid = true;
             break;
         }
@@ -142,7 +146,7 @@ EncodedTargetInput EffectiveTargetAdapter::encode(
             out.effective_target_world_valid = true;
             // Pure rotation: the virtual target stays at the CURRENT
             // altitude, so the 3D effective direction is horizontal.
-            out.z = state.z;
+            out.z = current_z;
             break;
         }
     }

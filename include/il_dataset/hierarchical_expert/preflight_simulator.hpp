@@ -59,7 +59,7 @@ public:
     /// executable command with the shared kinematics and audits the
     /// executed segment continuously (swept collision + boundary).
     struct SimStepResult {
-        VehicleState2D state;
+        VehicleState3D state;
         ExpertStepOutput output;
         bool truth_collision = false;
         bool out_of_bounds = false;
@@ -67,7 +67,7 @@ public:
     };
     SimStepResult step(uint64_t tick, bool collision_override = false);
 
-    const VehicleState2D& state() const { return state_; }
+    const VehicleState3D& state() const { return state_; }
     const Scene2D& scene() const { return scene_; }
     double flightZ() const { return flight_z_; }
 
@@ -100,7 +100,7 @@ private:
     std::vector<bool> ray_seen_;
     HierarchicalExpert expert_;
     Flightmare2DObservation obs_builder_;
-    VehicleState2D state_;
+    VehicleState3D state_;
     Task2D task_;
     double flight_z_ = 2.0;
     bool configured_ = false;

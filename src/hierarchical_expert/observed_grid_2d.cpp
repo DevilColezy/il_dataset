@@ -8,7 +8,8 @@ namespace il_dataset {
 namespace expert {
 
 void ObservedGrid2D::configure(const Vec2d& min_bounds, const Vec2d& max_bounds,
-                               double resolution, uint32_t max_age_ticks) {
+                               double resolution, uint32_t max_age_ticks,
+                               uint32_t free_clear_confirmations) {
     obs_.resolution = resolution;
     obs_.origin = min_bounds;
     obs_.width = static_cast<int>(
@@ -16,6 +17,7 @@ void ObservedGrid2D::configure(const Vec2d& min_bounds, const Vec2d& max_bounds,
     obs_.height = static_cast<int>(
         std::ceil((max_bounds.y() - min_bounds.y()) / resolution));
     obs_.max_age_ticks = max_age_ticks;
+    free_clear_confirmations_ = std::max<uint32_t>(1, free_clear_confirmations);
     reset();
 }
 
@@ -23,6 +25,7 @@ void ObservedGrid2D::reset() {
     obs_.cells.assign(static_cast<size_t>(obs_.width) * obs_.height,
                       CellState::UNKNOWN);
     obs_.age_ticks.assign(static_cast<size_t>(obs_.width) * obs_.height, 0);
+    free_confirm_.assign(static_cast<size_t>(obs_.width) * obs_.height, 0);
     obs_.tick = 0;
     first_observed_event_ = 0;
     seen_occupied_ = false;
@@ -61,6 +64,13 @@ void ObservedGrid2D::integrate(const LocalObservation& patch, uint64_t tick) {
 
     // Merge the fresh patch: only observed (FREE/OCCUPIED) patch cells
     // overwrite; UNKNOWN patch cells never erase known cells.
+    //
+    // R25: a cell the current frame sees FREE is no longer treated as
+    // permanently occupied.  The merged OCCUPIED cell is kept only until
+    // it has been re-confirmed FREE for `free_clear_confirmations_`
+    // CONSECUTIVE current frames, then it is cleared to FREE (fresh
+    // evidence outranks stale history).  Any fresh OCCUPIED observation
+    // resets the confirmation counter.
     for (int iy = 0; iy < patch.height; ++iy) {
         for (int ix = 0; ix < patch.width; ++ix) {
             const CellState s = patch.cells[patch.idx(ix, iy)];
@@ -69,14 +79,27 @@ void ObservedGrid2D::integrate(const LocalObservation& patch, uint64_t tick) {
             const int gy = offset_y + iy;
             if (!obs_.inGrid(gx, gy)) continue;
             const size_t id = obs_.idx(gx, gy);
-            if (obs_.cells[id] == CellState::OCCUPIED && s == CellState::FREE) {
-                // A cell previously seen occupied stays occupied until it
-                // ages out (conservative; an obstacle can only disappear
-                // through aging).
-                continue;
+            if (s == CellState::FREE) {
+                if (obs_.cells[id] == CellState::OCCUPIED) {
+                    // Fresh FREE evidence against a stale OCCUPIED cell:
+                    // confirm over several frames before clearing.
+                    ++free_confirm_[id];
+                    if (free_confirm_[id] >= free_clear_confirmations_) {
+                        obs_.cells[id] = CellState::FREE;
+                        obs_.age_ticks[id] = 0;
+                        free_confirm_[id] = 0;
+                    }
+                    // else: stay OCCUPIED (conservative, not yet confirmed)
+                } else {
+                    obs_.cells[id] = CellState::FREE;
+                    obs_.age_ticks[id] = 0;
+                    free_confirm_[id] = 0;
+                }
+            } else {  // OCCUPIED (fresh hard evidence)
+                obs_.cells[id] = CellState::OCCUPIED;
+                obs_.age_ticks[id] = 0;
+                free_confirm_[id] = 0;
             }
-            obs_.cells[id] = s;
-            obs_.age_ticks[id] = 0;
         }
     }
 

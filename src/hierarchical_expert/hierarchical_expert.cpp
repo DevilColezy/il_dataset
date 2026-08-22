@@ -72,7 +72,8 @@ void HierarchicalExpert::configure(const Params2D& p, const Vec2d& min_bounds,
     min_bounds_ = min_bounds;
     max_bounds_ = max_bounds;
     history_.configure(min_bounds_, max_bounds_, p_.obs_resolution,
-                       p_.obs_history_max_age_ticks);
+                       p_.obs_history_max_age_ticks,
+                       p_.obs_free_clear_confirmations);
     // The FSM is stateless until the first resetTask; reconfigure its
     // parameter copy.
     fsm_ = HierarchicalExpertFsm(p_);
@@ -88,8 +89,21 @@ void HierarchicalExpert::resetTask(const Vec2d& start, const Vec2d& goal,
     task_.initial_yaw = CoordinateAdapter::flightmareYawToExpert(initial_yaw_fm);
     task_.valid = true;
     flight_z_ = flight_z;
+    // ── 3D extension: canonical 3D navigation task (mission altitude +
+    //    the configured flight band). ───────────────────────────────
+    navigation_task_.start = HorizontalProjection::lift(start, flight_z);
+    navigation_task_.goal = HorizontalProjection::lift(goal, flight_z);
+    navigation_task_.initial_yaw = task_.initial_yaw;
+    navigation_task_.z_min = p_.lp_z_min_m;
+    navigation_task_.z_max = p_.lp_z_max_m;
+    navigation_task_.task_id = task_.task_id;
+    navigation_task_.scene_id = task_.scene_id;
+    navigation_task_.seed = task_.seed;
+    navigation_task_.valid = true;
     history_.reset();
     fsm_.reset(task_, tick);
+    // Re-arm the vertical command-ramp base for the new task.
+    last_vz_command_ = 0.0;
     // Re-arm the ZOH mirror with a fresh PASS_THROUGH block.
     last_macro_label_valid_ = 1;
     last_macro_correction_type_ = "PASS_THROUGH";
@@ -131,6 +145,7 @@ void HierarchicalExpert::fillOutput(ExpertStepOutput& out,
         fsm_out.target_distance_normalized * std::max(1e-9, p_.obs_range_m);
     out.effective_target_source = fsm_out.target_correction_type_name;
     out.target_correction_active = fsm_out.target_correction_active;
+    out.directive_terminal_stop = fsm_out.directive_terminal_stop;
     // Quantized token of the LIVE effective direction (diagnostic only).
     const EffectiveTargetAdapter adapter(p_);
     out.effective_direction_token =
@@ -144,15 +159,18 @@ void HierarchicalExpert::fillOutput(ExpertStepOutput& out,
     out.effective_target_world_z = fsm_out.local_target.z;
     out.effective_target_world_valid = fsm_out.effective_target_world_valid;
 
-    // ── 30 Hz executable label (3D: vx / vy / vz / yaw_rate) ───────
+    // ── 30 Hz executable label.  The planner result is PLANAR; the final
+    //    3D BODY/FLU command (including vz) is composed by
+    //    CommandComposer3D in step()/stepFromPatch() and overrides these
+    //    horizontal placeholders. ─────────────────────────────────────
     out.target_velocity_flu_x = fsm_out.local.vx_body;
     out.target_velocity_flu_y = fsm_out.local.vy_body;
-    out.target_velocity_flu_z = fsm_out.local.vz_body;
+    out.target_velocity_flu_z = 0.0;
     out.target_yaw_rate = fsm_out.local.yaw_rate;
     out.intent_vx_body = fsm_out.local.intent_vx_body;
     out.intent_vy_body = fsm_out.local.intent_vy_body;
     out.intent_yaw_rate = fsm_out.local.intent_yaw_rate;
-    out.intent_vz_body = fsm_out.local.intent_vz_body;
+    out.intent_vz_body = 0.0;
 
     // ── 30 Hz diagnostics ──────────────────────────────────────────
     out.hierarchical_mode = mapHierarchicalMode(fsm_out);
@@ -164,12 +182,53 @@ void HierarchicalExpert::fillOutput(ExpertStepOutput& out,
     out.obstacle_risk_cost = fsm_out.local.obstacle_risk_cost;
     out.avoidance_active = fsm_out.local.avoidance_active;
     out.local_corridor_blocked = fsm_out.local.local_corridor_blocked;
+    out.risk_corridor_near_obstacle =
+        fsm_out.local.risk_corridor_near_obstacle;
+    // R25 structured corridor diagnostics (never student inputs).
+    out.corridor_block_reason =
+        corridorBlockReasonName(fsm_out.local.corridor_block_reason);
+    out.corridor_block_source =
+        fsm_out.local.corridor_block_reason ==
+                CorridorBlockReason::CURRENT_OCCUPIED
+            ? "current"
+            : (fsm_out.local.corridor_block_reason ==
+                       CorridorBlockReason::HISTORY_OCCUPIED
+                   ? "history"
+                   : "none");
+    out.first_blocking_distance_m =
+        fsm_out.local.first_blocking_obstacle_distance;
+    out.first_block_x = fsm_out.local.first_block_x;
+    out.first_block_y = fsm_out.local.first_block_y;
+    out.first_block_age_ticks = fsm_out.local.first_block_age_ticks;
     out.emergency_brake = fsm_out.local.emergency_brake;
     out.immediate_avoidance = fsm_out.local.immediate_avoidance;
     out.local_limit_cycle_detected = fsm_out.local.local_limit_cycle_detected;
     out.target_bearing_error_deg = fsm_out.local.target_bearing_error_deg;
     out.consecutive_failures_30hz = fsm_out.consecutive_failures_30hz;
     out.unknown_recovery_ticks = fsm_out.unknown_recovery_ticks;
+    // ── 30 Hz planned trajectory (diagnostic; world XY, downsampled) ──
+    const PlanarTrajectory& traj = fsm_out.local.selected;
+    out.plan_valid = traj.valid && traj.points.size() >= 2;
+    out.plan_terminal = fsm_out.local.plan_terminal;
+    out.plan_end_speed_mps = fsm_out.local.plan_end_speed_mps;
+    out.plan_executed_speed_mps = fsm_out.local.plan_executed_speed_mps;
+    out.plan_points_x.clear();
+    out.plan_points_y.clear();
+    if (out.plan_valid) {
+        constexpr size_t kMaxPlanPts = 16;
+        const size_t n = traj.points.size();
+        const size_t stride = std::max<size_t>(1, (n + kMaxPlanPts - 1) /
+                                                      kMaxPlanPts);
+        for (size_t i = 0; i < n; i += stride) {
+            out.plan_points_x.push_back(traj.points[i].x());
+            out.plan_points_y.push_back(traj.points[i].y());
+        }
+        // Always include the exact endpoint.
+        if ((n - 1) % stride != 0) {
+            out.plan_points_x.push_back(traj.points.back().x());
+            out.plan_points_y.push_back(traj.points.back().y());
+        }
+    }
     // ── 30 Hz candidate-rejection breakdown (diagnostic) ───────────
     out.reject_not_known_free = fsm_out.local.reject_not_known_free;
     out.reject_outside_current_fov =
@@ -257,8 +316,8 @@ void HierarchicalExpert::fillOutput(ExpertStepOutput& out,
 //  3D goal directions (3D expert extension)
 // ────────────────────────────────────────────────────────────────────
 void HierarchicalExpert::apply3DGoalDirections(ExpertStepOutput& out,
-                                               const VehicleState2D& st,
-                                               double flight_z) {
+                                               const PlanarState& st,
+                                               double z, double flight_z) {
     // ── 3D effective-target direction (30 Hz student input).  The
     //    effective target XY comes from the adapter; its altitude is the
     //    mission z for PASS/NORMAL and the live state z for TURN (pure
@@ -274,7 +333,7 @@ void HierarchicalExpert::apply3DGoalDirections(ExpertStepOutput& out,
         }
         const double ez = out.effective_target_world_z;
         const Vec2d d2(ex - st.position.x(), ey - st.position.y());
-        const double dz = ez - st.z;
+        const double dz = ez - z;
         const double d3 = std::sqrt(d2.squaredNorm() + dz * dz);
         if (d3 > 1e-9) {
             const Vec2d xy = d2 / d3;  // normalized by the 3D distance
@@ -300,7 +359,7 @@ void HierarchicalExpert::apply3DGoalDirections(ExpertStepOutput& out,
     // ── 3D original-goal direction + distance (5 Hz student input). ──
     {
         const Vec2d to2 = task_.goal - st.position;
-        const double dz = flight_z - st.z;
+        const double dz = flight_z - z;
         const double d3 = std::sqrt(to2.squaredNorm() + dz * dz);
         Vec2d body(1.0, 0.0);
         double dn = 0.0;
@@ -318,6 +377,26 @@ void HierarchicalExpert::apply3DGoalDirections(ExpertStepOutput& out,
         out.navigation_goal_distance_clipped_m = clip;
         out.navigation_goal_distance_norm = clip / R;
     }
+
+    // Canonical terminal label.  The final committed row previously kept
+    // the residual within-goal-tolerance distance (for example 0.0385),
+    // contradicting the public contract and teaching the student that a
+    // reached goal still has non-zero range.
+    if (out.fsm_state == "GOAL_REACHED") {
+        out.goal_direction_flu_x = 1.0;
+        out.goal_direction_flu_y = 0.0;
+        out.goal_direction_flu_z = 0.0;
+        out.goal_distance_clipped_m = 0.0;
+        out.goal_distance_norm = 0.0;
+        out.effective_direction_token =
+            EffectiveTargetAdapter(p_).quantizeBearing(0.0);
+
+        out.navigation_goal_direction_flu_x = 1.0;
+        out.navigation_goal_direction_flu_y = 0.0;
+        out.navigation_goal_direction_flu_z = 0.0;
+        out.navigation_goal_distance_clipped_m = 0.0;
+        out.navigation_goal_distance_norm = 0.0;
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -328,17 +407,17 @@ ExpertStepOutput HierarchicalExpert::step(
     double yaw_rate_fm, const std::vector<float>& depth_m, int depth_w,
     int depth_h, const double cam_pos[3], const double cam_q[4],
     double flight_z, uint64_t tick, bool collision) {
-    // Coordinate adaptation (single layer): Flightmare → expert frame.
-    VehicleState2D st;
-    st.position = Vec2d(pos[0], pos[1]);
-    st.yaw = CoordinateAdapter::flightmareYawToExpert(yaw_fm);
-    st.velocity_world = Vec2d(vel_world[0], vel_world[1]);
-    st.yaw_rate = yaw_rate_fm;  // left-turn positive in both frames
-    // ── 3D extension: vertical state (world z-up). ─────────────────
-    st.z = pos[2];
-    st.vz_world = vel_world[2];
-    st.pitch = 0.0;
+    // ── 3D extension: build the canonical 3D state, then project the
+    //    horizontal part for the planar expert layers.  Coordinate
+    //    adaptation (Flightmare → expert frame) lives in CoordinateAdapter.
+    VehicleState3D st3;
+    st3.position = Vec3d(pos[0], pos[1], pos[2]);
+    st3.velocity_world = Vec3d(vel_world[0], vel_world[1], vel_world[2]);
+    st3.yaw = CoordinateAdapter::flightmareYawToExpert(yaw_fm);
+    st3.yaw_rate = yaw_rate_fm;  // left-turn positive in both frames
+    st3.pitch = 0.0;
     flight_z_ = flight_z;
+    const PlanarState st = HorizontalProjection::state(st3);
 
     // Depth → current FOV patch (grid-aligned to the global grid).  The
     // camera FOV/range/resolution come from Params2D only; the true camera
@@ -350,14 +429,35 @@ ExpertStepOutput HierarchicalExpert::step(
     history_.integrate(current_patch, tick);
 
     FsmInput in{task_, st, current_patch, history_.observation(), tick,
-                collision, flight_z};
+                collision, flight_z, st3.position.z(),
+                st3.velocity_world.z()};
     const FsmStepOutput fsm_out = fsm_.step(in);
 
     ExpertStepOutput out;
     fillOutput(out, fsm_out, tick, flight_z);
     // ── 3D extension: live 3D goal directions (effective target + the
     //    original goal) projected into the FLU body frame. ──────────
-    apply3DGoalDirections(out, st, flight_z);
+    apply3DGoalDirections(out, st, st3.position.z(), flight_z);
+
+    // ── 3D extension: compose the FINAL BODY/FLU command.  The planar
+    //    planner emits horizontal vx/vy/yaw_rate; the VerticalController
+    //    regulates the altitude toward the effective target z; the
+    //    CommandComposer3D merges them (no XY/Z frame mixing). ───────
+    {
+        VerticalController vc(p_);
+        const VerticalCommand vcmd = vc.compute(
+            st3, fsm_out.local_target.z, p_.lp_horizon_s, p_.lp_dt,
+            last_vz_command_);
+        CommandComposer3D composer(p_);
+        const VelocityCommand3D cmd = composer.compose(fsm_out.local, vcmd);
+        out.target_velocity_flu_x = cmd.vx_body;
+        out.target_velocity_flu_y = cmd.vy_body;
+        out.target_velocity_flu_z = cmd.vz_body;
+        out.target_yaw_rate = cmd.yaw_rate;
+        out.intent_vz_body = vcmd.intent_vz_body;
+        // Remember the executable vz for the next tick's command ramp.
+        last_vz_command_ = vcmd.vz_body;
+    }
     return out;
 }
 
@@ -365,19 +465,38 @@ ExpertStepOutput HierarchicalExpert::step(
 //  Step (preflight path: patch already synthesized from the truth scene)
 // ────────────────────────────────────────────────────────────────────
 ExpertStepOutput HierarchicalExpert::stepFromPatch(
-    const VehicleState2D& expert_state, const LocalObservation& current_patch,
+    const VehicleState3D& expert_state, const LocalObservation& current_patch,
     double flight_z, uint64_t tick, bool collision) {
     flight_z_ = flight_z;
     history_.integrate(current_patch, tick);
 
-    FsmInput in{task_, expert_state, current_patch, history_.observation(),
-                tick, collision, flight_z};
+    const PlanarState st = HorizontalProjection::state(expert_state);
+    FsmInput in{task_, st, current_patch, history_.observation(), tick,
+                collision, flight_z, expert_state.position.z(),
+                expert_state.velocity_world.z()};
     const FsmStepOutput fsm_out = fsm_.step(in);
 
     ExpertStepOutput out;
     fillOutput(out, fsm_out, tick, flight_z);
     // ── 3D extension: live 3D goal directions (preflight path). ─────
-    apply3DGoalDirections(out, expert_state, flight_z);
+    apply3DGoalDirections(out, st, expert_state.position.z(), flight_z);
+
+    // ── 3D extension: compose the FINAL BODY/FLU command (preflight). ─
+    {
+        VerticalController vc(p_);
+        const VerticalCommand vcmd = vc.compute(
+            expert_state, fsm_out.local_target.z, p_.lp_horizon_s, p_.lp_dt,
+            last_vz_command_);
+        CommandComposer3D composer(p_);
+        const VelocityCommand3D cmd = composer.compose(fsm_out.local, vcmd);
+        out.target_velocity_flu_x = cmd.vx_body;
+        out.target_velocity_flu_y = cmd.vy_body;
+        out.target_velocity_flu_z = cmd.vz_body;
+        out.target_yaw_rate = cmd.yaw_rate;
+        out.intent_vz_body = vcmd.intent_vz_body;
+        // Remember the executable vz for the next tick's command ramp.
+        last_vz_command_ = vcmd.vz_body;
+    }
     return out;
 }
 

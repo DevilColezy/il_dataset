@@ -27,6 +27,8 @@
 #include "il_dataset/hierarchical_expert/local_planner_30hz.hpp"
 #include "il_dataset/hierarchical_expert/hierarchical_expert_fsm.hpp"
 #include "il_dataset/hierarchical_expert/flightmare_2d_observation.hpp"
+#include "il_dataset/hierarchical_expert/vertical_controller.hpp"
+#include "il_dataset/hierarchical_expert/command_composer_3d.hpp"
 
 #include <cstdint>
 #include <string>
@@ -57,6 +59,10 @@ struct ExpertStepOutput {
     // TURN_LEFT / TURN_RIGHT) — diagnostic only.
     std::string effective_target_source = "PASS_THROUGH";
     bool target_correction_active = false;
+    // R24: persistent terminal/brake-only semantic of the current ZOH
+    // directive (1 = the corrected target is a stop target, never
+    // fly-through).  Diagnostic; zero-order held with the directive.
+    bool directive_terminal_stop = false;
     int effective_direction_token = -1;  // quantized token of live direction
     // Effective world target (diagnostic; world-latched for NORMAL).
     double effective_target_world_x = 0.0;
@@ -90,12 +96,34 @@ struct ExpertStepOutput {
     double obstacle_risk_cost = 0.0;
     bool avoidance_active = false;
     bool local_corridor_blocked = false;
+    // R26: soft 1 m risk-corridor proximity (diagnostic; NEVER a hard
+    // topology block — see corridor_block_reason for the hard verdict).
+    bool risk_corridor_near_obstacle = false;
+    // R25 structured corridor diagnostics: WHY the straight corridor to the
+    // target was judged blocked + the first blocking cell (age 0 = current
+    // frame, > 0 = stale history).  Never student inputs.
+    std::string corridor_block_reason = "CLEAR";
+    std::string corridor_block_source = "none";
+    double first_blocking_distance_m =
+        std::numeric_limits<double>::quiet_NaN();
+    double first_block_x = std::numeric_limits<double>::quiet_NaN();
+    double first_block_y = std::numeric_limits<double>::quiet_NaN();
+    int first_block_age_ticks = 0;
     bool emergency_brake = false;
     bool immediate_avoidance = false;
     bool local_limit_cycle_detected = false;
     double target_bearing_error_deg = 0.0;
     uint32_t consecutive_failures_30hz = 0;
     uint32_t unknown_recovery_ticks = 0;
+    // ── 30 Hz planned trajectory (diagnostic for the stepped viewer).
+    //    plan_points_* are world XY (positions are identical between the
+    //    expert and Flightmare frames), downsampled to ≤16 points.
+    bool plan_valid = false;
+    bool plan_terminal = false;
+    double plan_end_speed_mps = 0.0;
+    double plan_executed_speed_mps = 0.0;
+    std::vector<double> plan_points_x;
+    std::vector<double> plan_points_y;
     // ── 30 Hz candidate-rejection breakdown (diagnostic) ───────────
     uint32_t reject_not_known_free = 0;
     uint32_t reject_outside_current_fov = 0;
@@ -181,8 +209,9 @@ public:
 
     /// Preflight access: run a step from an already-integrated observation
     /// without a new depth frame (used by the dry-run simulator which
-    /// synthesizes depth rays from the truth scene).  See preflight.cpp.
-    ExpertStepOutput stepFromPatch(const VehicleState2D& expert_state,
+    /// synthesizes depth rays from the truth scene).  Takes the canonical
+    /// 3D state; the planar layers receive the horizontal projection.
+    ExpertStepOutput stepFromPatch(const VehicleState3D& expert_state,
                                    const LocalObservation& current_patch,
                                    double flight_z, uint64_t tick,
                                    bool collision);
@@ -199,6 +228,7 @@ public:
         return history_.obstacleFirstObservedEvent();
     }
     const Task2D& task() const { return task_; }
+    const NavigationTask3D& navigationTask() const { return navigation_task_; }
     double flightZ() const { return flight_z_; }
 
 private:
@@ -207,8 +237,8 @@ private:
     /// ── 3D extension: overwrite the 2D goal directions with the live 3D
     ///    unit direction (effective target + original goal) projected into
     ///    the FLU body frame, and the 3D macro direction on 5 Hz frames. ─
-    void apply3DGoalDirections(ExpertStepOutput& out,
-                               const VehicleState2D& st, double flight_z);
+    void apply3DGoalDirections(ExpertStepOutput& out, const PlanarState& st,
+                               double z, double flight_z);
 
     Params2D p_;
     Vec2d min_bounds_{-20.0, -20.0};
@@ -218,7 +248,16 @@ private:
     Flightmare2DObservation obs_builder_;
     HierarchicalExpertFsm fsm_{Params2D{}};
     Task2D task_;
+    /// ── 3D extension: canonical 3D navigation task (start/goal with the
+    ///    mission altitude + flight band). ────────────────────────────
+    NavigationTask3D navigation_task_;
     double flight_z_ = 2.0;
+    // Vertical command-ramp base (previous executable vz), reset per task.
+    // The VerticalController ramps the executable vz relative to this so it
+    // can lead a recovery from a sink (state-pinning it to vz_world made the
+    // drone drop ~1.3 m under horizontal-acceleration tilt, joint_v2
+    // episode 000000_3d0c3119).
+    double last_vz_command_ = 0.0;
 
     // ZOH mirror of the last 5 Hz label block.
     int last_macro_label_valid_ = 1;

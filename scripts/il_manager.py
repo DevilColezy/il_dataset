@@ -32,10 +32,10 @@ Data-collection sequence (item 五):
     never re-randomises tasks and never generates scenes while flying.
 
 There is exactly ONE HierarchicalExpert instance; it is the sole generator
-of every control command.  3D extension: the expert outputs the full
-body-FLU velocity [vx, vy, vz] + yaw_rate (the vertical channel is
-regulated toward the mission goal z inside the planner).  The legacy
-AltitudeHold class is retained but unused.
+of every control command.  The expert outputs the full 3D BODY/FLU
+velocity [vx, vy, vz] + yaw_rate (the vertical channel is regulated toward
+the mission goal z by the C++ VerticalController / CommandComposer3D).  No
+Python-side altitude merge exists.
 
 The following are NOT part of the production / preflight / blueprint /
 label paths and have been REMOVED entirely (deleted sources and tests):
@@ -83,46 +83,6 @@ except Exception as e:  # pragma: no cover
 
 
 # ============================================================================
-#  Altitude hold (vertical channel only — the 2D expert never sees z)
-# ============================================================================
-
-class AltitudeHold(object):
-    """Simple PD altitude keeper producing vz (FLU +up).
-
-    The 2D expert outputs only horizontal vx/vy and yaw_rate; z control is
-    merged here and the FINAL command (including this vz) is what gets
-    recorded as target_velocity_flu_z and sent to Flightmare.
-    """
-
-    def __init__(self, cfg):
-        ah = (cfg.get("global", {}).get("hierarchical_expert", {}) or {}).get(
-            "altitude_hold", {}) or {}
-        self._kp = float(ah.get("kp", 1.5))
-        self._kd = float(ah.get("kd", 0.6))
-        self._deadband = float(ah.get("deadband_m", 0.02))
-        self._max_speed = float(ah.get("max_speed_mps", 0.6))
-        self._prev_z = None
-        self._prev_t = None
-
-    def reset(self):
-        self._prev_z = None
-        self._prev_t = None
-
-    def compute(self, target_z, z, vz_world, now_s):
-        dz = float(target_z - z)
-        if abs(dz) <= self._deadband:
-            vz = 0.0
-        else:
-            vz = float(self._kp * dz)
-        if self._prev_z is not None and now_s is not None and \
-                self._prev_t is not None and now_s > self._prev_t:
-            vz -= float(self._kd * vz_world)
-        self._prev_z = z
-        self._prev_t = now_s
-        return float(np.clip(vz, -self._max_speed, self._max_speed))
-
-
-# ============================================================================
 #  Episode commit audit (real; geometry in C++ TruthCylinderAudit)
 # ============================================================================
 
@@ -167,6 +127,11 @@ class EpisodeAudit(object):
         self.terminal_state = ""
         self.final_speed_mps = -1.0
         self.final_yaw_rate_rps = -1.0
+        # R26 judge-only quality-watchdog flags (reject pathological
+        # episodes that churn/spin instead of progressing).
+        self.goal_no_progress = False
+        self.near_goal_timeout = False
+        self.excessive_yaw = False
 
     def note_state_segment(self, x0, y0, x1, y1, truth):
         """Continuous swept audit of one EXECUTED dynamics segment."""
@@ -194,6 +159,7 @@ class JointV2Manager(object):
         # to blueprint regeneration, which also clears old manifests).
         self._manifest_file = (
             os.path.expanduser(manifest_file) if manifest_file else None)
+        self._manifest_expert_revision = ""
         self._episode_id_counter = 0
         self._current_episode_id = ""
 
@@ -218,6 +184,10 @@ class JointV2Manager(object):
 
         # The ONE C++ expert instance (owns all expert state).
         self._expert = expert_mod.HierarchicalExpert()
+        rospy.loginfo(
+            "[Manager] expert .so revision = %s",
+            str(getattr(expert_mod, "EXPERT_REVISION",
+                        "<no EXPERT_REVISION — STALE .so>")))
         self._expert.configure(self._params, list(min_b), list(max_b))
 
         # ROS params (launch-provided).
@@ -247,7 +217,6 @@ class JointV2Manager(object):
         self._flight_height = float(
             (self._g.get("task_generation", {}) or {}).get(
                 "flight_height_m", 2.0))
-        self._altitude_hold = AltitudeHold(self._config)
 
         # Sync / commit thresholds (strict frame synchronisation).
         self._sync_cfg = self._g.get("sync", {}) or {}
@@ -270,6 +239,19 @@ class JointV2Manager(object):
             self._commit_cfg.get("max_frame_retries", 5))
         self._wall_timeout_s = float(
             self._g.get("fsm", {}).get("trajectory_wall_timeout_s", 0.0))
+        # R26 judge-only quality watchdogs (reject pathological episodes).
+        self._goal_no_progress_ticks = int(
+            self._commit_cfg.get("goal_no_progress_ticks", 150))
+        self._goal_no_progress_min_m = float(
+            self._commit_cfg.get("goal_no_progress_min_m", 0.15))
+        self._goal_no_progress_floor_m = float(
+            self._commit_cfg.get("goal_no_progress_floor_m", 0.5))
+        self._near_goal_radius_m = float(
+            self._commit_cfg.get("near_goal_radius_m", 1.0))
+        self._near_goal_timeout_ticks = int(
+            self._commit_cfg.get("near_goal_timeout_ticks", 300))
+        self._max_cumulative_yaw_rad = float(
+            self._commit_cfg.get("max_cumulative_yaw_rad", 12.566))
 
         self._bridge = None
         self._dynamics = None
@@ -684,6 +666,8 @@ class JointV2Manager(object):
                     "accepted": bool(t.audit.accepted),
                     "reached_goal": bool(t.audit.reached_goal),
                     "truth_collision": bool(t.audit.truth_collision),
+                    "truth_brake_triggered": bool(
+                        t.audit.truth_brake_triggered),
                     "out_of_bounds": bool(t.audit.out_of_bounds),
                     "macro_label_ok": bool(t.audit.macro_label_ok),
                     "qualification_exceeded":
@@ -703,6 +687,9 @@ class JointV2Manager(object):
 
         payload = {
             "expert_stack_revision": "hierarchical_local_v1",
+            "expert_revision": str(getattr(
+                expert_mod, "EXPERT_REVISION",
+                "<no EXPERT_REVISION in .so — stale build>")),
             "schema_extensions": ["two_level_expert_labels_v1"],
             "generation_ok": bool(result.generation_ok),
             "failure_reason": str(result.failure_reason),
@@ -892,6 +879,23 @@ class JointV2Manager(object):
         with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
 
+        manifest_revision = str(payload.get("expert_revision", ""))
+        runtime_revision = str(getattr(expert_mod, "EXPERT_REVISION", ""))
+        # R26: record the manifest revision so every episode metadata can
+        # distinguish the RUNNING expert from the (possibly older) preflight
+        # expert whose preflight statistics are diagnostic only.
+        self._manifest_expert_revision = manifest_revision
+        self._runtime_expert_revision = runtime_revision
+        if not manifest_revision:
+            rospy.logwarn(
+                "[Manager] loaded manifest has no expert_revision; its "
+                "preflight acceptance may use stale planner behaviour")
+        elif manifest_revision != runtime_revision:
+            rospy.logwarn(
+                "[Manager] manifest expert revision %s != runtime %s; "
+                "regenerate blueprint before production collection",
+                manifest_revision, runtime_revision)
+
         scenes = []
         for sd in payload.get("scenes", []):
             s = SimpleNamespace()
@@ -923,6 +927,8 @@ class JointV2Manager(object):
             ad = td.get("audit", {}) or {}
             t.audit = SimpleNamespace(
                 accepted=bool(ad.get("accepted", True)),
+                truth_brake_triggered=bool(
+                    ad.get("truth_brake_triggered", False)),
                 preflight_ticks=int(ad.get("preflight_ticks", 0)),
                 min_truth_clearance_m=float(
                     ad.get("min_truth_clearance_m", 0.0)),
@@ -1186,7 +1192,6 @@ class JointV2Manager(object):
         # Reset the C++ expert for the new episode (fresh FSM / history).
         self._expert.reset_task(start, goal, initial_yaw, tick_base,
                                 flight_h)
-        self._altitude_hold.reset()
         if self._dynamics is not None:
             self._dynamics.reset(
                 np.asarray(start + [flight_h], dtype=np.float64),
@@ -1202,6 +1207,15 @@ class JointV2Manager(object):
         reason = ""
         control_tick = 0  # data.csv episode_frame_index (committed only)
         dt = 1.0 / self._control_hz
+
+        # ── R26 judge-only quality-watchdog state ──────────────────
+        goal_wd_x, goal_wd_y = float(goal[0]), float(goal[1])
+        wd_last_goal_dist = math.hypot(
+            float(start[0]) - goal_wd_x, float(start[1]) - goal_wd_y)
+        wd_no_progress_ticks = 0
+        wd_near_goal_ticks = 0
+        wd_cum_yaw = 0.0
+        wd_last_yaw = None
 
         try:
             while not rospy.is_shutdown():
@@ -1222,6 +1236,64 @@ class JointV2Manager(object):
                 yaw = self._yaw_from_xyzw(q)
                 yaw_rate = float(state.angular_velocity_body[2])
                 sim_t = float(state.simulation_time_s)
+
+                # ── R26 judge-only quality watchdog (never student
+                #    inputs; rejects pathological spin/stop/replan loops
+                #    such as task 65: 0.48 m for 36 s, 2458° of yaw). ──
+                wd_goal_dist = math.hypot(
+                    float(pos[0]) - goal_wd_x, float(pos[1]) - goal_wd_y)
+                if wd_last_yaw is not None:
+                    wd_dy = yaw - wd_last_yaw
+                    while wd_dy > math.pi:
+                        wd_dy -= 2.0 * math.pi
+                    while wd_dy < -math.pi:
+                        wd_dy += 2.0 * math.pi
+                    wd_cum_yaw += abs(wd_dy)
+                wd_last_yaw = yaw
+                # A moving drone counts as progress even when the straight
+                # goal distance is temporarily stagnant (legitimate lateral
+                # detour around an obstacle).  Only a STATIONARY drone with
+                # no goal progress is a true stall / spin loop.
+                wd_speed = math.hypot(float(vel[0]), float(vel[1]))
+                if wd_goal_dist <= wd_last_goal_dist - \
+                        self._goal_no_progress_min_m:
+                    wd_no_progress_ticks = 0
+                    wd_last_goal_dist = wd_goal_dist
+                elif wd_speed < 0.15:
+                    wd_no_progress_ticks += 1
+                else:
+                    wd_no_progress_ticks = 0
+                if wd_goal_dist <= self._near_goal_radius_m:
+                    wd_near_goal_ticks += 1
+                else:
+                    wd_near_goal_ticks = 0
+                if wd_no_progress_ticks >= self._goal_no_progress_ticks and \
+                        wd_goal_dist > self._goal_no_progress_floor_m:
+                    reason = "goal_no_progress"
+                    audit.goal_no_progress = True
+                    rospy.logwarn(
+                        "[Manager] episode %s: stationary with no goal "
+                        "progress for %d ticks at %.2f m; rejecting",
+                        episode_id, wd_no_progress_ticks, wd_goal_dist)
+                    break
+                if wd_near_goal_ticks >= self._near_goal_timeout_ticks:
+                    reason = "near_goal_timeout"
+                    audit.near_goal_timeout = True
+                    rospy.logwarn(
+                        "[Manager] episode %s: inside %.2f m of the goal "
+                        "for %d ticks; rejecting",
+                        episode_id, self._near_goal_radius_m,
+                        wd_near_goal_ticks)
+                    break
+                if wd_cum_yaw > self._max_cumulative_yaw_rad and \
+                        control_tick > 30:
+                    reason = "excessive_yaw"
+                    audit.excessive_yaw = True
+                    rospy.logwarn(
+                        "[Manager] episode %s: cumulative yaw %.1f deg "
+                        "exceeds cap; rejecting",
+                        episode_id, math.degrees(wd_cum_yaw))
+                    break
 
                 # 2. Strict render-attempt loop on the SAME saved state:
                 #    send a NEW render frame_id until an exact-match valid
@@ -1316,12 +1388,12 @@ class JointV2Manager(object):
                         % (episode_id, control_tick))
                     break
 
-                # 5. The 3D expert now commands the vertical channel itself
-                #    (altitude regulation toward the mission goal z inside
-                #    the planner).  The FINAL command is the full 3D body
-                #    FLU velocity + yaw rate — no Python-side altitude
-                #    merge.  (AltitudeHold is retained but unused.)  The
-                #    backend still clamps to its own physical limits.
+                # 5. The 3D expert commands the vertical channel itself
+                #    (C++ VerticalController / CommandComposer3D regulate
+                #    the altitude toward the mission goal z).  The FINAL
+                #    command is the full 3D BODY/FLU velocity + yaw rate —
+                #    no Python-side altitude merge.  The backend still
+                #    clamps to its own physical limits.
                 final_vel = np.array([float(out.target_velocity_flu_x),
                                       float(out.target_velocity_flu_y),
                                       float(out.target_velocity_flu_z)],
@@ -1395,10 +1467,17 @@ class JointV2Manager(object):
                 control_tick += 1
                 if out.terminal:
                     audit.terminal_state = str(out.fsm_state)
+                    # R26: measure the terminal speed at the DECISION state
+                    # (state read at this tick's step 1 — the same state the
+                    # FSM's goalReached() gated on), NOT after executing the
+                    # terminal command.  The post-command state can sit a few
+                    # mm/s ABOVE the goal-stop threshold (measured 0.203-0.208
+                    # vs 0.20) while the FSM legitimately declared
+                    # GOAL_REACHED, causing 3 false terminal_speed rejects.
                     audit.final_speed_mps = float(
-                        np.linalg.norm(state_after.velocity_world))
+                        np.linalg.norm(state.velocity_world))
                     audit.final_yaw_rate_rps = float(
-                        state_after.angular_velocity_body[2])
+                        state.angular_velocity_body[2])
                     if out.fsm_state == "GOAL_REACHED":
                         audit.reached_goal = True
                         committed = True
@@ -1467,10 +1546,6 @@ class JointV2Manager(object):
         terminal checks are expressed against the committed control ticks
         (data.csv cadence).  Every condition must pass (item 七).
         """
-        if not audit.reached_goal:
-            return (False, "goal_not_reached",
-                    "episode did not reach the original goal %s "
-                    "(terminal=%s)" % (list(goal), audit.terminal_state))
         if audit.unity_collision:
             return False, "unity_collision", \
                 "Unity reported a vehicle collision"
@@ -1498,6 +1573,18 @@ class JointV2Manager(object):
         if audit.catastrophic_latency:
             return False, "catastrophic_latency", \
                 "a frame exceeded the catastrophic latency"
+        # ── R26 judge-only quality watchdogs (pathological behaviour is
+        #    rejected even when the episode would eventually reach the
+        #    goal — spin / stop / replan loops are not expert data). ──
+        if audit.goal_no_progress:
+            return False, "goal_no_progress", \
+                "no original-goal progress for the configured window"
+        if audit.near_goal_timeout:
+            return False, "near_goal_timeout", \
+                "inside the near-goal radius for longer than the window"
+        if audit.excessive_yaw:
+            return False, "excessive_yaw", \
+                "cumulative yaw exceeded the cap"
         total = max(1, audit.render_attempts)
         if 100.0 * audit.unmatched / total > self._max_unmatched_pct:
             return False, "unmatched_render_rate", \
@@ -1515,6 +1602,18 @@ class JointV2Manager(object):
                 "latency violations %.1f%% > %.1f%%" % (
                     100.0 * audit.latency_violations / ctrl_total,
                     self._max_latency_violation_pct)
+        # Keep the commit reason diagnostic.  A collision or an externally
+        # interrupted run must not be flattened into goal_not_reached.
+        if audit.terminal_state == "COLLISION":
+            return False, "collision", \
+                "expert terminated in COLLISION state"
+        if not audit.reached_goal:
+            if not audit.terminal_state:
+                return False, "episode_interrupted", \
+                    "episode ended before an expert terminal state"
+            return (False, "goal_not_reached",
+                    "episode did not reach the original goal %s "
+                    "(terminal=%s)" % (list(goal), audit.terminal_state))
         # Final-state terminal conditions (only meaningful when the episode
         # actually reached a terminal state).
         if audit.final_speed_mps >= 0.0 and \
@@ -1918,6 +2017,14 @@ class JointV2Manager(object):
             macro_update_hz=self._macro_update_hz)
         writer.add_metadata({
             "expert_stack_revision": "hierarchical_local_v1",
+            "expert_revision": str(getattr(
+                expert_mod, "EXPERT_REVISION",
+                "<no EXPERT_REVISION in .so — stale build>")),
+            # R26: the revision of the blueprint manifest whose preflight
+            # statistics are diagnostic only (may differ from the runtime
+            # expert revision during behaviour-debug collection).
+            "manifest_expert_revision": str(
+                getattr(self, "_manifest_expert_revision", "") or ""),
             "schema_extensions": ["two_level_expert_labels_v1"],
             "blueprint_seed": int(task.seed),
             "blueprint_behavior_class": str(task.behavior_class),
@@ -1927,6 +2034,8 @@ class JointV2Manager(object):
             "blueprint_side_class": str(task.side_class),
             "blueprint_preflight_audit": {
                 "accepted": bool(task.audit.accepted),
+                "truth_brake_triggered": bool(getattr(
+                    task.audit, "truth_brake_triggered", False)),
                 "preflight_ticks": int(task.audit.preflight_ticks),
                 "min_truth_clearance_m":
                     float(task.audit.min_truth_clearance_m)
@@ -2049,6 +2158,23 @@ class JointV2Manager(object):
         g_world = np.array([0.0, 0.0, -1.0], dtype=np.float64)
         return r.T.dot(g_world)
 
+    @staticmethod
+    def _encode_plan_points(px, py):
+        """Encode a planned trajectory (world XY) as 'x1,y1;x2,y2;...'.
+
+        The points are already in the Flightmare world frame (the expert
+        frame is position-identical, yaw-offset only), so the stepped
+        viewer can draw them directly.  Empty/None -> ''.
+        """
+        try:
+            xs = list(px or [])
+            ys = list(py or [])
+        except TypeError:
+            return ""
+        if not xs or not ys or len(xs) != len(ys):
+            return ""
+        return ";".join("%.3f,%.3f" % (xs[i], ys[i]) for i in range(len(xs)))
+
     def _build_row(self, writer, tick, frame_index, out, state, yaw,
                    yaw_rate, depth_m, raw_ratio, final_vel, final_yaw_rate,
                    pos, q, scene_id, task_id, goal, flight_h, frame_id,
@@ -2060,10 +2186,16 @@ class JointV2Manager(object):
 
         # ── Truth audit values for THIS frame (judge-only) ─────────
         speed = float(np.linalg.norm(state.velocity_world[0:2]))
+        # The EFFECTIVE acceleration (lp_eff_accel_mps2, 2.0 with the
+        # command-ramp feedforward) — the brake-risk audit must use the
+        # physically achieved stopping ability, not a nominal overestimate.
+        eff_accel = float(getattr(
+            self._params, "lp_eff_accel_mps2",
+            float(self._params.lp_max_accel)))
         truth_risk, truth_would = self._truth.brake_risk(
             float(pos[0]), float(pos[1]),
             float(state.velocity_world[0]), float(state.velocity_world[1]),
-            float(self._params.lp_max_accel),
+            eff_accel,
             float(self._params.lp_brake_stop_margin_m))
         if truth_would:
             audit.truth_brake_triggered = True
@@ -2071,9 +2203,17 @@ class JointV2Manager(object):
         obs_min_clr = float(out.min_observed_clearance_m)
         obs_risk = 0.0
         if math.isfinite(obs_min_clr) and obs_min_clr >= 0.0:
-            stop_dist = speed * speed / (
-                2.0 * max(1e-6, float(self._params.lp_max_accel)))
-            env = stop_dist + float(self._params.lp_brake_stop_margin_m)
+            stop_dist = speed * speed / (2.0 * max(1e-6, eff_accel))
+            static_handoff = (
+                float(self._params.lp_min_clearance) +
+                max(0.0, float(
+                    self._params.lp_clearance_discretization_margin_m)))
+            reaction_dist = speed * max(
+                0.0, float(self._params.lp_obstacle_reaction_time_s))
+            # Same centre-to-occupied-cell envelope used by all local path
+            # validators; this diagnostic must not compare against the
+            # unrelated truth surface-edge margin.
+            env = static_handoff + reaction_dist + stop_dist
             if obs_min_clr < env:
                 obs_risk = min(1.0, max(0.0, (env - obs_min_clr) / env))
         audit.max_observed_brake_risk = max(audit.max_observed_brake_risk,
@@ -2137,6 +2277,7 @@ class JointV2Manager(object):
             "fsm_state": str(out.fsm_state),
             "effective_target_source": str(out.effective_target_source),
             "target_correction_active": int(out.target_correction_active),
+            "directive_terminal_stop": int(out.directive_terminal_stop),
             "effective_direction_token": int(out.effective_direction_token),
             "directive_update_event": int(out.directive_update_event),
             "mission_revision": int(out.mission_revision),
@@ -2149,12 +2290,29 @@ class JointV2Manager(object):
             "obstacle_risk_cost": float(out.obstacle_risk_cost),
             "avoidance_active": int(out.avoidance_active),
             "local_corridor_blocked": int(out.local_corridor_blocked),
+            "risk_corridor_near_obstacle":
+                int(out.risk_corridor_near_obstacle),
+            # R25 structured corridor diagnostics (privileged).
+            "corridor_block_reason": str(out.corridor_block_reason),
+            "corridor_block_source": str(out.corridor_block_source),
+            "first_blocking_distance_m":
+                float(out.first_blocking_distance_m),
+            "first_block_x": float(out.first_block_x),
+            "first_block_y": float(out.first_block_y),
+            "first_block_age_ticks": int(out.first_block_age_ticks),
             "emergency_brake": int(out.emergency_brake),
             "immediate_avoidance": int(out.immediate_avoidance),
             "local_limit_cycle_detected": int(out.local_limit_cycle_detected),
             "target_bearing_error_deg": float(out.target_bearing_error_deg),
             "consecutive_failures_30hz": int(out.consecutive_failures_30hz),
             "unknown_recovery_ticks": int(out.unknown_recovery_ticks),
+            # ── planned trajectory (world XY, diagnostic for the viewer) ─
+            "plan_valid": int(out.plan_valid),
+            "plan_terminal": int(out.plan_terminal),
+            "plan_end_speed_mps": float(out.plan_end_speed_mps),
+            "plan_executed_speed_mps": float(out.plan_executed_speed_mps),
+            "plan_points_xy": self._encode_plan_points(
+                out.plan_points_x, out.plan_points_y),
             # ── world-frame diagnostics (privileged) ────────────────
             "navigation_goal_world_x": float(goal[0]),
             "navigation_goal_world_y": float(goal[1]),

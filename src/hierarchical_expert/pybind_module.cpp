@@ -402,6 +402,195 @@ void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
 PYBIND11_MODULE(_il_hierarchical_expert, m) {
     m.doc() = "Hierarchical local expert (5 Hz corrector + 30 Hz planner)";
 
+    // Build-identity marker.  Bump this string whenever the C++ expert
+    // behaviour changes so a stale .so is instantly detectable: read it at
+    // runtime (il_manager logs it and writes it into metadata.json).
+    // Current source state:
+    //   R2 signed per-side blocker clearance (Fix A)
+    //   R3 30 Hz planner spin guard (70-tick release + cooldown)
+    //   R4 spin-settle gate + TURN_STEP_PENDING exit_ang hold
+    //   R5 minimal-turn best_clear (min |body bearing| among clearing)
+    //   R6 CameraRig2D::rayWorldDirXY left-right MIRROR FIX
+    //      (positive bearing now = LEFT; +sin -> -sin).  The mirror made
+    //      every right-side obstacle appear on the LEFT, so the corrector
+    //      always turned left into the mirrored image (the +28 deg target /
+    //      in-place spin in joint_v2 episodes).  Verified offline: with the
+    //      fix the corrector picks a ~straight target until the real
+    //      blocker enters range, then a small ~10 deg left nudge.
+    //   R7 selectSide MINIMAL-TURN tie-break: when free-range evidence is
+    //      ambiguous, pick the side whose blocker-clearing bypass needs the
+    //      smaller turn (LEFT ~0.5 deg vs RIGHT ~24.5 deg in task369).
+    //      Previously the ambiguous case defaulted RIGHT -> big right
+    //      detour -> stall + spin (episode 97845b3f).
+    //   R8 obs_body_ignore_radius_m: mask the drone's OWN body out of the
+    //      depth (the render shows body/rotors up to ~1.5 m from the vehicle
+    //      centre at the FOV edges).  Without this the own body became a
+    //      false OCCUPIED blob at spawn, the corrector entered on it
+    //      (corridor blocked) and issued TURN_LEFT forever (stuck in place,
+    //      cvx=0; episode d3e14461).  REMOVED in R18: with the camera
+    //      mounted 0.3 m FORWARD of the centre the 0.3 m centre-radius mask
+    //      is geometrically dead (every valid depth pixel sits >= 0.31 m
+    //      from the centre) and the body never renders in practice.
+    //   R10 r20260819_cmd_ramp_feedforward: reachableCommand switched from
+    //      state-pinning to COMMAND-RAMP (clamp relative to the previous
+    //      command), so the backend VelocityYawRateController feedforward
+    //      delivers the lp_max_accel=2 m/s^2 ramp and the closed loop
+    //      reaches ~2 m/s^2 (P error ~0.3 m/s -> P = 2.4 < 4, tilt ~11.5 deg
+    //      < 35 deg).  The historical ±15 deg limit cycle (af4159ce) was
+    //      with kp=36 (P saturated on any error > 0.11 m/s); kp=8/kd=1.2
+    //      keeps 5x the headroom.  lp_eff_accel_mps2 restored to 2.0 to
+    //      match.
+    //   R11 r20260819_nodding_fix: real episodes under R10 showed a ~3 Hz
+    //      tilt limit cycle ("nodding", roll swings to 16-19 deg, a_cmd
+    //      clipping at max_accel on ~10% of ticks).  Root causes (from CSV
+    //      analysis): (1) the Python feedforward divided d(cmd) by the
+    //      1/50 control dt while the command updates at 30 Hz -> a 1.67x
+    //      FF over-pulse that, with the P term, clipped at max_accel;
+    //      fixed in il_dynamics.py by computing the FF once per 30 Hz
+    //      command interval (d(cmd)/duration) and holding it; (2) at a 5 Hz
+    //      correction exit the effective target jumps (~4.8 m), triggering a
+    //      planner memory reset that state-pinned the command down from its
+    //      leading value -> P-error spike; fixed by seeding last_command_
+    //      at the current state velocity on reset.
+    //   R12 r20260819_vz_cmd_ramp: episodes under R11 showed large altitude
+    //      fluctuation (z range ~1.4 m, min 0.59 below the 0.8 floor) during
+    //      horizontal acceleration.  Root cause: VerticalController::
+    //      executableVz state-pinned the vertical command to vz_world ±
+    //      lp_max_v_accel*dt, so when tilt made the drone sink (~0.8 m/s) the
+    //      command was forced to stay negative and could not command a climb
+    //      until the disturbance ended.  Fixed like the horizontal channel:
+    //      the executable vz now command-ramps relative to the PREVIOUS vz
+    //      command (last_vz_command_, reset per task), so it leads the
+    //      recovery; divergence > 2*lp_max_vz falls back to vz_world.
+    //   R13 r20260819_roll_coord_turn: episodes under R12 succeeded but still
+    //      showed a ~2.5 Hz roll oscillation (roll swings to ~19-20 deg)
+    //      during yaw-while-moving.  Root cause: UNCOORDINATED turns — the
+    //      planner commands yaw_rate + forward velocity but vy_cmd = 0, so
+    //      the velocity vector does not rotate with the body; the body-frame
+    //      side-slip vy grows at rate -w*v and the lateral velocity loop
+    //      over-banks to fight it.  Fixed in il_dynamics.py by adding a
+    //      coordinated-turn centripetal feedforward to the lateral accel:
+    //      accel_y += v_fwd * yaw_rate (Python controller update(), using
+    //      the measured body yaw rate).  Cancels the side-slip rate; loop
+    //      only trims the residual.
+    //   R14 r20260819_avoidance_labels_macro_v9: user reported local
+    //      planning "does not avoid" and macro waypoints "stiff/fixed".
+    //      A side-by-side diff vs il_2d_multiscale_debug showed: (1) the
+    //      local planner's avoidance_active barely fired (only in the
+    //      planned-trajectory branch on a >3° bearing deviation; false
+    //      during turns/escapes/brakes and when the B-spline weaved with
+    //      chosen_b==b_t) — now set in ALL live avoidance branches (turn,
+    //      planned detour incl. plan cross-track > 0.35 m, escape rotation,
+    //      blocked brake) plus an obstacle-proximity signal (observed
+    //      OCCUPIED within 2 m); (2) the macro corrector had 5 deliberate
+    //      anti-spin modifications that made it stiffer than v9 — removed
+    //      to restore il_2d v9 behavior: selectSide minimal-turn tie-break,
+    //      makeCorrectionDirective best_clear nose-nudge (back to max
+    //      along-progress), spin-settle HOLD_SPINNING gate, TURN re-step at
+    //      exit_ang 8° (back to fov_half 45°), NORMAL_CORRECTION
+    //      world-latch + stall-refresh.
+    //   R15 r20260819_align_while_planning: user architecture spec — local
+    //      planner keeps ONE target (original or macro sub-target, world-
+    //      latched and converted to body at 30 Hz); macro takeover has 4
+    //      behaviours (TURN_LEFT / TURN_RIGHT / NORMAL_CORRECTION sub-
+    //      target / PASS_THROUGH keep-original).  Gap fixed: when the
+    //      target is inside the ±35° usable band but planning fails, the
+    //      planner now KEEPS turning the nose toward the target and
+    //      re-plans every 30 Hz tick; only once aligned (|b_t| <=
+    //      lp_turn_exit_deg = 8°) and still unplannable does it hand over
+    //      to the macro takeover (escape rotation / brake).  Removes the
+    //      30-35° "dead zone" brake.
+    //   R16 r20260819_yaw_cmd_ramp: user reported a "clumsy nose" — the
+    //      drone braked to a stop, sat still ~1 s, then took ~1.5 s to
+    //      build yaw rate (CSV: command -0.12 -> -0.93 rad/s over 1.5 s
+    //      while turnYawRate wanted -1.5 immediately, target 65° off-nose,
+    //      episode 000000_b99de7ca).  Root cause: reachableCommand state-
+    //      pinned the yaw-rate COMMAND to the actual yaw rate ± dyr, so it
+    //      tracked the slowly-building measured rate.  Fixed: the yaw rate
+    //      now command-ramps relative to the PREVIOUS yaw-rate command at
+    //      lp_max_yaw_accel = 4 rad/s^2 (~0.4 s to full rate), with a
+    //      divergence guard (> 2*lp_max_yaw_rate falls back to the state
+    //      yaw rate).
+    //   R17 r20260819_brake_and_rotate (R16 REVERTED + turnYawRate scaling):
+    //      the user clarified the real complaint was NOT yaw build speed —
+    //      it was the nose FROZEN IN PLACE during macro -> PASS_THROUGH and
+    //      planning transitions.  turnYawRate had a hard gate
+    //      (speed > kTurnMaxSpeedMps=0.2 -> yaw_rate 0) that froze the nose
+    //      for the full ~1 s brake while the target sat 55-65° off-nose
+    //      (yaw_rate_command=0.000, yaw constant, speed braking 1.83->0.77,
+    //      joint_v2 ep 000000_99ca0c06 t=4.43-4.97).  Now turnYawRate
+    //      scales the yaw rate by 1/(1+3*spd): gentle rotation while
+    //      braking (large radius, small sweep, drone decelerating at
+    //      lp_max_accel), full rate near standstill.  R16 itself is
+    //      REVERTED (reachableCommand yaw back to state-pinning): the
+    //      command-ramp executed the fast-flipping goal bearing at the
+    //      terminal approach and produced a sustained yaw oscillation
+    //      (final yaw rate never < lp_turn_exit_max_yaw_rate ->
+    //      terminal_yaw_rate episode failures, ep 000000_99ca0c06).
+    //      Also added goal-proximity guards so the terminal phase SETTLES:
+    //      the yaw-first gate, the align-while-planning turn, and the
+    //      planned-terminal yaw intent all command 0 yaw once
+    //      dist <= task_goal_tolerance (the bearing flips with sub-
+    //      tolerance jitter; chasing it blocks goalReached()).
+    //   R18: removed the geometrically-dead drone-body mask
+    //      (obs_body_ignore_radius_m): with the camera mounted 0.3 m FORWARD
+    //      of the vehicle centre every valid depth pixel sits >= 0.31 m from
+    //      the centre, so the 0.3 m centre-radius mask could never fire, and
+    //      the body never renders (zero masked pixels over full episodes).
+    //   R19 r20260819_ego_bspline: EGO-style optimisation-based B-spline
+    //      local path (structure copied from the open-source ZJU-FAST-Lab/
+    //      ego-planner BsplineOptimizer + the okazaki L-BFGS solver — see
+    //      ego_bspline.hpp/.cpp and lbfgs.hpp).  The cubic B-spline is BENT
+    //      around observed obstacles (sample-based collision + a lateral
+    //      detour guide, our substitute for EGO's A* guide path) instead of
+    //      the old straight-ray core (collinear control points = zero
+    //      curvature = boxed-in deadlocks).  The optimised path is still
+    //      validated with the hard clearance + dynamic envelope and falls
+    //      back to the straight-line planner / escape-rotate / brake
+    //      (planEgoOrStraight in local_planner_30hz), so existing success
+    //      cases never regress.  Tuned via Params2D.ego_*.
+    //   R20 r20260820_smooth_turn_brake: vector-magnitude XY slew limiting,
+    //      previous-command yaw slew limiting, brake-before-rotate staging,
+    //      strict zero-translation TURN execution, terminal speed/yaw caps,
+    //      and canonical zero-distance GOAL_REACHED labels.
+    //   R21 r20260822_persistent_recovery: separate rotation availability
+    //      from translational feasibility, keep macro recovery persistent
+    //      until translation re-entry is confirmed, and preview-certify
+    //      every buffered fly-through correction with the 30 Hz local planner
+    //      while its student distance label remains clipped to 4.5/5.
+    //   R22 r20260822_receding_safe_recovery: keep temporary guides as
+    //      receding non-terminal fly-through targets, preserve search yaw
+    //      across brake staging, restore a physical stopping envelope, and
+    //      make blueprint truth-brake acceptance match runtime collection.
+    //   R23 r20260822_fixed_waypoint_handoff: gate macro takeover on actual
+    //      persistent 30 Hz failure plus topology evidence, hold finite
+    //      world-frame waypoints instead of extending a receding ray, keep
+    //      live feasible execution across cold previews, and lock the near
+    //      visible original goal for terminal capture.
+    //   R24 r20260822_brake_latch_terminal_stop: persistent terminal_stop
+    //      brake semantics (never re-derived from live distance), latched
+    //      brake-before-search point, exit correction when the goal is
+    //      outside the FOV with a clear corridor, goal-directed search
+    //      rotation, and local-planner corridor evidence for takeover.
+    //   R25 r20260822_goal_capture_recovery: goal_capture_lock can no
+    //      longer revoke an ACTIVE correction (measured 50 s deadlock in
+    //      joint_v2_000004_4ab1e354), stale-history FREE clearing with
+    //      confirmation, decayed failure counting (no single-frame
+    //      TERMINAL_SETTLING reset), real local_limit_cycle_detected,
+    //      separate waypoint-reached tolerance, held-waypoint persistent
+    //      failure gate, and structured corridor-block diagnostics.
+    //   R26 r20260822_terminal_capture_microapproach: fix the 0.4-0.8 m
+    //      terminal dead zone (task 65: 0.48 m for 36 s, 2458° of yaw) via
+    //      a hard-clear terminal micro-approach; split the 1 m RISK
+    //      corridor from the HARD (handoffClearance) corridor so a cell
+    //      ~0.9 m beyond the goal can no longer trigger macro takeover;
+    //      terminal-capture lock (<=1 m: no locked-side search TURN, only
+    //      a real hard block releases it); macro-level limit-cycle
+    //      watchdog on the ORIGINAL goal; Python judge-only quality
+    //      watchdogs (no-progress / near-goal timeout / cumulative yaw).
+    m.attr("EXPERT_REVISION") =
+        std::string("r20260822_terminal_capture_microapproach_r26");
+
     // ── Params2D: the single authoritative parameter source ─────────
     py::class_<Params2D>(m, "Params2D")
         .def(py::init<>())
@@ -426,17 +615,30 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                        &Params2D::obs_ray_angular_res_deg)
         .def_readwrite("obs_history_max_age_ticks",
                        &Params2D::obs_history_max_age_ticks)
+        .def_readwrite("obs_free_clear_confirmations",
+                       &Params2D::obs_free_clear_confirmations)
         .def_readwrite("obs_ground_clearance_m",
                        &Params2D::obs_ground_clearance_m)
         // local planner
         .def_readwrite("lp_horizon_s", &Params2D::lp_horizon_s)
         .def_readwrite("lp_dt", &Params2D::lp_dt)
-        .def_readwrite("lp_speed_samples", &Params2D::lp_speed_samples)
-        .def_readwrite("lp_lateral_ratio_samples",
-                       &Params2D::lp_lateral_ratio_samples)
-        .def_readwrite("lp_yaw_rate_samples", &Params2D::lp_yaw_rate_samples)
+        .def_readwrite("ego_enabled", &Params2D::ego_enabled)
+        .def_readwrite("ego_lambda_smooth", &Params2D::ego_lambda_smooth)
+        .def_readwrite("ego_lambda_collision", &Params2D::ego_lambda_collision)
+        .def_readwrite("ego_lambda_feasibility",
+                       &Params2D::ego_lambda_feasibility)
+        .def_readwrite("ego_lambda_fitness", &Params2D::ego_lambda_fitness)
+        .def_readwrite("ego_lambda_fov", &Params2D::ego_lambda_fov)
+        .def_readwrite("ego_clearance_m", &Params2D::ego_clearance_m)
+        .def_readwrite("ego_ts", &Params2D::ego_ts)
+        .def_readwrite("ego_n_segments", &Params2D::ego_n_segments)
+        .def_readwrite("ego_max_iter", &Params2D::ego_max_iter)
         .def_readwrite("lp_max_speed", &Params2D::lp_max_speed)
+        .def_readwrite("lp_cruise_speed_mps", &Params2D::lp_cruise_speed_mps)
+        .def_readwrite("lp_terminal_micro_approach_m",
+                       &Params2D::lp_terminal_micro_approach_m)
         .def_readwrite("lp_max_accel", &Params2D::lp_max_accel)
+        .def_readwrite("lp_eff_accel_mps2", &Params2D::lp_eff_accel_mps2)
         .def_readwrite("lp_max_yaw_rate", &Params2D::lp_max_yaw_rate)
         .def_readwrite("lp_max_yaw_accel", &Params2D::lp_max_yaw_accel)
         .def_readwrite("lp_max_vz", &Params2D::lp_max_vz)
@@ -454,16 +656,6 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("lp_obstacle_reaction_time_s",
                        &Params2D::lp_obstacle_reaction_time_s)
         .def_readwrite("lp_control_period_s", &Params2D::lp_control_period_s)
-        .def_readwrite("lp_max_allowed_regress_m",
-                       &Params2D::lp_max_allowed_regress_m)
-        .def_readwrite("lp_limit_cycle_window_ticks",
-                       &Params2D::lp_limit_cycle_window_ticks)
-        .def_readwrite("lp_limit_cycle_net_progress_m",
-                       &Params2D::lp_limit_cycle_net_progress_m)
-        .def_readwrite("lp_limit_cycle_min_blocked_ticks",
-                       &Params2D::lp_limit_cycle_min_blocked_ticks)
-        .def_readwrite("lp_limit_cycle_lateral_flip_count",
-                       &Params2D::lp_limit_cycle_lateral_flip_count)
         .def_readwrite("lp_turn_enter_deg", &Params2D::lp_turn_enter_deg)
         .def_readwrite("lp_turn_exit_deg", &Params2D::lp_turn_exit_deg)
         .def_readwrite("lp_turn_exit_max_yaw_rate",
@@ -473,60 +665,22 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                        &Params2D::lp_near_goal_heading_relax_distance)
         .def_readwrite("lp_near_goal_turn_enter_deg",
                        &Params2D::lp_near_goal_turn_enter_deg)
-        .def_readwrite("lp_terminal_control_distance",
-                       &Params2D::lp_terminal_control_distance)
         .def_readwrite("lp_terminal_speed_gain",
                        &Params2D::lp_terminal_speed_gain)
         .def_readwrite("lp_terminal_max_speed", &Params2D::lp_terminal_max_speed)
         .def_readwrite("lp_terminal_max_yaw_rate",
                        &Params2D::lp_terminal_max_yaw_rate)
-        .def_readwrite("lp_min_progress_m", &Params2D::lp_min_progress_m)
         .def_readwrite("lp_min_progress_speed_mps",
                        &Params2D::lp_min_progress_speed_mps)
-        .def_readwrite("lp_min_progress_epsilon_m",
-                       &Params2D::lp_min_progress_epsilon_m)
         .def_readwrite("lp_target_discontinuity_reset_m",
                        &Params2D::lp_target_discontinuity_reset_m)
         .def_readwrite("lp_nominal_clearance_m",
                        &Params2D::lp_nominal_clearance_m)
         .def_readwrite("lp_risk_corridor_half_width",
                        &Params2D::lp_risk_corridor_half_width)
-        .def_readwrite("lp_risk_distance_horizon_m",
-                       &Params2D::lp_risk_distance_horizon_m)
-        .def_readwrite("lp_risk_ttc_horizon_s", &Params2D::lp_risk_ttc_horizon_s)
-        .def_readwrite("lp_risk_trajectory_radius_m",
-                       &Params2D::lp_risk_trajectory_radius_m)
-        .def_readwrite("lp_avoidance_active_threshold",
-                       &Params2D::lp_avoidance_active_threshold)
         .def_readwrite("lp_brake_stop_margin_m",
                        &Params2D::lp_brake_stop_margin_m)
-        .def_readwrite("lp_min_executable_prefix_s",
-                       &Params2D::lp_min_executable_prefix_s)
-        .def_readwrite("lp_scoring_horizon_s", &Params2D::lp_scoring_horizon_s)
-        .def_readwrite("lp_cost_tie_tolerance",
-                       &Params2D::lp_cost_tie_tolerance)
-        .def_readwrite("lp_cross_track_normalize_m",
-                       &Params2D::lp_cross_track_normalize_m)
-        .def_readwrite("cost_w_progress", &Params2D::cost_w_progress)
-        .def_readwrite("cost_w_clearance", &Params2D::cost_w_clearance)
-        .def_readwrite("cost_w_smoothness", &Params2D::cost_w_smoothness)
-        .def_readwrite("cost_w_speed_change", &Params2D::cost_w_speed_change)
-        .def_readwrite("cost_w_yaw_rate_change",
-                       &Params2D::cost_w_yaw_rate_change)
-        .def_readwrite("cost_w_terminal_heading",
-                       &Params2D::cost_w_terminal_heading)
-        .def_readwrite("cost_w_velocity_alignment",
-                       &Params2D::cost_w_velocity_alignment)
-        .def_readwrite("cost_w_cross_track", &Params2D::cost_w_cross_track)
-        .def_readwrite("cost_w_obstacle_risk",
-                       &Params2D::cost_w_obstacle_risk)
         // macro / corrector
-        .def_readwrite("macro_local_failure_duration_s",
-                       &Params2D::macro_local_failure_duration_s)
-        .def_readwrite("macro_reentry_guard_ticks",
-                       &Params2D::macro_reentry_guard_ticks)
-        .def_readwrite("macro_correction_enter_stable_ticks",
-                       &Params2D::macro_correction_enter_stable_ticks)
         .def_readwrite("macro_observable_frontier_min_distance_m",
                        &Params2D::macro_observable_frontier_min_distance_m)
         .def_readwrite("macro_observable_frontier_min_progress_m",
@@ -541,6 +695,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                        &Params2D::macro_min_evidence_ray_pairs)
         .def_readwrite("macro_corridor_half_width",
                        &Params2D::macro_corridor_half_width)
+        .def_readwrite("macro_blocking_lateral_span_ratio",
+                       &Params2D::macro_blocking_lateral_span_ratio)
         .def_readwrite("macro_corridor_rear_tolerance_m",
                        &Params2D::macro_corridor_rear_tolerance_m)
         .def_readwrite("macro_local_recovery_prefix_m",
@@ -549,10 +705,24 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                        &Params2D::macro_local_candidate_bearing_step_deg)
         .def_readwrite("macro_local_candidate_distance_step_m",
                        &Params2D::macro_local_candidate_distance_step_m)
+        .def_readwrite("macro_guide_horizon_m",
+                       &Params2D::macro_guide_horizon_m)
         .def_readwrite("macro_local_target_event_tolerance_m",
                        &Params2D::macro_local_target_event_tolerance_m)
+        .def_readwrite("macro_takeover_confirm_ticks_30hz",
+                       &Params2D::macro_takeover_confirm_ticks_30hz)
         .def_readwrite("macro_unknown_recovery_threshold_ticks",
                        &Params2D::macro_unknown_recovery_threshold_ticks)
+        .def_readwrite("macro_brake_confirm_ticks_5hz",
+                       &Params2D::macro_brake_confirm_ticks_5hz)
+        .def_readwrite("macro_waypoint_reached_tolerance_m",
+                       &Params2D::macro_waypoint_reached_tolerance_m)
+        .def_readwrite("macro_terminal_capture_radius_m",
+                       &Params2D::macro_terminal_capture_radius_m)
+        .def_readwrite("macro_limit_cycle_goal_progress_m",
+                       &Params2D::macro_limit_cycle_goal_progress_m)
+        .def_readwrite("macro_limit_cycle_window_5hz",
+                       &Params2D::macro_limit_cycle_window_5hz)
         // target encoding
         .def_readwrite("te_direction_bin_count",
                        &Params2D::te_direction_bin_count)
@@ -611,6 +781,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                       &ExpertStepOutput::effective_target_source)
         .def_readonly("target_correction_active",
                       &ExpertStepOutput::target_correction_active)
+        .def_readonly("directive_terminal_stop",
+                      &ExpertStepOutput::directive_terminal_stop)
         .def_readonly("effective_direction_token",
                       &ExpertStepOutput::effective_direction_token)
         .def_readonly("effective_target_world_x",
@@ -645,6 +817,18 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readonly("avoidance_active", &ExpertStepOutput::avoidance_active)
         .def_readonly("local_corridor_blocked",
                       &ExpertStepOutput::local_corridor_blocked)
+        .def_readonly("risk_corridor_near_obstacle",
+                      &ExpertStepOutput::risk_corridor_near_obstacle)
+        .def_readonly("corridor_block_reason",
+                      &ExpertStepOutput::corridor_block_reason)
+        .def_readonly("corridor_block_source",
+                      &ExpertStepOutput::corridor_block_source)
+        .def_readonly("first_blocking_distance_m",
+                      &ExpertStepOutput::first_blocking_distance_m)
+        .def_readonly("first_block_x", &ExpertStepOutput::first_block_x)
+        .def_readonly("first_block_y", &ExpertStepOutput::first_block_y)
+        .def_readonly("first_block_age_ticks",
+                      &ExpertStepOutput::first_block_age_ticks)
         .def_readonly("emergency_brake", &ExpertStepOutput::emergency_brake)
         .def_readonly("immediate_avoidance",
                       &ExpertStepOutput::immediate_avoidance)
@@ -656,6 +840,14 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                       &ExpertStepOutput::consecutive_failures_30hz)
         .def_readonly("unknown_recovery_ticks",
                       &ExpertStepOutput::unknown_recovery_ticks)
+        .def_readonly("plan_valid", &ExpertStepOutput::plan_valid)
+        .def_readonly("plan_terminal", &ExpertStepOutput::plan_terminal)
+        .def_readonly("plan_end_speed_mps",
+                      &ExpertStepOutput::plan_end_speed_mps)
+        .def_readonly("plan_executed_speed_mps",
+                      &ExpertStepOutput::plan_executed_speed_mps)
+        .def_readonly("plan_points_x", &ExpertStepOutput::plan_points_x)
+        .def_readonly("plan_points_y", &ExpertStepOutput::plan_points_y)
         .def_readonly("macro_label_valid", &ExpertStepOutput::macro_label_valid)
         .def_readonly("macro_correction_type",
                       &ExpertStepOutput::macro_correction_type)
@@ -891,6 +1083,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("accepted", &BlueprintTaskAudit::accepted)
         .def_readwrite("reached_goal", &BlueprintTaskAudit::reached_goal)
         .def_readwrite("truth_collision", &BlueprintTaskAudit::truth_collision)
+        .def_readwrite("truth_brake_triggered",
+                       &BlueprintTaskAudit::truth_brake_triggered)
         .def_readwrite("out_of_bounds", &BlueprintTaskAudit::out_of_bounds)
         .def_readwrite("macro_label_ok", &BlueprintTaskAudit::macro_label_ok)
         .def_readwrite("qualification_exceeded",

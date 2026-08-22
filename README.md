@@ -302,8 +302,9 @@ The result reports efficiency diagnostics:
 `total_preflight_ticks`, `full_preflight_attempted/success`,
 `preflight_acceptance_ratio`, `selected_per_preflight_ratio`, and per-round
 `round_logs` (also logged to stderr with `early_termination.log_rounds`),
-including a per-round rejection breakdown (collision / timeout /
-no_progress / stall / out_of_bounds / macro_label / goal_not_reached).
+including a per-round rejection breakdown (collision / truth_collision /
+timeout / no_progress / stall / out_of_bounds / macro_label /
+goal_not_reached / episode_interrupted).
 
 **generation_ok (new semantics)**: false ONLY when a HARD minimum
 coverage / structural balance / scene / task-count gate fails; soft
@@ -357,29 +358,44 @@ sequence:
   shutdown).
 - Every **executed** dynamics step is audited continuously (first and last
   segment included) with the exact truth cylinders: `segmentCollision` on
-  pos→pos_after, boundary crossing, per-obstacle brake risk
-  (`truth_brake_risk` = MAX over obstacles of closing-speed stopping
-  distance + envelope), plus Unity's own collision flag.  An episode is
+  pos→pos_after, boundary crossing, the configured truth edge-clearance
+  brake floor (plus stopping distance at the region boundary), and Unity's
+  own collision flag.  An episode is
   committed only if it reaches the goal with none of
   collision/out-of-bounds/brake/label/latency/rejection flags set.
 
 ## Two-level expert (hierarchical_local_v1)
 
-- **5 Hz VisibilityTargetCorrector** answers "is the current FOV enough
-  for the 30 Hz expert to finish its own avoidance?" and outputs a
-  zero-order-held `TargetCorrectionDirective`:
-  `PASS_THROUGH` / `NORMAL_CORRECTION` / `TURN_LEFT` / `TURN_RIGHT`
-  (one bounded world-latched rotation step).  It reads ONLY current patch /
-  causal history / vehicle state / original goal / its own memory — never
-  the 30 Hz outcome, truth ESDF, obstacle truth or a global path.
+- **5 Hz VisibilityTargetCorrector** asks the real 30 Hz planner for a
+  local-information-only feasibility preview, but takeover additionally
+  requires persistent failure from the actually executing 30 Hz planner and
+  observed blockage/occlusion evidence. A one-frame or speed-dependent
+  braking failure remains local. Outside recovery, yaw-first handling of an
+  out-of-FOV goal is enough for `PASS_THROUGH`; during recovery, three
+  consecutive translational previews are required before release. If direct
+  translation genuinely fails, the upper layer outputs a preview-certified,
+  fixed world-coordinate `NORMAL_CORRECTION` from current/history evidence.
+  It holds that waypoint until reached or unusable, and every new waypoint
+  must make measurable progress toward the original goal. A near, visible,
+  unblocked original goal has a capture lock and cannot be replaced by a
+  correction. Temporary waypoints carry explicit internal fly-through
+  semantics and never inherit final-goal braking semantics. With insufficient
+  evidence it brakes, then emits bounded world-latched `TURN_LEFT` /
+  `TURN_RIGHT` search steps; yaw sweep persists across the brake stage and
+  changes side after a half-turn without a route. It never reads truth ESDF,
+  obstacle truth or a global path.
 - **EffectiveTargetAdapter** (every 30 Hz tick) converts the directive at
-  the live pose into the 30 Hz information bottleneck (body-FLU unit
-  direction + normalized distance, and the world `LocalTarget` for the
-  planner).
-- **LocalPlanner30Hz** samples speed×lateral×yaw-rate candidates, rolls
-  them out under the shared kinematics, validates against current FOV +
-  known-FREE + soft/dynamic clearance, truncates to the executable safe
-  prefix, and scores by progress/clearance/smoothness/alignment/risk.
+  the live pose into two parallel forms: the full world-coordinate target
+  for the C++ expert, and the body-FLU unit direction + clipped normalized
+  distance used by training and persisted labels. World-latched upper goals
+  are re-expressed into the live body frame on every 30 Hz tick.
+- **LocalPlanner30Hz** owns three behaviors: rotate first when its target is
+  outside the physical camera FOV; plan a terminal braking trajectory when an in-FOV
+  target is closer than 4.5 m; otherwise perform normal reactive local
+  avoidance/navigation. Candidate paths share a static handoff buffer plus
+  reaction-time and physically achievable stopping distance. It uses only
+  the current state and causal local observation/history, with no scene truth
+  or global route.
 
 ## Target encoding protocol (R = 5.0 m, reserve = 0.5 m)
 
@@ -479,6 +495,23 @@ roslaunch il_dataset il_dataset_joint_v2_collect.launch
 roslaunch il_dataset il_dataset_collect.launch \
     config_file:=/path/to/my_config.yaml dry_run:=true blueprint_only:=true
 ```
+
+### Interactive trajectory debug
+
+After collection, the stepped top-down viewer can scan an output directory,
+let you choose an episode, and advance one 30 Hz row at a time:
+
+```bash
+python3 test/interactive_trajectory_debug.py \
+    /path/to/il_data_joint_v2 \
+    --manifest /path/to/joint_v2_blueprint_manifest.json
+```
+
+Use `Right`/`Down`/`N`/`Space` for the next timestamp, `Left`/`Up`/`P` for
+the previous timestamp, `Home`/`End` to jump, and `Q`/`Esc` to quit.  The
+viewer displays the world-XY path, current local plan, original/effective
+targets, body-frame target arrows, macro decision, planner status, and
+clearance/braking diagnostics.
 
 The launch never starts or stops AvoidBench: start it separately first
 (see `launch/il_dataset_collect.launch` header).

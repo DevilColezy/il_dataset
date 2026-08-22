@@ -59,10 +59,10 @@ void PreflightSimulator::resetTask(const Vec2d& start, const Vec2d& goal,
     task_.initial_yaw = CoordinateAdapter::flightmareYawToExpert(initial_yaw_fm);
     task_.valid = true;
     flight_z_ = flight_z;
-    state_ = VehicleState2D{};
-    state_.position = start;
+    state_ = VehicleState3D{};
+    state_.position = Vec3d(start.x(), start.y(), flight_z);
     state_.yaw = task_.initial_yaw;
-    state_.velocity_world = Vec2d(0.0, 0.0);
+    state_.velocity_world = Vec3d(0.0, 0.0, 0.0);
     state_.yaw_rate = 0.0;
     expert_.resetTask(start, goal, initial_yaw_fm, tick, flight_z);
 }
@@ -70,7 +70,7 @@ void PreflightSimulator::resetTask(const Vec2d& start, const Vec2d& goal,
 LocalObservation PreflightSimulator::synthesizePatch(uint64_t tick) {
     // ── The SAME camera rig as the runtime path. ────────────────────
     const double pos[3] = {state_.position.x(), state_.position.y(),
-                           flight_z_};
+                           state_.position.z()};
     double q[4];
     CameraRig2D::quatFromExpertYaw(state_.yaw, q);
     CameraRig2D rig(p_, pos, q);
@@ -130,7 +130,8 @@ PreflightSimulator::SimStepResult PreflightSimulator::step(
     uint64_t tick, bool collision_override) {
     SimStepResult result;
     result.state = state_;
-    const Vec2d prev_pos = state_.position;
+    const Vec2d prev_pos = HorizontalProjection::position(state_.position);
+    const Vec2d pos2 = prev_pos;
 
     // Truth collision audit (privileged, judge-only):
     //  * POINT collision at the current state;
@@ -138,7 +139,7 @@ PreflightSimulator::SimStepResult PreflightSimulator::step(
     //  * out-of-bounds of the drone disk.
     bool point_collision = false;
     for (const auto& o : scene_.obstacles) {
-        if ((state_.position - o.center).norm() < o.radius + p_.drone_radius) {
+        if ((pos2 - o.center).norm() < o.radius + p_.drone_radius) {
             point_collision = true;
             break;
         }
@@ -148,21 +149,22 @@ PreflightSimulator::SimStepResult PreflightSimulator::step(
     result.output = expert_.stepFromPatch(
         state_, patch, flight_z_, tick, point_collision || collision_override);
 
-    // Integrate the executable command (shared kinematics, incl. vz).
+    // Integrate the executable 3D BODY/FLU command (shared kinematics).
     if (!result.output.terminal) {
-        state_ = integrateKinematicStep(
+        state_ = integrateVehicle3DStep(
             state_,
-            BodyCommand2D{result.output.target_velocity_flu_x,
-                          result.output.target_velocity_flu_y,
-                          result.output.target_yaw_rate,
-                          result.output.target_velocity_flu_z},
+            VelocityCommand3D{result.output.target_velocity_flu_x,
+                              result.output.target_velocity_flu_y,
+                              result.output.target_velocity_flu_z,
+                              result.output.target_yaw_rate},
             1.0 / 30.0, p_);
     }
 
+    const Vec2d new_pos2 = HorizontalProjection::position(state_.position);
     // Swept collision of the drone disk along prev→new.
     bool swept = false;
     for (const auto& o : scene_.obstacles) {
-        if (distToSegment(o.center, prev_pos, state_.position) <
+        if (distToSegment(o.center, prev_pos, new_pos2) <
             o.radius + p_.drone_radius - 1e-9) {
             swept = true;
             break;
@@ -171,21 +173,21 @@ PreflightSimulator::SimStepResult PreflightSimulator::step(
     // Point collision at the NEW state.
     bool new_point = false;
     for (const auto& o : scene_.obstacles) {
-        if ((state_.position - o.center).norm() <
+        if ((new_pos2 - o.center).norm() <
             o.radius + p_.drone_radius) {
             new_point = true;
             break;
         }
     }
     result.out_of_bounds = segmentCrossesBounds(
-        prev_pos.x(), prev_pos.y(), state_.position.x(), state_.position.y(),
+        prev_pos.x(), prev_pos.y(), new_pos2.x(), new_pos2.y(),
         p_.drone_radius);
     result.truth_collision =
         collision_override || point_collision || swept || new_point;
 
     result.goal_reached =
         result.output.fsm_state == "GOAL_REACHED" ||
-        (task_.goal - state_.position).norm() <= p_.task_goal_tolerance;
+        (task_.goal - new_pos2).norm() <= p_.task_goal_tolerance;
     result.state = state_;
     return result;
 }

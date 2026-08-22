@@ -41,15 +41,24 @@ def _num(value, name, errors, default=None, allow_zero=False):
     return float(value)
 
 
-def _num_list(value, name, errors, default=None):
+def _bool(value, name, errors, default=None):
+    """Accept a real YAML boolean (or a numeric / string flag) and return
+    a Python bool.  `_num` deliberately rejects bool, so boolean knobs must
+    use this helper instead of being wrapped in bool(_num(...))."""
     if value is None:
         return default
-    if not isinstance(value, (list, tuple)) or not value or \
-            any(not isinstance(v, (int, float)) or isinstance(v, bool) or
-                not math.isfinite(float(v)) for v in value):
-        errors.append("%s must be a non-empty list of finite numbers" % name)
-        return default
-    return [float(v) for v in value]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return float(value) != 0.0
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True
+        if s in ("0", "false", "no", "off"):
+            return False
+    errors.append("%s must be a boolean" % name)
+    return default
 
 
 def _parse_t_bc(value, errors, name="depth.t_bc"):
@@ -109,7 +118,7 @@ def build_params(global_cfg, errors=None):
                           "he.drone_radius_m", problems, 0.15)
     p.scene_safety_clearance = _num(
         he.get("scene_safety_clearance_m"),
-        "he.scene_safety_clearance_m", problems, 0.5)
+        "he.scene_safety_clearance_m", problems, 0.5, allow_zero=True)
     p.macro_route_clearance_margin = _num(
         he.get("macro_route_clearance_margin_m"),
         "he.macro_route_clearance_margin_m", problems, 0.1,
@@ -134,6 +143,9 @@ def build_params(global_cfg, errors=None):
     p.obs_history_max_age_ticks = int(_num(
         obs.get("history_max_age_ticks"),
         "he.observation.history_max_age_ticks", problems, 120))
+    p.obs_free_clear_confirmations = int(_num(
+        obs.get("free_clear_confirmations"),
+        "he.observation.free_clear_confirmations", problems, 3))
     p.obs_ground_clearance_m = _num(
         obs.get("ground_clearance_m"),
         "he.observation.ground_clearance_m", problems, 0.5)
@@ -167,21 +179,26 @@ def build_params(global_cfg, errors=None):
     # ── local planner (30 Hz) ─────────────────────────────────────
     lp = he.get("local_planner", {}) or {}
     p.lp_horizon_s = _num(lp.get("horizon_s"), "he.lp.horizon_s",
-                          problems, 2.5)
+                          problems, 4.0)
     p.lp_dt = _num(lp.get("dt"), "he.lp.dt", problems, 0.1)
-    p.lp_speed_samples = _num_list(
-        lp.get("speed_samples"), "he.lp.speed_samples", problems,
-        [0.0, 0.3, 0.6, 1.2, 1.8, 2.5])
-    p.lp_lateral_ratio_samples = _num_list(
-        lp.get("lateral_ratio_samples"), "he.lp.lateral_ratio_samples",
-        problems, [-0.5, -0.3, -0.15, -0.05, 0.0, 0.05, 0.15, 0.3, 0.5])
-    p.lp_yaw_rate_samples = _num_list(
-        lp.get("yaw_rate_samples"), "he.lp.yaw_rate_samples", problems,
-        [-2.0, -1.0, -0.5, -0.25, -0.15, 0.0, 0.15, 0.25, 0.5, 1.0, 2.0])
     p.lp_max_speed = _num(lp.get("max_speed"), "he.lp.max_speed",
                           problems, 3.0)
+    p.lp_cruise_speed_mps = _num(
+        lp.get("cruise_speed_mps"), "he.lp.cruise_speed_mps", problems, 2.0,
+        allow_zero=True)
+    p.lp_terminal_micro_approach_m = _num(
+        lp.get("terminal_micro_approach_m"),
+        "he.lp.terminal_micro_approach_m", problems, 0.8,
+        allow_zero=True)
     p.lp_max_accel = _num(lp.get("max_accel"), "he.lp.max_accel",
                           problems, 2.0)
+    # The EFFECTIVE (physically achieved) horizontal acceleration of the
+    # closed loop.  With the command-ramp feedforward the drone tracks the
+    # lp_max_accel ramp, so this equals max_accel = 2.0.  Used for braking
+    # / clearance / trajectory profiles so the planner can actually stop
+    # where it thinks it can.
+    p.lp_eff_accel_mps2 = _num(
+        lp.get("eff_accel_mps2"), "he.lp.eff_accel_mps2", problems, 2.0)
     p.lp_max_yaw_rate = _num(lp.get("max_yaw_rate"),
                              "he.lp.max_yaw_rate", problems, 2.0)
     p.lp_max_yaw_accel = _num(lp.get("max_yaw_accel"),
@@ -197,37 +214,52 @@ def build_params(global_cfg, errors=None):
         lp.get("vertical_clearance_m"),
         "he.lp.vertical_clearance_m", problems, 0.3)
     p.lp_min_clearance = _num(lp.get("min_clearance"),
-                              "he.lp.min_clearance", problems, 0.5)
+                              "he.lp.min_clearance", problems, 0.4)
     p.lp_soft_clearance_radius_m = _num(
         lp.get("soft_clearance_radius_m"),
-        "he.lp.soft_clearance_radius_m", problems, 2.0)
+        "he.lp.soft_clearance_radius_m", problems, 1.0)
     p.lp_clearance_discretization_margin_m = _num(
         lp.get("clearance_discretization_margin_m"),
-        "he.lp.clearance_discretization_margin_m", problems, 0.05,
+        "he.lp.clearance_discretization_margin_m", problems, 0.15,
         allow_zero=True)
     p.lp_obstacle_reaction_time_s = _num(
         lp.get("obstacle_reaction_time_s"),
         "he.lp.obstacle_reaction_time_s", problems, 0.20)
+    # ── EGO-style optimisation B-spline (R19) ─────────────────────
+    # Optimization-based local path (structure from ZJU-FAST-Lab/ego-planner
+    # BsplineOptimizer + okazaki L-BFGS).  Bends the cubic B-spline around
+    # observed obstacles instead of the straight-ray degeneracy of the old
+    # core.  The optimised geometry is still validated with the hard
+    # clearance + dynamic envelope and falls back to the straight-line
+    # planner / escape-rotate / brake.
+    p.ego_enabled = _bool(
+        lp.get("ego_enabled"), "he.lp.ego_enabled", problems, True)
+    p.ego_lambda_smooth = _num(
+        lp.get("ego_lambda_smooth"), "he.lp.ego_lambda_smooth",
+        problems, 0.5, allow_zero=True)
+    p.ego_lambda_collision = _num(
+        lp.get("ego_lambda_collision"), "he.lp.ego_lambda_collision",
+        problems, 2.0, allow_zero=True)
+    p.ego_lambda_feasibility = _num(
+        lp.get("ego_lambda_feasibility"), "he.lp.ego_lambda_feasibility",
+        problems, 0.2, allow_zero=True)
+    p.ego_lambda_fitness = _num(
+        lp.get("ego_lambda_fitness"), "he.lp.ego_lambda_fitness",
+        problems, 0.8, allow_zero=True)
+    p.ego_lambda_fov = _num(
+        lp.get("ego_lambda_fov"), "he.lp.ego_lambda_fov",
+        problems, 0.3, allow_zero=True)
+    p.ego_clearance_m = _num(
+        lp.get("ego_clearance_m"), "he.lp.ego_clearance_m",
+        problems, 0.55)
+    p.ego_ts = _num(lp.get("ego_ts"), "he.lp.ego_ts", problems, 0.4)
+    p.ego_n_segments = int(_num(
+        lp.get("ego_n_segments"), "he.lp.ego_n_segments", problems, 8))
+    p.ego_max_iter = int(_num(
+        lp.get("ego_max_iter"), "he.lp.ego_max_iter", problems, 60))
     p.lp_control_period_s = _num(lp.get("control_period_s"),
                                  "he.lp.control_period_s", problems,
                                  1.0 / 30.0)
-    p.lp_max_allowed_regress_m = _num(
-        lp.get("max_allowed_regress_m"),
-        "he.lp.max_allowed_regress_m", problems, 0.05,
-        allow_zero=True)
-    p.lp_limit_cycle_window_ticks = int(_num(
-        lp.get("limit_cycle_window_ticks"),
-        "he.lp.limit_cycle_window_ticks", problems, 15))
-    p.lp_limit_cycle_net_progress_m = _num(
-        lp.get("limit_cycle_net_progress_m"),
-        "he.lp.limit_cycle_net_progress_m", problems, 0.10,
-        allow_zero=True)
-    p.lp_limit_cycle_min_blocked_ticks = int(_num(
-        lp.get("limit_cycle_min_blocked_ticks"),
-        "he.lp.limit_cycle_min_blocked_ticks", problems, 8))
-    p.lp_limit_cycle_lateral_flip_count = int(_num(
-        lp.get("limit_cycle_lateral_flip_count"),
-        "he.lp.limit_cycle_lateral_flip_count", problems, 2))
     p.lp_turn_enter_deg = _num(lp.get("turn_enter_deg"),
                                "he.lp.turn_enter_deg", problems, 42.0)
     p.lp_turn_exit_deg = _num(lp.get("turn_exit_deg"),
@@ -243,9 +275,6 @@ def build_params(global_cfg, errors=None):
     p.lp_near_goal_turn_enter_deg = _num(
         lp.get("near_goal_turn_enter_deg"),
         "he.lp.near_goal_turn_enter_deg", problems, 75.0)
-    p.lp_terminal_control_distance = _num(
-        lp.get("terminal_control_distance"),
-        "he.lp.terminal_control_distance", problems, 1.2)
     p.lp_terminal_speed_gain = _num(
         lp.get("terminal_speed_gain"), "he.lp.terminal_speed_gain",
         problems, 1.0)
@@ -255,16 +284,9 @@ def build_params(global_cfg, errors=None):
     p.lp_terminal_max_yaw_rate = _num(
         lp.get("terminal_max_yaw_rate"), "he.lp.terminal_max_yaw_rate",
         problems, 0.5)
-    p.lp_min_progress_m = _num(lp.get("min_progress_m"),
-                               "he.lp.min_progress_m", problems, 0.05,
-                               allow_zero=True)
     p.lp_min_progress_speed_mps = _num(
         lp.get("min_progress_speed_mps"),
         "he.lp.min_progress_speed_mps", problems, 0.03,
-        allow_zero=True)
-    p.lp_min_progress_epsilon_m = _num(
-        lp.get("min_progress_epsilon_m"),
-        "he.lp.min_progress_epsilon_m", problems, 0.01,
         allow_zero=True)
     p.lp_target_discontinuity_reset_m = _num(
         lp.get("target_discontinuity_reset_m"),
@@ -275,72 +297,11 @@ def build_params(global_cfg, errors=None):
     p.lp_risk_corridor_half_width = _num(
         lp.get("risk_corridor_half_width"),
         "he.lp.risk_corridor_half_width", problems, 1.0)
-    p.lp_risk_distance_horizon_m = _num(
-        lp.get("risk_distance_horizon_m"),
-        "he.lp.risk_distance_horizon_m", problems, 5.0)
-    p.lp_risk_ttc_horizon_s = _num(lp.get("risk_ttc_horizon_s"),
-                                   "he.lp.risk_ttc_horizon_s", problems, 2.5)
-    p.lp_risk_trajectory_radius_m = _num(
-        lp.get("risk_trajectory_radius_m"),
-        "he.lp.risk_trajectory_radius_m", problems, 1.0)
-    p.lp_avoidance_active_threshold = _num(
-        lp.get("avoidance_active_threshold"),
-        "he.lp.avoidance_active_threshold", problems, 0.10,
-        allow_zero=True)
     p.lp_brake_stop_margin_m = _num(
         lp.get("brake_stop_margin_m"), "he.lp.brake_stop_margin_m",
         problems, 0.3, allow_zero=True)
-    p.lp_min_executable_prefix_s = _num(
-        lp.get("min_executable_prefix_s"),
-        "he.lp.min_executable_prefix_s", problems, 0.2)
-    p.lp_scoring_horizon_s = _num(
-        lp.get("scoring_horizon_s"), "he.lp.scoring_horizon_s",
-        problems, 0.8)
-    p.lp_cost_tie_tolerance = _num(
-        lp.get("cost_tie_tolerance"), "he.lp.cost_tie_tolerance",
-        problems, 1e-6, allow_zero=True)
-    p.lp_cross_track_normalize_m = _num(
-        lp.get("cross_track_normalize_m"),
-        "he.lp.cross_track_normalize_m", problems, 2.0)
-
-    cw = lp.get("cost_weights", {}) or {}
-    p.cost_w_progress = _num(cw.get("progress"), "he.lp.cost.progress",
-                             problems, 1.0, allow_zero=True)
-    p.cost_w_clearance = _num(cw.get("clearance"), "he.lp.cost.clearance",
-                              problems, 2.0, allow_zero=True)
-    p.cost_w_smoothness = _num(cw.get("smoothness"),
-                               "he.lp.cost.smoothness", problems, 0.5,
-                               allow_zero=True)
-    p.cost_w_speed_change = _num(cw.get("speed_change"),
-                                 "he.lp.cost.speed_change", problems, 0.3,
-                                 allow_zero=True)
-    p.cost_w_yaw_rate_change = _num(cw.get("yaw_rate_change"),
-                                    "he.lp.cost.yaw_rate_change", problems,
-                                    0.3, allow_zero=True)
-    p.cost_w_terminal_heading = _num(
-        cw.get("terminal_heading"), "he.lp.cost.terminal_heading",
-        problems, 1.0, allow_zero=True)
-    p.cost_w_velocity_alignment = _num(
-        cw.get("velocity_alignment"), "he.lp.cost.velocity_alignment",
-        problems, 1.2, allow_zero=True)
-    p.cost_w_cross_track = _num(cw.get("cross_track"),
-                                "he.lp.cost.cross_track", problems, 0.8,
-                                allow_zero=True)
-    p.cost_w_obstacle_risk = _num(cw.get("obstacle_risk"),
-                                  "he.lp.cost.obstacle_risk", problems, 3.0,
-                                  allow_zero=True)
-
     # ── 5 Hz corrector (macro) ────────────────────────────────────
     mc = he.get("corrector", {}) or {}
-    p.macro_local_failure_duration_s = _num(
-        mc.get("local_failure_duration_s"),
-        "he.corrector.local_failure_duration_s", problems, 0.4)
-    p.macro_reentry_guard_ticks = int(_num(
-        mc.get("reentry_guard_ticks"),
-        "he.corrector.reentry_guard_ticks", problems, 30))
-    p.macro_correction_enter_stable_ticks = int(_num(
-        mc.get("correction_enter_stable_ticks"),
-        "he.corrector.correction_enter_stable_ticks", problems, 1))
     p.macro_observable_frontier_min_distance_m = _num(
         mc.get("observable_frontier_min_distance_m"),
         "he.corrector.observable_frontier_min_distance_m", problems, 1.5)
@@ -364,6 +325,10 @@ def build_params(global_cfg, errors=None):
     p.macro_corridor_half_width = _num(
         mc.get("corridor_half_width"),
         "he.corrector.corridor_half_width", problems, 1.5)
+    p.macro_blocking_lateral_span_ratio = _num(
+        mc.get("blocking_lateral_span_ratio"),
+        "he.corrector.blocking_lateral_span_ratio", problems, 0.5,
+        allow_zero=True)
     p.macro_corridor_rear_tolerance_m = _num(
         mc.get("corridor_rear_tolerance_m"),
         "he.corrector.corridor_rear_tolerance_m", problems, 0.5,
@@ -378,13 +343,37 @@ def build_params(global_cfg, errors=None):
     p.macro_local_candidate_distance_step_m = _num(
         mc.get("local_candidate_distance_step_m"),
         "he.corrector.local_candidate_distance_step_m", problems, 0.5)
+    p.macro_guide_horizon_m = _num(
+        mc.get("guide_horizon_m"), "he.corrector.guide_horizon_m",
+        problems, 4.8)
     p.macro_local_target_event_tolerance_m = _num(
         mc.get("local_target_event_tolerance_m"),
         "he.corrector.local_target_event_tolerance_m", problems, 0.05,
         allow_zero=True)
+    p.macro_takeover_confirm_ticks_30hz = int(_num(
+        mc.get("takeover_confirm_ticks_30hz"),
+        "he.corrector.takeover_confirm_ticks_30hz", problems, 6))
     p.macro_unknown_recovery_threshold_ticks = int(_num(
         mc.get("unknown_recovery_threshold_ticks"),
         "he.corrector.unknown_recovery_threshold_ticks", problems, 60))
+    p.macro_brake_confirm_ticks_5hz = int(_num(
+        mc.get("brake_confirm_ticks_5hz"),
+        "he.corrector.brake_confirm_ticks_5hz", problems, 2))
+    p.macro_waypoint_reached_tolerance_m = _num(
+        mc.get("waypoint_reached_tolerance_m"),
+        "he.corrector.waypoint_reached_tolerance_m", problems, 0.3,
+        allow_zero=True)
+    p.macro_terminal_capture_radius_m = _num(
+        mc.get("terminal_capture_radius_m"),
+        "he.corrector.terminal_capture_radius_m", problems, 1.0,
+        allow_zero=True)
+    p.macro_limit_cycle_goal_progress_m = _num(
+        mc.get("limit_cycle_goal_progress_m"),
+        "he.corrector.limit_cycle_goal_progress_m", problems, 0.1,
+        allow_zero=True)
+    p.macro_limit_cycle_window_5hz = int(_num(
+        mc.get("limit_cycle_window_5hz"),
+        "he.corrector.limit_cycle_window_5hz", problems, 15))
 
     # ── target encoding protocol ──────────────────────────────────
     te = he.get("target_encoding", {}) or {}

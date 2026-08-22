@@ -96,22 +96,17 @@ void TruthCylinderAudit::brakeRisk(double x, double y, double vx, double vy,
     const Vec2d v(vx, vy);
     const double speed = v.norm();
 
-    // ── Per-obstacle brake risk: use the closing speed along the vector
-    //    to THAT obstacle and take the MAXIMUM over all obstacles.  The
-    //    nearest side/behind obstacle never masks the front obstacle. ──
+    // ── Per-obstacle brake risk: edge-clearance floor ONLY.  USER
+    //    DIRECTIVE (2026-08-20): the speed-dependent dynamic braking
+    //    envelope is removed from all planners; the judge keeps the same
+    //    rule — reject only when the drone's edge is closer than stop_margin
+    //    (0.1 m) to a surface, i.e. centre closer than 0.4 m, at any speed. ──
     auto eval = [&](const Vec2d& rel, double d_surface, double& out_risk,
                     bool& out_would) {
         out_risk = 0.0;
         out_would = false;
-        const double rn = rel.norm();
         const double d_free = d_surface - vehicle_radius_;
-        // Closing speed = -(v·rel)/|rel| (positive when moving toward).
-        double closing = 0.0;
-        if (rn > 1e-9) closing = -(v.dot(rel)) / rn;
-        if (closing <= 0.0) return;  // moving away / stationary
-        const double stop_dist =
-            closing * closing / (2.0 * std::max(1e-6, max_decel));
-        const double envelope = stop_dist + stop_margin;
+        const double envelope = stop_margin;
         if (d_free < envelope) {
             out_would = true;
             out_risk = clamp((envelope - d_free) / (envelope + 1e-9), 0.0, 1.0);

@@ -75,8 +75,17 @@ CameraRig2D::CameraRig2D(const Params2D& p, const double cam_pos[3],
 }
 
 void CameraRig2D::rayWorldDirXY(double bearing, double out[2]) const {
-    // rotZ(bearing)·[0,0,1] = [sin(bearing), 0, cos(bearing)] (camera frame).
-    const double dc[3] = {std::sin(bearing), 0.0, std::cos(bearing)};
+    // Positive body bearing = LEFT (expert convention: CCW from the camera
+    // forward axis; every other consumer — build() pixel binning, the
+    // candidate sampler dir_world(cos(yaw+b), sin(yaw+b)), the adapter
+    // bearingToWorldPoint — uses positive = LEFT).  The optical ray is
+    // therefore tilted toward -X (image left):
+    //   rotZ(-bearing)·[0,0,1] = [-sin(bearing), 0, cos(bearing)] (camera frame).
+    // (Was +sin(bearing) which points a LEFT pixel's ray to the RIGHT and
+    // mirrors the whole map about the forward axis — obstacles seen on the
+    // right were laid out on the left, so the corrector turned LEFT into
+    // every obstacle's mirrored image instead of flying straight past it.)
+    const double dc[3] = {-std::sin(bearing), 0.0, std::cos(bearing)};
     double dfl[3], dw[3];
     applyR3(R_bc_fl_, dc[0], dc[1], dc[2], dfl);
     applyR3(R_, dfl[0], dfl[1], dfl[2], dw);
@@ -163,6 +172,17 @@ LocalObservation Flightmare2DObservation::build(
             // their lower half is harmless (the upper half yields the same
             // horizontal position).
             if (p_world[2] < -p_.obs_ground_clearance_m) continue;
+            // Drone-own-body mask: NONE.  The depth render does not include
+            // the vehicle's own body (verified over full episodes: zero
+            // pixels ever land within 0.3 m of the vehicle centre), and the
+            // historical mask was geometrically dead anyway — with the
+            // camera mounted 0.3 m FORWARD of the centre, every valid depth
+            // pixel sits >= 0.31 m from the centre, so `hypot < 0.3` could
+            // never fire.  A mask radius large enough to be reachable (e.g.
+            // the old 1.5 m) HIDES real obstacle surfaces (episode
+            // 06b9d879) and must not be reintroduced.  Obstacles are seen
+            // right up to the body; if the drone body ever renders, mask
+            // it in the camera-space sphere around the CAMERA instead.
             // rel = point_world - cam_world = R_WB · (R_bc_fl · p_opt).
             const double rel_x = p_world[0];
             const double rel_y = p_world[1];

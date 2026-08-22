@@ -3,16 +3,17 @@
 /// @brief  Two-level expert state machine (v9).
 ///
 /// The 5 Hz VisibilityTargetCorrector runs on every 5 Hz boundary
-/// (tick % 6 == 0) inside the single 30 Hz step — independent of the
-/// 30 Hz outcome — and produces a zero-order-held
-/// TargetCorrectionDirective.  The EffectiveTargetAdapter converts that
-/// directive EVERY 30 Hz tick into the LocalTarget the 30 Hz planner sees
-/// (world point for the C++ expert, body direction + normalized distance
-/// for the future student).
+/// (tick % 6 == 0). It uses a memory-independent preview of the same local
+/// planner to decide PASS / correction / search and produces a zero-order-
+/// held TargetCorrectionDirective. The EffectiveTargetAdapter converts that
+/// directive EVERY 30 Hz tick into the full world point used by the C++
+/// expert and the live body direction + normalized distance saved for the
+/// student.
 ///
 /// States: DIRECT_LOCAL, TURN_TO_TARGET, GOAL_REACHED, TASK_INVALID,
 /// COLLISION, TIMEOUT.  The 30 Hz planner keeps its own TURN_TO_TARGET
-/// hysteresis; the 5 Hz layer never reads the 30 Hz result.
+/// hysteresis; the 5 Hz layer receives only compact preview feasibility,
+/// never executable commands or candidate trajectories.
 
 #include "il_dataset/hierarchical_expert/local_planner_30hz.hpp"
 #include "il_dataset/hierarchical_expert/macro_expert_5hz.hpp"
@@ -30,7 +31,10 @@ namespace expert {
 /// Everything the FSM needs from the outside world for one tick.
 struct FsmInput {
     const Task2D& task;
-    const VehicleState2D& state;
+    /// The PLANAR (horizontal) state — the vertical channel is carried
+    /// separately in `z` / `vz_world` (only the goal / terminal judgement
+    /// and the vertical controller ever read those).
+    const PlanarState& state;
     /// INSTANTANEOUS FOV patch of THIS tick (before merging into history).
     /// Only the 5 Hz VisibilityTargetCorrector reads it.
     const LocalObservation& current_patch;
@@ -41,6 +45,9 @@ struct FsmInput {
     bool collision;
     // ── 3D extension: mission altitude (world z) of the original goal. ─
     double goal_z = 2.0;
+    // ── 3D extension: current altitude / vertical velocity (world z-up). ─
+    double z = 2.0;
+    double vz_world = 0.0;
 };
 
 /// Flat per-tick output consumed by the Python manager / CSV writer.
@@ -55,6 +62,10 @@ struct FsmStepOutput {
     uint8_t target_correction_type = 0;  // TargetCorrectionType
     std::string target_correction_type_name = "PASS_THROUGH";
     bool target_correction_active = false;
+    // R24: persistent terminal/brake-only semantic of the current ZOH
+    // directive (true = the corrected target is a stop target, never
+    // fly-through).  Diagnostic; mirrors the directive flag.
+    bool directive_terminal_stop = false;
     int32_t target_direction_token = -1;
     double target_direction_x_body = 1.0;
     double target_direction_y_body = 0.0;
@@ -133,9 +144,15 @@ private:
                     const std::string& reason);
     void fillObservability(FsmStepOutput& out) const;
     bool goalReached(const FsmInput& in) const;
+    LocalPlanningAssessment assessOriginalTarget(const FsmInput& in) const;
+    LocalPlanningAssessment assessDirectiveTarget(
+        const FsmInput& in,
+        const TargetCorrectionDirective& directive) const;
     void updateFailureBookkeeping(const FsmStepOutput& out,
                                   const FsmInput& in);
-    LocalTarget makeLocalTarget(const EncodedTargetInput& encoded) const;
+    LocalTarget makeLocalTarget(
+        const EncodedTargetInput& encoded,
+        const TargetCorrectionDirective& directive) const;
 
     Params2D p_;
     FsmState state_ = FsmState::DIRECT_LOCAL;
@@ -155,11 +172,17 @@ private:
     bool directive_updated_ = false;
     uint64_t last_delivered_event_ = 0;
     Vec2d last_original_goal_{0.0, 0.0};
+    PlannerResult last_local_result_;
+    bool has_last_local_result_ = false;
 
     uint32_t consecutive_failures_ = 0;
     uint64_t failure_start_tick_ = 0;
     uint32_t unknown_recovery_ticks_ = 0;
     uint32_t unknown_recovery_episode_count_ = 0;
+    // R25 (Fix #4): consecutive frames of GENUINE progress (decayed failure
+    // counting).  A single good frame no longer hard-resets the failure
+    // evidence; only ~0.5 s of sustained real progress fully clears it.
+    uint32_t progress_window_ticks_ = 0;
     uint64_t goal_revision_ = 0;
     uint64_t mission_revision_ = 0;
     int reentry_guard_ = 0;

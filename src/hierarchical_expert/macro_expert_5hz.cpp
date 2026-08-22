@@ -9,12 +9,12 @@
 namespace il_dataset {
 namespace expert {
 
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 //  Local free-grid construction + observability judgement
-//  (current patch + decaying local history — deterministic, local, causal)
-// ═══════════════════════════════════════════════════════════════════
+//  (current patch + decaying local history 鈥?deterministic, local, causal)
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 VisibilityTargetCorrector::LocalFreeGrid
-VisibilityTargetCorrector::buildLocalFreeGrid(const VehicleState2D& state,
+VisibilityTargetCorrector::buildLocalFreeGrid(const PlanarState& state,
                                               const LocalObservation& patch) const {
     LocalFreeGrid grid;
     if (!patch.valid()) return grid;
@@ -38,10 +38,13 @@ VisibilityTargetCorrector::buildLocalFreeGrid(const VehicleState2D& state,
     grid.blocked.assign(static_cast<size_t>(grid.width) * grid.height, 0);
     grid.reachable.assign(static_cast<size_t>(grid.width) * grid.height, 0);
 
+    // Unified collision distance (USER DIRECTIVE): 4 cells = 0.4 m from an
+    // OCCUPIED cell centre.  No ESDF geometric envelope.
+    const double clearance_margin =
+        std::max(0.0, p_.lp_clearance_discretization_margin_m);
     const double req = std::max(
-        {0.0, p_.lp_min_clearance, p_.lp_nominal_clearance_m,
-         p_.scene_safety_clearance + p_.macro_route_clearance_margin +
-             p_.lp_clearance_discretization_margin_m});
+        {0.0, p_.lp_min_clearance + clearance_margin,
+         p_.lp_nominal_clearance_m + clearance_margin});
     const double inv = 1.0 / std::max(1e-6, grid.resolution);
     const int k = static_cast<int>(std::ceil(req * inv));
     const double kr2 = (req * inv) * (req * inv);
@@ -114,25 +117,6 @@ VisibilityTargetCorrector::buildLocalFreeGrid(const VehicleState2D& state,
     return grid;
 }
 
-bool VisibilityTargetCorrector::chordClear(
-    const VehicleState2D& state, const LocalObservation& patch,
-    const LocalFreeGrid& grid, const Vec2d& endpoint) const {
-    if (!patch.valid() || !grid.valid()) return false;
-    const Vec2d delta = endpoint - state.position;
-    const double dist = delta.norm();
-    if (dist < 1e-9) return false;
-    const double recovery = p_.macro_local_recovery_prefix_m;
-    const double step = std::max(1e-3, 0.5 * patch.resolution);
-    const int samples = std::max(1, static_cast<int>(std::ceil(dist / step)));
-    for (int s = 0; s <= samples; ++s) {
-        const double u = static_cast<double>(s) / samples;
-        const Vec2d p = state.position + u * delta;
-        if (!grid.freeAt(p)) return false;
-        if (u * dist > recovery && !grid.traversableAt(p)) return false;
-    }
-    return true;
-}
-
 double VisibilityTargetCorrector::freeRangeAlongFrom(
     const LocalObservation& obs, const Vec2d& from,
     double bearing_world) const {
@@ -149,17 +133,18 @@ double VisibilityTargetCorrector::freeRangeAlongFrom(
 }
 
 double VisibilityTargetCorrector::freeRangeAlong(
-    const VehicleState2D& state, const LocalObservation& obs,
+    const PlanarState& state, const LocalObservation& obs,
     double bearing_body) const {
     return freeRangeAlongFrom(obs, state.position, state.yaw + bearing_body);
 }
 
 bool VisibilityTargetCorrector::extractBlocker(
-    const VehicleState2D& state, const Vec2d& goal,
+    const PlanarState& state, const Vec2d& goal,
     const LocalObservation& patch, double& blocker_min_along,
-    double& blocker_max_lateral) const {
+    double& blocker_lat_min, double& blocker_lat_max) const {
     blocker_min_along = std::numeric_limits<double>::infinity();
-    blocker_max_lateral = 0.0;
+    blocker_lat_min = std::numeric_limits<double>::infinity();
+    blocker_lat_max = -std::numeric_limits<double>::infinity();
     if (!patch.valid()) return false;
     const Vec2d axis = goal - state.position;
     const double axis_len = std::max(1e-6, axis.norm());
@@ -179,22 +164,39 @@ bool VisibilityTargetCorrector::extractBlocker(
             const Vec2d p(patch.origin.x() + (ix + 0.5) * patch.resolution,
                           patch.origin.y() + (iy + 0.5) * patch.resolution);
             const Vec2d rel = p - state.position;
-            const double lateral = std::fabs(cross2(rel, dir));
+            // SIGNED lateral, goal-axis convention: cross2(dir, rel) > 0
+            // is LEFT, < 0 is RIGHT (matches the best_clear lat test and
+            // sampleSideCandidates).
+            const double lat = cross2(dir, rel);
             const double along = rel.dot(dir);
-            if (lateral <= hw &&
+            if (std::fabs(lat) <= hw &&
                 along >= -p_.macro_corridor_rear_tolerance_m &&
                 along <= max_along) {
                 blocker_min_along = std::min(blocker_min_along, along);
-                blocker_max_lateral = std::max(blocker_max_lateral, lateral);
+                blocker_lat_min = std::min(blocker_lat_min, lat);
+                blocker_lat_max = std::max(blocker_lat_max, lat);
                 found = true;
             }
         }
+    }
+    // Lateral-span gate (align with il_2d_multiscale_debug
+    // macro/blocking_lateral_span_ratio): the corridor is only BLOCKED when
+    // the observed OCCUPIED cells span >= this fraction of the corridor
+    // half-width across the goal axis.  A single small obstacle (or a 1-cell
+    // depth artifact) that barely touches the corridor edge is left to the
+    // 30 Hz planner to weave around; the 5 Hz corrector must NOT take over
+    // for it.  (v8 identifyBlocker design: corridor-crossing cluster,
+    // lateral span >= corridor_half_width * ratio.)
+    if (found &&
+        (blocker_lat_max - blocker_lat_min) <
+            hw * p_.macro_blocking_lateral_span_ratio) {
+        found = false;
     }
     return found;
 }
 
 AvoidanceObservability VisibilityTargetCorrector::assessObservability(
-    const VehicleState2D& state, const Vec2d& goal,
+    const PlanarState& state, const Vec2d& goal,
     const LocalObservation& patch) const {
     AvoidanceObservability obs;
     obs.reason = "NO_PATCH";
@@ -209,15 +211,17 @@ AvoidanceObservability VisibilityTargetCorrector::assessObservability(
         wrapAngle(std::atan2(to_goal.y(), to_goal.x()) - state.yaw);
     obs.goal_inside_fov = std::fabs(b_goal) <= fov_half + 1e-9;
 
-    // 1) Direct corridor check (vehicle → original goal, to perception
+    // 1) Direct corridor check (vehicle 鈫?original goal, to perception
     //    range). Only locally observed OCCUPIED blocks.
     double blocker_min_along = std::numeric_limits<double>::infinity();
-    double blocker_max_lateral = 0.0;
+    double blocker_lat_min = std::numeric_limits<double>::infinity();
+    double blocker_lat_max = -std::numeric_limits<double>::infinity();
     const bool has_blocker =
         extractBlocker(state, goal, patch, blocker_min_along,
-                       blocker_max_lateral);
+                       blocker_lat_min, blocker_lat_max);
     obs.direct_corridor_blocked = has_blocker;
     obs.blocker_observed = has_blocker;
+    obs.blocker_min_along = blocker_min_along;
 
     // UNKNOWN occlusion along the goal-axis corridor (diagnostic).
     {
@@ -274,9 +278,11 @@ AvoidanceObservability VisibilityTargetCorrector::assessObservability(
         !obs.right_bypass_observable) {
         const double fov_hw_at_blocker =
             std::tan(fov_half) * std::max(1e-3, blocker_min_along);
+        const double blocker_max_abs = std::max(
+            std::fabs(blocker_lat_min), std::fabs(blocker_lat_max));
         obs.fov_boundary_truncated =
             blocker_min_along >= p_.obs_range_m - 1.0 ||
-            blocker_max_lateral >= 0.9 * fov_hw_at_blocker;
+            blocker_max_abs >= 0.9 * fov_hw_at_blocker;
     }
 
     if (obs.left_bypass_observable || obs.right_bypass_observable) {
@@ -295,12 +301,12 @@ AvoidanceObservability VisibilityTargetCorrector::assessObservability(
     return obs;
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 //  Side candidate sampling / certification
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 std::vector<VisibilityTargetCorrector::SideCandidate>
 VisibilityTargetCorrector::sampleSideCandidates(
-    const VehicleState2D& state, const Vec2d& goal,
+    const PlanarState& state, const Vec2d& goal,
     const LocalObservation& patch, const LocalFreeGrid& grid,
     bool has_blocker, double blocker_min_along, SideSelection side,
     bool strict) const {
@@ -324,11 +330,12 @@ VisibilityTargetCorrector::sampleSideCandidates(
     const double dmin = std::max(p_.macro_observable_frontier_min_distance_m,
                                  2.0 * patch.resolution);
     const double dmax = p_.obs_range_m - 0.5 * patch.resolution;
-    // A local correction is guidance toward the current mission goal, not a
-    // request to travel beyond it.  (NORMAL_CORRECTION candidates must not
-    // cross the goal.)
-    const double candidate_max_distance = std::min(
-        dmax, goal_dist + std::max(0.0, p_.task_goal_tolerance));
+    // A macro correction is a bounded temporary waypoint, not a terminal
+    // mission goal.  Candidate distance is limited by local observability;
+    // the progress checks below also prevent successive waypoints from
+    // walking indefinitely away from the original goal.
+    const double candidate_max_distance =
+        std::min(dmax, p_.macro_guide_horizon_m);
     const double step_d = p_.macro_local_candidate_distance_step_m;
     if (!(step_b > 0.0) || !(step_d > 0.0) ||
         !(candidate_max_distance >= dmin)) {
@@ -364,11 +371,26 @@ VisibilityTargetCorrector::sampleSideCandidates(
                 (side == SideSelection::RIGHT && lat > 0.05)) {
                 continue;
             }
+            // A correction on the goal line is not a bypass when an observed
+            // blocker spans the direct corridor.  Require lateral separation
+            // so the local planner receives an executable detour target.
+            if (has_blocker) {
+                const double min_lateral = std::max(
+                    0.5, p_.macro_corridor_half_width *
+                             p_.macro_blocking_lateral_span_ratio);
+                if (std::fabs(lat) < min_lateral) continue;
+            }
             const double along = (endpoint - state.position).dot(axis);
             if (along < p_.macro_observable_frontier_min_progress_m) {
                 continue;
             }
-            if (along > goal_dist + p_.task_goal_tolerance) {
+            // A temporary waypoint must make measurable progress toward the
+            // original mission goal.  Mere local reachability is not enough:
+            // an indefinitely reachable side ray previously carried the
+            // vehicle from 7.2 m to 14.3 m away from the goal.
+            const double endpoint_goal_dist = (goal - endpoint).norm();
+            if (endpoint_goal_dist >
+                goal_dist - p_.macro_observable_frontier_min_progress_m) {
                 continue;
             }
             if (strict &&
@@ -377,7 +399,24 @@ VisibilityTargetCorrector::sampleSideCandidates(
             }
             if (strict && along < beyond) continue;
             if (!grid.reachableAt(endpoint)) continue;
-            if (!strict && !chordClear(state, patch, grid, endpoint)) continue;
+            // USER DIRECTIVE: NO straight-chord validation for the guide 鈥?
+            // the guide only needs its OWN point to be free with
+            // >= lp_min_clearance (0.5) to the nearest observed cell (the
+            // 0.5-inflated grid enforces that via traversableAt); the
+            // 30 Hz planner routes around obstacles itself.  A straight-
+            // chord requirement forced the guide to the SIDE of every
+            // blocker (measured: task254 first guide ~50掳 off the goal
+            // line) instead of letting it sit on the goal line beyond the
+            // blocker, and pinned it at the perception edge.
+            // Applied to BOTH strict (bypass certification + side lock)
+            // and non-strict (guide placement): a strict bypass that only
+            // threads 0.37 m from a surface is not a certifiable escape,
+            // and a guide placed inside the 0.5 m band is unreachable by
+            // the 30 Hz A* (its 0.5 m inflation blocks the goal cell) 鈥?
+            // measured: joint_v2_000000_0e798c93 guide (2.88,15.86) at
+            // 0.37 m from obstacle (4.07,15.05) r1.07; the local plan
+            // could never end there and fell to the FOV-edge scan.
+            if (!grid.traversableAt(endpoint)) continue;
             // NOT truncated: known-FREE continuation beyond the endpoint
             // along the same ray.
             const double cont = freeRangeAlongFrom(
@@ -398,13 +437,45 @@ VisibilityTargetCorrector::sampleSideCandidates(
     return out;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Side selection (current patch visible evidence only)
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+//  Side selection (strict bypass certification first, then free-range)
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 SideSelection VisibilityTargetCorrector::selectSide(
-    const VehicleState2D& state, const LocalObservation& patch,
+    const PlanarState& state, const LocalObservation& patch,
     const Vec2d& goal) const {
     if (!patch.valid()) return SideSelection::RIGHT;
+
+    // 鈹€鈹€ PRIMARY: strict bypass-observability preference 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // If exactly ONE side has a certifiable strict bypass on the current
+    // local map, lock that side.  The free-range metric below can disagree
+    // with the strict certification (measured: task30 entry had
+    // right_bypass_observable=1 / left=0 yet the free-range + goal-side
+    // fallback locked LEFT, leading the drone into a west dead-end pocket
+    // where it was boxed in forever).  A certified strict bypass (known-
+    // free reachable path + free continuation beyond the FOV boundary) is
+    // real evidence of an escape route; the free-range average is not.
+    {
+        const LocalFreeGrid grid = buildLocalFreeGrid(state, patch);
+        if (grid.valid()) {
+            double blocker_min_along = std::numeric_limits<double>::infinity();
+            double blocker_lat_min = std::numeric_limits<double>::infinity();
+            double blocker_lat_max = -std::numeric_limits<double>::infinity();
+            const bool has_blocker =
+                extractBlocker(state, goal, patch, blocker_min_along,
+                               blocker_lat_min, blocker_lat_max);
+            const bool left_ok = !sampleSideCandidates(
+                state, goal, patch, grid, has_blocker, blocker_min_along,
+                SideSelection::LEFT, /*strict=*/true).empty();
+            const bool right_ok = !sampleSideCandidates(
+                state, goal, patch, grid, has_blocker, blocker_min_along,
+                SideSelection::RIGHT, /*strict=*/true).empty();
+            if (left_ok != right_ok) {
+                return left_ok ? SideSelection::LEFT : SideSelection::RIGHT;
+            }
+        }
+    }
+
+    // 鈹€鈹€ FALLBACK: paired-ray free-range evidence 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     const double fov = deg2rad(p_.obs_fov_deg);
     const double b_goal =
         wrapAngle(std::atan2(goal.y() - state.position.y(),
@@ -423,23 +494,44 @@ SideSelection VisibilityTargetCorrector::selectSide(
         ++pairs;
     }
     if (pairs < std::max(1, p_.macro_min_evidence_ray_pairs)) {
-        return SideSelection::RIGHT;  // ambiguous → fixed RIGHT
+        // Too little paired evidence to judge free space 鈥?prefer the
+        // side the ORIGINAL goal lies on (same rule as the ambiguity
+        // fallback below; fixed RIGHT only when the goal is dead ahead).
+        if (std::fabs(b_goal) > 1e-9) {
+            return b_goal > 0.0 ? SideSelection::LEFT
+                                : SideSelection::RIGHT;
+        }
+        return SideSelection::RIGHT;
     }
     const double left_avg = left_total / static_cast<double>(pairs);
     const double right_avg = right_total / static_cast<double>(pairs);
     const double m = p_.macro_side_evidence_margin;
     if (left_avg > right_avg + m) return SideSelection::LEFT;
     if (right_avg > left_avg + m) return SideSelection::RIGHT;
-    return SideSelection::RIGHT;  // indistinguishable → fixed RIGHT
+
+    // Ambiguous free-range evidence 鈫?prefer the side the ORIGINAL goal
+    // lies on (b_goal > 0 = goal LEFT of the nose in the expert frame).
+    // The drone enters correction heading at the goal line, so the
+    // goal-side bypass is the minimal-turn detour (no backtracking across
+    // the blocker).  Fixed-RIGHT here sent joint_v2_000002 on an east
+    // detour away from a west goal (it then stalled at the blocker
+    // boundary) and turned joint_v2_000000 (a turn_right task) into a
+    // LEFT bypass that the preflight predicted as TURN_RIGHT.
+    if (std::fabs(b_goal) > 1e-9) {
+        return b_goal > 0.0 ? SideSelection::LEFT : SideSelection::RIGHT;
+    }
+    return SideSelection::RIGHT;  // goal exactly dead ahead 鈫?fixed RIGHT
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 //  Correction directive construction
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 TargetCorrectionDirective VisibilityTargetCorrector::makeCorrectionDirective(
-    const VehicleState2D& state, const Vec2d& goal,
+    const PlanarState& state, const Vec2d& goal,
     const LocalObservation& patch, const LocalFreeGrid& grid,
-    SideSelection side) const {
+    SideSelection side, bool live_directive_usable,
+    bool drop_held_waypoint_allowed,
+    const DirectiveAssessmentFn& assess_directive) const {
     TargetCorrectionDirective d;
     d.valid = true;
     d.locked_side = side;
@@ -457,40 +549,104 @@ TargetCorrectionDirective VisibilityTargetCorrector::makeCorrectionDirective(
     d.reason = side == SideSelection::LEFT ? "TURN_LEFT_NO_FRONTIER"
                                            : "TURN_RIGHT_NO_FRONTIER";
 
-    // Try NORMAL_CORRECTION: a safe ordinary observation frontier on the
-    // locked side (strict=false).  The expert's CONTINUOUS bearing is then
-    // quantized through the student adapter and the executed world point is
-    // REBUILT from the quantized direction + clamped distance.
+    // Try NORMAL_CORRECTION candidates on the locked side.  Geometry only
+    // proposes candidates; the exact same 30 Hz local planner preview that
+    // executes the target is the final feasibility authority.
     double blocker_min_along = std::numeric_limits<double>::infinity();
-    double blocker_max_lateral = 0.0;
+    double blocker_lat_min = std::numeric_limits<double>::infinity();
+    double blocker_lat_max = -std::numeric_limits<double>::infinity();
     const bool has_blocker =
         extractBlocker(state, goal, patch, blocker_min_along,
-                       blocker_max_lateral);
-    const std::vector<SideCandidate> cands =
+                       blocker_lat_min, blocker_lat_max);
+    std::vector<SideCandidate> cands =
         sampleSideCandidates(state, goal, patch, grid, has_blocker,
                              blocker_min_along, side, /*strict=*/false);
-    if (!cands.empty()) {
-        const SideCandidate* best = nullptr;
-        for (const SideCandidate& c : cands) {
-            if (!best || c.along_progress > best->along_progress ||
-                (c.along_progress == best->along_progress &&
-                 c.dist > best->dist)) {
-                best = &c;
+    std::sort(cands.begin(), cands.end(),
+              [](const SideCandidate& a, const SideCandidate& b) {
+                  if (a.along_progress != b.along_progress) {
+                      return a.along_progress > b.along_progress;
+                  }
+                  return a.dist > b.dist;
+              });
+
+    // Keep the previous FIXED world waypoint until it is reached or becomes
+    // locally unusable.  Never extrapolate it from the live pose: doing so
+    // turns a finite waypoint into an endless ray and destroys mission-goal
+    // convergence.  Fly-through semantics are carried internally by
+    // PlanarTarget::flythrough, independently of its remaining distance.
+    //
+    // R25: a single cold-start preview miss must NOT discard a waypoint
+    // that is still actually executing.  The waypoint is only dropped when
+    // (a) it is reached, (b) `drop_held_waypoint_allowed` is true, meaning
+    // the real 30 Hz execution has failed for >= 3 consecutive 5 Hz updates
+    // (tracked in update()), or (c) a fresh hard obstacle blocks it.
+    if (last_directive_.type == TargetCorrectionType::NORMAL_CORRECTION &&
+        last_directive_.normalized_distance > 1e-9 &&
+        last_directive_.corrected_target_world_valid) {
+        const Vec2d previous_delta =
+            last_directive_.corrected_target_world - state.position;
+        const double waypoint_reached_tolerance = waypointReachedTolerance();
+        if (previous_delta.norm() > waypoint_reached_tolerance) {
+            TargetCorrectionDirective held = last_directive_;
+            const double bearing = wrapAngle(
+                std::atan2(previous_delta.y(), previous_delta.x()) -
+                state.yaw);
+            held.direction_token = adapter_.quantizeBearing(bearing);
+            held.decoded_direction_body =
+                adapter_.decodeDirectionToken(held.direction_token);
+            held.normalized_distance =
+                adapter_.clampNormalizedDistance(previous_delta.norm());
+            held.turn_direction_world_valid = false;
+            held.locked_side = side;
+            held.reason = "FIXED_WAYPOINT_HELD";
+            const LocalPlanningAssessment held_assessment =
+                assess_directive(held);
+            const bool can_hold =
+                !drop_held_waypoint_allowed || live_directive_usable ||
+                held_assessment.translation_plan_valid ||
+                held_assessment.rotation_available;
+            if (can_hold) {
+                return held;
             }
         }
-        const int token = adapter_.quantizeBearing(best->bearing);
-        d.direction_token = token;
-        d.decoded_direction_body = adapter_.decodeDirectionToken(token);
-        const double normalized =
-            adapter_.clampNormalizedDistance(best->dist);
-        d.normalized_distance = normalized;
-        const Vec2d dir_world = rot2(d.decoded_direction_body, state.yaw);
-        d.corrected_target_world =
-            state.position + dir_world * adapter_.normalizedToWorld(normalized);
-        d.corrected_target_world_valid = true;
-        d.turn_direction_world_valid = false;
-        d.type = TargetCorrectionType::NORMAL_CORRECTION;
-        d.reason = "NORMAL_CORRECTION_FRONTIER";
+    }
+
+    std::vector<uint8_t> previewed_tokens(
+        static_cast<size_t>(std::max(3, p_.te_direction_bin_count) + 2), 0);
+    size_t preview_count = 0;
+    constexpr size_t kMaxCandidatePreviews = 16;
+    for (const SideCandidate& chosen : cands) {
+        TargetCorrectionDirective candidate = d;
+        const int token = adapter_.quantizeBearing(chosen.bearing);
+        if (previewed_tokens[static_cast<size_t>(token)] != 0) continue;
+        previewed_tokens[static_cast<size_t>(token)] = 1;
+        candidate.direction_token = token;
+        candidate.decoded_direction_body =
+            adapter_.decodeDirectionToken(token);
+        const double command_distance = chosen.dist;
+        candidate.normalized_distance =
+            adapter_.clampNormalizedDistance(command_distance);
+        const Vec2d dir_world =
+            rot2(candidate.decoded_direction_body, state.yaw);
+        candidate.corrected_target_world =
+            state.position + dir_world * command_distance;
+        if ((goal - candidate.corrected_target_world).norm() >
+            (goal - state.position).norm() -
+                p_.macro_observable_frontier_min_progress_m) {
+            continue;
+        }
+        candidate.corrected_target_world_valid = true;
+        candidate.turn_direction_world_valid = false;
+        candidate.type = TargetCorrectionType::NORMAL_CORRECTION;
+        candidate.reason = "NORMAL_CORRECTION_PREVIEW_CERTIFIED";
+
+        ++preview_count;
+        const LocalPlanningAssessment candidate_assessment =
+            assess_directive(candidate);
+        if (candidate_assessment.translation_plan_valid) {
+            return candidate;
+        }
+        if (preview_count >= kMaxCandidatePreviews) break;
     }
     return d;
 }
@@ -499,6 +655,9 @@ bool VisibilityTargetCorrector::directiveChanged(
     const TargetCorrectionDirective& a,
     const TargetCorrectionDirective& b) const {
     if (a.type != b.type) return true;
+    // A flip between fly-through and terminal-brake semantics is a change
+    // even when the world point is identical (R24 terminal_stop).
+    if (a.terminal_stop != b.terminal_stop) return true;
     if (a.locked_side != b.locked_side) return true;
     if (a.type == TargetCorrectionType::NORMAL_CORRECTION ||
         a.type == TargetCorrectionType::TURN_LEFT ||
@@ -527,18 +686,30 @@ bool VisibilityTargetCorrector::directiveChanged(
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 //  Public API: reset / bump / update
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 void VisibilityTargetCorrector::reset() {
     correction_active_ = false;
     locked_side_ = SideSelection::NONE;
-    enter_stable_count_ = 0;
-    reentry_guard_until_tick_ = 0;
     update_event_ = 0;
     correction_enter_event_ = 0;
     correction_exit_event_ = 0;
     correction_update_event_ = 0;
+    stagnant_update_count_ = 0;
+    reentry_success_updates_ = 0;
+    search_episode_active_ = false;
+    search_swept_rad_ = 0.0;
+    last_search_yaw_ = 0.0;
+    has_last_search_yaw_ = false;
+    brake_latched_ = false;
+    brake_world_point_ = Vec2d(0.0, 0.0);
+    brake_stationary_updates_ = 0;
+    waypoint_execution_fail_updates_ = 0;
+    lc_goal_dist_start_ = std::numeric_limits<double>::infinity();
+    lc_no_progress_ticks_ = 0;
+    last_state_position_ = Vec2d(0.0, 0.0);
+    has_last_state_position_ = false;
     last_directive_ = TargetCorrectionDirective{};
     last_obs_ = AvoidanceObservability{};
 }
@@ -546,8 +717,20 @@ void VisibilityTargetCorrector::reset() {
 void VisibilityTargetCorrector::resetForNewGoal() {
     correction_active_ = false;
     locked_side_ = SideSelection::NONE;
-    enter_stable_count_ = 0;
-    reentry_guard_until_tick_ = 0;
+    stagnant_update_count_ = 0;
+    reentry_success_updates_ = 0;
+    search_episode_active_ = false;
+    search_swept_rad_ = 0.0;
+    last_search_yaw_ = 0.0;
+    has_last_search_yaw_ = false;
+    brake_latched_ = false;
+    brake_world_point_ = Vec2d(0.0, 0.0);
+    brake_stationary_updates_ = 0;
+    waypoint_execution_fail_updates_ = 0;
+    lc_goal_dist_start_ = std::numeric_limits<double>::infinity();
+    lc_no_progress_ticks_ = 0;
+    last_state_position_ = Vec2d(0.0, 0.0);
+    has_last_state_position_ = false;
     last_directive_ = TargetCorrectionDirective{};
     last_directive_.update_event = update_event_;
     last_obs_ = AvoidanceObservability{};
@@ -559,155 +742,532 @@ uint64_t VisibilityTargetCorrector::bumpDirectiveEvent() {
 }
 
 TargetCorrectionDirective VisibilityTargetCorrector::update(
-    const VehicleState2D& state, const Vec2d& original_goal,
+    const PlanarState& state, const Vec2d& original_goal,
     const LocalObservation& current_patch,
-    const LocalObservation& local_history, uint64_t tick) {
-
-    // 1) Local observability judgement.  The fused history contains the
-    //    current patch plus recent causal observations.  A fresh-patch
-    //    judgement is retained for the correction-entry gate and side
-    //    choice, preventing stale-only entry.
-    last_obs_ = assessObservability(state, original_goal, local_history);
-    const AvoidanceObservability& obs = last_obs_;
-    const AvoidanceObservability fresh_obs =
-        assessObservability(state, original_goal, current_patch);
-
-    // 2) Enter / exit conditions (5 Hz's own judgement — NEVER the 30 Hz
-    //    outcome):
-    const bool enter_ready =
-        fresh_obs.goal_inside_fov && fresh_obs.direct_corridor_blocked &&
-        !obs.local_avoidance_observable;
-    const Vec2d to_goal = original_goal - state.position;
-    const double goal_bearing =
-        to_goal.squaredNorm() > 1e-12
-            ? wrapAngle(std::atan2(to_goal.y(), to_goal.x()) - state.yaw)
-            : 0.0;
-    const double fov_half = 0.5 * deg2rad(p_.obs_fov_deg);
-    const double handoff_half =
-        std::max(0.0, fov_half - deg2rad(p_.te_turn_ray_margin_deg));
-    const bool goal_handoff_ready =
-        std::fabs(goal_bearing) <= handoff_half + 1e-9;
-    const bool yaw_rate_handoff_ready =
-        std::fabs(state.yaw_rate) <= p_.lp_turn_exit_max_yaw_rate + 1e-9;
-    const bool base_exit_ready =
-        goal_handoff_ready && yaw_rate_handoff_ready &&
-        obs.local_avoidance_observable;
-
-    TargetCorrectionDirective d;
-    d.valid = true;
-    d.type = TargetCorrectionType::PASS_THROUGH;
-    d.locked_side = correction_active_ ? locked_side_ : SideSelection::NONE;
-    d.reason = "PASS_THROUGH";
-    d.update_event = update_event_;
-
-    bool changed = false;
-    if (!correction_active_) {
-        if (enter_ready && tick >= reentry_guard_until_tick_) {
-            ++enter_stable_count_;
-            if (enter_stable_count_ >= p_.macro_correction_enter_stable_ticks) {
-                // ENTER correction: lock the side from current-patch
-                // evidence only (ambiguous → fixed RIGHT).
-                locked_side_ = selectSide(state, current_patch, original_goal);
-                if (locked_side_ == SideSelection::NONE) {
-                    locked_side_ = SideSelection::RIGHT;
-                }
-                correction_active_ = true;
-                enter_stable_count_ = 0;
-                ++correction_enter_event_;
-                const LocalFreeGrid grid = buildLocalFreeGrid(state, local_history);
-                d = makeCorrectionDirective(state, original_goal, local_history,
-                                            grid, locked_side_);
-                d.reason = "CORRECTION_ENTER " + d.reason;
-                changed = true;
-            } else {
-                d.reason = "CORRECTION_ENTER_PENDING";
-            }
+    const LocalObservation& local_history,
+    const LocalPlanningAssessment& assessment,
+    bool live_directive_usable,
+    const DirectiveAssessmentFn& assess_directive) {
+    // The corrector runs at 5 Hz.  Count consecutive updates with negligible
+    // motion while a correction is active so a stale target cannot hold the
+    // vehicle in a permanent brake/hold loop.
+    const bool previous_normal_translation =
+        correction_active_ &&
+        last_directive_.type == TargetCorrectionType::NORMAL_CORRECTION &&
+        last_directive_.normalized_distance > 1e-9;
+    if (has_last_state_position_ && previous_normal_translation) {
+        const double moved =
+            (state.position - last_state_position_).norm();
+        // At 5 Hz, twice the configured stationary-speed displacement is a
+        // conservative no-progress threshold.  The old 0.12 m/update test
+        // misclassified legitimate slow avoidance (~0.5 m/s) as stagnation.
+        const double progress_epsilon = std::max(
+            0.01, 0.4 * p_.vehicle_stationary_speed_mps);
+        if (moved < progress_epsilon) {
+            ++stagnant_update_count_;
         } else {
-            enter_stable_count_ = 0;
+            stagnant_update_count_ = 0;
         }
     } else {
-        // Construct the next local-only correction before deciding whether
-        // to release.
-        const LocalFreeGrid grid = buildLocalFreeGrid(state, local_history);
-        TargetCorrectionDirective proposed = makeCorrectionDirective(
-            state, original_goal, local_history, grid, locked_side_);
-        proposed.locked_side = locked_side_;
+        stagnant_update_count_ = 0;
+    }
+    last_state_position_ = state.position;
+    has_last_state_position_ = true;
 
-        const bool previous_was_turn =
-            last_directive_.type == TargetCorrectionType::TURN_LEFT ||
-            last_directive_.type == TargetCorrectionType::TURN_RIGHT;
-        const bool visible_bypass =
-            obs.direct_corridor_blocked &&
-            (obs.left_bypass_observable || obs.right_bypass_observable);
-        const bool normal_bridge_available =
-            proposed.type == TargetCorrectionType::NORMAL_CORRECTION;
-
-        // A TURN token is a bounded, world-latched angular step.  If no
-        // ordinary frontier is available yet and the previous turn anchor
-        // is still outside the current FOV, keep that exact anchor.  Once
-        // it has entered the FOV, this 5 Hz boundary may issue another
-        // bounded step (finite turns, no infinite in-place spin).
-        if (previous_was_turn && !normal_bridge_available &&
-            last_directive_.turn_direction_world_valid) {
-            const Vec2d old_direction =
-                last_directive_.turn_direction_world;
-            if (old_direction.squaredNorm() > 1e-12) {
-                const double old_bearing = wrapAngle(
-                    std::atan2(old_direction.y(), old_direction.x()) -
-                    state.yaw);
-                if (std::fabs(old_bearing) > fov_half + 1e-9) {
-                    proposed = last_directive_;
-                    proposed.reason = "TURN_STEP_PENDING";
-                }
-            }
+    // Search is monotonic on one locked side.  Accumulate actual yaw swept
+    // while TURN directives are active; after a half turn without finding a
+    // preview-certified translational guide, try the opposite side once
+    // instead of oscillating around the original-goal bearing.
+    const bool previous_search_phase =
+        correction_active_ && search_episode_active_;
+    bool switched_search_side = false;
+    if (previous_search_phase) {
+        if (has_last_search_yaw_) {
+            search_swept_rad_ +=
+                std::fabs(wrapAngle(state.yaw - last_search_yaw_));
         }
-        const bool require_turn_to_normal_bridge =
-            previous_was_turn && visible_bypass && normal_bridge_available;
-        const bool exit_ready =
-            base_exit_ready && !require_turn_to_normal_bridge;
+        last_search_yaw_ = state.yaw;
+        has_last_search_yaw_ = true;
+        if (search_swept_rad_ >= deg2rad(180.0) - 1e-6) {
+            locked_side_ = locked_side_ == SideSelection::LEFT
+                               ? SideSelection::RIGHT
+                               : SideSelection::LEFT;
+            search_swept_rad_ = 0.0;
+            last_search_yaw_ = state.yaw;
+            switched_search_side = true;
+        }
+    } else {
+        search_swept_rad_ = 0.0;
+        has_last_search_yaw_ = false;
+    }
 
-        if (exit_ready) {
-            // Release immediately on the first real 5 Hz observation that
-            // certifies a locally observable route, a safe original-goal
-            // handoff bearing, and sufficiently low actual yaw rate.
-            correction_active_ = false;
-            locked_side_ = SideSelection::NONE;
-            enter_stable_count_ = 0;
-            ++correction_exit_event_;
-            reentry_guard_until_tick_ =
-                tick + static_cast<uint64_t>(
-                           std::max(0, p_.macro_reentry_guard_ticks));
-            d.type = TargetCorrectionType::PASS_THROUGH;
-            d.locked_side = SideSelection::NONE;
-            d.reason = "CORRECTION_EXIT_HANDOFF_READY";
-            changed = true;
+    // Geometric observability remains diagnostic/search evidence. The
+    // authoritative handoff decision is the real local-planner assessment.
+    last_obs_ = assessObservability(state, original_goal, local_history);
+    const AvoidanceObservability fresh_obs =
+        assessObservability(state, original_goal, current_patch);
+    last_obs_.goal_inside_fov = fresh_obs.goal_inside_fov;
+    last_obs_.direct_corridor_blocked =
+        fresh_obs.direct_corridor_blocked;
+    last_obs_.blocker_observed = fresh_obs.blocker_observed;
+    last_obs_.blocker_min_along = fresh_obs.blocker_min_along;
+    last_obs_.left_bypass_observable = fresh_obs.left_bypass_observable;
+    last_obs_.right_bypass_observable = fresh_obs.right_bypass_observable;
+    last_obs_.fov_boundary_truncated = fresh_obs.fov_boundary_truncated;
+    last_obs_.unknown_occluded = fresh_obs.unknown_occluded;
+    last_obs_.local_avoidance_observable =
+        assessment.translation_plan_valid;
+    last_obs_.reason = fresh_obs.reason;
+    last_obs_.left_score = fresh_obs.left_score;
+    last_obs_.right_score = fresh_obs.right_score;
+
+    // Outside recovery, yaw-first capability is sufficient to pass the
+    // original goal to the local layer.  During recovery, however, TURNING
+    // only proves that the target can be looked at.  Release the corrected
+    // target solely after three consecutive 5 Hz previews prove a genuine
+    // translational path to the original target.
+    constexpr uint32_t kReentrySuccessUpdates = 3;
+    if (correction_active_) {
+        if (assessment.translation_plan_valid) {
+            reentry_success_updates_ = std::min(
+                reentry_success_updates_ + 1, kReentrySuccessUpdates);
         } else {
-            d = std::move(proposed);
-            if (require_turn_to_normal_bridge) {
-                d.reason = "TURN_TO_NORMAL_HANDOFF_BRIDGE " + d.reason;
-            } else if (obs.local_avoidance_observable &&
-                       !yaw_rate_handoff_ready) {
-                d.reason = "HANDOFF_PENDING_YAW_RATE " + d.reason;
-            } else if (obs.local_avoidance_observable &&
-                       !goal_handoff_ready) {
-                d.reason = "HANDOFF_PENDING_GOAL_OUTSIDE_CONE " + d.reason;
-            }
-            if (directiveChanged(last_directive_, d)) {
-                changed = true;
-                ++correction_update_event_;
+            reentry_success_updates_ = 0;
+        }
+    } else {
+        reentry_success_updates_ = 0;
+    }
+    const bool direct_local_available =
+        assessment.translation_plan_valid || assessment.rotation_available;
+    const double original_goal_distance =
+        (original_goal - state.position).norm();
+    // R26: macro-level limit-cycle watchdog on the ORIGINAL goal distance.
+    // The local detector watches the current EFFECTIVE target, but the
+    // macro switches goal<->TURN, so each switch resets the local bearing
+    // evidence (measured: task 65 PASS/TURN_RIGHT loop at 0.48 m for ~36 s
+    // with 2458° of yaw).  Whenever the original-goal distance decreases by
+    // >= macro_limit_cycle_goal_progress_m the window resets; after
+    // macro_limit_cycle_window_5hz updates without such progress the macro
+    // treats the episode as cycling and forces a fresh handoff to local.
+    if (lc_goal_dist_start_ - original_goal_distance >=
+        p_.macro_limit_cycle_goal_progress_m) {
+        lc_goal_dist_start_ = original_goal_distance;
+        lc_no_progress_ticks_ = 0;
+    } else if (std::isfinite(lc_goal_dist_start_)) {
+        ++lc_no_progress_ticks_;
+    } else {
+        lc_goal_dist_start_ = original_goal_distance;
+        lc_no_progress_ticks_ = 0;
+    }
+    const bool macro_limit_cycle =
+        lc_no_progress_ticks_ >=
+        static_cast<uint64_t>(std::max(1, p_.macro_limit_cycle_window_5hz));
+    // Terminal capture zone: inside macro_terminal_capture_radius_m of the
+    // original goal the macro must NEVER issue a locked-side search TURN.
+    // As soon as the HARD corridor is clear (and local can rotate or the
+    // goal is inside the FOV), hand the target back to local so it
+    // micro-approaches / rotates toward the goal.  Only a genuine HARD
+    // corridor block may keep the macro engaged.  (task 65: the macro
+    // issued TURN_RIGHT at 0.48 m with the goal in FOV and a clear
+    // corridor — the 1 m risk corridor was treated as a hard block.)
+    const bool terminal_capture_zone =
+        original_goal_distance <= p_.macro_terminal_capture_radius_m;
+    const bool local_can_take_goal =
+        assessment.rotation_available || !assessment.target_outside_fov ||
+        assessment.translation_plan_valid;
+    const bool terminal_capture_lock =
+        (terminal_capture_zone || macro_limit_cycle) &&
+        !assessment.local_corridor_blocked && local_can_take_goal;
+    // Final approach has higher priority than macro recovery.  When the
+    // original goal is visible, near and geometrically unobstructed, keep
+    // the original terminal target even if a cold-start preview temporarily
+    // cannot certify the current-speed stopping trajectory.
+    //
+    // R25 (measured deadlock joint_v2_000004_4ab1e354 / task 491): the
+    // near-goal capture lock is an INITIAL priority for the LOCAL layer,
+    // not a permanent veto on macro recovery.  It must never fire while a
+    // correction is ACTIVE (it revoked a working bypass waypoint the
+    // instant the goal crossed 4.5 m, leaving PASS_THROUGH + local BLOCKED
+    // for ~50 s), and it must not block a CONFIRMED takeover: when the
+    // local planner is persistently failing, the 5 Hz layer must be allowed
+    // to re-issue a temporary target.  During correction only
+    // recovery_reentry_confirmed (3 consecutive translational previews)
+    // releases the corrected target.
+    const bool goal_capture_lock =
+        !correction_active_ &&
+        original_goal_distance <= adapter_.normalMaxDistanceM() + 1e-9 &&
+        fresh_obs.goal_inside_fov &&
+        !fresh_obs.direct_corridor_blocked &&
+        !assessment.takeover_confirmed;
+    const bool recovery_reentry_confirmed =
+        correction_active_ &&
+        reentry_success_updates_ >= kReentrySuccessUpdates;
+    // R24: if the original goal is OUTSIDE the FOV but the direct corridor
+    // is NOT blocked, the 30 Hz local planner can rotate to re-acquire it
+    // (its own preview reports rotation_available).  Do NOT keep issuing
+    // locked-side search TURNs that push the goal further behind the nose;
+    // hand the original target straight back to local so it rotates toward
+    // the goal.  (joint_v2_000001_469baa3b @22.4 s: goal only 5.6° outside
+    // the left FOV with a clear corridor; the expert instead issued
+    // TURN_RIGHT along the locked side and drove the goal to the tail.)
+    const bool reacquire_original_goal =
+        correction_active_ &&
+        assessment.target_outside_fov &&
+        !fresh_obs.direct_corridor_blocked &&
+        assessment.rotation_available;
+    if (goal_capture_lock ||
+        (!correction_active_ && direct_local_available) ||
+        recovery_reentry_confirmed ||
+        reacquire_original_goal ||
+        terminal_capture_lock) {
+        TargetCorrectionDirective d;
+        d.valid = true;
+        d.type = TargetCorrectionType::PASS_THROUGH;
+        d.locked_side = SideSelection::NONE;
+        const bool leaving_correction = correction_active_;
+        d.reason = goal_capture_lock
+                       ? "ORIGINAL_GOAL_CAPTURE_LOCK"
+                       : (terminal_capture_lock
+                              ? (terminal_capture_zone
+                                     ? "TERMINAL_CAPTURE_ZONE_LOCAL_APPROACH"
+                                     : "MACRO_LIMIT_CYCLE_FORCE_LOCAL")
+                              : (reacquire_original_goal
+                                     ? "REACQUIRE_ORIGINAL_GOAL_LOCAL_ROTATE"
+                                     : (assessment.rotation_available &&
+                                        !assessment.translation_plan_valid
+                                           ? "LOCAL_CAN_ROTATE_TO_ORIGINAL_TARGET"
+                                           : (leaving_correction
+                                                  ? "ORIGINAL_TRANSLATION_REENTRY_CONFIRMED"
+                                                  : "LOCAL_CAN_PLAN_ORIGINAL_TARGET"))));
+
+        const bool changed =
+            leaving_correction ||
+            last_directive_.type != TargetCorrectionType::PASS_THROUGH;
+        if (leaving_correction) ++correction_exit_event_;
+        correction_active_ = false;
+        locked_side_ = SideSelection::NONE;
+        stagnant_update_count_ = 0;
+        reentry_success_updates_ = 0;
+        search_episode_active_ = false;
+        search_swept_rad_ = 0.0;
+        has_last_search_yaw_ = false;
+        // R24: a latched brake belongs to the correction episode only; it
+        // must never leak into the next episode via a stale world point.
+        brake_latched_ = false;
+        brake_stationary_updates_ = 0;
+        waypoint_execution_fail_updates_ = 0;
+        if (changed) ++update_event_;
+        d.update_event = update_event_;
+        last_directive_ = d;
+        return d;
+    }
+
+    // A preview miss does not authorize an upper-layer target change.  Wait
+    // until the actually executing 30 Hz planner has reported continuous
+    // failure for the configured confirmation window.  During this window
+    // PASS_THROUGH lets local brake, slow down or retry the same goal.
+    //
+    // R24: the LOCAL planner's own corridor verdict is authoritative macro
+    // topology evidence.  The geometric extractBlocker lateral-span gate
+    // deliberately ignores small/single obstacles, but the 30 Hz A* (with
+    // its 0.5 m inflation) can be genuinely blocked by exactly those small
+    // obstacles.  Relying only on the geometric gate created a
+    // responsibility vacuum: the upper layer said "small obstacle → local
+    // can handle it" while the local planner itself continuously reported
+    // it could not (joint_v2_000001_469baa3b: 108/122 locally-BLOCKED
+    // frames had no geometric corridor blocker; 133/141 for
+    // joint_v2_000000_a411ef5a).
+    const bool macro_topology_evidence =
+        !current_patch.valid() || fresh_obs.direct_corridor_blocked ||
+        fresh_obs.unknown_occluded || fresh_obs.fov_boundary_truncated ||
+        assessment.local_corridor_blocked;
+    if (!correction_active_ &&
+        (!assessment.takeover_confirmed || !macro_topology_evidence)) {
+        TargetCorrectionDirective d;
+        d.valid = true;
+        d.type = TargetCorrectionType::PASS_THROUGH;
+        d.locked_side = SideSelection::NONE;
+        d.reason = !assessment.takeover_confirmed
+                       ? "LOCAL_TAKEOVER_PENDING_CONFIRMED_FAILURE"
+                       : "LOCAL_FAILURE_WITHOUT_MACRO_TOPOLOGY_EVIDENCE";
+        const bool changed =
+            last_directive_.type != TargetCorrectionType::PASS_THROUGH;
+        if (changed) ++update_event_;
+        d.update_event = update_event_;
+        last_directive_ = d;
+        return d;
+    }
+
+    // 2/3) The original target is not locally plannable. Lock a bypass
+    // side for this episode, then publish either an in-FOV temporary target
+    // or a bounded pure-rotation search step when route evidence is weak.
+    const bool entering = !correction_active_;
+    if (entering) {
+        locked_side_ = selectSide(state, local_history, original_goal);
+        if (locked_side_ == SideSelection::NONE) {
+            locked_side_ = selectSide(state, current_patch, original_goal);
+        }
+        if (locked_side_ == SideSelection::NONE) {
+            locked_side_ = SideSelection::RIGHT;
+        }
+        correction_active_ = true;
+        ++correction_enter_event_;
+        stagnant_update_count_ = 0;
+        reentry_success_updates_ = 0;
+        search_episode_active_ = false;
+        search_swept_rad_ = 0.0;
+        has_last_search_yaw_ = false;
+        // R24: never carry a latched brake / stationary count into a new
+        // correction episode.
+        brake_latched_ = false;
+        brake_stationary_updates_ = 0;
+        waypoint_execution_fail_updates_ = 0;
+    }
+
+    // If the current patch already contains the blocker, build the guide from
+    // that patch.  History may still be used when the current view is clear,
+    // but it must not override fresh blocker/bypass evidence with an older
+    // straight frontier.
+    const LocalObservation& planning_observation =
+        fresh_obs.direct_corridor_blocked
+            ? current_patch
+            : (local_history.valid() ? local_history : current_patch);
+    const LocalFreeGrid grid =
+        buildLocalFreeGrid(state, planning_observation);
+
+    // R25 (Fix #6): a single cold preview miss must not discard a waypoint
+    // that is still actually executing.  Track consecutive 5 Hz updates in
+    // which the held waypoint is neither reached nor executing; only after
+    // >= 3 such updates may makeCorrectionDirective drop it.
+    {
+        const bool held_waypoint =
+            last_directive_.type == TargetCorrectionType::NORMAL_CORRECTION &&
+            last_directive_.normalized_distance > 1e-9 &&
+            last_directive_.corrected_target_world_valid;
+        if (held_waypoint) {
+            const Vec2d pd =
+                last_directive_.corrected_target_world - state.position;
+            if (pd.norm() > waypointReachedTolerance()) {
+                waypoint_execution_fail_updates_ =
+                    live_directive_usable
+                        ? 0
+                        : waypoint_execution_fail_updates_ + 1;
             } else {
-                // Keep the previous numeric directive exactly.
-                const std::string current_reason = d.reason;
-                d = last_directive_;
-                d.reason = current_reason;
+                waypoint_execution_fail_updates_ = 0;
+            }
+        } else {
+            waypoint_execution_fail_updates_ = 0;
+        }
+    }
+    const bool drop_held_allowed =
+        waypoint_execution_fail_updates_ >= 3;
+    TargetCorrectionDirective d = makeCorrectionDirective(
+        state, original_goal, planning_observation, grid, locked_side_,
+        live_directive_usable, drop_held_allowed, assess_directive);
+    d.locked_side = locked_side_;
+
+    // R24: a pure-rotation search step must first serve "re-acquire the
+    // original goal".  When the direct corridor has NO blocker evidence,
+    // turn TOWARD the original goal (bring it back into the FOV) instead
+    // of blindly following the locked bypass side — the locked side is
+    // only a bypass aid while a blocker is actually present.
+    // (joint_v2_000001_469baa3b @22.4 s: goal 5.6° outside the LEFT FOV,
+    // no corridor blocker; the expert rotated RIGHT along the locked side
+    // and pushed the goal to the tail.)
+    {
+        const bool proposed_search_turn_rd =
+            d.type == TargetCorrectionType::TURN_LEFT ||
+            d.type == TargetCorrectionType::TURN_RIGHT;
+        if (proposed_search_turn_rd &&
+            !fresh_obs.direct_corridor_blocked) {
+            const Vec2d to_goal = original_goal - state.position;
+            const double b_goal = wrapAngle(
+                std::atan2(to_goal.y(), to_goal.x()) - state.yaw);
+            const double fov_half = 0.5 * deg2rad(p_.obs_fov_deg);
+            const bool goal_left = b_goal > fov_half + 1e-9;
+            const bool goal_right = b_goal < -(fov_half + 1e-9);
+            if (goal_left || goal_right) {
+                const int n = std::max(3, p_.te_direction_bin_count);
+                d.type = goal_left ? TargetCorrectionType::TURN_LEFT
+                                   : TargetCorrectionType::TURN_RIGHT;
+                d.direction_token = goal_left ? 0 : n + 1;
+                d.decoded_direction_body =
+                    adapter_.decodeDirectionToken(d.direction_token);
+                d.normalized_distance = 1.0;
+                d.corrected_target_world_valid = false;
+                d.turn_direction_world =
+                    rot2(d.decoded_direction_body, state.yaw).normalized();
+                d.turn_direction_world_valid = true;
+                d.reason = "SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL";
             }
         }
     }
 
-    if (changed) ++update_event_;
-    d.update_event = update_event_;
+    // Candidate generation already falls back to pure rotation when current
+    // plus causal-history information cannot produce a certified guide.  The
+    // watchdog handles the remaining case where a nominal guide is feasible
+    // on paper but repeatedly produces no translation.
+    const uint32_t stagnation_limit = static_cast<uint32_t>(std::max(
+        3, p_.macro_unknown_recovery_threshold_ticks / 6));
+    const bool progress_watchdog =
+        stagnant_update_count_ >= stagnation_limit;
+    // Geometry is diagnostic here and must not veto a preview-certified
+    // target from the other planner.
+    if (progress_watchdog &&
+        d.type == TargetCorrectionType::NORMAL_CORRECTION) {
+        const int n = std::max(3, p_.te_direction_bin_count);
+        const bool left = locked_side_ == SideSelection::LEFT;
+        d.type = left ? TargetCorrectionType::TURN_LEFT
+                      : TargetCorrectionType::TURN_RIGHT;
+        d.direction_token = left ? 0 : n + 1;
+        d.decoded_direction_body = adapter_.decodeDirectionToken(
+            d.direction_token);
+        d.normalized_distance = 1.0;
+        d.corrected_target_world_valid = false;
+        d.turn_direction_world =
+            rot2(d.decoded_direction_body, state.yaw).normalized();
+        d.turn_direction_world_valid = true;
+        d.reason = "LOCAL_BLOCKED_SEARCH_ROTATION_NO_PROGRESS";
+    }
+
+    // A distance==1 directive is a strict pure-rotation label.  Do not
+    // publish it while the vehicle is still translating: first issue a
+    // zero-distance ordinary correction so the 30 Hz planner smoothly
+    // brakes.  Once measured speed is stationary (for a confirmation
+    // window), the next 5 Hz update may publish the world-latched TURN
+    // step.
+    //
+    // R24 — the brake is now a LATCHED, TERMINAL semantic:
+    //   * terminal_stop is a PERSISTENT directive flag: the 30 Hz planner
+    //     treats the point as a stop-target and NEVER re-labels a coasted-
+    //     past brake as fly-through (previously fly-through was re-derived
+    //     from the live distance every tick, so a brake whose vehicle
+    //     coasted a few cm instantly became an accelerate-through target).
+    //   * the world point is latched at FIRST issue and held FIXED.  It is
+    //     NOT rewritten to the live pose every 5 Hz cycle (that turned a
+    //     brake into an endlessly moving target — joint_v2_000001_469baa3b
+    //     "nominal brake, actual accelerate away": 9.41 m travelled, goal
+    //     7.52 → 16.62 m).
+    //   * while latched, the directive is unchanged (no new events) until
+    //     the vehicle is stationary for macro_brake_confirm_ticks_5hz
+    //     consecutive updates, or a certified guide / PASS replaces the
+    //     search turn (which releases the latch immediately).
+    const bool proposed_search_turn =
+        d.type == TargetCorrectionType::TURN_LEFT ||
+        d.type == TargetCorrectionType::TURN_RIGHT;
+    const double speed = state.velocity_world.norm();
+    const bool vehicle_stationary =
+        speed <= p_.vehicle_stationary_speed_mps;
+    bool brake_before_search = false;
+    if (proposed_search_turn && !vehicle_stationary) {
+        if (!brake_latched_) {
+            brake_latched_ = true;
+            brake_world_point_ = state.position;
+            brake_stationary_updates_ = 0;
+        }
+        if (vehicle_stationary) ++brake_stationary_updates_;
+        brake_before_search = true;
+    } else if (brake_latched_) {
+        if (proposed_search_turn) {
+            // Still braking toward the fixed point until the confirmation
+            // window elapses.
+            if (vehicle_stationary) ++brake_stationary_updates_;
+            brake_before_search = true;
+        } else {
+            // A certified guide / pass-through replaced the search turn
+            // this cycle: release the brake latch and let it through.
+            brake_latched_ = false;
+            brake_stationary_updates_ = 0;
+        }
+    }
+    if (brake_before_search) {
+        const uint32_t brake_confirm = static_cast<uint32_t>(std::max(
+            1, p_.macro_brake_confirm_ticks_5hz));
+        const bool brake_confirmed =
+            vehicle_stationary &&
+            brake_stationary_updates_ >= brake_confirm;
+        if (brake_confirmed) {
+            // Brake achieved → release the latch and publish the TURN step.
+            brake_latched_ = false;
+            brake_stationary_updates_ = 0;
+            brake_before_search = false;
+        } else {
+            d.type = TargetCorrectionType::NORMAL_CORRECTION;
+            d.direction_token = adapter_.quantizeBearing(0.0);
+            d.decoded_direction_body = adapter_.decodeDirectionToken(
+                d.direction_token);
+            d.normalized_distance = 0.0;
+            // FIXED latched world point — never the live pose.
+            d.corrected_target_world = brake_world_point_;
+            d.corrected_target_world_valid = true;
+            d.turn_direction_world_valid = false;
+            // Persistent terminal semantics: the 30 Hz planner must stop
+            // here and never fly through, regardless of live distance.
+            d.terminal_stop = true;
+            d.reason = "BRAKE_BEFORE_SEARCH_ROTATION";
+        }
+    }
+
+    // A TURN is a bounded world-latched step. Keep its anchor until it
+    // enters the FOV; only then may the 5 Hz layer issue another step.
+    const bool previous_turn =
+        last_directive_.type == TargetCorrectionType::TURN_LEFT ||
+        last_directive_.type == TargetCorrectionType::TURN_RIGHT;
+    const bool proposed_turn =
+        d.type == TargetCorrectionType::TURN_LEFT ||
+        d.type == TargetCorrectionType::TURN_RIGHT;
+    if (!entering && !switched_search_side && previous_turn && proposed_turn &&
+        last_directive_.turn_direction_world_valid) {
+        const Vec2d direction = last_directive_.turn_direction_world;
+        if (direction.squaredNorm() > 1e-12) {
+            const double bearing = wrapAngle(
+                std::atan2(direction.y(), direction.x()) - state.yaw);
+            const double fov_half = 0.5 * deg2rad(p_.obs_fov_deg);
+            if (std::fabs(bearing) > fov_half + 1e-9) {
+                d = last_directive_;
+                d.reason = "SEARCH_TURN_STEP_PENDING";
+            }
+        }
+    }
+
+    if (d.type == TargetCorrectionType::NORMAL_CORRECTION) {
+        if (brake_before_search) {
+            d.reason = "BRAKE_BEFORE_SEARCH_ROTATION";
+        } else {
+            d.reason = entering
+                           ? "LOCAL_BLOCKED_CORRECTION_ENTER_PREVIEW_CERTIFIED"
+                           : "LOCAL_BLOCKED_CORRECTION_UPDATE_PREVIEW_CERTIFIED";
+        }
+    } else if (d.reason != "SEARCH_TURN_STEP_PENDING" &&
+               d.reason != "LOCAL_BLOCKED_SEARCH_ROTATION_NO_PROGRESS" &&
+               d.reason != "SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL") {
+        d.reason = entering ? "LOCAL_BLOCKED_SEARCH_ROTATION_ENTER"
+                            : "LOCAL_BLOCKED_SEARCH_ROTATION_UPDATE";
+    }
+
+    const bool changed = entering || directiveChanged(last_directive_, d);
+    if (changed) {
+        ++update_event_;
+        if (!entering) ++correction_update_event_;
+    } else if (!brake_before_search) {
+        const std::string reason = d.reason;
+        d = last_directive_;
+        d.reason = reason;
+    }
     d.valid = true;
+    d.update_event = update_event_;
     last_directive_ = d;
+    const bool next_search_phase = proposed_turn || brake_before_search;
+    search_episode_active_ = next_search_phase;
+    if (next_search_phase) {
+        if (!has_last_search_yaw_) {
+            last_search_yaw_ = state.yaw;
+            has_last_search_yaw_ = true;
+        }
+    } else {
+        search_swept_rad_ = 0.0;
+        has_last_search_yaw_ = false;
+    }
     return d;
 }
 
