@@ -2070,6 +2070,8 @@ class JointV2Manager(object):
             audit_summary.get("unmatched", 0),
             audit_summary.get("none_depth", 0),
             audit_summary.get("min_truth_clearance_m", 0.0))
+        audit_summary = dict(audit_summary)
+        audit_summary["episode_id"] = episode_id
         return committed, reason, audit_summary, final_dir
 
     def _run_topup(self, plan, scene_map):
@@ -2437,6 +2439,15 @@ class JointV2Manager(object):
                                    scenes=blueprint.scenes,
                                    preflighted=blueprint.preflighted)
 
+        # ── Sort tasks by scene so episodes run scene-contiguously ──
+        # The blueprint pool is ordered by distance-class balancing, which
+        # interleaves the scenes; re-switching the Unity scene on almost
+        # every episode burns the warm-up render budget and the FIRST
+        # episode of each scene gets rejected (unmatched_render_rate).
+        # Grouping by scene keeps each scene's episodes contiguous — one
+        # Unity scene switch per scene instead of one per episode.
+        plan.tasks.sort(key=lambda t: int(t.scene_id))
+
         # 2. Only NOW connect Unity + create dynamics.
         self._connect()
         self._create_dynamics()
@@ -2468,6 +2479,20 @@ class JointV2Manager(object):
             committed, reason, audit_summary, final_dir = \
                 self._collect_task_once(scene, task,
                                         int(task.task_id) * 600000)
+            # A scene switch can make Unity's first render of the new scene
+            # exceed the strict unmatched-render budget
+            # (unmatched_render_rate) even though the warm-up already ran:
+            # the scene is now warm, so retry ONCE — the identical episode
+            # normally commits on the second attempt.  Non-render rejections
+            # (collision / timeout / label issues) are NOT retried.
+            if not committed and reason == "unmatched_render_rate":
+                rospy.logwarn(
+                    "[Manager] episode %s rejected (%s); retrying once after "
+                    "scene warm-up", audit_summary.get("episode_id", "?"),
+                    reason)
+                committed, reason, audit_summary, final_dir = \
+                    self._collect_task_once(scene, task,
+                                            int(task.task_id) * 600000 + 1)
             self._used_task_ids.add(int(task.task_id))
             if committed and final_dir:
                 self._committed_dirs.append(final_dir)
@@ -2504,15 +2529,39 @@ def main():
         blueprint_only=blueprint_only,
         dry_run=dry_run,
         manifest_file=manifest_file)
+    interrupted = False
     try:
         manager.run()
     except rospy.ROSInterruptException:
-        pass
+        interrupted = True
+    except KeyboardInterrupt:
+        # rospy usually converts SIGINT into ROSInterruptException, but a
+        # raw Ctrl-C during early init can still surface as
+        # KeyboardInterrupt; treat it identically.
+        interrupted = True
     finally:
-        if manager._bridge is not None:
-            manager._bridge.close()
-        if manager._dynamics is not None:
-            manager._dynamics.close()
+        # Individual guards: one resource failing to close must never mask
+        # the other.
+        try:
+            if manager._bridge is not None:
+                manager._bridge.close()
+        except Exception:
+            pass
+        try:
+            if manager._dynamics is not None:
+                manager._dynamics.close()
+        except Exception:
+            pass
+        if interrupted:
+            # Hard-exit on Ctrl-C: skip the interpreter's atexit / pybind
+            # static-destructor phase.  Real collections aborted by Ctrl-C
+            # used to die with SIGABRT (roslaunch reports return value -6)
+            # during that phase (flightlib / zmq static teardown).
+            # os._exit(0) is clean: every dataset file is already
+            # flushed/closed by the writer, and the OS reclaims the ZMQ
+            # sockets / shared libs on process exit.  Non-interrupt errors
+            # still propagate normally so failures are never masked.
+            os._exit(0)
 
 
 if __name__ == "__main__":
