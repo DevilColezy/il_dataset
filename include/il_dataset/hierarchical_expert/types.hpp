@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace il_dataset {
@@ -312,6 +313,11 @@ struct Params2D {
     // single-frame depth gap must not erase a real obstacle, but stale
     // history must not fabricate a permanent blockage either).
     uint32_t obs_free_clear_confirmations = 3;
+    // Occupied cells older than this are retained for observability but are
+    // not allowed to hard-block a new local trajectory.  The local planner
+    // still sees current and recent history, while a stale cell must be
+    // refreshed before it can force a HOLD/macro takeover.
+    uint32_t lp_planning_history_max_age_ticks = 45;
     // R26: within this distance of the ORIGINAL goal the macro layer locks
     // terminal capture: it must never issue a locked-side search TURN; the
     // target is handed to local (rotate toward the goal / micro-approach).
@@ -347,6 +353,26 @@ struct Params2D {
     // dead zone where the exact-goal B-spline + pullbacks fail and the
     // drone reported BLOCKED at 0.48 m (task 65, 36 s infinite turn loop).
     double lp_terminal_micro_approach_m = 0.8;
+    // ── R27: receding-horizon tracking (plan/track split) ─────────
+    // The B-spline is re-optimised every `lp_replan_interval_ticks` control
+    // ticks (3 = 10 Hz); between replans the drone PURSUES the committed
+    // trajectory instead of chasing a freshly re-solved head every tick.
+    // This stops the receding-horizon head-drift accumulation (the executed
+    // path becomes the envelope of per-tick constraint-satisfying heads
+    // rather than one spline).  1 disables tracking (replan every tick).
+    int    lp_replan_interval_ticks = 3;
+    // Pure-pursuit lookahead along the planned B-spline (m).  The command
+    // steers at the trajectory point this far AHEAD of the closest point
+    // (instead of only plan.points[1]), so each executed segment is longer
+    // and the plan tail is consumed rather than re-solved away.
+    double lp_pursuit_lookahead_m = 0.6;
+    // Max cross-track deviation from the stored trajectory before a forced
+    // replan (m).
+    double lp_track_max_cross_track_m = 0.5;
+    // Minimum arc length still ahead of the drone on the stored trajectory
+    // before a forced replan (m).  Below this the plan is nearly consumed
+    // and the next hop must be planned.
+    double lp_track_min_front_m = 0.8;
     // Command-ramp limit for reachableCommand (m/s^2): the executable
     // command changes by at most lp_max_accel*dt per tick, and because
     // reachableCommand ramps relative to the PREVIOUS COMMAND the command
@@ -363,7 +389,12 @@ struct Params2D {
     // overshoot collisions, sc3/tk254.)
     double lp_eff_accel_mps2 = 2.0;
     double lp_max_yaw_rate = 2.0;
-    double lp_max_yaw_accel = 4.0;
+    // R28c: raise the yaw command-ramp rate (was 4 -> ~0.6 s to reverse a
+    // full-rate turn; too clumsy to follow a freshly re-planned trajectory).
+    // The command is slew-limited by lp_max_yaw_accel*dt per tick; 8 rad/s^2
+    // halves the reversal time (~0.3 s).  The backend yaw controller tracks
+    // the command with feedforward, so a faster ramp is achievable.
+    double lp_max_yaw_accel = 8.0;
     // Unified collision distance (USER DIRECTIVE 2026-08-20): obstacle
     // minimum collision = 4 grid cells = 0.4 m from an OCCUPIED cell centre
     // (= drone radius 0.3 + cell 0.1).  This is the shared static base;
@@ -406,11 +437,36 @@ struct Params2D {
     double ego_ts = 0.4;                 // initial B-spline knot span (s)
     int    ego_n_segments = 8;
     int    ego_max_iter = 60;
+    // R27: temporal anchoring weight for the EGO B-spline.  When > 0 a soft
+    // ego_lambda_ref * |q - ref|^2 cost pulls consecutive replans toward the
+    // previous plan (receding-horizon continuity); the free control points
+    // are ALWAYS warm-started from a compatible previous plan regardless of
+    // this weight.  0 disables only the cost term.
+    double ego_lambda_ref = 0.3;
     double lp_control_period_s = 0.0333333333;
     double lp_turn_enter_deg = 42.0;
     double lp_turn_exit_deg = 8.0;
     double lp_turn_exit_max_yaw_rate = 0.15;
     double lp_turn_k = 2.5;
+    // R28c: the local planner must NOT produce big lateral detours — that is
+    // the UPPER planner's job (it places bypass waypoints around large
+    // blockers).  A selected plan whose endpoint direction deviates from the
+    // current target direction by more than this (deg) is rejected and
+    // handed back to the macro (NO_SAFE_CANDIDATE).  The local only makes
+    // SMALL adjustments inside this band, never a ~40°-off-target side
+    // excursion (measured task 33: 315° plan vs 274° goal -> east spiral).
+    // R28g: 30 -> 35 (= the +-35° scan band).  A razor-thin 30° cliff killed
+    // a working local detour when the nose drifted a few degrees across it
+    // (task 401: the east-side pass around obs7 needs ~31°, the plan was
+    // 0.8 m clear, yet NO_SAFE_CANDIDATE -> 14 s stall).  At 35° the local
+    // may use its full scan band; beyond it (task-33-style 40°+) the plan is
+    // still rejected and handed to the macro.
+    double lp_max_local_deviation_deg = 35.0;
+    // Prefer the smallest local steering correction first.  The planner may
+    // expand to lp_max_local_deviation_deg only when no candidate exists in
+    // this preferred band, preventing an otherwise clear small opening from
+    // being replaced by a FOV-edge detour.
+    double lp_preferred_local_deviation_deg = 20.0;
     double lp_near_goal_heading_relax_distance = 1.0;
     double lp_near_goal_turn_enter_deg = 75.0;
     double lp_terminal_speed_gain = 1.0;
@@ -445,7 +501,7 @@ struct Params2D {
     // temporary waypoint from the original terminal goal.
     double macro_guide_horizon_m = 4.8;
     double macro_local_target_event_tolerance_m = 0.05;
-    int    macro_takeover_confirm_ticks_30hz = 6;
+    int    macro_takeover_confirm_ticks_30hz = 12;
     int    macro_unknown_recovery_threshold_ticks = 60;
     // Consecutive 5 Hz updates the vehicle must remain at/below the
     // stationary speed before a latched brake-before-search is released
@@ -607,6 +663,18 @@ struct LocalObservation {
     template <typename Visitor>
     void forEachOccupiedWithin(const Vec2d& p, double search_radius,
                                Visitor&& visitor) const {
+        forEachOccupiedWithin(
+            p, search_radius, std::numeric_limits<uint32_t>::max(),
+            std::forward<Visitor>(visitor));
+    }
+
+    /// Same query with an explicit history-age limit.  This lets the local
+    /// planner keep short-term memory without allowing an old, unrefreshed
+    /// cell to permanently veto a visible route.
+    template <typename Visitor>
+    void forEachOccupiedWithin(const Vec2d& p, double search_radius,
+                               uint32_t max_age_ticks,
+                               Visitor&& visitor) const {
         if (!valid() || !(search_radius > 0.0) ||
             !std::isfinite(search_radius)) {
             return;
@@ -625,7 +693,13 @@ struct LocalObservation {
              ++iy) {
             for (int ix = std::max(0, ix0); ix <= std::min(width - 1, ix1);
                  ++ix) {
-                if (cells[idx(ix, iy)] != CellState::OCCUPIED) continue;
+                const size_t cell_id = idx(ix, iy);
+                if (cells[cell_id] != CellState::OCCUPIED) continue;
+                if (max_age_ticks != std::numeric_limits<uint32_t>::max() &&
+                    cell_id < age_ticks.size() &&
+                    age_ticks[cell_id] > max_age_ticks) {
+                    continue;
+                }
                 const Vec2d centre(origin.x() + (ix + 0.5) * resolution,
                                    origin.y() + (iy + 0.5) * resolution);
                 const double d2 = (centre - p).squaredNorm();
@@ -639,11 +713,19 @@ struct LocalObservation {
     /// radius-r search neighbourhood.
     NearestOccupiedResult nearestOccupied(const Vec2d& p,
                                           double search_radius) const {
+        return nearestOccupied(p, search_radius,
+                               std::numeric_limits<uint32_t>::max());
+    }
+
+    NearestOccupiedResult nearestOccupied(const Vec2d& p,
+                                          double search_radius,
+                                          uint32_t max_age_ticks) const {
         NearestOccupiedResult out;
         double best = std::numeric_limits<double>::infinity();
         Vec2d best_centre(0.0, 0.0);
         forEachOccupiedWithin(
-            p, search_radius, [&](const Vec2d& centre, double distance) {
+            p, search_radius, max_age_ticks,
+            [&](const Vec2d& centre, double distance) {
                 if (distance < best) {
                     best = distance;
                     best_centre = centre;
@@ -661,6 +743,11 @@ struct LocalObservation {
     /// inside the radius-r search neighbourhood.
     double minClearanceToOccupied(const Vec2d& p, double r) const {
         return nearestOccupied(p, r).distance;
+    }
+
+    double minClearanceToOccupied(const Vec2d& p, double r,
+                                  uint32_t max_age_ticks) const {
+        return nearestOccupied(p, r, max_age_ticks).distance;
     }
 };
 

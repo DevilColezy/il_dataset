@@ -430,6 +430,11 @@ class JointV2Manager(object):
                 bp.get("control_rate_hz",
                        (self._g.get("hierarchical_expert", {}) or {}).get(
                            "control_hz", 30.0))),
+            "macro_probe": dict(btg.get("macro_probe", {}) or {}),
+            # Candidate-pool-first exploration is intentionally separate from
+            # distribution targets: early random coverage is collected first,
+            # then the C++ selector supplements deficits from that pool.
+            "exploration": dict(bp.get("exploration", {}) or {}),
             "legacy": dict(leg),
         }
         legacy["blueprint"] = blueprint

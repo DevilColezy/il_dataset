@@ -402,7 +402,14 @@ global:
       maximum_acceleration_mps2: [4.0, 4.0, 2.0]
       maximum_tilt_deg: 35.0
       maximum_yaw_rate_rps: 1.5
-      maximum_yaw_acceleration_rps2: 4.0
+      # R28c: raised from 4.0 in lock-step with local_planner.max_yaw_accel
+      # (8.0).  This is the PYTHON-side command ramp (il_dynamics.py) on the
+      # commanded yaw rate — flightlib has NO yaw-rate/acceleration limit in
+      # C++, so it is not a hard simulator cap, just the executable ramp.
+      # With 4.0 a full-rate (1.5 rad/s) turn reversal took ~0.75 s, too
+      # clumsy to follow a freshly re-planned trajectory; 8.0 halves it.
+      # Full yaw rate is still clipped to maximum_yaw_rate_rps.
+      maximum_yaw_acceleration_rps2: 8.0
       attitude_gain: 6.0
       maximum_body_rate_rps: 6.0
       integrator_limit: [1.0, 1.0, 0.5]
@@ -447,6 +454,7 @@ global:
       resolution: 0.10
       ray_angular_res_deg: 0.5
       history_max_age_ticks: 120
+      planning_history_max_age_ticks: 45
       # Ground / below-flight-plane filtering for the runtime depth->patch
       # projection: pixels whose 3D point is more than this far below the
       # camera are ignored (the floor band would otherwise become a near
@@ -474,7 +482,17 @@ global:
       # (dynamics.velocity_controller.maximum_yaw_rate_rps = 1.5) so the
       # recorded label equals the actually executed command.
       max_yaw_rate: 1.5
-      max_yaw_accel: 4.0
+      # R28c: raised from 4.0 — a 4 rad/s^2 ramp took ~0.6 s to reverse a
+      # full-rate turn, too clumsy to follow a freshly re-planned trajectory.
+      max_yaw_accel: 8.0
+      # R28c/R28g: local plan endpoint must stay within this bearing band of
+      # the current target direction (deg); big detours belong to the upper
+      # layer.  35 = the +-35° scan band: a legitimate local detour up to the
+      # band is kept (task 401 needs ~31° around obs7); 40°+ spirals (task 33)
+      # are still rejected for the macro.  Was 30.0 -> killed a working detour
+      # at a razor-thin cliff when the nose drifted across it.
+      max_local_deviation_deg: 35.0
+      preferred_local_deviation_deg: 20.0
       control_period_s: 0.0333333333
 
       # ── 3b. EGO-style optimisation B-spline (R19) ────────────────
@@ -494,10 +512,21 @@ global:
       ego_lambda_feasibility: 0.2 # velocity / acceleration limits
       ego_lambda_fitness: 0.8     # guidance toward the detour guide
       ego_lambda_fov: 0.3         # soft FOV-wedge penalty
+      ego_lambda_ref: 0.3         # R27 temporal anchor toward previous plan
       ego_clearance_m: 0.4        # collision distance = 4 cells (0.3 radius + 0.1 cell)
       ego_ts: 0.4                 # initial B-spline knot span (s)
       ego_n_segments: 8           # B-spline segments (>= 4)
       ego_max_iter: 60            # L-BFGS iterations
+
+      # ── 3c. R27 plan/track split ────────────────────────────────
+      # Re-optimise the B-spline every N control ticks (3 = 10 Hz at 30 Hz);
+      # between replans PURSUE the committed trajectory with an arc-length
+      # lookahead instead of re-solving a fresh head every tick (kills the
+      # receding-horizon head-drift accumulation).  1 disables tracking.
+      replan_interval_ticks: 3
+      pursuit_lookahead_m: 0.6    # arc-length lookahead along the spline
+      track_max_cross_track_m: 0.5  # max deviation before forced replan
+      track_min_front_m: 0.8        # replan when < this much path remains
 
       # ── 5. vertical channel (3D expert extension) ────────────────
       # The expert now commands vz itself (altitude regulation toward the
@@ -557,7 +586,7 @@ global:
       local_candidate_distance_step_m: 0.5
       guide_horizon_m: 4.8   # maximum fixed local waypoint distance
       local_target_event_tolerance_m: 0.05
-      takeover_confirm_ticks_30hz: 6  # 0.2 s real local failure before macro takeover
+      takeover_confirm_ticks_30hz: 12  # 0.4 s real local failure before macro takeover
       unknown_recovery_threshold_ticks: 60
     target_encoding:
       direction_bin_count: 11

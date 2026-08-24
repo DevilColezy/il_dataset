@@ -539,6 +539,9 @@ def _validate_config(cfg):
         _positive(tq.get("max_total_qualification_expansions", 400000),
                   "blueprint_generation.task_qualification."
                   "max_total_qualification_expansions", errors)
+        _positive(tq.get("max_expansions_per_scene", 0),
+                  "blueprint_generation.task_qualification."
+                  "max_expansions_per_scene", errors, allow_zero=True)
         _positive(tq.get("start_recovery_max_radius_m", 0.5),
                   "blueprint_generation.task_qualification."
                   "start_recovery_max_radius_m", errors)
@@ -548,6 +551,14 @@ def _validate_config(cfg):
         if float(tq.get("min_route_stretch_for_long_detour", 1.5)) < 1.0:
             errors.append("blueprint_generation.task_qualification."
                           "min_route_stretch_for_long_detour must be >= 1.0")
+
+        exploration = bp.get("exploration", {}) or {}
+        _positive(exploration.get("rounds", 2),
+                  "blueprint_generation.exploration.rounds", errors,
+                  allow_zero=True)
+        _positive(exploration.get("min_pool_tasks", 0),
+                  "blueprint_generation.exploration.min_pool_tasks", errors,
+                  allow_zero=True)
 
         # Preflight control rate (Hz): the production tick grid is FIXED at
         # 30 Hz (dt = 1/30 s is the preflight/stall time base everywhere).

@@ -10,6 +10,88 @@
 #include <tuple>
 #include <utility>
 
+namespace {
+
+using PlanarTrajectoryRef = il_dataset::expert::PlanarTrajectory;
+using Vec2dRef = il_dataset::expert::Vec2d;
+
+// R27: pure-pursuit lookahead point along a planned trajectory.  Returns
+// the point `lookahead_m` of ARC LENGTH past the trajectory point closest
+// to `pos` (interpolated); falls back to the closest point / plan end when
+// the lookahead runs past the end.
+Vec2dRef pursuitLookaheadPoint(const PlanarTrajectoryRef& plan,
+                               const Vec2dRef& pos, double lookahead_m) {
+    const size_t n = plan.points.size();
+    if (n == 0) return pos;
+    if (n == 1) return plan.points[0];
+    std::vector<double> arc(n, 0.0);
+    size_t best = 0;
+    double best_d = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < n; ++i) {
+        if (i > 0) {
+            arc[i] = arc[i - 1] + (plan.points[i] - plan.points[i - 1]).norm();
+        }
+        const double d = (plan.points[i] - pos).squaredNorm();
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    const double target = arc[best] + std::max(0.0, lookahead_m);
+    if (target >= arc.back()) return plan.points.back();
+    for (size_t i = best + 1; i < n; ++i) {
+        if (arc[i] >= target) {
+            const double seg = arc[i] - arc[i - 1];
+            const double w =
+                seg > 1e-9 ? (target - arc[i - 1]) / seg : 0.0;
+            return plan.points[i - 1] +
+                   (plan.points[i] - plan.points[i - 1]) * w;
+        }
+    }
+    return plan.points.back();
+}
+
+// R28c: max perpendicular distance of `pts` from the line start->end (m).
+// Used to prefer the plan with the SMALLEST lateral bend (a slow straight
+// thread through a gap beats a fast wide detour).
+double maxCrossTrackFromLine(const std::vector<Vec2dRef>& pts,
+                             const Vec2dRef& start, const Vec2dRef& end) {
+    const Vec2dRef ab = end - start;
+    const double L2 = ab.squaredNorm();
+    if (L2 < 1e-12) return 0.0;
+    double mx = 0.0;
+    for (const Vec2dRef& q : pts) {
+        const double u =
+            std::max(0.0, std::min(1.0, (q - start).dot(ab) / L2));
+        const Vec2dRef proj = start + ab * u;
+        mx = std::max(mx, (q - proj).norm());
+    }
+    return mx;
+}
+
+// R27: arc length (m) from the point of `plan` closest to `pos` to the
+// plan end.
+double planRemainingArc(const PlanarTrajectoryRef& plan,
+                        const Vec2dRef& pos) {
+    if (plan.points.empty()) return 0.0;
+    size_t best = 0;
+    double best_d = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < plan.points.size(); ++i) {
+        const double d = (plan.points[i] - pos).squaredNorm();
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    double s = 0.0;
+    for (size_t i = best; i + 1 < plan.points.size(); ++i) {
+        s += (plan.points[i + 1] - plan.points[i]).norm();
+    }
+    return s;
+}
+
+}  // namespace
+
 namespace il_dataset {
 namespace expert {
 
@@ -28,6 +110,17 @@ void LocalPlanner30Hz::reset() {
     last_mission_revision_ = 0;
     last_target_position_ = Vec2d(0.0, 0.0);
     last_target_valid_ = false;
+    // R27 plan/track state: cleared per task.
+    stored_mission_revision_ = 0;
+    stored_target_pos_ = Vec2d(0.0, 0.0);
+    stored_terminal_ = false;
+    stored_endpoint_ = Vec2d(0.0, 0.0);
+    stored_v_end_ = 0.0;
+    stored_min_clear_ = std::numeric_limits<double>::infinity();
+    // R28i side-commitment: no committed side on a fresh task.
+    last_plan_side_ = 0.0;
+    side_commit_until_tick_ = 0;
+    direct_clear_ticks_ = 0;
     // R25 limit-cycle windows: cleared per task.
     limit_cycle_dist_window_.clear();
     limit_cycle_bearing_window_.clear();
@@ -476,6 +569,22 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
         res.first_block_y = first_block.y();
         res.first_block_age_ticks = first_age;
         res.risk_corridor_near_obstacle = risk_near;
+        if (mutate) {
+            if (corridor_blocked) {
+                direct_clear_ticks_ = 0;
+            } else {
+                direct_clear_ticks_ = std::min<uint32_t>(
+                    direct_clear_ticks_ + 1, 1000000U);
+                // Do not erase a bypass decision on a single clear frame.
+                // Depth/history evidence toggles at obstacle silhouettes;
+                // require a stable clear corridor before returning to the
+                // uncommitted DIRECT state.
+                if (direct_clear_ticks_ >= 15 &&
+                    plan_ticks_ >= side_commit_until_tick_) {
+                    last_plan_side_ = 0.0;
+                }
+            }
+        }
     }
 
     // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
@@ -585,6 +694,32 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
         // Bearing of the SUBGOAL actually selected (used to decide whether
         // the planner is actively avoiding vs going straight to the goal).
         double chosen_b = b_t;
+        // R28: when the direct corridor is blocked, force the (non-terminal)
+        // receding-horizon validation to cover the blocking cell — a straight
+        // chord through a blocked corridor must not "validate" merely because
+        // the blocker sits beyond the ~3 m front window (measured: task 440
+        // BLOCKED_BY_OBSERVED_OBSTACLE + an unnecessary 5 Hz macro takeover
+        // on first sight of a small obstacle at ~5 m).
+        double min_validate_m = 0.0;
+        if (res.local_corridor_blocked &&
+            !std::isnan(res.first_blocking_obstacle_distance)) {
+            min_validate_m =
+                std::max(0.0, res.first_blocking_obstacle_distance);
+        }
+        const bool side_commit_active =
+            mutate && last_plan_side_ != 0.0 &&
+            plan_ticks_ < side_commit_until_tick_;
+        const auto candidateSide = [&](double bearing) {
+            const double dev = wrapAngle(bearing - b_t);
+            return std::fabs(dev) <= deg2rad(3.0)
+                       ? 0.0
+                       : ((dev > 0.0) ? 1.0 : -1.0);
+        };
+        const auto committedSideAllows = [&](double bearing) {
+            const double side = candidateSide(bearing);
+            return !side_commit_active || side == 0.0 ||
+                   side == last_plan_side_;
+        };
         // 鈹€鈹€ Goal-capture stop (R20e) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         // Within the capture tolerance the drone must STOP and settle the
         // heading, never route away.  The goal is already inside capture
@@ -644,38 +779,190 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
             return res;
         }
         if (!target.terminal) {
-            // Non-terminal target: A*-first local reactive routing.  Route
-            // from the current position to the target and initialise the
-            // B-spline along that
-            // route, ending AT the guide (route.back()) 鈥?NOT at a ~3 m
-            // horizon truncation and NOT a straight chord.  The straight-
-            // direct branch is skipped: the guide is a near-term waypoint
-            // the 5 Hz corrector places around big-scale blockers, so the
-            // local planner's job is to follow the obstacle-free corridor
-            // toward it.  The time-parameterised B-spline bends around
-            // observed obstacles (real curvature), validated against the
-            // 0.5 m clearance floor.  A* / plan failures fall through to
-            // the bearing scan below (architecture C) — never a hard stop
-            // merely because a temporary waypoint needs a local reroute.
-            std::vector<Vec2d> route =
-                routeAStar(obs, state.position, target.position,
-                           /*max_expansions=*/6000,
-                           /*fov_front_m=*/macroGuideFrontFovM(),
-                           state.yaw);
-            if (route.size() >= 2) {
-                endpoint = route.back();
+            // ── R28h (P0#1): straight-through priority. ──
+            // In clear space the minimal-deviation plan is a STRAIGHT line to
+            // a target-direction endpoint at the local range.  Try it FIRST
+            // with the straight planner (no EGO lateral freedom): the
+            // global-grid A* below routes 6-8 m through unknown space and
+            // bends the spline (measured 0.4-0.65 m lateral bend with 1-2 m
+            // truth clearance in task 440/491/475).  Only when the straight
+            // front is blocked do we invoke A* routing.
+            // The command endpoint is the target direction about 3 m ahead,
+            // matching the receding-horizon contract.  Safety is checked
+            // separately through the FULL observable ray.  This separation
+            // avoids both old failure modes: a 4.95 m endpoint caused large
+            // heading jumps, while validating only the 3 m execution prefix
+            // noticed a simple obstacle too late.
+            const double dir_range =
+                p_.obs_range_m - 0.5 * p_.obs_resolution;
+            const double b_direct =
+                clamp(b_t, -planning_fov_half, planning_fov_half);
+            {
+                const Vec2d direct_dir(
+                    std::cos(state.yaw + b_direct),
+                    std::sin(state.yaw + b_direct));
+                const double exec_range =
+                    std::min(dist, localRouteHorizon());
+                const double probe_range = std::min(dist, dir_range);
+                endpoint =
+                    state.position + direct_dir * exec_range;
                 v_end = std::min(p_.lp_cruise_speed_mps, p_.lp_max_speed);
                 terminal = false;
-                planned = planEgoOrStraightWithPath(
-                    state, obs, endpoint, v_end, terminal, route, plan,
-                    min_clear);
-                if (planned) {
-                    // Active-avoidance label: the A* route deviated from the
-                    // direct target bearing.
-                    chosen_b = wrapAngle(
-                        std::atan2(endpoint.y() - state.position.y(),
-                                   endpoint.x() - state.position.x()) -
-                        state.yaw);
+                planned = forwardCorridorSafe(
+                              state, obs, direct_dir, probe_range) &&
+                          planFovTrajectory(
+                              state, obs, endpoint, v_end,
+                              /*terminal=*/false, plan, min_clear);
+                if (planned) chosen_b = b_direct;
+            }
+            if (!planned) {
+                // ANTICIPATE before invoking topology search.  Search every
+                // small bearing through the full observable range, then
+                // execute only its first ~3 m.  A distant, compact obstacle
+                // is therefore handled by the smallest clear yaw change;
+                // A* is reserved for cases where no straight local ray can
+                // make progress (large/concave obstacles).
+                const double step = deg2rad(2.0);
+                const double max_dev = std::min(
+                    planning_fov_half,
+                    deg2rad(p_.lp_max_local_deviation_deg));
+                const double preferred_dev = std::min(
+                    max_dev,
+                    std::max(0.0, deg2rad(
+                        p_.lp_preferred_local_deviation_deg)));
+                const Vec2d line_unit =
+                    dist > 1e-9 ? to / dist : Vec2d(1.0, 0.0);
+                double best_cost = std::numeric_limits<double>::infinity();
+                PlanarTrajectory best_plan;
+                double best_clear = std::numeric_limits<double>::infinity();
+                double best_b = b_direct;
+                bool preferred_candidate_found = false;
+                for (int band = 0; band < 2 && !preferred_candidate_found;
+                     ++band) {
+                    const double band_max_dev =
+                        band == 0 ? preferred_dev : max_dev;
+                    const int k_max = std::max(
+                        1, static_cast<int>(std::ceil(band_max_dev / step)));
+                    for (int k = 1; k <= k_max; ++k) {
+                    for (int side = 0; side < 2; ++side) {
+                        const double preferred =
+                            last_plan_side_ != 0.0
+                                ? last_plan_side_
+                                : ((b_t >= 0.0) ? 1.0 : -1.0);
+                        const double sign = side == 0 ? preferred : -preferred;
+                        const double b = clamp(
+                            b_direct + sign * static_cast<double>(k) * step,
+                            -planning_fov_half, planning_fov_half);
+                        if (!committedSideAllows(b)) continue;
+                        const Vec2d ray_dir(
+                            std::cos(state.yaw + b),
+                            std::sin(state.yaw + b));
+                        const double probe_range = std::min(dist, dir_range);
+                        if (!forwardCorridorSafe(state, obs, ray_dir,
+                                                 probe_range)) {
+                            continue;
+                        }
+                        const double cand_range =
+                            std::min(dist, localRouteHorizon());
+                        const Vec2d cand_endpoint =
+                            state.position + ray_dir * cand_range;
+                        PlanarTrajectory cand;
+                        double cand_clear =
+                            std::numeric_limits<double>::infinity();
+                        if (!planFovTrajectory(
+                                state, obs, cand_endpoint, v_end,
+                                /*terminal=*/false, cand, cand_clear)) {
+                            continue;
+                        }
+                        const double dev =
+                            std::fabs(wrapAngle(b - b_t));
+                        const Vec2d ep_rel = cand_endpoint - state.position;
+                        const double lateral =
+                            (ep_rel - line_unit * ep_rel.dot(line_unit)).norm();
+                        const double curvature = maxCrossTrackFromLine(
+                            cand.points, state.position, cand_endpoint);
+                        const double progress =
+                            dist - (target.position - cand_endpoint).norm();
+                        const double clearance_reward = std::min(
+                            0.8, std::max(
+                                     0.0, cand_clear - handoffClearance()));
+                        const double cost =
+                            1.4 * dev + 0.45 * lateral + 0.35 * curvature -
+                            0.30 * progress - 0.15 * clearance_reward;
+                        if (cost < best_cost) {
+                            best_cost = cost;
+                            best_plan = std::move(cand);
+                            best_clear = cand_clear;
+                            best_b = b;
+                            endpoint = cand_endpoint;
+                            if (band == 0) preferred_candidate_found = true;
+                        }
+                    }
+                }
+                }
+                if (best_cost < std::numeric_limits<double>::infinity()) {
+                    plan = std::move(best_plan);
+                    min_clear = best_clear;
+                    chosen_b = best_b;
+                    // Reconstruct from the winning bearing; `endpoint` may
+                    // otherwise contain the last evaluated candidate.
+                    endpoint = state.position +
+                               Vec2d(std::cos(state.yaw + best_b),
+                                     std::sin(state.yaw + best_b)) *
+                                   std::min(dist, localRouteHorizon());
+                    planned = true;
+                }
+            }
+            if (!planned) {
+                // Non-terminal A* routing with a LOCAL route goal + a
+                // local-horizon endpoint cap.  (R28h P0#2 + R28j.)  The
+                // route runs on the GLOBAL history grid, so routing to the
+                // FULL world target threaded ~11 m of UNKNOWN cells (the
+                // scene-level grid covers the whole area) — local
+                // information pretending to plan a route to a far world
+                // goal, whose executed first 3 m were then used.  Far
+                // UNKNOWN regions distorted the current topology and the
+                // bypass-side choice (R28i: task 401's A* routed EAST
+                // because the WEST corridor sat in the blocker's occlusion
+                // shadow = UNKNOWN).  R28j: search to the LOCAL OBSERVABLE
+                // HORIZON instead — the route goal is the target direction
+                // clamped to the local observation range (~4.95 m); the
+                // full target stays the attract direction (heading /
+                // scoring) but never the search goal.  The executed
+                // endpoint and EGO guide are then capped to the ~3 m
+                // receding horizon.
+                const double route_dist = std::min(dist, range);
+                const Vec2d route_goal =
+                    state.position +
+                    (dist > 1e-9 ? to / dist : Vec2d(1.0, 0.0)) *
+                        route_dist;
+                std::vector<Vec2d> route =
+                    routeAStar(obs, state.position, route_goal,
+                               /*max_expansions=*/6000,
+                               /*fov_front_m=*/macroGuideFrontFovM(),
+                               state.yaw);
+                if (route.size() >= 2) {
+                    v_end =
+                        std::min(p_.lp_cruise_speed_mps, p_.lp_max_speed);
+                    const double horizon = localRouteHorizon();
+                    const size_t hi = static_cast<size_t>(std::min<double>(
+                        horizon / obs.resolution, route.size() - 1));
+                    endpoint = route[hi];
+                    std::vector<Vec2d> local_route(
+                        route.begin(), route.begin() + hi + 1);
+                    planned = planEgoOrStraightWithPath(
+                        state, obs, endpoint, v_end, /*terminal=*/false,
+                        local_route, plan, min_clear, min_validate_m);
+                    if (planned) {
+                        chosen_b = wrapAngle(
+                            std::atan2(endpoint.y() - state.position.y(),
+                                       endpoint.x() - state.position.x()) -
+                            state.yaw);
+                        // A* used to bypass the scan's side hysteresis and
+                        // could reverse the bypass on the very next replan.
+                        // Honour the same minimum-dwell commitment here.
+                        if (!committedSideAllows(chosen_b)) planned = false;
+                    }
                 }
             }
             if (!planned) {
@@ -684,33 +971,49 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                 // observed cell, or a guide placed at the edge of the free
                 // corridor), so routeAStar returns EMPTY and the plan would
                 // otherwise fall straight to the far FOV-edge scan.  Retry
-                // with the goal pulled back along the drone->guide line so
-                // the drone still ADVANCES toward the guide through the free
-                // corridor instead of drifting to a far boundary point (the
-                // 30 Hz layer continuously replans toward the same fixed
-                // upper waypoint until its lifecycle completes).
-                const Vec2d to_guide = target.position - state.position;
+                // with the LOCAL route goal pulled back along the
+                // drone->guide line so the drone still ADVANCES toward the
+                // guide through the free corridor instead of drifting to a
+                // far boundary point (the 30 Hz layer continuously replans
+                // toward the same fixed upper waypoint until its lifecycle
+                // completes).  R28j: the pull starts from the local
+                // observable-horizon route goal (not the full far target).
+                const double route_dist = std::min(dist, range);
+                const Vec2d route_goal =
+                    state.position +
+                    (dist > 1e-9 ? to / dist : Vec2d(1.0, 0.0)) *
+                        route_dist;
+                const Vec2d to_guide = route_goal - state.position;
                 const double gd = to_guide.norm();
                 const Vec2d gdir =
                     gd > 1e-9 ? to_guide / gd : Vec2d(1.0, 0.0);
                 const double pbs[2] = {0.5, 0.9};
                 for (double pb : pbs) {
-                    const Vec2d pull = target.position - gdir * pb;
-                    route = routeAStar(obs, state.position, pull,
-                                       /*max_expansions=*/6000,
-                                       /*fov_front_m=*/macroGuideFrontFovM(),
-                                       state.yaw);
+                    const Vec2d pull = route_goal - gdir * pb;
+                    std::vector<Vec2d> route =
+                        routeAStar(obs, state.position, pull,
+                                   /*max_expansions=*/6000,
+                                   /*fov_front_m=*/macroGuideFrontFovM(),
+                                   state.yaw);
                     if (route.size() < 2) continue;
-                    endpoint = route.back();
+                    const double horizon = localRouteHorizon();
+                    const size_t hi = static_cast<size_t>(std::min<double>(
+                        horizon / obs.resolution, route.size() - 1));
+                    endpoint = route[hi];
+                    std::vector<Vec2d> local_route(
+                        route.begin(), route.begin() + hi + 1);
                     planned = planEgoOrStraightWithPath(
-                        state, obs, endpoint, v_end, terminal, route, plan,
-                        min_clear);
+                        state, obs, endpoint, v_end, /*terminal=*/false,
+                        local_route, plan, min_clear, min_validate_m);
                     if (planned) {
                         chosen_b = wrapAngle(
                             std::atan2(endpoint.y() - state.position.y(),
                                        endpoint.x() - state.position.x()) -
                             state.yaw);
-                        break;
+                        if (committedSideAllows(chosen_b)) {
+                            break;
+                        }
+                        planned = false;
                     }
                 }
             }
@@ -722,7 +1025,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                 v_end = 0.0;
                 terminal = true;
                 planned = planEgoOrStraight(state, obs, endpoint, v_end, terminal,
-                                            plan, min_clear);
+                                            plan, min_clear, min_validate_m);
                 if (!planned) {
                     // Pullback retry: a stale / spurious observed cell at (or
                     // within clearance of) the goal cell makes the exact-goal
@@ -738,7 +1041,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                         const Vec2d stop_pt = target.position - to_goal_dir * pb;
                         if (planEgoOrStraight(state, obs, stop_pt, 0.0,
                                               /*terminal=*/true, plan,
-                                              min_clear)) {
+                                              min_clear, min_validate_m)) {
                             endpoint = stop_pt;
                             planned = true;
                             break;
@@ -841,15 +1144,15 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                         terminal = false;
                         v_end =
                             std::min(p_.lp_cruise_speed_mps, p_.lp_max_speed);
-                        const double horizon =
-                            std::max(2.0, std::min(3.0, v_end * 1.5));
+                        const double horizon = localRouteHorizon();
                         const size_t hi = static_cast<size_t>(
                             std::min<double>(horizon / obs.resolution,
                                              route.size() - 1));
                         endpoint = route[hi];
                     }
                     planned = planEgoOrStraight(state, obs, endpoint, v_end,
-                                                terminal, plan, min_clear);
+                                                terminal, plan, min_clear,
+                                                min_validate_m);
                     if (planned) {
                         // Active-avoidance label: the A* route deviated from
                         // the direct target bearing.
@@ -862,48 +1165,169 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
             }
         }
         if (!planned) {
-            // A* gave no route (start/goal cell occupied or grid
-            // invalid) 鈫?legacy segmented horizontal FOV scan fallback:
-            // scan bearings from the target direction outward; the first
-            // clear segment is the subgoal.
-            const double step =
-                deg2rad(p_.macro_local_candidate_bearing_step_deg);
+            // ── R28j: SCORED local-frontier scan (replaces the legacy
+            //    first-valid ±35° scan + fine re-scan). ──
+            // The old scan accepted the FIRST bearing that validated — it
+            // optimised nothing, so near a blocker it sat at the ±35° band
+            // edge (the 35° deviation guard EQUALS the 35° band and never
+            // constrained it), and its endpoint sat at the full 4.95 m
+            // range although only the front ~3 m was validated.  Now every
+            // bearing in the band is evaluated at a fine step and the best
+            // candidate is scored by
+            //   J = w_h·|b−b_t|   (heading deviation from target = progress)
+            //     + w_l·lateral  (endpoint cross-track from the target line
+            //                      = minimal detour)
+            //     + w_c·curvature (plan sag from the start→endpoint line)
+            //     + w_s·side_flip (stay on the committed side, R28i)
+            //     − w_p·progress  (advance toward the effective target)
+            //     − w_c·clearance (safety reward)
+            // so the scan prefers the minimal-deviation plan AND the
+            // clearer / committed side instead of an arbitrary edge
+            // bearing.  Endpoints sit at the local route horizon (~3 m) and
+            // the already-failed direct bearing is not retried here.
+            const double step = deg2rad(2.0);  // fine: 2° across ±35°
             const double b0 = clamp(b_t, -planning_fov_half,
                                     planning_fov_half);
-            // Scan the full planning band (both safe FOV edges), not just
-            // around b0: the free opening may lie far from the
-            // target bearing (e.g. a diagonal gap or a lateral detour) and
-            // the drone must be able to steer to either edge regardless of
-            // where the goal points.  kMax covers both sides; clamping
-            // makes duplicated edge bearings harmless.
-            const int kMax = static_cast<int>(
-                std::ceil(2.0 * planning_fov_half / step));
-            for (int k = 0; k <= kMax && !planned; ++k) {
-                for (int side = 0; side < 2 && !planned; ++side) {
-                    const double sgn = (side == 0) ? 1.0 : -1.0;
+            const double max_scan_dev = std::min(
+                planning_fov_half,
+                deg2rad(p_.lp_max_local_deviation_deg));
+            const double preferred_scan_dev = std::min(
+                max_scan_dev,
+                std::max(0.0, deg2rad(
+                    p_.lp_preferred_local_deviation_deg)));
+            // R28i: first-expanded side = the target's side (plan bends
+            // toward the goal); a committed side (last_plan_side_) is kept
+            // via the side-flip cost term below.
+            const double ps = (last_plan_side_ != 0.0)
+                                  ? last_plan_side_
+                                  : ((b_t >= 0.0) ? 1.0 : -1.0);
+            const Vec2d line_unit =
+                (dist > 1e-9) ? to / dist : Vec2d(1.0, 0.0);
+            // kMax covers the FULL ±planning_fov_half band regardless of
+            // where b0 sits: expand `planning_fov_half + |b0|` either side
+            // so clamping reaches both band edges (a lateral opening on the
+            // FAR side of a target near the opposite edge stays reachable).
+            double best_cost = std::numeric_limits<double>::infinity();
+            PlanarTrajectory best_plan;
+            double best_clear = std::numeric_limits<double>::infinity();
+            double best_b = b0;
+            bool preferred_candidate_found = false;
+            for (int band = 0; band < 2 && !preferred_candidate_found;
+                 ++band) {
+                const double band_dev =
+                    band == 0 ? preferred_scan_dev : max_scan_dev;
+                const int kMax = static_cast<int>(std::ceil(
+                    (band_dev + std::fabs(b0)) / step));
+                for (int k = 0; k <= kMax; ++k) {
+                for (int side = 0; side < 2; ++side) {
+                    const double sgn = (side == 0) ? ps : -ps;
                     if (k == 0 && side == 1) continue;
+                    // The full-range DIRECT ray already failed above.  Do
+                    // not resurrect it here by validating only a short 3 m
+                    // endpoint and advancing toward the same far blocker.
+                    if (k == 0) continue;
                     const double b = clamp(
                         b0 + sgn * static_cast<double>(k) * step,
                         -planning_fov_half, planning_fov_half);
+                    // All fallback endpoints use the same ~3 m executable
+                    // horizon, capped by a nearer effective target.
+                    const double cand_range =
+                        std::min(dist, localRouteHorizon());
                     endpoint =
                         state.position +
                         Vec2d(std::cos(state.yaw + b),
                               std::sin(state.yaw + b)) *
-                            range;
-                    planned = planEgoOrStraight(state, obs, endpoint, v_end,
-                                                /*terminal=*/false, plan,
-                                                min_clear);
-                    if (planned) chosen_b = b;
+                            cand_range;
+                    // Direct was rejected by the full-range ray above; these
+                    // are genuine side candidates validated to their endpoint.
+                    const double v_m = 0.0;
+                    PlanarTrajectory cand;
+                    double cand_clear =
+                        std::numeric_limits<double>::infinity();
+                    if (!planEgoOrStraight(state, obs, endpoint, v_end,
+                                           /*terminal=*/false, cand,
+                                           cand_clear, v_m)) {
+                        continue;
+                    }
+                    const double dev = std::fabs(wrapAngle(b - b_t));
+                    const Vec2d ep_rel = endpoint - state.position;
+                    const double lateral =
+                        (ep_rel - line_unit * ep_rel.dot(line_unit)).norm();
+                    const double curv = maxCrossTrackFromLine(
+                        cand.points, state.position, endpoint);
+                    const double side_this =
+                        (dev > 1e-6)
+                            ? ((wrapAngle(b - b_t) > 0.0) ? 1.0 : -1.0)
+                            : 0.0;
+                    if (side_commit_active && side_this != 0.0 &&
+                        side_this != last_plan_side_) {
+                        continue;
+                    }
+                    const double flip =
+                        (last_plan_side_ != 0.0 && side_this != 0.0 &&
+                         side_this != last_plan_side_)
+                            ? 1.0
+                            : 0.0;
+                    const double clr = std::min(
+                        0.8, std::max(0.0, cand_clear - handoffClearance()));
+                    const double progress =
+                        dist - (target.position - endpoint).norm();
+                    const double cost =
+                        1.4 * dev + 0.45 * lateral + 0.35 * curv +
+                        0.8 * flip - 0.30 * progress - 0.15 * clr;
+                    if (cost < best_cost) {
+                        best_cost = cost;
+                        best_plan = std::move(cand);
+                        best_clear = cand_clear;
+                        best_b = b;
+                        if (band == 0) preferred_candidate_found = true;
+                    }
                 }
             }
+            }
+            if (best_cost < std::numeric_limits<double>::infinity()) {
+                plan = std::move(best_plan);
+                chosen_b = best_b;
+                min_clear = best_clear;
+                planned = true;
+            }
+        }
+
+        // R28c/R28g: the local planner must NOT produce big lateral detours —
+        // that is the UPPER planner's job (it places bypass waypoints around
+        // large blockers).  When the selected plan's endpoint direction
+        // deviates from the current target direction by more than
+        // lp_max_local_deviation_deg (35° = the ±35° scan band), reject it
+        // and hand back to the macro.  R28g: was 30°, and the razor-thin
+        // cliff killed a WORKING local detour when the nose drifted a few
+        // degrees across it — task 401: the east-side pass around obs7
+        // (-2.57,12.90) needs ~31° off the goal, the plan was 0.8 m clear
+        // against truth, yet NO_SAFE_CANDIDATE for ~14 s (macro waypoints
+        // were themselves unreachable).  35° lets the local use its full
+        // scan band (a legitimate minimal detour) while still rejecting the
+        // task-33-style 40-48° side excursions that spiralled the drone
+        // east (315° plan vs 274° goal).  Non-terminal only: the terminal
+        // A* routing around a near-goal blocker is a legitimate short
+        // re-route and stays allowed.
+        if (planned && !terminal &&
+            std::fabs(wrapAngle(chosen_b - b_t)) >
+                deg2rad(p_.lp_max_local_deviation_deg)) {
+            planned = false;
         }
 
         if (planned) {
             // (4) execute: pure-pursuit along the planned B-spline reference
             //     (smooth, time-parameterized, dynamics-feasible); the nose
-            //     tracks the reference heading (yaw control).
+            //     tracks the reference heading (yaw control).  R27: the
+            //     lookahead is a fixed ARC-LENGTH ahead of the closest
+            //     point (lp_pursuit_lookahead_m) instead of only
+            //     plan.points[1], so each executed segment consumes more of
+            //     the committed spline (longer lookahead → less head-chase).
             const Vec2d look =
-                plan.points.size() > 1 ? plan.points[1] : endpoint;
+                plan.points.size() > 1
+                    ? pursuitLookaheadPoint(plan, state.position,
+                                            p_.lp_pursuit_lookahead_m)
+                    : endpoint;
             const Vec2d d_to = look - state.position;
             const double heading =
                 d_to.squaredNorm() > 1e-12 ? std::atan2(d_to.y(), d_to.x())
@@ -1018,7 +1442,17 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                 res.local_corridor_blocked &&
                 std::fabs(wrapAngle(chosen_b - b_t)) <= deg2rad(3.0) &&
                 plan_cross_track <= 0.35;
-            if (direct_blocked_without_detour) {
+            // R28b: the corridor assessment looks TOWARD THE GOAL, but the
+            // selected plan may be a clear line parallel to the blocked goal
+            // corridor, or a short hop whose tail ends before the blocker
+            // (task 440: drone flying a 0.66 m-clear line while the goal
+            // corridor passed 0.54 m from obs5's cell -> spurious BLOCKED +
+            // false 5 Hz takeover).  Only BLOCK when the PLAN PATH ITSELF
+            // clips an observed cell; otherwise accept and advance — the
+            // 30 Hz replan routes around the blocker when it enters the
+            // plan's reach.
+            if (direct_blocked_without_detour &&
+                planPathBlocked(state, obs, plan)) {
                 const VelocityCommand3D brake = reachableCommand(
                     state, VelocityCommand3D{0.0, 0.0, 0.0, 0.0});
                 res.success = false;
@@ -1085,6 +1519,34 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                 current_trajectory_ = plan;
                 last_command_ = out;
                 has_last_command_ = true;
+                // R27: commit the plan metadata so the tracking fast-path
+                // can validate the stored trajectory against the current
+                // target on the non-replan ticks.
+                stored_mission_revision_ = target.mission_revision;
+                stored_target_pos_ = target.position;
+                stored_terminal_ = target.terminal;
+                stored_endpoint_ = endpoint;
+                stored_v_end_ = v_end;
+                stored_min_clear_ = min_clear;
+                // R28i: remember which side of the target direction this
+                // plan deviates to, so the next scan commits to the same
+                // side (no right/left flapping around a blocker).
+                if (!terminal) {
+                    const double dev = wrapAngle(chosen_b - b_t);
+                    const double new_side =
+                        std::fabs(dev) > deg2rad(3.0)
+                            ? ((dev > 0.0) ? 1.0 : -1.0)
+                            : 0.0;
+                    // A direct-looking frame must not erase an active
+                    // bypass.  Commit only on a meaningful detour, and arm
+                    // the dwell timer only when entering/changing sides so
+                    // it cannot be extended forever by ordinary replans.
+                    if (new_side != 0.0 && new_side != last_plan_side_) {
+                        last_plan_side_ = new_side;
+                        side_commit_until_tick_ = plan_ticks_ + 45;
+                        direct_clear_ticks_ = 0;
+                    }
+                }
             }
             return res;
         }
@@ -1100,11 +1562,20 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
         // / brake / macro TURN or sub-target).  This removes the 30-35掳
         // "dead zone" where the drone braked and waited for the macro even
         // though a little more rotation would have produced a plan.
-        // A visible target must not trigger a pure-rotation retry.  If the
-        // local planner cannot find a safe trajectory while the target is in
-        // the actual FOV, report NO_SAFE_CANDIDATE so the slower macro planner
-        // can issue a temporary correction target.
-        if (!target_angle_in_fov && std::fabs(b_t) > exit_ang + 1e-9 &&
+        // R28f: the rotation threshold is the PLANNING band (planning_fov_
+        // half = 35掳), NOT the camera FOV (45掳).  Previously a target
+        // 35-45掳 off the nose was inside the camera FOV (so no pure-rotate
+        // at section 1) but outside the +-35掳 scan band (so no plan) ->
+        // the drone oscillated around 45掳 with NO_SAFE_CANDIDATE for ~14 s
+        // (task 401 joint_v2_000010_2f0cc210: dead stop near obs7
+        // (-2.57,12.90); macro stayed PASS_THROUGH or placed waypoints the
+        // local could not reach).  Rotate toward the target whenever it is
+        // beyond the planning band and no plan was found; at |b_t| <= 35掳
+        // the drone stops rotating and hands a properly-aligned
+        // NO_SAFE_CANDIDATE to the macro (which then sees the drone facing
+        // the opening and can place a reachable bypass).
+        if (std::fabs(b_t) > planning_fov_half + 1e-9 &&
+            std::fabs(b_t) > exit_ang + 1e-9 &&
             dist > p_.task_goal_tolerance) {
             if (rotationBrakeRequired()) {
                 return brakeBeforeRotation();
@@ -1165,7 +1636,9 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                 for (double d = mstep; d <= p_.obs_range_m + 1e-9;
                      d += mstep) {
                     const Vec2d p = state.position + dir * d;
-                    if (obs.minClearanceToOccupied(p, handoffClearance()) <
+                    if (obs.minClearanceToOccupied(
+                            p, handoffClearance(),
+                            p_.lp_planning_history_max_age_ticks) <
                         handoffClearance()) {
                         break;
                     }
@@ -1226,6 +1699,91 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                     has_last_command_ = true;
                 }
                 return res;
+            }
+            // ── R28: stale-history re-orientation (deadlock breaker) ──
+            // The FOV scan found no plan and the drone is about to brake in
+            // place.  If a HISTORY_OCCUPIED cell (age > 0 — not confirmed
+            // this tick) sits within a short proximity AND outside the
+            // current FOV, the drone cannot re-confirm it: the stale cell
+            // keeps hard-blocking every scan bearing for its full max_age
+            // lifetime (~120 ticks / 4 s, observed_grid_2d.cpp) while the
+            // drone sits parked (measured: task 440 — 123 consecutive
+            // NO_SAFE_CANDIDATE frames, then instant recovery when the cell
+            // expired).  Rotate in place (bounded by the spin guard) toward
+            // the most-open FOV edge so the observation is refreshed and the
+            // re-oriented scan band exposes the bypass — a real cell is
+            // re-confirmed, a spurious one is cleared by fresh FREE evidence.
+            {
+                constexpr double kStaleProximityM = 1.2;
+                constexpr uint64_t kMaxRotateTicks = 70;   // ~2.3 s
+                constexpr uint64_t kRotateCooldownTicks = 60;
+                bool stale_out_of_fov = false;
+                obs.forEachOccupiedWithin(
+                    state.position, kStaleProximityM,
+                    [&](const Vec2d& centre, double) {
+                        const GridIndex2D gi = worldToGrid(
+                            centre, obs.origin, obs.resolution);
+                        if (!obs.inGrid(gi.ix, gi.iy)) return;
+                        if (obs.age_ticks[obs.idx(gi.ix, gi.iy)] == 0) return;
+                        const double b = wrapAngle(
+                            std::atan2(centre.y() - state.position.y(),
+                                       centre.x() - state.position.x()) -
+                            state.yaw);
+                        if (std::fabs(b) > fov_half + 1e-9) {
+                            stale_out_of_fov = true;
+                        }
+                    });
+                if (stale_out_of_fov &&
+                    best_r >= std::max(p_.lp_min_clearance, 0.5)) {
+                    if (rotationBrakeRequired()) {
+                        return brakeBeforeRotation();
+                    }
+                    if (plan_ticks_ < turn_hold_until_) {
+                        return brakeBeforeRotation();
+                    }
+                    if (mutate) {
+                        ++turn_ticks_;
+                        if (turn_ticks_ > kMaxRotateTicks) {
+                            turn_ticks_ = 0;
+                            turn_hold_until_ =
+                                plan_ticks_ + kRotateCooldownTicks;
+                            return brakeBeforeRotation();
+                        }
+                    }
+                    const VelocityCommand3D intent{
+                        0.0, 0.0, 0.0, turnYawRate(state, best_b)};
+                    const VelocityCommand3D out =
+                        reachableCommand(state, intent);
+                    res.success = true;
+                    res.turn_mode = true;
+                    res.avoidance_active = true;  // stale-history re-search
+                    res.vx_body = out.vx_body;
+                    res.vy_body = out.vy_body;
+                    res.yaw_rate = out.yaw_rate;
+                    res.intent_vx_body = intent.vx_body;
+                    res.intent_vy_body = intent.vy_body;
+                    res.intent_yaw_rate = intent.yaw_rate;
+                    res.selected_output_speed_mps =
+                        std::hypot(out.vx_body, out.vy_body);
+                    res.planner_status = PlannerStatus::TURNING;
+                    res.candidate_progress_qualified = false;
+                    res.output_progress_qualified = false;
+                    res.progress_qualified = false;
+                    res.stationary_candidate_selected =
+                        res.selected_output_speed_mps <=
+                        p_.lp_min_progress_speed_mps;
+                    res.stationary_selection_reason =
+                        res.stationary_candidate_selected
+                            ? "stale_history_reorient"
+                            : "";
+                    res.failure_reason = FailureReason::NONE;
+                    if (mutate) {
+                        current_trajectory_ = PlanarTrajectory{};
+                        last_command_ = out;
+                        has_last_command_ = true;
+                    }
+                    return res;
+                }
             }
             // Genuinely boxed in: brake safely.  The next 5 Hz assessment
             // will observe this planning outcome through an independent
@@ -1293,11 +1851,201 @@ PlannerResult LocalPlanner30Hz::plan(const PlanarState& state,
                                      const PlanarTarget& target) {
     ++plan_ticks_;
     const ResolvedPlanarTarget resolved = resolveTarget(state, target);
-    PlannerResult res = computePlan(state, obs, resolved, /*mutate=*/true);
+    // R27: plan/track split.  Re-optimise only every lp_replan_interval_ticks
+    // ticks (10 Hz at 3/30) AND whenever the stored plan is stale / blocked /
+    // consumed; between replans PURSUE the committed trajectory so the
+    // executed path follows ONE spline instead of the envelope of per-tick
+    // heads (kills the receding-horizon head-drift accumulation).
+    const int interval = std::max(1, p_.lp_replan_interval_ticks);
+    const bool replan_tick =
+        interval <= 1 ||
+        (plan_ticks_ % static_cast<uint64_t>(interval)) == 0;
+    PlannerResult res;
+    if (replan_tick || !trackingAvailable(state, obs, resolved)) {
+        res = computePlan(state, obs, resolved, /*mutate=*/true);
+    } else {
+        res = trackStoredTrajectory(state, obs, resolved);
+    }
     // R25: limit-cycle window must see EVERY branch's actual outcome, so it
     // is updated here (computePlan has many early returns).
     updateLimitCycleWindow(state, resolved, res);
     return res;
+}
+
+bool LocalPlanner30Hz::trackingAvailable(
+    const PlanarState& state, const LocalObservation& obs,
+    const ResolvedPlanarTarget& target) const {
+    if (p_.lp_replan_interval_ticks <= 1) return false;
+    if (!current_trajectory_.valid || current_trajectory_.points.size() < 2)
+        return false;
+    const Vec2d to = target.position - state.position;
+    const double dist = to.norm();
+    // Terminal micro-approach / goal-capture zones are owned by the fast
+    // terminal controller, not spline tracking.
+    if (target.terminal && dist <= p_.lp_terminal_micro_approach_m)
+        return false;
+    if (dist <= p_.task_goal_tolerance) return false;
+    // The stored plan must still target the SAME effective target.
+    if (target.mission_revision != stored_mission_revision_) return false;
+    if ((target.position - stored_target_pos_).norm() >
+        std::max(0.5 * p_.obs_resolution, 1e-3))
+        return false;
+    if (target.terminal != stored_terminal_) return false;
+    // Target outside the physical FOV → the yaw-first turn owns the tick.
+    const double fov_half = 0.5 * deg2rad(p_.obs_fov_deg);
+    const double b_t = wrapAngle(std::atan2(to.y(), to.x()) - state.yaw);
+    if (std::fabs(b_t) > fov_half + 1e-9) return false;
+    // A newly observed obstacle cutting the stored path → forced replan.
+    bool dynamic_violation = false;
+    if (currentTrajectoryBlocked(state, obs, dynamic_violation)) return false;
+    // Cross-track deviation from the committed trajectory too large.
+    double best_d = std::numeric_limits<double>::infinity();
+    for (const Vec2d& q : current_trajectory_.points) {
+        best_d = std::min(best_d, (q - state.position).squaredNorm());
+    }
+    if (std::sqrt(best_d) > p_.lp_track_max_cross_track_m) return false;
+    // Plan front nearly consumed → replan the next hop.
+    if (planRemainingArc(current_trajectory_, state.position) <
+        p_.lp_track_min_front_m)
+        return false;
+    return true;
+}
+
+PlannerResult LocalPlanner30Hz::trackStoredTrajectory(
+    const PlanarState& state, const LocalObservation& obs,
+    const ResolvedPlanarTarget& target) {
+    PlannerResult res;
+    res.failure_reason = FailureReason::NONE;
+    res.target_mission_revision = target.mission_revision;
+    res.handoff_clearance_m = handoffClearance();
+    const PlanarTrajectory& plan = current_trajectory_;
+    const Vec2d endpoint = stored_endpoint_;
+    const double v_end = stored_v_end_;
+    const bool terminal = stored_terminal_;
+    const double dist = (target.position - state.position).norm();
+
+    // Keep the corridor assessment live so the FSM / CSV see the same
+    // blocking semantics on tracking ticks (a HARD block here is converted
+    // into a forced replan by trackingAvailable on the next tick).
+    {
+        bool corridor_blocked = false;
+        double first_dist = std::numeric_limits<double>::quiet_NaN();
+        CorridorBlockReason cbr = CorridorBlockReason::CLEAR;
+        Vec2d first_block(0.0, 0.0);
+        uint32_t first_age = 0;
+        bool risk_near = false;
+        assessLocalCorridor(state, obs, target, corridor_blocked, first_dist,
+                            cbr, first_block, first_age, risk_near);
+        res.local_corridor_blocked = corridor_blocked;
+        res.first_blocking_obstacle_distance = first_dist;
+        res.corridor_block_reason = cbr;
+        res.first_block_x = first_block.x();
+        res.first_block_y = first_block.y();
+        res.first_block_age_ticks = first_age;
+        res.risk_corridor_near_obstacle = risk_near;
+    }
+
+    // Pure-pursuit along the committed trajectory with a real lookahead:
+    // the nose tracks the plan `lp_pursuit_lookahead_m` AHEAD of the
+    // closest point, so the executed segment is longer than one spline
+    // sample and the plan tail is actually consumed (not re-solved away).
+    const Vec2d look = pursuitLookaheadPoint(plan, state.position,
+                                             p_.lp_pursuit_lookahead_m);
+    const Vec2d d_to = look - state.position;
+    const double heading = d_to.squaredNorm() > 1e-12
+                               ? std::atan2(d_to.y(), d_to.x())
+                               : state.yaw;
+    const double remaining = (endpoint - state.position).norm();
+    // Keep the diagnostic target distance valid on the tracking fast-path.
+    // PlannerResult defaults this field to zero; leaving it untouched makes
+    // the hierarchical mode mapper mislabel an ordinary stored-plan tick as
+    // GOAL_CAPTURE even when the effective target is several metres away.
+    res.local_target_distance = dist;
+    // Same speed semantics as the planned branch: never command faster than
+    // the cruise level at which the stored plan was validated.
+    const double v_plan = (plan.cruise_mps > 1e-6)
+                              ? std::min(v_end, plan.cruise_mps)
+                              : v_end;
+    double v_des;
+    if (terminal) {
+        // Brake profile to stop AT the stored endpoint (v_end=0), braking
+        // 0.3 m early so the actual stop lands inside the goal tolerance.
+        const double rem_eff = std::max(0.0, remaining - 0.3);
+        v_des = std::min(
+            p_.lp_terminal_max_speed,
+            std::sqrt(std::max(0.0, 2.0 * p_.lp_eff_accel_mps2 * rem_eff)));
+    } else {
+        v_des = v_plan;
+    }
+    if (plan.cruise_mps > 1e-6) v_des = std::min(v_des, plan.cruise_mps);
+    const double yaw_limit =
+        terminal ? p_.lp_terminal_max_yaw_rate : p_.lp_max_yaw_rate;
+    const double yaw_intent =
+        (terminal && dist <= p_.task_goal_tolerance)
+            ? 0.0
+            : clamp(p_.lp_turn_k * wrapAngle(heading - state.yaw),
+                    -yaw_limit, yaw_limit);
+    const VelocityCommand3D intent{v_des, 0.0, 0.0, yaw_intent};
+    const VelocityCommand3D out = reachableCommand(state, intent);
+    res.success = true;
+    res.turn_mode = false;
+    res.vx_body = out.vx_body;
+    res.vy_body = out.vy_body;
+    res.yaw_rate = out.yaw_rate;
+    res.intent_vx_body = intent.vx_body;
+    res.intent_vy_body = intent.vy_body;
+    res.intent_yaw_rate = intent.yaw_rate;
+    res.selected_output_speed_mps = std::hypot(out.vx_body, out.vy_body);
+    res.planner_status = terminal ? PlannerStatus::TERMINAL_SETTLING
+                                  : PlannerStatus::SAFE_PROGRESSING;
+    res.selected = plan;
+    res.plan_terminal = terminal;
+    res.plan_end_speed_mps = v_end;
+    res.plan_executed_speed_mps = v_des;
+    res.min_observed_clearance = stored_min_clear_;
+    res.avoidance_active =
+        res.local_corridor_blocked ||
+        nearObservedObstacle(obs, state.position, 2.0);
+    res.nominal_progress_m = 0.0;
+    res.executable_progress_m =
+        plan.valid && !plan.points.empty()
+            ? (dist - (target.position - plan.points.back()).norm())
+            : 0.0;
+    res.safe_prefix_duration_s = plan.valid ? plan.t.back() : 0.0;
+    res.candidate_progress_qualified =
+        res.selected_output_speed_mps > p_.lp_min_progress_speed_mps;
+    res.output_progress_qualified = res.candidate_progress_qualified;
+    res.progress_qualified = res.output_progress_qualified;
+    res.stationary_candidate_selected =
+        res.selected_output_speed_mps <= p_.lp_min_progress_speed_mps;
+    res.stationary_selection_reason =
+        res.stationary_candidate_selected ? "track_stored_plan" : "";
+    // Keep the command ramp continuous (same as every mutate branch).
+    last_command_ = out;
+    has_last_command_ = true;
+    return res;
+}
+
+const std::vector<Vec2d>* LocalPlanner30Hz::anchoredReference(
+    const PlanarState& state, const Vec2d& endpoint) const {
+    if (!current_trajectory_.valid ||
+        current_trajectory_.points.size() < 4)
+        return nullptr;
+    // The reference must start near the current state and end near the new
+    // endpoint — otherwise it is a different plan and must not anchor.
+    const double ref_end =
+        (current_trajectory_.points.back() - endpoint).norm();
+    const double ref_start =
+        (current_trajectory_.points.front() - state.position).norm();
+    const double max_shift = std::max(1.0, 2.0 * p_.lp_pursuit_lookahead_m);
+    if (ref_end > max_shift || ref_start > max_shift) return nullptr;
+    return &current_trajectory_.points;
+}
+
+bool LocalPlanner30Hz::nearObservedObstacle(const LocalObservation& obs,
+                                            const Vec2d& pos,
+                                            double proximity_m) const {
+    return obs.minClearanceToOccupied(pos, proximity_m) < proximity_m;
 }
 
 void LocalPlanner30Hz::updateLimitCycleWindow(const PlanarState& state,
@@ -1416,7 +2164,8 @@ bool LocalPlanner30Hz::currentTrajectoryBlocked(
             bool hard_violation = false;
             bool envelope_violation = false;
             obs.forEachOccupiedWithin(
-                p, search_r, [&](const Vec2d& centre, double distance) {
+                p, search_r, p_.lp_planning_history_max_age_ticks,
+                [&](const Vec2d& centre, double distance) {
                     if (distance < handoffClearance()) {
                         hard_violation = true;
                     }
@@ -1433,6 +2182,57 @@ bool LocalPlanner30Hz::currentTrajectoryBlocked(
                 dynamic_violation = true;
                 return true;
             }
+        }
+    }
+    return false;
+}
+
+bool LocalPlanner30Hz::planPathBlocked(
+    const PlanarState& state, const LocalObservation& obs,
+    const PlanarTrajectory& plan) const {
+    if (!plan.valid || plan.points.size() < 2) return false;
+    size_t start_i = 0;
+    double best = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < plan.points.size(); ++i) {
+        const double d = (plan.points[i] - state.position).squaredNorm();
+        if (d < best) {
+            best = d;
+            start_i = i;
+        }
+    }
+    const double step = std::max(1e-3, 0.5 * p_.obs_resolution);
+    for (size_t i = start_i + 1; i < plan.points.size(); ++i) {
+        const Vec2d& a = plan.points[i - 1];
+        const Vec2d& b = plan.points[i];
+        double dt_seg = p_.lp_dt;
+        if (i < plan.t.size() && i - 1 < plan.t.size()) {
+            const double dt = plan.t[i] - plan.t[i - 1];
+            if (dt > 1e-9) dt_seg = dt;
+        }
+        const double seg = (b - a).norm();
+        const Vec2d v_seg =
+            (seg > 1e-9) ? (b - a) / dt_seg : Vec2d(0.0, 0.0);
+        const double search_r = clearanceSearchRadius(v_seg.norm());
+        const int steps = std::max(1, static_cast<int>(std::ceil(seg / step)));
+        for (int k = 0; k <= steps; ++k) {
+            const Vec2d p = a + (b - a) * (static_cast<double>(k) / steps);
+            bool hard_violation = false;
+            bool envelope_violation = false;
+            obs.forEachOccupiedWithin(
+                p, search_r, p_.lp_planning_history_max_age_ticks,
+                [&](const Vec2d& centre, double distance) {
+                    if (distance < handoffClearance()) {
+                        hard_violation = true;
+                    }
+                    Vec2d dir_c = centre - p;
+                    const double dl = dir_c.norm();
+                    if (dl > 1e-9) dir_c /= dl;
+                    const double closing = std::max(0.0, v_seg.dot(dir_c));
+                    if (distance < requiredClearance(closing)) {
+                        envelope_violation = true;
+                    }
+                });
+            if (hard_violation || envelope_violation) return true;
         }
     }
     return false;
@@ -1464,7 +2264,8 @@ static Vec2d cubicBSplinePoint(const Vec2d& p0, const Vec2d& p1,
 bool LocalPlanner30Hz::planFovTrajectory(
     const PlanarState& state, const LocalObservation& obs,
     const Vec2d& endpoint, double v_end, bool terminal,
-    PlanarTrajectory& out, double& min_clear) const {
+    PlanarTrajectory& out, double& min_clear,
+    double min_validate_m) const {
     out = PlanarTrajectory{};
     out.valid = false;
     min_clear = std::numeric_limits<double>::infinity();
@@ -1480,20 +2281,21 @@ bool LocalPlanner30Hz::planFovTrajectory(
     const double v_start = state.velocity_world.norm();
     const double a = p_.lp_eff_accel_mps2;
 
-    // B-spline control points: depart along the endpoint direction for
-    // boundary subgoals 鈥?the segment is validated over a SHORT receding
-    // horizon, so the drone must be able to turn tightly (e.g. thread a
-    // diagonal gap) instead of lazily arcing along its current velocity.
-    // Terminal stops keep departing along the current velocity for a
-    // smooth, decelerating approach to the goal.
+    // Preserve the measured velocity direction at the spline start.  The
+    // handle is deliberately short: this models lateral momentum without
+    // delaying the turn toward the new endpoint for an entire metre.
     const Vec2d dir = delta / L;
     const Vec2d dep_dir =
-        (terminal && v_start > p_.vehicle_stationary_speed_mps)
+        (v_start > p_.vehicle_stationary_speed_mps)
             ? state.velocity_world / v_start
             : dir;
     const Vec2d p0 = state.position;
     const Vec2d p3 = endpoint;
-    const Vec2d p1 = p0 + dep_dir * (L / 3.0);
+    const double departure_handle =
+        v_start > p_.vehicle_stationary_speed_mps
+            ? std::min(L / 3.0, std::max(0.15, 0.35 * v_start))
+            : L / 3.0;
+    const Vec2d p1 = p0 + dep_dir * departure_handle;
     const Vec2d p2 = p3 - dir * (L / 3.0);
 
     // Dense arc-length table of the spline (geometry is cruise-independent).
@@ -1530,6 +2332,14 @@ bool LocalPlanner30Hz::planFovTrajectory(
     const double cruise_cands[6] = {
         cruise_nom,        0.5 * cruise_nom, 0.25 * cruise_nom,
         0.125 * cruise_nom, 0.0625 * cruise_nom, 0.03125 * cruise_nom};
+    // R28c: prefer the plan with the SMALLEST lateral bend across the
+    // cruise retries (a slow straight thread through a gap beats a fast
+    // wide detour).  The straight candidate has cross-track ~0 and wins
+    // whenever it validates at some cruise.  Declared OUTSIDE the cruise
+    // loop so the best-candidate selection after the loop can see them.
+    PlanarTrajectory best;
+    double best_ct = std::numeric_limits<double>::infinity();
+    double best_cmin = std::numeric_limits<double>::infinity();
     for (double cruise : cruise_cands) {
         if (cruise <= 1e-6) continue;
         const double ve = terminal ? 0.0 : std::min(v_end, cruise);
@@ -1544,7 +2354,13 @@ bool LocalPlanner30Hz::planFovTrajectory(
         // clutter and previously caused permanent NO_SAFE_CANDIDATE brakes.
         const double lookahead =
             std::max(2.5, std::min(3.0, cruise * 1.5));
-        const double L_check = terminal ? Ls : std::min(Ls, lookahead);
+        // R28: extend the CLEARANCE check to cover the first observed
+        // corridor block (min_validate_m) so a straight chord through a
+        // blocked corridor fails validation.  The FOV gate stays at the
+        // short lookahead (the drone turns into the curve as it advances).
+        const double L_check =
+            terminal ? Ls
+                     : std::min(Ls, std::max(lookahead, min_validate_m));
         // Time parameterization: v(s) = min(v_acc(s), v_dec(s)).
         auto speedAt = [&](double ss) -> double {
             const double v_acc = std::min(
@@ -1578,39 +2394,54 @@ bool LocalPlanner30Hz::planFovTrajectory(
             ss = std::min(Ls, ss + v_cur * p_.lp_dt +
                                0.5 * a * p_.lp_dt * p_.lp_dt);
             const Vec2d p = pointAt(ss);
+            const bool in_front_fov = ss <= lookahead + 1e-9;
+            const bool in_front_clr = ss <= L_check + 1e-9;
             // 鈹€鈹€ FOV constraint: the trajectory must stay inside the FOV 鈹€鈹€
-            const double b_p = wrapAngle(
-                std::atan2(p.y() - state.position.y(),
-                           p.x() - state.position.x()) -
-                state.yaw);
-            if (std::fabs(b_p) > fov_half + 1e-9) {
-                bad = true;
-                break;
+            // (base short lookahead only — the drone turns into the curve).
+            if (in_front_fov) {
+                const double b_p = wrapAngle(
+                    std::atan2(p.y() - state.position.y(),
+                               p.x() - state.position.x()) -
+                    state.yaw);
+                if (std::fabs(b_p) > fov_half + 1e-9) {
+                    bad = true;
+                    break;
+                }
             }
             // 鈹€鈹€ Clearance vs observed OCCUPIED (ESDF); UNKNOWN passable 鈹€鈹€
+            // (extended to L_check = corridor-block distance when blocked).
+            // R28b FIX: the clearance gate must NOT `continue` — that skipped
+            // the point push AND the `reached` flag for every non-terminal
+            // plan (L_check < Ls), so the straight-fallback ALWAYS failed and
+            // the whole local planner collapsed to NO_SAFE_CANDIDATE (task 440
+            // R28 batch: goal_no_progress + false macro takeover).  Wrap the
+            // check instead, matching EgoBsplineOptimizer::buildAndValidate.
             const Vec2d tangent =
                 (p - prev).squaredNorm() > 1e-12 ? (p - prev).normalized()
                                                  : dir;
-            const double v = speedAt(ss);
-            bool hard_violation = false;
-            bool envelope_violation = false;
-            const double search_r = clearanceSearchRadius(v);
-            obs.forEachOccupiedWithin(
-                p, search_r, [&](const Vec2d& centre, double distance) {
-                    cmin = std::min(cmin, distance);
-                    if (distance < handoffClearance())
-                        hard_violation = true;
-                    Vec2d dir_c = centre - p;
-                    const double dl = dir_c.norm();
-                    if (dl > 1e-9) dir_c /= dl;
-                    const double closing =
-                        std::max(0.0, dir_c.dot(tangent) * v);
-                    if (distance < requiredClearance(closing))
-                        envelope_violation = true;
-                });
-            if (hard_violation || envelope_violation) {
-                bad = true;
-                break;
+            if (in_front_clr) {
+                const double v = speedAt(ss);
+                bool hard_violation = false;
+                bool envelope_violation = false;
+                const double search_r = clearanceSearchRadius(v);
+                obs.forEachOccupiedWithin(
+                    p, search_r, p_.lp_planning_history_max_age_ticks,
+                    [&](const Vec2d& centre, double distance) {
+                        cmin = std::min(cmin, distance);
+                        if (distance < handoffClearance())
+                            hard_violation = true;
+                        Vec2d dir_c = centre - p;
+                        const double dl = dir_c.norm();
+                        if (dl > 1e-9) dir_c /= dl;
+                        const double closing =
+                            std::max(0.0, dir_c.dot(tangent) * v);
+                        if (distance < requiredClearance(closing))
+                            envelope_violation = true;
+                    });
+                if (hard_violation || envelope_violation) {
+                    bad = true;
+                    break;
+                }
             }
             prev = p;
             cand.points.push_back(p);
@@ -1621,10 +2452,22 @@ bool LocalPlanner30Hz::planFovTrajectory(
         if (!bad && reached) {
             cand.valid = true;
             cand.cruise_mps = cruise;
-            out = std::move(cand);
-            min_clear = cmin;
-            return true;
+            // R28c: keep the plan with the SMALLEST lateral bend across the
+            // cruise retries — a slow straight thread through a gap beats a
+            // fast wide detour (the straight candidate has cross-track ~0).
+            const double ct =
+                maxCrossTrackFromLine(cand.points, state.position, endpoint);
+            if (ct < best_ct) {
+                best_ct = ct;
+                best = std::move(cand);
+                best_cmin = cmin;
+            }
         }
+    }
+    if (best.valid) {
+        out = std::move(best);
+        min_clear = best_cmin;
+        return true;
     }
     return false;
 }
@@ -1639,6 +2482,8 @@ EgoBsplineOptimizer::Config LocalPlanner30Hz::egoConfig(const Params2D& p) {
     c.lambda_feasibility = p.ego_lambda_feasibility;
     c.lambda_fitness = p.ego_lambda_fitness;
     c.lambda_fov = p.ego_lambda_fov;
+    // R27 temporal anchoring toward the previous plan (soft cost).
+    c.lambda_ref = p.ego_lambda_ref;
     c.clearance_m = p.ego_clearance_m +
                     std::max(0.0, p.lp_clearance_discretization_margin_m);
     c.n_segments = std::max(4, p.ego_n_segments);
@@ -1660,6 +2505,7 @@ EgoBsplineOptimizer::Config LocalPlanner30Hz::egoConfig(const Params2D& p) {
     c.obs_range_m = p.obs_range_m;
     c.obs_resolution = p.obs_resolution;
     c.obs_fov_deg = p.obs_fov_deg;
+    c.max_history_age_ticks = p.lp_planning_history_max_age_ticks;
     c.lp_dt = p.lp_dt;
     c.horizon_s = p.lp_horizon_s;
     // The optimizer must use the physical camera FOV as its soft boundary.
@@ -1674,34 +2520,52 @@ EgoBsplineOptimizer::Config LocalPlanner30Hz::egoConfig(const Params2D& p) {
 bool LocalPlanner30Hz::planEgoOrStraight(
     const PlanarState& state, const LocalObservation& obs,
     const Vec2d& endpoint, double v_end, bool terminal,
-    PlanarTrajectory& out, double& min_clear) const {
+    PlanarTrajectory& out, double& min_clear,
+    double min_validate_m) const {
     if (p_.ego_enabled) {
-        const EgoBsplineOptimizer::Config cfg = egoConfig(p_);
+        EgoBsplineOptimizer::Config cfg = egoConfig(p_);
+        // R28: validate up to the first observed corridor block so a
+        // straight chord through a blocked corridor can never "pass".
+        cfg.validate_front_m = min_validate_m;
+        // R27: anchor to the previous committed plan when compatible.
+        const std::vector<Vec2d>* ref = anchoredReference(state, endpoint);
         PlanarTrajectory e =
-            ego_bspline_.plan(state, obs, endpoint, v_end, terminal, cfg,
-                              min_clear);
+            (ref != nullptr)
+                ? ego_bspline_.planAnchored(state, obs, endpoint, v_end,
+                                            terminal, cfg, min_clear,
+                                            /*astar_path=*/nullptr, ref)
+                : ego_bspline_.plan(state, obs, endpoint, v_end, terminal,
+                                    cfg, min_clear);
         if (e.valid) {
             out = std::move(e);
             return true;
         }
     }
     return planFovTrajectory(state, obs, endpoint, v_end, terminal, out,
-                             min_clear);
+                             min_clear, min_validate_m);
 }
 
 bool LocalPlanner30Hz::planEgoOrStraightWithPath(
     const PlanarState& state, const LocalObservation& obs,
     const Vec2d& endpoint, double v_end, bool terminal,
     const std::vector<Vec2d>& astar_path, PlanarTrajectory& out,
-    double& min_clear) const {
+    double& min_clear, double min_validate_m) const {
     // USER ARCHITECTURE A+B: the EGO B-spline is initialised along the REAL
     // A* route (resampled), so the optimised curve follows the obstacle-free
     // corridor, curves around blockers and ends AT the endpoint (the guide).
     if (p_.ego_enabled) {
-        const EgoBsplineOptimizer::Config cfg = egoConfig(p_);
+        EgoBsplineOptimizer::Config cfg = egoConfig(p_);
+        // R28: validate up to the first observed corridor block.
+        cfg.validate_front_m = min_validate_m;
+        // R27: anchor to the previous committed plan when compatible.
+        const std::vector<Vec2d>* ref = anchoredReference(state, endpoint);
         PlanarTrajectory e =
-            ego_bspline_.plan(state, obs, endpoint, v_end, terminal, cfg,
-                              min_clear, astar_path);
+            (ref != nullptr)
+                ? ego_bspline_.planAnchored(state, obs, endpoint, v_end,
+                                            terminal, cfg, min_clear,
+                                            &astar_path, ref)
+                : ego_bspline_.plan(state, obs, endpoint, v_end, terminal,
+                                    cfg, min_clear, astar_path);
         if (e.valid) {
             out = std::move(e);
             return true;
@@ -1712,7 +2576,7 @@ bool LocalPlanner30Hz::planEgoOrStraightWithPath(
     // validation rejects a straight chord through a blocker 鈥?so the caller
     // then moves on to the bearing scan.
     return planFovTrajectory(state, obs, endpoint, v_end, terminal, out,
-                             min_clear);
+                             min_clear, min_validate_m);
 }
 
 // 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -1771,6 +2635,13 @@ std::vector<Vec2d> LocalPlanner30Hz::routeAStar(
     for (int iy = 0; iy < obs.height; ++iy) {
         for (int ix = 0; ix < obs.width; ++ix) {
             if (obs.at(ix, iy) != CellState::OCCUPIED) continue;
+            const size_t cell_id = obs.idx(ix, iy);
+            if (p_.lp_planning_history_max_age_ticks !=
+                    std::numeric_limits<uint32_t>::max() &&
+                cell_id < obs.age_ticks.size() &&
+                obs.age_ticks[cell_id] > p_.lp_planning_history_max_age_ticks) {
+                continue;
+            }
             const Vec2d oc = gridCellCenter(ix, iy, obs.origin, res);
             for (int dy = -cr; dy <= cr; ++dy) {
                 for (int dx = -cr; dx <= cr; ++dx) {
@@ -1813,9 +2684,44 @@ std::vector<Vec2d> LocalPlanner30Hz::routeAStar(
         const double dy = (iy - g.iy) * res;
         return std::sqrt(dx * dx + dy * dy);
     };
+    // ─── R28i: goal-line lateral penalty ────────────────────────────────
+    // The A* should hug the direct start->goal line (minimal detour)
+    // instead of wandering onto a far observed corridor.  When a blocker
+    // sits ON the goal line, this prefers the blocker side whose route
+    // stays closest to the line (the GOAL side), rather than the far side
+    // whose corridor happens to be observed FREE while the goal-side
+    // corridor lies in the blocker's occlusion shadow (every UNKNOWN cell
+    // there costs +3*res).  Measured joint_v2_000010_5d9e5002: the A*
+    // routed EAST (away from the goal) of the blocker because the WEST
+    // corridor was occluded/UNKNOWN and the EAST corridor was observed
+    // FREE — the pilot/blueprint (turn_right) expects the WEST route, and
+    // the 30 Hz scan kept flapping east<->west.  Weight is LIGHT
+    // (0.25 per cell per metre off the line): it only re-ranks routes of
+    // near-equal cost and never overrides an actually-free shorter path
+    // (R28b lesson).  For a goal BEHIND the drone the fov_front penalty
+    // (8*res) still dominates, so the route must still leave through the
+    // visible front cone.
+    const Vec2d line_v = goal - start;
+    const double line_len = line_v.norm();
+    const Vec2d line_unit =
+        line_len > 1e-9 ? line_v / line_len : Vec2d(1.0, 0.0);
+    auto latPenalty = [&](int ix, int iy) -> double {
+        if (line_len < 1e-9) return 0.0;
+        const Vec2d c = gridCellCenter(ix, iy, obs.origin, res);
+        const Vec2d rel = c - start;
+        const Vec2d off = rel - line_unit * rel.dot(line_unit);
+        return 0.25 * off.norm();
+    };
 
     int best_ix = s.ix, best_iy = s.iy;
-    double best_f = heuristic(s.ix, s.iy);
+    // R28: when the expansion budget is exhausted the search returns a
+    // PARTIAL path to the best REACHED cell.  Select it by the minimum
+    // heuristic (straight-line distance to the goal — the actual frontier),
+    // not by min(g+h): an f-minimising cell can be a cheap-to-reach dead-end
+    // that points the EGO spline the wrong way.  If the best cell made no
+    // progress from the start, return empty (the caller falls back to the
+    // FOV scan instead of following a degenerate 1-2 cell path).
+    double best_h = heuristic(s.ix, s.iy);
     int exp = 0;
     while (!open.empty() && exp < max_expansions) {
         const auto [f, gv, cx, cy] = open.top();
@@ -1829,8 +2735,9 @@ std::vector<Vec2d> LocalPlanner30Hz::routeAStar(
             best_iy = cy;
             break;
         }
-        if (f < best_f) {
-            best_f = f;
+        const double h = heuristic(cx, cy);
+        if (h < best_h) {
+            best_h = h;
             best_ix = cx;
             best_iy = cy;
         }
@@ -1847,7 +2754,8 @@ std::vector<Vec2d> LocalPlanner30Hz::routeAStar(
             const double extra =
                 (obs.at(nx, ny) == CellState::UNKNOWN) ? unknown_cost : 0.0;
             const double fpen = fovFrontPenalty(nx, ny);
-            const double ng = gv + kCost[k] * res + extra + fpen;
+            const double latpen = latPenalty(nx, ny);
+            const double ng = gv + kCost[k] * res + extra + fpen + latpen;
             if (ng < gcost[nid] - 1e-9) {
                 gcost[nid] = ng;
                 parent[nid] = static_cast<int>(cid);
@@ -1858,6 +2766,10 @@ std::vector<Vec2d> LocalPlanner30Hz::routeAStar(
 
     // Reconstruct from the goal cell when reached, else the best-reached
     // cell (the nearest opening the search found).
+    // R28: a partial path that made no progress from the start is a dead
+    // end — return empty so the caller falls back to the FOV scan instead
+    // of committing to a degenerate path.
+    if (best_ix == s.ix && best_iy == s.iy) return empty;
     std::vector<Vec2d> path;
     int ix = best_ix, iy = best_iy;
     while (ix >= 0 && iy >= 0) {
@@ -1913,7 +2825,8 @@ void LocalPlanner30Hz::assessLocalCorridor(
         Vec2d bc(0.0, 0.0);
         uint32_t bage = 0;
         obs.forEachOccupiedWithin(
-            p, radius, [&](const Vec2d& centre, double distance) {
+            p, radius, p_.lp_planning_history_max_age_ticks,
+            [&](const Vec2d& centre, double distance) {
                 if (distance >= best) return;
                 best = distance;
                 found = true;
@@ -1945,8 +2858,20 @@ void LocalPlanner30Hz::assessLocalCorridor(
     // diagnostic reason only when the rest of the corridor is clear, so
     // the CSV can distinguish "real obstacle at goal" from "goal cell
     // never observed free" without fabricating extra blockages.
-    const CellState target_state =
+    CellState target_state =
         obs.atWorld(target.position.x(), target.position.y());
+    if (target_state == CellState::OCCUPIED) {
+        const GridIndex2D tg = worldToGrid(
+            target.position, obs.origin, obs.resolution);
+        const size_t target_id = obs.inGrid(tg.ix, tg.iy)
+                                     ? obs.idx(tg.ix, tg.iy)
+                                     : std::numeric_limits<size_t>::max();
+        if (target_id < obs.age_ticks.size() &&
+            obs.age_ticks[target_id] >
+                p_.lp_planning_history_max_age_ticks) {
+            target_state = CellState::UNKNOWN;
+        }
+    }
     if (target_state == CellState::OCCUPIED) {
         blocked = true;
         reason = CorridorBlockReason::TARGET_NOT_FREE;
@@ -1967,7 +2892,9 @@ void LocalPlanner30Hz::assessLocalCorridor(
                                : CorridorBlockReason::HISTORY_OCCUPIED;
             return;
         }
-        if (obs.minClearanceToOccupied(p, risk_corridor) < risk_corridor) {
+        if (obs.minClearanceToOccupied(
+                p, risk_corridor, p_.lp_planning_history_max_age_ticks) <
+            risk_corridor) {
             risk_near_obstacle = true;
         }
     }
@@ -1990,7 +2917,39 @@ bool LocalPlanner30Hz::microApproachSafe(const PlanarState& state,
     const double clr = handoffClearance();
     for (double d = step; d <= dist + 1e-6; d += step) {
         const Vec2d p = state.position + dir * d;
-        if (obs.minClearanceToOccupied(p, clr) < clr) return false;
+        if (obs.minClearanceToOccupied(
+                p, clr, p_.lp_planning_history_max_age_ticks) < clr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool LocalPlanner30Hz::forwardCorridorSafe(
+    const PlanarState& state, const LocalObservation& obs,
+    const Vec2d& world_direction, double distance_m) const {
+    const double n = world_direction.norm();
+    if (n < 1e-9 || distance_m <= 0.0) return true;
+    const Vec2d dir = world_direction / n;
+    const double step = std::max(1e-3, 0.5 * p_.obs_resolution);
+    const double clr = handoffClearance();
+    const double speed = state.velocity_world.norm();
+    const double search_r = clearanceSearchRadius(speed);
+    for (double d = step; d <= distance_m + 1e-6; d += step) {
+        const Vec2d p = state.position + dir * d;
+        bool unsafe = false;
+        obs.forEachOccupiedWithin(
+            p, search_r, p_.lp_planning_history_max_age_ticks,
+            [&](const Vec2d& centre, double distance) {
+                if (distance < clr) unsafe = true;
+                Vec2d toward = centre - p;
+                const double dl = toward.norm();
+                if (dl > 1e-9) toward /= dl;
+                const double closing =
+                    std::max(0.0, speed * dir.dot(toward));
+                if (distance < requiredClearance(closing)) unsafe = true;
+            });
+        if (unsafe) return false;
     }
     return true;
 }

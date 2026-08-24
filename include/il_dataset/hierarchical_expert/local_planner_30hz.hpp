@@ -153,11 +153,16 @@ private:
     /// stop at the endpoint; boundary → cruise up to v_end.  Returns false
     /// when no safe path reaches the endpoint within the horizon.
     /// min_clear is the smallest centre-to-surface distance along the path.
+    /// `min_validate_m` (R28) forces the non-terminal receding-horizon
+    /// validation to cover at least this arc (the first observed corridor
+    /// block): a straight chord through a blocked corridor can no longer
+    /// "validate" because the blocker sits beyond the ~3 m front window.
     bool planFovTrajectory(const PlanarState& state,
                            const LocalObservation& obs,
                            const Vec2d& endpoint, double v_end,
                            bool terminal, PlanarTrajectory& out,
-                           double& min_clear) const;
+                           double& min_clear,
+                           double min_validate_m = 0.0) const;
 
     /// EGO-style optimisation B-spline first, straight-ray fallback.
     /// Tries the EGO optimiser (bends the spline around observed
@@ -168,7 +173,8 @@ private:
                            const LocalObservation& obs,
                            const Vec2d& endpoint, double v_end,
                            bool terminal, PlanarTrajectory& out,
-                           double& min_clear) const;
+                           double& min_clear,
+                           double min_validate_m = 0.0) const;
     /// A*-route initialised EGO B-spline (USER ARCHITECTURE A+B): the EGO
     /// optimiser is given the REAL A* route to the endpoint so the curve
     /// follows the obstacle-free corridor and ends AT the endpoint.  Falls
@@ -180,7 +186,8 @@ private:
                                    bool terminal,
                                    const std::vector<Vec2d>& astar_path,
                                    PlanarTrajectory& out,
-                                   double& min_clear) const;
+                                   double& min_clear,
+                                   double min_validate_m = 0.0) const;
     /// Build the EGO Config from the current Params2D (ego_* section).
     static EgoBsplineOptimizer::Config egoConfig(const Params2D& p);
 
@@ -214,10 +221,46 @@ private:
             std::min(p_.lp_cruise_speed_mps, p_.lp_max_speed);
         return std::max(2.0, std::min(3.0, cruise * 1.5));
     }
+    /// R28j: the receding local route horizon — the arc-length at which the
+    /// B-spline endpoint / routing waypoint sits for NON-terminal plans.
+    /// The local B-spline plans only to this ~3 m waypoint (never the full
+    /// far target); the executed yaw control stays on the short pure-pursuit
+    /// lookahead (lp_pursuit_lookahead_m, 0.6 m).  Routing heading = the
+    /// direction to this waypoint; control heading = the pursuit tangent —
+    /// the two layers are deliberately separate.
+    double localRouteHorizon() const {
+        const double cruise =
+            std::min(p_.lp_cruise_speed_mps, p_.lp_max_speed);
+        return std::max(2.0, std::min(3.0, cruise * 1.5));
+    }
 
     PlannerResult computePlan(const PlanarState& state,
                               const LocalObservation& obs,
                               const ResolvedPlanarTarget& target, bool mutate);
+    /// R27: true when the drone can (and should) PURSUE the committed
+    /// current_trajectory_ this tick instead of re-optimising (tracking
+    /// fast-path gate).  False when: no stored plan, target changed,
+    /// terminal micro-approach / goal-capture zone, target out of FOV,
+    /// stored path cut by a newly observed obstacle, large cross-track
+    /// deviation, or the plan front is nearly consumed.
+    bool trackingAvailable(const PlanarState& state,
+                           const LocalObservation& obs,
+                           const ResolvedPlanarTarget& target) const;
+    /// R27: pure-pursuit along the stored trajectory (no re-optimisation).
+    /// Mirrors the planned-branch command semantics so the FSM / CSV see
+    /// the same fields (status / selected / plan_terminal / progress bits).
+    PlannerResult trackStoredTrajectory(const PlanarState& state,
+                                        const LocalObservation& obs,
+                                        const ResolvedPlanarTarget& target);
+    /// R27: EGO temporal-anchoring reference (the previous plan's world
+    /// points), or nullptr when no compatible stored plan exists.  The
+    /// reference must start near the current state and end near the new
+    /// endpoint, else it is ignored.
+    const std::vector<Vec2d>* anchoredReference(const PlanarState& state,
+                                                const Vec2d& endpoint) const;
+    /// R27: near-obstacle proximity signal (mirrors computePlan's lambda).
+    bool nearObservedObstacle(const LocalObservation& obs, const Vec2d& pos,
+                              double proximity_m) const;
     /// R25: after a full mutate plan, push this tick's outcome into the
     /// limit-cycle window and set res.local_limit_cycle_detected.  Called
     /// from plan() (every branch reaches it; preview probes never mutate).
@@ -227,6 +270,16 @@ private:
     bool currentTrajectoryBlocked(const PlanarState& state,
                                   const LocalObservation& obs,
                                   bool& dynamic_violation) const;
+    /// R28b: true if any point of `plan` (from the closest point to the
+    /// state onward) comes within the hard/dynamic clearance of an observed
+    /// OCCUPIED cell.  Reconciles the corridor assessment (which looks
+    /// toward the GOAL) with the ACTUAL planned path: a clear line parallel
+    /// to a blocked goal corridor, or a short hop whose tail ends before
+    /// the blocker, must NOT be rejected (task 440: BLOCKED + false macro
+    /// takeover while flying a 0.66 m-clear line past obs5).
+    bool planPathBlocked(const PlanarState& state,
+                         const LocalObservation& obs,
+                         const PlanarTrajectory& plan) const;
     VelocityCommand3D reachableCommand(const PlanarState& state,
                                        const VelocityCommand3D& intent) const;
     Vec2d bodyVelocity(const PlanarState& state) const;
@@ -247,6 +300,14 @@ private:
     bool microApproachSafe(const PlanarState& state,
                            const LocalObservation& obs,
                            const Vec2d& goal) const;
+    /// Check a straight world-frame ray through the full observable range.
+    /// The executed spline may end at the shorter receding horizon, but a
+    /// far obstacle must still be noticed before the vehicle advances into
+    /// a locally avoidable dead end.
+    bool forwardCorridorSafe(const PlanarState& state,
+                             const LocalObservation& obs,
+                             const Vec2d& world_direction,
+                             double distance_m) const;
     double stoppingDistance(const PlanarState& state) const;
     bool spaceToStop(const PlanarState& state, const LocalObservation& obs,
                      double dist) const;
@@ -270,6 +331,30 @@ private:
     uint64_t last_mission_revision_ = 0;
     Vec2d last_target_position_{0.0, 0.0};
     bool last_target_valid_ = false;
+    // ── R27 plan/track state ──────────────────────────────────────
+    // Metadata of the last committed planned trajectory (current_trajectory_
+    // holds its geometry).  The tracking fast-path uses these to decide
+    // whether the stored plan still applies to the current target.
+    uint64_t stored_mission_revision_ = 0;
+    Vec2d stored_target_pos_{0.0, 0.0};
+    bool stored_terminal_ = false;
+    Vec2d stored_endpoint_{0.0, 0.0};
+    double stored_v_end_ = 0.0;
+    double stored_min_clear_ = std::numeric_limits<double>::infinity();
+    // ── R28i side-commitment ──────────────────────────────────────
+    // Side (sign of chosen_b - b_t) of the last committed non-terminal plan:
+    // +1 = plan deviates to the +b (counter-clockwise / left) side of the
+    // target direction, -1 = the -b (clockwise / right) side, 0 = none yet.
+    // The bearing scan uses it to keep expanding on the SAME side first so
+    // the drone commits to one side of a blocker instead of flapping between
+    // both sides as the observed-grid validation toggles (task 401: the plan
+    // flipped right (toward goal) <-> left (away) around obs7 every ~0.3 s).
+    double last_plan_side_ = 0.0;
+    // A side change is forbidden for a short dwell after choosing a bypass.
+    // This is deliberately a minimum dwell, not a permanent latch: a side
+    // that becomes genuinely infeasible may still be abandoned afterwards.
+    uint64_t side_commit_until_tick_ = 0;
+    uint32_t direct_clear_ticks_ = 0;
     // ── R25 limit-cycle / stagnation detector (mutate path only) ──
     // Sliding window over the distance/bearing to the EFFECTIVE target and
     // the blocked-frame ratio.  When the target is not being approached and

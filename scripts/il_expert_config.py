@@ -146,6 +146,9 @@ def build_params(global_cfg, errors=None):
     p.obs_free_clear_confirmations = int(_num(
         obs.get("free_clear_confirmations"),
         "he.observation.free_clear_confirmations", problems, 3))
+    p.lp_planning_history_max_age_ticks = int(_num(
+        obs.get("planning_history_max_age_ticks"),
+        "he.observation.planning_history_max_age_ticks", problems, 45))
     p.obs_ground_clearance_m = _num(
         obs.get("ground_clearance_m"),
         "he.observation.ground_clearance_m", problems, 0.5)
@@ -190,6 +193,24 @@ def build_params(global_cfg, errors=None):
         lp.get("terminal_micro_approach_m"),
         "he.lp.terminal_micro_approach_m", problems, 0.8,
         allow_zero=True)
+    # ── R27: receding-horizon tracking (plan/track split) ─────────
+    # The B-spline is re-optimised every lp_replan_interval_ticks control
+    # ticks (3 = 10 Hz at 30 Hz); between replans the drone PURSUES the
+    # committed trajectory (arc-length lookahead) instead of chasing a
+    # freshly re-solved head every tick — kills the receding-horizon
+    # head-drift accumulation.  1 disables tracking (legacy behaviour).
+    p.lp_replan_interval_ticks = int(_num(
+        lp.get("replan_interval_ticks"),
+        "he.lp.replan_interval_ticks", problems, 3))
+    p.lp_pursuit_lookahead_m = _num(
+        lp.get("pursuit_lookahead_m"),
+        "he.lp.pursuit_lookahead_m", problems, 0.6)
+    p.lp_track_max_cross_track_m = _num(
+        lp.get("track_max_cross_track_m"),
+        "he.lp.track_max_cross_track_m", problems, 0.5)
+    p.lp_track_min_front_m = _num(
+        lp.get("track_min_front_m"),
+        "he.lp.track_min_front_m", problems, 0.8)
     p.lp_max_accel = _num(lp.get("max_accel"), "he.lp.max_accel",
                           problems, 2.0)
     # The EFFECTIVE (physically achieved) horizontal acceleration of the
@@ -202,7 +223,19 @@ def build_params(global_cfg, errors=None):
     p.lp_max_yaw_rate = _num(lp.get("max_yaw_rate"),
                              "he.lp.max_yaw_rate", problems, 2.0)
     p.lp_max_yaw_accel = _num(lp.get("max_yaw_accel"),
-                              "he.lp.max_yaw_accel", problems, 4.0)
+                              "he.lp.max_yaw_accel", problems, 8.0)
+    # R28c/R28g: local plan endpoint must stay within this bearing band of the
+    # current target direction (deg).  Big lateral detours are the UPPER
+    # planner's job; the local only makes small adjustments here and hands
+    # back NO_SAFE_CANDIDATE otherwise.  35 = the +-35° scan band: a local
+    # detour up to the band is legitimate (task 401 needs ~31° around obs7);
+    # beyond it (task-33-style 40°+ spirals) it is rejected for the macro.
+    p.lp_max_local_deviation_deg = _num(
+        lp.get("max_local_deviation_deg"),
+        "he.lp.max_local_deviation_deg", problems, 35.0)
+    p.lp_preferred_local_deviation_deg = _num(
+        lp.get("preferred_local_deviation_deg"),
+        "he.lp.preferred_local_deviation_deg", problems, 20.0)
     # ── vertical channel (3D expert extension) ────────────────────
     p.lp_max_vz = _num(lp.get("max_vz"), "he.lp.max_vz", problems, 1.0)
     p.lp_max_v_accel = _num(lp.get("max_v_accel"),
@@ -257,6 +290,13 @@ def build_params(global_cfg, errors=None):
         lp.get("ego_n_segments"), "he.lp.ego_n_segments", problems, 8))
     p.ego_max_iter = int(_num(
         lp.get("ego_max_iter"), "he.lp.ego_max_iter", problems, 60))
+    # R27: temporal anchoring weight — a soft cost pulling consecutive EGO
+    # replans toward the previous committed plan (receding-horizon
+    # continuity).  The warm-start init is applied whenever a compatible
+    # reference exists; 0 disables only the cost term.
+    p.ego_lambda_ref = _num(
+        lp.get("ego_lambda_ref"), "he.lp.ego_lambda_ref",
+        problems, 0.3, allow_zero=True)
     p.lp_control_period_s = _num(lp.get("control_period_s"),
                                  "he.lp.control_period_s", problems,
                                  1.0 / 30.0)
@@ -352,7 +392,7 @@ def build_params(global_cfg, errors=None):
         allow_zero=True)
     p.macro_takeover_confirm_ticks_30hz = int(_num(
         mc.get("takeover_confirm_ticks_30hz"),
-        "he.corrector.takeover_confirm_ticks_30hz", problems, 6))
+        "he.corrector.takeover_confirm_ticks_30hz", problems, 12))
     p.macro_unknown_recovery_threshold_ticks = int(_num(
         mc.get("unknown_recovery_threshold_ticks"),
         "he.corrector.unknown_recovery_threshold_ticks", problems, 60))

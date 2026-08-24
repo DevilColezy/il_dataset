@@ -18,7 +18,9 @@ void HierarchicalExpertFsm::reset(const Task2D& task, uint64_t tick) {
     tick_ = tick;
     reset_tick_ = tick;
     consecutive_failures_ = 0;
+    consecutive_hold_ticks_ = 0;
     failure_start_tick_ = 0;
+    last_failure_tick_ = 0;
     unknown_recovery_ticks_ = 0;
     unknown_recovery_episode_count_ = 0;
     progress_window_ticks_ = 0;
@@ -173,9 +175,22 @@ void HierarchicalExpertFsm::updateFailureBookkeeping(
     // cold preview miss alone never authorizes macro takeover.
     const bool blocked =
         out.local.failure_reason == FailureReason::BLOCKED_BY_OBSERVED_OBSTACLE;
+    // R28h (P0#4 refined): a SAFE_HOLD is benign while TRANSIENT — a brief
+    // replan wait, a pre-rotation brake, or an already-safe motion state.
+    // Counting every hold frame inflated consecutive_failures_ and drove
+    // spurious 5 Hz takeovers on momentary replan blips (task 236: 6
+    // corrections with ZERO NO_SAFE_CANDIDATE).  But a hold that PERSISTS
+    // with no plan is a genuine dead-end and MUST hand over to the macro
+    // (task 401 r28h: counting nothing left the drone at a 0.1 m corridor
+    // block with consecutive_failures_ = 0 forever, episode interrupted).
+    // Track consecutive hold frames; count a hold as a failure only once it
+    // is sustained (>= kSustainedHoldTicks, ~0.4 s).
+    const bool hold = out.local.planner_status == PlannerStatus::SAFE_HOLD;
+    consecutive_hold_ticks_ = hold ? consecutive_hold_ticks_ + 1 : 0;
+    const bool sustained_hold = consecutive_hold_ticks_ >= kSustainedHoldTicks;
     const bool no_safe =
         out.local.failure_reason == FailureReason::NO_SAFE_CANDIDATE ||
-        out.local.planner_status == PlannerStatus::SAFE_HOLD;
+        sustained_hold;
     const bool limit_cycle = out.local.local_limit_cycle_detected;
 
     // R25 (Fix #4): "genuine" progress that is allowed to DECAY the
@@ -211,6 +226,10 @@ void HierarchicalExpertFsm::updateFailureBookkeeping(
     constexpr uint32_t kProgressClearWindowTicks = 15;  // 0.5 s at 30 Hz
     if (blocked || no_safe || limit_cycle) {
         if (consecutive_failures_ == 0) failure_start_tick_ = in.tick;
+        // R28j: remember when the CURRENT failure happened so the 5 Hz
+        // takeover can require a RECENT failure (not a decaying leftover
+        // from an earlier stall).
+        last_failure_tick_ = in.tick;
         ++consecutive_failures_;
         progress_window_ticks_ = 0;
         if (no_safe) {
@@ -320,7 +339,9 @@ void HierarchicalExpertFsm::acceptNewGoal(const Vec2d& new_goal,
     directive_.update_event = corrector_.bumpDirectiveEvent();
     directive_.reason = "NEW_FINAL_GOAL";
     consecutive_failures_ = 0;
+    consecutive_hold_ticks_ = 0;
     failure_start_tick_ = 0;
+    last_failure_tick_ = 0;
     unknown_recovery_ticks_ = 0;
     progress_window_ticks_ = 0;
     last_local_result_ = PlannerResult{};
@@ -394,20 +415,36 @@ FsmStepOutput HierarchicalExpertFsm::step(const FsmInput& in) {
         }
         const uint32_t confirm_ticks = static_cast<uint32_t>(
             std::max(1, p_.macro_takeover_confirm_ticks_30hz));
+        // R28j: the takeover must reflect a CURRENT inability to plan, not
+        // a decaying failure counter.  Measured (task 475 r28i): after an
+        // emergency brake the counter stayed above the confirm threshold
+        // for ~0.3 s of recovery, and the 5 Hz layer published TURN_RIGHT
+        // at frame 60 while the local was already planner_failure_reason=
+        // NONE with both bypass corridors visible.  Require the last
+        // failure frame to be RECENT (within one 6-tick macro window) in
+        // addition to the count and the current block evidence.
+        const bool failure_recent =
+            last_failure_tick_ != 0 &&
+            in.tick - last_failure_tick_ <= kTakeoverFailureRecencyTicks;
         const bool persistent_failure =
-            consecutive_failures_ >= confirm_ticks ||
-            unknown_recovery_ticks_ >= confirm_ticks;
+            (consecutive_failures_ >= confirm_ticks ||
+             unknown_recovery_ticks_ >= confirm_ticks) &&
+            failure_recent;
         // A speed-dependent clearance failure means "brake/slow down",
         // not "the topology is blocked".  It remains owned by local.
         const bool dynamic_braking_only =
             has_last_local_result_ &&
             last_local_result_.dynamic_clearance_blocked &&
             !last_local_result_.local_corridor_blocked;
+        // R28h (P0#4): a stationary body is NOT topology evidence — the
+        // drone may simply be holding/braking (SAFE_HOLD no longer counts
+        // as a failure above).  Only an OBSERVED blocked corridor confirms
+        // the topology is genuinely blocked; together with persistent real
+        // failures this is the sustained large-scale evidence the upper
+        // layer must see before taking over.
         const bool topology_evidence_ready =
             has_last_local_result_ &&
-            (last_local_result_.local_corridor_blocked ||
-             in.state.velocity_world.norm() <=
-                 p_.vehicle_stationary_speed_mps);
+            last_local_result_.local_corridor_blocked;
         assessment.takeover_confirmed =
             persistent_failure && topology_evidence_ready &&
             !dynamic_braking_only;

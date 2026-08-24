@@ -222,6 +222,27 @@ double EgoBsplineOptimizer::fitnessCost(const CtrlPts& c,
     return cost;
 }
 
+double EgoBsplineOptimizer::referenceCost(const CtrlPts& c,
+                                          const std::vector<Vec2d>& ref,
+                                          const Config& cfg,
+                                          std::vector<Vec2d>& grad) {
+    (void)cfg;
+    double cost = 0.0;
+    const int M = static_cast<int>(c.q.size()) - 1;
+    if (static_cast<int>(ref.size()) != M + 1) return 0.0;
+    // Soft temporal anchor: pull the FREE control points toward the previous
+    // plan's curve (resampled to control-point resolution).  Control-point
+    // space is used for a simple gradient; the reference guide was built
+    // from the previous CURVE, so this keeps consecutive replans within ~a
+    // segment of the committed path without hard-constraining the detour.
+    for (int i = 3; i <= M - 4; ++i) {
+        const Vec2d d = c.q[i] - ref[i];
+        cost += d.squaredNorm();
+        grad[i] += 2.0 * d;
+    }
+    return cost;
+}
+
 double EgoBsplineOptimizer::fovCost(const CtrlPts& c,
                                     const PlanarState& state,
                                     const Config& cfg,
@@ -346,38 +367,48 @@ bool EgoBsplineOptimizer::optimizeControlPoints(
     const PlanarState& state, const LocalObservation& obs,
     const Vec2d& endpoint, bool terminal, const Config& cfg,
     const Vec2d& dep_dir, const Vec2d& dir, double L,
-    const std::vector<Vec2d>* guide_override, CtrlPts& out) const {
+    const std::vector<Vec2d>* guide_override,
+    const std::vector<Vec2d>* ref_guide, CtrlPts& out) const {
     (void)terminal;
     const int M = cfg.n_segments + 3;
     const int n_free = M - 6;  // free control points Q[3..M-4]
     if (n_free < 1) return false;
     const double d = L / 6.0;
+    const double speed = state.velocity_world.norm();
+    const double departure_d =
+        speed > 0.05 ? std::min(d, std::max(0.15, 0.35 * speed)) : d;
 
-    // Guide reference used for the fitness term AND the free-control-point
-    // initialisation: a REAL A* path when provided (USER A+B — the curve
-    // follows the obstacle-free corridor), otherwise the lateral detour
-    // guide (straight line + obstacle push).
+    // Guide reference used for the fitness term: a REAL A* path when
+    // provided (USER A+B — the curve follows the obstacle-free corridor),
+    // otherwise the lateral detour guide (straight line + obstacle push).
     const std::vector<Vec2d> guide =
         guide_override ? *guide_override
                        : buildDetourGuide(state, obs, endpoint, M, cfg);
+    // R27 temporal anchor: a compatible previous plan (resampled to M+1
+    // control-point positions).  When available it WARM-STARTS the free
+    // control points (temporal continuity) and, if lambda_ref > 0, adds the
+    // anchoring cost — the guide still drives the obstacle-fitness term.
+    const bool use_ref = ref_guide != nullptr &&
+                         static_cast<int>(ref_guide->size()) == M + 1;
 
     CtrlPts c;
     c.q.assign(M + 1, Vec2d(0.0, 0.0));
     c.ts = cfg.ts;
     // Clamped start: curve passes through Q[1] = start, departing along
     // dep_dir (tangent ∝ Q2 - Q0).
-    c.q[0] = state.position - dep_dir * d;
+    c.q[0] = state.position - dep_dir * departure_d;
     c.q[1] = state.position;
-    c.q[2] = state.position + dep_dir * d;
+    c.q[2] = state.position + dep_dir * departure_d;
     // Clamped end: curve passes through Q[M-2] = endpoint, arriving along
     // dir (tangent ∝ Q[M] - Q[M-2]).
     c.q[M - 3] = endpoint - dir * d;
     c.q[M - 2] = endpoint;
     c.q[M - 1] = endpoint + dir * d;
     c.q[M] = endpoint + dir * (2.0 * d);
-    // Initialise the free control points ALONG THE DETOUR GUIDE.
+    // Initialise the free control points ALONG the temporal reference when
+    // present (previous plan), else along the detour guide / A* route.
     for (int i = 3; i <= M - 4; ++i) {
-        c.q[i] = guide[i];
+        c.q[i] = use_ref ? (*ref_guide)[i] : guide[i];
     }
 
     // Pack the free control points into the L-BFGS variable vector.
@@ -388,7 +419,7 @@ bool EgoBsplineOptimizer::optimizeControlPoints(
     }
 
     // Objective: f = λ1*smooth + λ2*collision + λ3*feasibility +
-    //             λ4*fitness + λfov*fov   (EGO combineCostRebound).
+    //             λ4*fitness + λfov*fov + λref*reference  (EGO combined).
     const auto obj = [&](const Eigen::VectorXd& xv,
                          Eigen::VectorXd& g) -> double {
         for (int j = 0; j < n_free; ++j) {
@@ -399,26 +430,34 @@ bool EgoBsplineOptimizer::optimizeControlPoints(
         std::vector<Vec2d> gf(M + 1, Vec2d(0.0, 0.0));
         std::vector<Vec2d> gfit(M + 1, Vec2d(0.0, 0.0));
         std::vector<Vec2d> gfo(M + 1, Vec2d(0.0, 0.0));
+        std::vector<Vec2d> gref(M + 1, Vec2d(0.0, 0.0));
         const double cs = smoothnessCost(c, gs);
         const double cc = collisionCost(c, obs, cfg, gc);
         const double cf = feasibilityCost(c, cfg, gf);
         const double cfit = fitnessCost(c, guide, cfg, gfit);
         const double cfo = fovCost(c, state, cfg, gfo);
+        const double cref =
+            (cfg.lambda_ref > 0.0 && use_ref)
+                ? referenceCost(c, *ref_guide, cfg, gref)
+                : 0.0;
         const double cost = cfg.lambda_smooth * cs + cfg.lambda_collision * cc +
                             cfg.lambda_feasibility * cf +
-                            cfg.lambda_fitness * cfit + cfg.lambda_fov * cfo;
+                            cfg.lambda_fitness * cfit + cfg.lambda_fov * cfo +
+                            cfg.lambda_ref * cref;
         for (int j = 0; j < n_free; ++j) {
             const int i = 3 + j;
             g[2 * j] = cfg.lambda_smooth * gs[i].x() +
                        cfg.lambda_collision * gc[i].x() +
                        cfg.lambda_feasibility * gf[i].x() +
                        cfg.lambda_fitness * gfit[i].x() +
-                       cfg.lambda_fov * gfo[i].x();
+                       cfg.lambda_fov * gfo[i].x() +
+                       cfg.lambda_ref * gref[i].x();
             g[2 * j + 1] = cfg.lambda_smooth * gs[i].y() +
                            cfg.lambda_collision * gc[i].y() +
                            cfg.lambda_feasibility * gf[i].y() +
                            cfg.lambda_fitness * gfit[i].y() +
-                           cfg.lambda_fov * gfo[i].y();
+                           cfg.lambda_fov * gfo[i].y() +
+                           cfg.lambda_ref * gref[i].y();
         }
         return cost;
     };
@@ -501,6 +540,18 @@ bool EgoBsplineOptimizer::buildAndValidate(
     // within the validated portion.
     const double front_dist =
         std::max(2.0, std::min(3.0, cruise * 1.5));
+    // R28: when a corridor block forces validation beyond the front window
+    // (validate_front_m > 0), extend the CLEARANCE check out to the block.
+    // The FOV gate stays at the base front — the drone turns into the curve
+    // as it advances, and A*-route plans skip the FOV gate anyway.  This
+    // makes a straight chord through a blocked corridor FAIL validation
+    // (instead of "passing" because the blocker sits beyond the ~3 m front)
+    // so the bearing scan continues to a genuine detour (task 440: BLOCKED
+    // + unnecessary macro takeover on first sight of a small obstacle).
+    const double front_clear =
+        cfg.validate_front_m > 0.0
+            ? std::max(front_dist, std::min(cfg.validate_front_m, Ls))
+            : front_dist;
 
     out.points.push_back(state.position);
     out.yaw.push_back(state.yaw);
@@ -517,8 +568,9 @@ bool EgoBsplineOptimizer::buildAndValidate(
         const Vec2d tangent = (p - prev).squaredNorm() > 1e-12
                                   ? (p - prev).normalized()
                                   : Vec2d(1.0, 0.0);
-        const bool in_front = ss <= front_dist + 1e-9;
-        if (in_front) {
+        const bool in_front_fov = ss <= front_dist + 1e-9;
+        const bool in_front_clr = ss <= front_clear + 1e-9;
+        if (in_front_fov || in_front_clr) {
             // FOV constraint (front only — the tail is re-planned).
             // USER DIRECTIVE (2026-08-20): EGO-style local planning from
             // the current state to the target.  The A*-route plan may
@@ -533,7 +585,7 @@ bool EgoBsplineOptimizer::buildAndValidate(
             // executed front clear and the 30 Hz replan re-validates as the
             // drone turns.  Skipped ONLY for A*-path plans (allow_fov_exit);
             // the detour-guide path keeps the gate.
-            if (!allow_fov_exit) {
+            if (!allow_fov_exit && in_front_fov) {
                 const double b_p = wrapAngle(
                     std::atan2(p.y() - state.position.y(),
                                p.x() - state.position.x()) -
@@ -544,12 +596,15 @@ bool EgoBsplineOptimizer::buildAndValidate(
                 }
             }
             // Clearance vs observed OCCUPIED (sparse ESDF); UNKNOWN
-            // passable.  Front only.
+            // passable.  Front only (extended to the corridor block when
+            // validate_front_m > 0).
+            if (!in_front_clr) continue;
             const double v = speedAt(ss);
             const double search_r = clearanceSearchRadius(v, cfg);
             bool hard_violation = false, env_violation = false;
             obs.forEachOccupiedWithin(
-                p, search_r, [&](const Vec2d& centre, double distance) {
+                p, search_r, cfg.max_history_age_ticks,
+                [&](const Vec2d& centre, double distance) {
                     cmin = std::min(cmin, distance);
                     if (distance < cfg.min_clearance) hard_violation = true;
                     Vec2d dir_c = centre - p;
@@ -588,7 +643,7 @@ PlanarTrajectory EgoBsplineOptimizer::plan(
     const Vec2d& endpoint, double v_end, bool terminal,
     const Config& cfg, double& min_clear) const {
     return planImpl(state, obs, endpoint, v_end, terminal, cfg, min_clear,
-                    /*guide_override=*/nullptr);
+                    /*guide_override=*/nullptr, /*ref_guide=*/nullptr);
 }
 
 PlanarTrajectory EgoBsplineOptimizer::plan(
@@ -600,17 +655,43 @@ PlanarTrajectory EgoBsplineOptimizer::plan(
     std::vector<Vec2d> guide = resamplePathToGuide(astar_path, M);
     if (guide.size() != static_cast<size_t>(M + 1)) {
         return planImpl(state, obs, endpoint, v_end, terminal, cfg, min_clear,
-                        /*guide_override=*/nullptr);
+                        /*guide_override=*/nullptr, /*ref_guide=*/nullptr);
     }
     return planImpl(state, obs, endpoint, v_end, terminal, cfg, min_clear,
-                    &guide);
+                    &guide, /*ref_guide=*/nullptr);
+}
+
+PlanarTrajectory EgoBsplineOptimizer::planAnchored(
+    const PlanarState& state, const LocalObservation& obs,
+    const Vec2d& endpoint, double v_end, bool terminal,
+    const Config& cfg, double& min_clear,
+    const std::vector<Vec2d>* astar_path,
+    const std::vector<Vec2d>* ref_traj) const {
+    const int M = cfg.n_segments + 3;
+    // Guide (fitness + fallback init): A* route when provided.
+    std::vector<Vec2d> guide;
+    const std::vector<Vec2d>* guide_ptr = nullptr;
+    if (astar_path != nullptr) {
+        guide = resamplePathToGuide(*astar_path, M);
+        if (guide.size() == static_cast<size_t>(M + 1)) guide_ptr = &guide;
+    }
+    // Temporal reference (warm-start + anchoring cost): previous plan.
+    std::vector<Vec2d> ref_guide;
+    const std::vector<Vec2d>* ref_ptr = nullptr;
+    if (ref_traj != nullptr && !ref_traj->empty()) {
+        ref_guide = resamplePathToGuide(*ref_traj, M);
+        if (ref_guide.size() == static_cast<size_t>(M + 1)) ref_ptr = &ref_guide;
+    }
+    return planImpl(state, obs, endpoint, v_end, terminal, cfg, min_clear,
+                    guide_ptr, ref_ptr);
 }
 
 PlanarTrajectory EgoBsplineOptimizer::planImpl(
     const PlanarState& state, const LocalObservation& obs,
     const Vec2d& endpoint, double v_end, bool terminal,
     const Config& cfg, double& min_clear,
-    const std::vector<Vec2d>* guide_override) const {
+    const std::vector<Vec2d>* guide_override,
+    const std::vector<Vec2d>* ref_guide) const {
     PlanarTrajectory out;
     out.valid = false;
     min_clear = std::numeric_limits<double>::infinity();
@@ -627,35 +708,27 @@ PlanarTrajectory EgoBsplineOptimizer::planImpl(
     }
     const Vec2d dir = to / L;
     const double v_start = state.velocity_world.norm();
-    // Departure direction:
-    //  * A*-path plan (guide_override): the STRAIGHT line to the endpoint
-    //    can point INTO a blocker — a macro guide is placed beyond/around
-    //    the blocker (its chord crosses the obstacle, e.g. task254 guide
-    //    (4.62,13.23) with a 0.04 m grazing chord past obstacle
-    //    (4.07,15.05) r1.07), so a tangent straight at the endpoint makes
-    //    the B-spline leave INTO the obstacle and the front 3 m clearance
-    //    validation rejects the curve (measured: the plan fell to the
-    //    FOV-edge scan).  Follow the A* route's INITIAL direction (or the
-    //    current velocity when already translating) so the curve leaves
-    //    ALONG the obstacle-free corridor and bends around the blocker.
-    //  * Detour-guide plan: current velocity for a moving terminal stop,
-    //    else straight toward the endpoint (matches planFovTrajectory).
+    // Departure direction is a physical boundary condition.  Preserve the
+    // measured velocity while moving, but keep the handle short so the
+    // spline turns promptly toward the route/endpoint.  At standstill, use
+    // the A* route's first segment (when available), otherwise the endpoint.
     const Vec2d dep_dir = [&]() -> Vec2d {
+        // The departure tangent is a physical boundary condition.  Keep the
+        // measured velocity direction while moving; route/endpoint direction
+        // is used only after the vehicle is effectively stationary.
+        if (v_start > 0.05) return state.velocity_world / v_start;
         if (guide_override) {
-            if (v_start > 0.05) return state.velocity_world / v_start;
             if (guide_override->size() >= 2) {
                 const Vec2d gd = (*guide_override)[1] - (*guide_override)[0];
                 if (gd.squaredNorm() > 1e-12) return gd.normalized();
             }
-            return dir;
         }
-        return (terminal && v_start > 0.05) ? state.velocity_world / v_start
-                                            : dir;
+        return dir;
     }();
 
     CtrlPts c;
     if (!optimizeControlPoints(state, obs, endpoint, terminal, cfg, dep_dir,
-                               dir, L, guide_override, c)) {
+                               dir, L, guide_override, ref_guide, c)) {
         return out;
     }
 
@@ -671,16 +744,44 @@ PlanarTrajectory EgoBsplineOptimizer::planImpl(
     const double cruises[6] = {cruise_nom,       0.5 * cruise_nom,
                                0.25 * cruise_nom, 0.125 * cruise_nom,
                                0.0625 * cruise_nom, 0.03125 * cruise_nom};
+    // R28c: prefer the plan with the SMALLEST lateral bend across the cruise
+    // retries (a slow straight thread through a gap beats a fast wide
+    // detour).  The straight/small-bend candidate has cross-track ~0 and
+    // wins whenever it validates at some cruise level.
     double mc = std::numeric_limits<double>::infinity();
+    PlanarTrajectory best;
+    double best_ct = std::numeric_limits<double>::infinity();
+    double best_mc = std::numeric_limits<double>::infinity();
     for (double cruise : cruises) {
         if (cruise <= 1e-6) continue;
+        PlanarTrajectory cand;
         if (buildAndValidate(c, state, obs, endpoint, v_start, v_end, terminal,
                              cfg, cruise,
-                             /*allow_fov_exit=*/guide_override != nullptr, out,
-                             mc)) {
-            min_clear = mc;
-            return out;
+                             /*allow_fov_exit=*/guide_override != nullptr,
+                             cand, mc)) {
+            double ct = 0.0;
+            if (cand.points.size() >= 2) {
+                const Vec2d ab = endpoint - state.position;
+                const double L2 = ab.squaredNorm();
+                if (L2 > 1e-12) {
+                    for (const Vec2d& q : cand.points) {
+                        const double u = std::max(
+                            0.0, std::min(1.0, (q - state.position).dot(ab) / L2));
+                        const Vec2d proj = state.position + ab * u;
+                        ct = std::max(ct, (q - proj).norm());
+                    }
+                }
+            }
+            if (ct < best_ct) {
+                best_ct = ct;
+                best = std::move(cand);
+                best_mc = mc;
+            }
         }
+    }
+    if (best.valid) {
+        min_clear = best_mc;
+        return best;
     }
     return out;
 }

@@ -107,7 +107,21 @@ global:
     # These are re-stated explicitly because joint_v2 is the production
     # recipe and the tightened balance / budget gates MUST hold here.
     performance:
-      max_total_preflight_ticks: 500000
+      max_task_candidates_per_scene: 48
+      max_total_preflight_ticks: 650000
+    task_generation:
+      macro_probe:
+        enabled: true
+        yaw_error_deg: 70.0
+        # A probe biases sampling but does not reject a valid task when the
+        # r29 local yaw-first branch emits a non-macro label.
+        require_match: false
+    # First collect a broad random candidate pool; deficit-driven weighting
+    # and greedy selection are applied only after exploration.
+    exploration:
+      pool_first: true
+      rounds: 2
+      min_pool_tasks: 24
     synthetic_observation:
       walls_visible_in_observation: true
     early_termination:
@@ -123,45 +137,45 @@ global:
       max_side_route_expansions: 20000
       max_total_side_route_expansions: 1200000
       max_total_qualification_expansions: 3000000
+      # Prevent one highly blocked scene from consuming the whole global A*
+      # budget.  Once this cap is reached, move to another random scene.
+      max_expansions_per_scene: 300000
       start_recovery_max_radius_m: 0.5
       side_bias: 0.4
       min_route_stretch_for_long_detour: 1.5
     distribution_targets:
       # ── 5 Hz macro coverage ──────────────────────────────────────
       - {key: "macro:total", metric: "count:macro:total",
-         target: 96, minimum: 24, weight: 0.5, minimum_hard: false}
+         target: 256, minimum: 128, weight: 0.5, minimum_hard: false}
       - {key: "macro:pass", metric: "count:macro:pass",
-         target: 72, minimum: 24, weight: 1.0, minimum_hard: true}
+         target: 128, minimum: 64, weight: 1.0, minimum_hard: true}
       - {key: "macro:normal", metric: "count:macro:normal",
-         target: 72, minimum: 24, weight: 1.0, minimum_hard: true}
+         target: 128, minimum: 64, weight: 1.0, minimum_hard: true}
       # New planner does LOCAL yaw-first turns whenever the target leaves
-      # the usable FOV band; the 5 Hz macro only issues TURN for hard
-      # cases (goal outside FOV AND no bypass visible), so macro turns are
-      # rarer than in the old architecture.  Targets reflect that reality
-      # (natural rate observed ~4 left / ~11 right per 533 candidates);
-      # the hard minimum only guarantees a usable turn sample per side.
+      # the usable FOV band.  The macro-turn probe is therefore only a
+      # post-exploration sampling hint for genuine upper-level takeovers.
       - {key: "macro:turn_left", metric: "count:macro:turn_left",
-         target: 24, minimum: 3, weight: 2.0, minimum_hard: true}
+         target: 64, minimum: 32, weight: 3.0, minimum_hard: true}
       - {key: "macro:turn_right", metric: "count:macro:turn_right",
-         target: 24, minimum: 3, weight: 2.0, minimum_hard: true}
+         target: 64, minimum: 32, weight: 3.0, minimum_hard: true}
       - {key: "corr_angle_total", metric: "hist:macro_correction_angle",
-         target: 96, minimum: 24, weight: 1.0, minimum_hard: true}
+         target: 192, minimum: 64, weight: 1.0, minimum_hard: true}
       # ── 30 Hz local coverage ─────────────────────────────────────
       - {key: "local:avoidance", metric: "count:local:avoidance",
-         target: 72, minimum: 24, weight: 1.2, minimum_hard: true}
+         target: 128, minimum: 64, weight: 1.2, minimum_hard: true}
       - {key: "local:direct", metric: "count:local:direct",
-         target: 72, minimum: 24, weight: 0.4, minimum_hard: false}
+         target: 128, minimum: 64, weight: 0.4, minimum_hard: false}
       - {key: "deflection_total", metric: "hist:local_deflection",
-         target: 96, minimum: 24, weight: 1.0, minimum_hard: true}
+         target: 192, minimum: 64, weight: 1.0, minimum_hard: true}
       # ── depth proxy coverage (hard) ──────────────────────────────
       - {key: "depth:near", metric: "count:depth:near",
-         target: 120, minimum: 40, weight: 1.0, minimum_hard: true}
+         target: 160, minimum: 64, weight: 1.0, minimum_hard: true}
       - {key: "depth:mid", metric: "count:depth:mid",
-         target: 120, minimum: 40, weight: 1.0, minimum_hard: true}
+         target: 160, minimum: 64, weight: 1.0, minimum_hard: true}
       - {key: "depth:far", metric: "count:depth:far",
-         target: 120, minimum: 40, weight: 1.2, minimum_hard: true}
+         target: 160, minimum: 64, weight: 1.2, minimum_hard: true}
       - {key: "depth:free", metric: "count:depth:free",
-         target: 120, minimum: 40, weight: 1.0, minimum_hard: true}
+         target: 160, minimum: 64, weight: 1.0, minimum_hard: true}
       # ── initial yaw coverage (hard per bin) ──────────────────────
       - {key: "yaw:bin0", metric: "hist:yaw_error_abs:0",
          target: 6, minimum: 3, weight: 1.0, minimum_hard: true}
@@ -185,12 +199,15 @@ global:
       # ── balances (structural, soft) ──────────────────────────────
       - {key: "balance:turn",
          metric: "balance:macro:turn_left/macro:turn_right",
-         target: 0.60, minimum: 0.60, weight: 2.0, minimum_hard: false}
+         target: 0.20, minimum: 0.20, weight: 3.0, minimum_hard: false}
       - {key: "balance:yaw", metric: "balance:yaw:left/yaw:right",
          target: 0.20, minimum: 0.20, weight: 1.0, minimum_hard: false}
     requirements:
+      min_tasks: 160
+      min_tasks_per_scene: 8
+      max_tasks_per_scene: 16
       min_selected_scenes: 4
-      max_turn_imbalance_ratio: 0.60
+      max_turn_imbalance_ratio: 0.20
       max_yaw_imbalance_ratio: 0.20
       min_grouped_deflection_samples: 8
       min_grouped_correction_samples: 4
@@ -227,6 +244,9 @@ global:
       resolution: 0.10
       ray_angular_res_deg: 0.5
       history_max_age_ticks: 120
+      # Older cells remain diagnostic history but do not hard-block local
+      # replanning until refreshed by the current view.
+      planning_history_max_age_ticks: 45
       # R25: consecutive current-frame FREE confirmations required to clear
       # a stale OCCUPIED history cell (3 = 0.1 s).  Prevents phantom
       # blockage from old observations (joint_v2_000004_4ab1e354).
@@ -250,13 +270,38 @@ global:
       terminal_capture_radius_m: 1.0
       limit_cycle_goal_progress_m: 0.1
       limit_cycle_window_5hz: 15
+      takeover_confirm_ticks_30hz: 12
     local_planner:
       max_yaw_rate: 1.5
-      max_yaw_accel: 4.0
+      # R28c: raised from 4.0 so the drone can follow a freshly re-planned
+      # trajectory quickly (reverse a full-rate turn in ~0.3 s, not ~0.6 s).
+      max_yaw_accel: 8.0
+      # R28c/R28g: local plan endpoint must stay within this bearing band of
+      # the current target direction (deg); big detours belong to the upper
+      # layer.  35 = the +-35° scan band: a legitimate local detour up to the
+      # band is kept (task 401 needs ~31° around obs7); 40°+ spirals (task 33)
+      # are still rejected for the macro.  Was 30.0 -> killed a working detour
+      # at a razor-thin cliff when the nose drifted across it.
+      max_local_deviation_deg: 35.0
+      # Search this narrow band first; use the full band only when no local
+      # candidate exists, avoiding unnecessary FOV-edge detours.
+      preferred_local_deviation_deg: 20.0
       # R26: terminal micro-approach radius — inside 0.8 m with an in-FOV,
       # hard-clear path the planner drives the proportional terminal
       # controller directly (bridges the 0.4-0.8 m B-spline dead zone).
       terminal_micro_approach_m: 0.8
+      # ── R27: plan/track split ───────────────────────────────────
+      # Re-optimise the B-spline every N control ticks (3 = 10 Hz); between
+      # replans PURSUE the committed trajectory with an arc-length lookahead
+      # so the executed path follows ONE spline instead of the envelope of
+      # per-tick heads (kills receding-horizon head-drift accumulation).
+      replan_interval_ticks: 3
+      pursuit_lookahead_m: 0.6    # arc-length lookahead along the spline
+      track_max_cross_track_m: 0.5  # max deviation before forced replan
+      track_min_front_m: 0.8        # replan when < this much path remains
+      # R27: temporal anchor — soft cost pulling consecutive EGO replans
+      # toward the previous committed plan (0 disables the cost term).
+      ego_lambda_ref: 0.3
     altitude_hold:
       kp: 1.5
       kd: 0.6

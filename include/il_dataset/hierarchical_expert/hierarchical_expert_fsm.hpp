@@ -177,8 +177,26 @@ private:
 
     uint32_t consecutive_failures_ = 0;
     uint64_t failure_start_tick_ = 0;
+    // R28j: the tick of the most recent local failure (blocked / no_safe /
+    // limit-cycle).  The 5 Hz takeover must reflect a CURRENT inability to
+    // plan, not a decaying history counter: after an emergency brake the
+    // counter can stay above the confirm threshold for ~0.3 s of recovery
+    // while the local is already fine (measured task 475 r28i — TURN_RIGHT
+    // published at frame 60 with planner_failure_reason=NONE and both
+    // bypass corridors visible).  The macro only takes over when the last
+    // failure frame is recent (within kTakeoverFailureRecencyTicks).
+    uint64_t last_failure_tick_ = 0;
+    static constexpr uint64_t kTakeoverFailureRecencyTicks = 6;  // 0.2 s at 30 Hz
     uint32_t unknown_recovery_ticks_ = 0;
     uint32_t unknown_recovery_episode_count_ = 0;
+    // R28h (P0#4 refined): consecutive SAFE_HOLD frames.  A SAFE_HOLD only
+    // counts as a failure when it is SUSTAINED (>= kSustainedHoldTicks) —
+    // transient holds (brief replan waits / pre-rotation brakes) are benign,
+    // but a hold that persists with no plan is a genuine dead-end and must
+    // hand over to the macro (task 401 r28h: without this the drone sat at a
+    // corridor block with consecutive_failures_ = 0 forever).
+    uint32_t consecutive_hold_ticks_ = 0;
+    static constexpr uint32_t kSustainedHoldTicks = 12;  // 0.4 s at 30 Hz
     // R25 (Fix #4): consecutive frames of GENUINE progress (decayed failure
     // counting).  A single good frame no longer hard-resets the failure
     // evidence; only ~0.5 s of sustained real progress fully clears it.

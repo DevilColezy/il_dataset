@@ -3,8 +3,10 @@
 /// @brief  Deficit-driven, budgeted, deterministic Blueprint generation.
 ///
 /// Pipeline (replaces the fixed "strata schedule + hard quota" path):
-///   round 1..max_generation_rounds:
-///     weighted SceneProfile pick (deficit weights)
+///   exploration rounds:
+///     random/base-weighted SceneProfile and task/yaw sampling
+///   supplementation rounds:
+///     deficit-driven SceneProfile and task sampling
 ///       -> scene realization (SceneProfileGenerator)
 ///       -> one-time geometry cache (SceneGeometryCache)
 ///       -> fast task-candidate sampling (TaskCandidateGenerator)
@@ -12,7 +14,7 @@
 ///       -> C++ preflight with the SAME expert (PreflightSimulator)
 ///          + TaskDistributionSummary (path / depth proxy / 5 Hz ticks /
 ///                                     30 Hz deflection / yaw / stretch)
-///     -> global DistributionAnalyzer recomputes deficits
+///     -> global DistributionAnalyzer records observed labels and recomputes deficits
 ///   final greedy selection (DistributionAnalyzer::select) with a
 ///   scene_switch_penalty (fewer scenes, more complementary tasks each)
 ///   -> BlueprintResult (manifest-ready, backward compatible).

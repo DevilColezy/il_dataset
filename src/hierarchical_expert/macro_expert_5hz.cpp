@@ -1130,83 +1130,25 @@ TargetCorrectionDirective VisibilityTargetCorrector::update(
         d.reason = "LOCAL_BLOCKED_SEARCH_ROTATION_NO_PROGRESS";
     }
 
-    // A distance==1 directive is a strict pure-rotation label.  Do not
-    // publish it while the vehicle is still translating: first issue a
-    // zero-distance ordinary correction so the 30 Hz planner smoothly
-    // brakes.  Once measured speed is stationary (for a confirmation
-    // window), the next 5 Hz update may publish the world-latched TURN
-    // step.
-    //
-    // R24 — the brake is now a LATCHED, TERMINAL semantic:
-    //   * terminal_stop is a PERSISTENT directive flag: the 30 Hz planner
-    //     treats the point as a stop-target and NEVER re-labels a coasted-
-    //     past brake as fly-through (previously fly-through was re-derived
-    //     from the live distance every tick, so a brake whose vehicle
-    //     coasted a few cm instantly became an accelerate-through target).
-    //   * the world point is latched at FIRST issue and held FIXED.  It is
-    //     NOT rewritten to the live pose every 5 Hz cycle (that turned a
-    //     brake into an endlessly moving target — joint_v2_000001_469baa3b
-    //     "nominal brake, actual accelerate away": 9.41 m travelled, goal
-    //     7.52 → 16.62 m).
-    //   * while latched, the directive is unchanged (no new events) until
-    //     the vehicle is stationary for macro_brake_confirm_ticks_5hz
-    //     consecutive updates, or a certified guide / PASS replaces the
-    //     search turn (which releases the latch immediately).
-    const bool proposed_search_turn =
-        d.type == TargetCorrectionType::TURN_LEFT ||
-        d.type == TargetCorrectionType::TURN_RIGHT;
-    const double speed = state.velocity_world.norm();
-    const bool vehicle_stationary =
-        speed <= p_.vehicle_stationary_speed_mps;
-    bool brake_before_search = false;
-    if (proposed_search_turn && !vehicle_stationary) {
-        if (!brake_latched_) {
-            brake_latched_ = true;
-            brake_world_point_ = state.position;
-            brake_stationary_updates_ = 0;
-        }
-        if (vehicle_stationary) ++brake_stationary_updates_;
-        brake_before_search = true;
-    } else if (brake_latched_) {
-        if (proposed_search_turn) {
-            // Still braking toward the fixed point until the confirmation
-            // window elapses.
-            if (vehicle_stationary) ++brake_stationary_updates_;
-            brake_before_search = true;
-        } else {
-            // A certified guide / pass-through replaced the search turn
-            // this cycle: release the brake latch and let it through.
-            brake_latched_ = false;
-            brake_stationary_updates_ = 0;
-        }
-    }
-    if (brake_before_search) {
-        const uint32_t brake_confirm = static_cast<uint32_t>(std::max(
-            1, p_.macro_brake_confirm_ticks_5hz));
-        const bool brake_confirmed =
-            vehicle_stationary &&
-            brake_stationary_updates_ >= brake_confirm;
-        if (brake_confirmed) {
-            // Brake achieved → release the latch and publish the TURN step.
-            brake_latched_ = false;
-            brake_stationary_updates_ = 0;
-            brake_before_search = false;
-        } else {
-            d.type = TargetCorrectionType::NORMAL_CORRECTION;
-            d.direction_token = adapter_.quantizeBearing(0.0);
-            d.decoded_direction_body = adapter_.decodeDirectionToken(
-                d.direction_token);
-            d.normalized_distance = 0.0;
-            // FIXED latched world point — never the live pose.
-            d.corrected_target_world = brake_world_point_;
-            d.corrected_target_world_valid = true;
-            d.turn_direction_world_valid = false;
-            // Persistent terminal semantics: the 30 Hz planner must stop
-            // here and never fly through, regardless of live distance.
-            d.terminal_stop = true;
-            d.reason = "BRAKE_BEFORE_SEARCH_ROTATION";
-        }
-    }
+    // A distance==1 directive is a strict pure-rotation label.  R28h
+    // (P0#5): the 30 Hz planner ALREADY brakes before rotating for a
+    // pure-rotation target (local_planner_30hz rotationBrakeRequired ->
+    // brakeBeforeRotation), so we NO LONGER issue a zero-distance
+    // "stop at current position" NORMAL_CORRECTION first.  That label
+    // (effective_target = current position, distance_norm = 0,
+    // terminal_stop = true) conflicted with the goal-distance contract and
+    // forced a full stop before every search rotation — task 440: ~0.3 s
+    // after one NO_SAFE the corrector published a NORMAL_CORRECTION stop at
+    // the vehicle pose, turning a transient local replan blip into an
+    // upper-layer brake event.  The world-latched TURN is published
+    // directly; the local layer brakes, then rotates, and the label is a
+    // clean turn_to_target.  (R24's brake-point latching is obsolete here —
+    // there is no brake point; the local's own brake-before-rotation owns
+    // the stop, and the TURN anchor is direction-latched, not position-
+    // latched, so the "moving target" bug cannot reappear.)
+    // Keep the (always-false) flag so the shared reason / search-phase
+    // bookkeeping below still compiles; no brake-before-search phase exists.
+    const bool brake_before_search = false;
 
     // A TURN is a bounded world-latched step. Keep its anchor until it
     // enters the FOV; only then may the 5 Hz layer issue another step.

@@ -49,6 +49,48 @@ inline const char* legacyRadiusClass(double max_radius, bool is_empty,
     return "medium";
 }
 
+/// Geometry classes that can plausibly produce a macro takeover.  CLEAR
+/// candidates are deliberately not used for a turn probe: forcing a yaw on a
+/// clear task would manufacture an unrepresentative spin sample.
+inline bool turnProbeGeometry(const std::string& geom_type) {
+    return geom_type == "LARGE_OCCLUSION" ||
+           geom_type == "LONG_DETOUR" ||
+           geom_type == "CHICANE" ||
+           geom_type == "MULTI_OBSTACLE" ||
+           geom_type == "LOCAL_AVOIDANCE" ||
+           geom_type == "OFFSET_AVOIDANCE" ||
+           geom_type == "NARROW_BUT_PLANNABLE";
+}
+
+/// Return the configured target for a count metric.  Explicit YAML targets
+/// are preferred; the fallback keeps the probe useful with legacy/default
+/// configurations.
+inline uint64_t countTarget(const DistributionAnalyzer& analyzer,
+                            const std::string& key, uint64_t fallback) {
+    const std::string metric = "count:" + key;
+    for (const auto& target : analyzer.targets()) {
+        if (target.metric == metric) {
+            return static_cast<uint64_t>(std::max(1.0, std::ceil(target.target)));
+        }
+    }
+    return fallback;
+}
+
+/// Force the initial heading to put the goal outside the configured FOV on a
+/// requested side.  This changes only the sampled task heading; the label is
+/// still accepted only when the real expert emits the requested TURN.
+inline void forceTurnProbeYaw(BlueprintTask& task, int side,
+                              double magnitude_deg,
+                              double& yaw_error_signed_deg) {
+    const double goal_bearing =
+        std::atan2(task.goal_y - task.start_y, task.goal_x - task.start_x);
+    const double magnitude = std::max(45.0 + 1.0, std::fabs(magnitude_deg));
+    yaw_error_signed_deg = side < 0 ? -magnitude : magnitude;
+    const double expert_yaw = wrapAngle(
+        goal_bearing - deg2rad(yaw_error_signed_deg));
+    task.initial_yaw = CoordinateAdapter::expertYawToFlightmare(expert_yaw);
+}
+
 /// Merge a per-candidate / per-round QualificationCounters into a total.
 inline void accumulateQual(QualificationCounters& dst,
                            const QualificationCounters& src) {
@@ -758,14 +800,21 @@ BlueprintResult BlueprintGenerationController::generate() {
 
             // ── profile pick (deficit-driven or explicit sequence) ──
             const SceneProfile* prof = nullptr;
+            const bool exploration_round =
+                cfg_.pool_first_exploration &&
+                (round <= std::max(0, cfg_.exploration_rounds) ||
+                 (cfg_.exploration_min_pool_tasks > 0 &&
+                  global_pool.size() < cfg_.exploration_min_pool_tasks));
             if (!cfg_.profile_sequence.empty()) {
                 const size_t idx =
                     static_cast<size_t>(scene_counter) % cfg_.profile_sequence.size();
                 prof = profile_gen_.findProfile(cfg_.profile_sequence[idx]);
                 if (!prof) break;  // unknown profile name: stop (config error)
             } else {
-                prof = profile_gen_.pickProfile(round_rng,
-                                                analyzer_.profileTagWeights());
+                prof = profile_gen_.pickProfile(
+                    round_rng, exploration_round
+                        ? std::map<std::string, double>()
+                        : analyzer_.profileTagWeights());
             }
             if (!prof) break;
 
@@ -821,10 +870,12 @@ BlueprintResult BlueprintGenerationController::generate() {
                 std::min(max_tasks_per_scene, remaining_preflight_cap);
             pool_target += static_cast<uint64_t>(task_target);
             std::vector<BlueprintTask> scene_pool;
+            uint64_t scene_qualification_expansions = 0;
+            bool scene_qualification_budget_exhausted = false;
             int attempts = 0;
             while (static_cast<int>(scene_pool.size()) < task_target &&
                    attempts < cfg_.max_task_generation_attempts &&
-                   !budgetExceeded()) {
+                   !budgetExceeded() && !scene_qualification_budget_exhausted) {
                 ++attempts;
                 const uint64_t task_seed =
                     mixSeed(scene_seed, 0x5EEDF157ULL +
@@ -837,8 +888,11 @@ BlueprintResult BlueprintGenerationController::generate() {
                 // empty scene, ...) is zeroed BEFORE sampling, so the
                 // sampler never burns attempts on an impossible request.
                 const auto feas = task_gen_.feasibilityFor(out.scene, geo);
-                std::vector<double> type_weights =
-                    analyzer_.taskTypeWeights();
+                std::vector<double> type_weights = exploration_round
+                    ? std::vector<double>(static_cast<size_t>(kNumTaskGeomTypes), 1.0)
+                    : analyzer_.taskTypeWeights();
+                const std::vector<double> yaw_weights = exploration_round
+                    ? cfg_.yaw_weights : analyzer_.yawWeights();
                 bool any_feasible = false;
                 for (size_t i = 0; i < type_weights.size(); ++i) {
                     if (i < feas.size() && !feas[i]) {
@@ -855,7 +909,7 @@ BlueprintResult BlueprintGenerationController::generate() {
                 }
                 const auto t_samp = Clock::now();
                 const bool sampled = task_gen_.sample(
-                    out.scene, geo, type_weights, analyzer_.yawWeights(),
+                    out.scene, geo, type_weights, yaw_weights,
                     task_seed, global_task_id, scene_id, task, geom, yaw_err);
                 timing.task_candidate_generation_ms += msSince(t_samp);
                 if (!sampled) break;
@@ -863,6 +917,36 @@ BlueprintResult BlueprintGenerationController::generate() {
                 ++global_task_id;
 
                 // ── cheap staged filter before preflight ────────────
+                // Probe rare macro-turn branches while their configured
+                // tick targets are unmet.  This is a sampling hint only;
+                // preflight must observe the requested TURN label.
+                int probe_side = 0;  // +1 LEFT, -1 RIGHT, 0 = ordinary
+                if (cfg_.macro_probe_enabled && !exploration_round) {
+                    const uint64_t left_target = countTarget(
+                        analyzer_, "macro:turn_left", 24);
+                    const uint64_t right_target = countTarget(
+                        analyzer_, "macro:turn_right", 24);
+                    const uint64_t left_now =
+                        analyzer_.accumulator().count("macro:turn_left");
+                    const uint64_t right_now =
+                        analyzer_.accumulator().count("macro:turn_right");
+                    if (left_now < left_target || right_now < right_target) {
+                        if (left_now < left_target &&
+                            (right_now >= right_target || left_now <= right_now)) {
+                            probe_side = 1;
+                        } else {
+                            probe_side = -1;
+                        }
+                        if (!turnProbeGeometry(task.geom_type)) {
+                            // A clear task cannot provide a meaningful
+                            // takeover label; resample before preflight.
+                            continue;
+                        }
+                        forceTurnProbeYaw(task, probe_side,
+                                           cfg_.macro_probe_yaw_error_deg,
+                                           yaw_err);
+                    }
+                }
                 const auto t_filter = Clock::now();
                 if (!cheapFilterPass(out.scene, geo, task)) {
                     timing.cheap_filter_ms += msSince(t_filter);
@@ -901,15 +985,30 @@ BlueprintResult BlueprintGenerationController::generate() {
                             BudgetExhaustion::QUALIFICATION_EXPANSION_BUDGET;
                         break;
                     }
+                    if (cfg_.qualification.max_expansions_per_scene > 0 &&
+                        scene_qualification_expansions >=
+                            cfg_.qualification.max_expansions_per_scene) {
+                        // Abandon only this scene.  The outer generator can
+                        // continue with another random scene while the
+                        // generation-wide budget remains available.
+                        scene_qualification_budget_exhausted = true;
+                        break;
+                    }
+                    if (cfg_.qualification.max_expansions_per_scene > 0) {
+                        remaining_global = std::min<uint64_t>(
+                            remaining_global,
+                            cfg_.qualification.max_expansions_per_scene -
+                                scene_qualification_expansions);
+                    }
+                    const uint64_t remaining_before = remaining_global;
                     const auto t_qual = Clock::now();
                     qualifier_.qualify(t_start, t_goal, q, qc_round,
                                        remaining_global);
                     timing.task_qualification_ms += msSince(t_qual);
                     // Real-time accounting (immediate, not round-end).
-                    const uint64_t used =
-                        (max_global - total_qualification_expansions) -
-                        remaining_global;
+                    const uint64_t used = remaining_before - remaining_global;
                     total_qualification_expansions += used;
+                    scene_qualification_expansions += used;
                     task.qualification = q;
                     if (!q.accepted) {
                         ++result.qualification_rejected;
@@ -924,6 +1023,13 @@ BlueprintResult BlueprintGenerationController::generate() {
                     task.qualification.realized_geom_type = task.geom_type;
                     task.qualification.qualification_class =
                         q.qualification_class;
+                    if (probe_side != 0 && q.straight_corridor_clear) {
+                        // A turn probe must exercise the upper-layer
+                        // takeover case, not merely rotate toward a clear
+                        // goal.  Reject clear corridors before the expensive
+                        // expert preflight and resample the geometry.
+                        continue;
+                    }
                 }
 
                 // ── full preflight + distribution summary ───────────
@@ -952,7 +1058,7 @@ BlueprintResult BlueprintGenerationController::generate() {
                 std::string reject_reason = "accepted";
                 double depth_proxy_ms = 0.0;
                 const uint64_t ticks_before = total_preflight_ticks;
-                const bool accepted = preflightOne(
+                bool accepted = preflightOne(
                     task, out.scene, tick_base, summary, yaw_err,
                     task_tick_budget, total_preflight_ticks, early_terminated,
                     global_tick_truncated, reject_reason, depth_proxy_ms);
@@ -963,8 +1069,24 @@ BlueprintResult BlueprintGenerationController::generate() {
                 ++result.tasks_preflighted;
                 ++total_preflight_attempts;
                 ++rs.preflight_attempted;
-                ++rs.failure_breakdown[reject_reason];
                 task.summary = summary;
+
+                // A probe is only a sampling hint by default.  Keep the
+                // actual preflight label in the candidate pool so local
+                // yaw-first behaviour is not mistaken for a failed task.
+                // Strict matching remains available for focused diagnostics.
+                if (accepted && probe_side != 0 &&
+                    cfg_.macro_probe_require_match) {
+                    const bool matched =
+                        probe_side > 0
+                            ? summary.macro_turn_left_count > 0
+                            : summary.macro_turn_right_count > 0;
+                    if (!matched) {
+                        accepted = false;
+                        reject_reason = "macro_turn_probe_mismatch";
+                    }
+                }
+                ++rs.failure_breakdown[reject_reason];
 
                 if (global_tick_truncated) {
                     // The GLOBAL remaining tick budget cut this task short
@@ -982,6 +1104,9 @@ BlueprintResult BlueprintGenerationController::generate() {
                     scene_pool.push_back(task);
                     global_pool.push_back(task);
                     analyzer_.addTask(summary);
+                    // Keep deficit-driven task/yaw weights current within a
+                    // round; recomputation is negligible next to preflight.
+                    analyzer_.recompute();
                 } else {
                     ++timing.preflight_failure_count;
                     ++result.preflight_failure_count;
@@ -995,6 +1120,13 @@ BlueprintResult BlueprintGenerationController::generate() {
             }
             result.total_task_candidates +=
                 static_cast<uint64_t>(scene_pool.size());
+            if (scene_qualification_budget_exhausted && cfg_.log_rounds) {
+                std::fprintf(stderr,
+                             "[blueprint] scene %llu qualification cap reached; "
+                             "continuing with another scene (pool=%llu)\n",
+                             static_cast<unsigned long long>(scene_id),
+                             static_cast<unsigned long long>(scene_pool.size()));
+            }
         }
 
         // ── end-of-round stats + sanity log ─────────────────────────
@@ -1047,7 +1179,7 @@ BlueprintResult BlueprintGenerationController::generate() {
             std::fprintf(stderr,
                          "[blueprint] round %llu: scenes=%llu/%llu "
                          "candidates=%llu cheap_rej=%llu preflight=%llu "
-                         "success=%llu pool=%llu hard=%s soft=%s "
+                         "success=%llu pool=%llu explore=%s hard=%s soft=%s "
                          "elapsed_ms=%.1f\n",
                          static_cast<unsigned long long>(round),
                          static_cast<unsigned long long>(rs.scenes_valid),
@@ -1057,6 +1189,14 @@ BlueprintResult BlueprintGenerationController::generate() {
                          static_cast<unsigned long long>(rs.preflight_attempted),
                          static_cast<unsigned long long>(rs.preflight_success),
                          static_cast<unsigned long long>(rs.selected_pool),
+                         (cfg_.pool_first_exploration &&
+                          (static_cast<int>(round) <=
+                               std::max(0, cfg_.exploration_rounds) ||
+                           (cfg_.exploration_min_pool_tasks > 0 &&
+                            global_pool.size() <
+                                cfg_.exploration_min_pool_tasks)))
+                             ? "1"
+                             : "0",
                          cov.hard_minimums_met ? "1" : "0",
                          cov.soft_targets_met ? "1" : "0", rs.elapsed_ms);
             // Failure breakdown (stall / no_progress are the key signals to

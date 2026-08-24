@@ -523,6 +523,21 @@ struct BlueprintGenerationConfig {
     std::vector<double> yaw_edges_deg{0.0, 15.0, 35.0, 55.0, 90.0, 150.0, 180.0};
     std::vector<double> yaw_weights{0.8, 1.2, 2.2, 1.6, 1.0, 0.9};
 
+    // Rare macro-turn probe.  This is only a sampling hint; preflight must
+    // still observe the requested TURN_LEFT/TURN_RIGHT label from the
+    // closed-loop expert before admitting the candidate.
+    bool macro_probe_enabled = true;
+    double macro_probe_yaw_error_deg = 70.0;
+    // A probe is a sampling hint; false keeps candidates whose observed
+    // expert label differs (for example local yaw-first vs macro TURN).
+    bool macro_probe_require_match = false;
+
+    // Explore a random candidate pool before switching to deficit-driven
+    // supplementation and final greedy selection.
+    bool pool_first_exploration = true;
+    int exploration_rounds = 2;
+    uint64_t exploration_min_pool_tasks = 0;
+
     // ── depth proxy (2D synthetic raycast, NOT a student input) ────
     int depth_proxy_num_rays = 96;
     int depth_proxy_sample_stride_ticks = 6;  // every 0.2 s @ 30 Hz
@@ -628,6 +643,9 @@ struct BlueprintGenerationConfig {
         // Once reached, no further qualification searches run and the
         // generation ends with a clear reason.
         uint64_t max_total_qualification_expansions = 400000;
+        // Per-scene cap prevents one difficult scene from consuming the
+        // entire generation-wide qualification budget.
+        uint64_t max_expansions_per_scene = 0;
         // Bounded radius (m) used by the start-clearance recovery (mirrors
         // the 2D macro_start_recovery_max_radius_m = 0.5).
         double start_recovery_max_radius_m = 0.5;

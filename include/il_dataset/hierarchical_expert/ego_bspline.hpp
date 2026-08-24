@@ -50,6 +50,10 @@ public:
         double lambda_feasibility = 0.2;
         double lambda_fitness = 0.8;    // toward the detour guide
         double lambda_fov = 0.3;
+        // R27: temporal anchoring (toward the previous plan's curve).
+        // > 0 adds a soft lambda_ref * |q - ref|^2 cost on the free control
+        // points so successive replans stay close to the committed path.
+        double lambda_ref = 0.0;
         // EGO collision margin: CURVE samples are pushed out until they are
         // >= clearance_m from an OCCUPIED cell centre (USER DIRECTIVE: 4
         // cells = 0.4 m = drone radius 0.3 + cell 0.1).  demarcation =
@@ -84,10 +88,18 @@ public:
         double soft_clearance_radius_m = 1.0;
         double handoff_clearance_m = 0.4;  // 4 cells = collision distance
         double obs_range_m = 5.0;
+        uint32_t max_history_age_ticks = 45;
         double obs_resolution = 0.1;
         double obs_fov_deg = 90.0;  // hard FOV validation bound (±fov/2)
         double lp_dt = 0.1;
         double horizon_s = 4.0;
+        // R28: force the non-terminal receding-horizon validation to cover
+        // at least this arc length (m) — set to the first observed corridor
+        // block so a straight chord through a blocked corridor fails
+        // validation instead of "passing" because the blocker is beyond the
+        // ~3 m front window (measured BLOCKED + macro takeover, task 440).
+        // 0 keeps the default front-only behaviour.
+        double validate_front_m = 0.0;
     };
 
     /// Optimise a cubic B-spline from `state` toward `endpoint` and return
@@ -113,6 +125,22 @@ public:
                           const Vec2d& endpoint, double v_end, bool terminal,
                           const Config& cfg, double& min_clear,
                           const std::vector<Vec2d>& astar_path) const;
+
+    /// R27 temporal anchoring.  Same optimisation as plan()/A*-plan(), but
+    /// the free control points are WARM-STARTED from `ref_traj` (the
+    /// previous plan's world points, resampled to control-point resolution)
+    /// instead of the guide, and a soft `lambda_ref * |q - ref|^2` cost
+    /// keeps consecutive replans close to the committed path (kills the
+    /// receding-horizon head-drift accumulation).  `astar_path` may be null
+    /// (detour-guide plan); `ref_traj` may be null (plain plan).  When the
+    /// reference is unusable the plain plan is produced.
+    PlanarTrajectory planAnchored(const PlanarState& state,
+                                  const LocalObservation& obs,
+                                  const Vec2d& endpoint, double v_end,
+                                  bool terminal, const Config& cfg,
+                                  double& min_clear,
+                                  const std::vector<Vec2d>* astar_path,
+                                  const std::vector<Vec2d>* ref_traj) const;
 
 private:
     /// Uniform cubic B-spline: control points Q[0..M], M = n_segments + 3,
@@ -142,6 +170,13 @@ private:
     /// toward the subgoal.
     double fitnessCost(const CtrlPts& c, const std::vector<Vec2d>& guide,
                        const Config& cfg, std::vector<Vec2d>& grad) const;
+    /// R27 soft temporal-anchoring cost: |q_i - ref_i|^2 over the FREE
+    /// control points (reference = previous plan resampled to control-point
+    /// resolution), so consecutive replans stay close to the committed path.
+    static double referenceCost(const CtrlPts& c,
+                                const std::vector<Vec2d>& ref,
+                                const Config& cfg,
+                                std::vector<Vec2d>& grad);
     double fovCost(const CtrlPts& c, const PlanarState& state,
                    const Config& cfg, std::vector<Vec2d>& grad) const;
 
@@ -160,27 +195,32 @@ private:
         const std::vector<Vec2d>& path, int M);
 
     /// Build the clamped control points (initialised along the detour
-    /// guide or an A* path when `guide_override` is non-null) and optimise
-    /// the free ones with L-BFGS.  `dep_dir` is the start departure
-    /// direction, `dir` the end approach direction, L the
-    /// start->endpoint distance.  Non-static (const) because it calls the
-    /// non-static const cost terms collisionCost / fitnessCost / fovCost.
+    /// guide or an A* path when `guide_override` is non-null — or the
+    /// previous plan when `ref_guide` is non-null) and optimise the free
+    /// ones with L-BFGS.  `dep_dir` is the start departure direction,
+    /// `dir` the end approach direction, L the start->endpoint distance.
+    /// Non-static (const) because it calls the non-static const cost terms
+    /// collisionCost / fitnessCost / fovCost.
     bool optimizeControlPoints(const PlanarState& state,
                                const LocalObservation& obs,
                                const Vec2d& endpoint, bool terminal,
                                const Config& cfg, const Vec2d& dep_dir,
                                const Vec2d& dir, double L,
                                const std::vector<Vec2d>* guide_override,
+                               const std::vector<Vec2d>* ref_guide,
                                CtrlPts& out) const;
 
     /// Shared plan() body; `guide_override` selects the fitness/init guide
-    /// (a resampled A* path) instead of the straight-line detour guide.
+    /// (a resampled A* path) instead of the straight-line detour guide;
+    /// `ref_guide` (previous plan resampled) warm-starts the free control
+    /// points and adds the temporal-anchoring cost.
     PlanarTrajectory planImpl(const PlanarState& state,
                               const LocalObservation& obs,
                               const Vec2d& endpoint, double v_end,
                               bool terminal, const Config& cfg,
                               double& min_clear,
-                              const std::vector<Vec2d>* guide_override) const;
+                              const std::vector<Vec2d>* guide_override,
+                              const std::vector<Vec2d>* ref_guide) const;
 
     /// Sample + time-parameterise (accel-limited speed profile) + validate
     /// the optimised spline at one cruise level.  `allow_fov_exit == true`

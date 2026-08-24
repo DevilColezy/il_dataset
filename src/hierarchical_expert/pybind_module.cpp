@@ -308,6 +308,37 @@ void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
     // duration time base.  Defaults to 30.0 (the preflight tick grid).
     b.control_rate_hz = get_d("control_rate_hz", b.control_rate_hz);
 
+    // Rare macro-turn probe.  By default it only biases sampling; strict
+    // requested-side admission is opt-in for focused diagnostics.
+    if (bp.contains("macro_probe")) {
+        const py::dict d = py::cast<py::dict>(bp["macro_probe"]);
+        if (d.contains("enabled")) {
+            b.macro_probe_enabled = py::cast<bool>(d["enabled"]);
+        }
+        if (d.contains("yaw_error_deg")) {
+            b.macro_probe_yaw_error_deg =
+                py::cast<double>(d["yaw_error_deg"]);
+        }
+        if (d.contains("require_match")) {
+            b.macro_probe_require_match =
+                py::cast<bool>(d["require_match"]);
+        }
+    }
+
+    if (bp.contains("exploration")) {
+        const py::dict d = py::cast<py::dict>(bp["exploration"]);
+        if (d.contains("pool_first")) {
+            b.pool_first_exploration = py::cast<bool>(d["pool_first"]);
+        }
+        if (d.contains("rounds")) {
+            b.exploration_rounds = py::cast<int>(d["rounds"]);
+        }
+        if (d.contains("min_pool_tasks")) {
+            b.exploration_min_pool_tasks =
+                py::cast<uint64_t>(d["min_pool_tasks"]);
+        }
+    }
+
     // ── privileged task qualification (2D causal-qualification port) ─
     if (bp.contains("task_qualification")) {
         const py::dict d = py::cast<py::dict>(bp["task_qualification"]);
@@ -343,6 +374,9 @@ void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
         b.qualification.max_total_qualification_expansions = gu(
             "max_total_qualification_expansions",
             b.qualification.max_total_qualification_expansions);
+        b.qualification.max_expansions_per_scene = gu(
+            "max_expansions_per_scene",
+            b.qualification.max_expansions_per_scene);
         // Start-endpoint recovery disk radius (2D macro start recovery).
         b.qualification.start_recovery_max_radius_m = gd(
             "start_recovery_max_radius_m",
@@ -588,8 +622,212 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
     //      a real hard block releases it); macro-level limit-cycle
     //      watchdog on the ORIGINAL goal; Python judge-only quality
     //      watchdogs (no-progress / near-goal timeout / cumulative yaw).
+    // R27 (2026-08-22, user: "为什么重新规划导致轨迹偏移"): the local
+    //      planner becomes a PLAN/TRACK hierarchy — the B-spline is
+    //      re-optimised every lp_replan_interval_ticks ticks (10 Hz) and
+    //      PURSUED between replans (longer lp_pursuit_lookahead_m arc
+    //      lookahead), and the EGO optimiser is temporally anchored
+    //      (warm-start + lambda_ref cost toward the previous plan) so the
+    //      executed path follows ONE committed spline instead of the
+    //      envelope of per-tick heads (kills receding-horizon head drift).
+    // R28 (2026-08-22, task 440 analysis): local-vs-upper consistency fixes.
+    //      (1) non-terminal A* now routes to a LOCAL horizon (4.5 m) instead
+    //      of the far target (out-of-grid -> EMPTY -> FOV scan -> straight
+    //      chord blind to a blocker just beyond the scan endpoint ->
+    //      spurious BLOCKED + macro takeover); (2) when the corridor is
+    //      blocked the receding-horizon validation is extended out to the
+    //      first block (min_validate_m / ego validate_front_m) so a straight
+    //      chord through the block can never "validate" — the scan continues
+    //      to a genuine detour; (3) a stale HISTORY cell parked next to the
+    //      drone and OUTSIDE the FOV (cannot be re-confirmed, blocks every
+    //      bearing for its full 120-tick lifetime) triggers a bounded
+    //      in-place re-orientation toward the most-open edge instead of a
+    //      ~4 s NO_SAFE_CANDIDATE stall; (4) A* budget exhaustion now picks
+    //      the min-heuristic frontier (not min g+h) and rejects degenerate
+    //      no-progress partial paths.
+    // R28b (2026-08-23, task 440 R28 batch regression): the R28
+    // planFovTrajectory clearance-gate edit used `if (!in_front_clr)
+    // continue;` BEFORE the point push + `reached` flag — every non-terminal
+    // straight-fallback plan failed validation (reached never set), the
+    // local planner collapsed to NO_SAFE_CANDIDATE, and the upper layer
+    // took over falsely.  Fixed by wrapping the gate (matching EGO
+    // buildAndValidate).  Also REVERTED the R28 "local-horizon A*" routing
+    // (it drifted the drone east around the obstacle chain into a dead-end
+    // at the next blocker); the original A*-to-target + scan fallback is
+    // restored.  min_validate_m / stale-history re-orientation / A* min-h
+    // budget fix are kept.
+    // R28c (2026-08-23, task 33 analysis — user architecture guidance):
+    //      (1) the LOCAL planner must NOT produce big lateral detours — the
+    //      UPPER planner owns bypasses.  Selected non-terminal plans whose
+    //      endpoint deviates > lp_max_local_deviation_deg (30) from the
+    //      target direction are rejected -> NO_SAFE_CANDIDATE -> macro
+    //      places a bypass waypoint (kills the ~40°-off-target side plans
+    //      that spiralled the drone east, task 33);
+    //      (2) multi-cruise retry now picks the SMALLEST lateral bend across
+    //      cruise levels (planFovTrajectory + EGO planImpl) — a slow
+    //      straight thread through a gap beats a fast wide detour (the
+    //      "search the neighbourhood for a satisfying point" request);
+    //      (3) lp_max_yaw_accel 4 -> 8 rad/s^2 so the drone can reverse a
+    //      full-rate turn in ~0.3 s and promptly follow a freshly
+    //      re-planned trajectory (was ~0.6 s, "too clumsy").
+    // R28d (2026-08-23, task 194 analysis — user question: "does the local
+    // yaw aim at the target or just pick the current velocity?"):
+    //      EGO dep_dir now ALWAYS aims at the endpoint/route — never the
+    //      current velocity.  Old code used the current velocity for moving
+    //      terminal stops and (first) for A*-guided plans; the B-spline
+    //      then departed along the nose (20-50° off the goal), the 0.6 m
+    //      pursuit lookahead saw only that nose-aligned start -> yaw_cmd
+    //      ~0.05 -> the drone crabbed the whole flight, and the terminal
+    //      approach (goal CLEAR, plan endpoint == goal) still departed west,
+    //      lost the plan at 4.2 m, stopped dead west of the goal and
+    //      re-oriented (~1.2 s stall).  Terminal now departs toward the
+    //      goal (front-3 m FOV gate passes within the 45° camera FOV; a
+    //      blocked straight departure falls to the bearing scan); A*-guided
+    //      plans depart along the route's initial corridor segment.
+    // R28e (2026-08-23, task 401 analysis — user question: "planner flips to
+    // the other side of an obstacle when close / after the nose turns; is it
+    // a cost weight? the local plan seems to prefer the FOV edges"):
+    //      NOT a cost-weight issue.  When the direct corridor to the goal is
+    //      blocked, R28's min_validate_m = first_blocking_distance (~3.1 m)
+    //      EXTENDED the clearance validation of EVERY bearing-scan candidate
+    //      (not just the direct chord).  As the drone moved past the blocker
+    //      (obs5, task 401), its observed cells toggled each side plan
+    //      valid/invalid -> the plan flipped between the west (toward goal)
+    //      and south (east of blocker, misses goal) sides every ~0.6 s ->
+    //      zigzag + brief east drift.  FIX: only the DIRECT bearing (k==0)
+    //      keeps the corridor-block extended validation (so the straight
+    //      chord still fails — task 440 stays fixed); side/detour bearings
+    //      validate to the base 3 m front only (receding-horizon contract:
+    //      only the executed front must be clear).  Side plans near the
+    //      target direction now stay valid consistently -> the drone commits
+    //      to one side and completes the detour.
+    // R28f (2026-08-23, task 401 analysis — user question: "does the planner
+    // use the local map? why can it plan far but struggles to advance near?"):
+    //      (1) YES — the planner uses the ObservedGrid2D (5m, 0.1m, 4s-expiry)
+    //      built from depth for corridor assessment, clearance validation and
+    //      A*.  Far: grid clear near the path -> straight plan validates.
+    //      Near obs7 (-2.57,12.90): its cells fill the grid -> direct corridor
+    //      BLOCKED -> the local constraint set (+-35° scan band + 30°
+    //      deviation + rotate-only-outside-FOV) finds no plan -> NO_SAFE_
+    //      CANDIDATE, and the macro's bypass waypoints were themselves
+    //      unreachable -> the drone stalled ~14 s (joint_v2_000010_2f0cc210).
+    //      (2) FIX: the "keep-aligning" rotation (section 2.5) used the CAMERA
+    //      FOV (45°) as its threshold, so a target 35-45° off the nose was
+    //      inside the FOV (no pure-rotate at section 1) yet outside the +-35°
+    //      scan band (no plan) -> dead-zone oscillation around 45°.  The
+    //      rotation now fires whenever |b_t| > planning_fov_half (35°) and no
+    //      plan was found, so the drone aligns to the opening and hands a
+    //      properly-oriented NO_SAFE_CANDIDATE to the macro.
+    // R28g (2026-08-23, task 401 debug — user: "near the obstacle, no matter
+    // how the map fills in, planning must not fail"):
+    //      The user was RIGHT: the far plan (t=4-5) already routed EAST
+    //      around obs7 (-2.57,12.90) at ~287° with 0.8 m truth clearance and
+    //      advanced toward the goal.  At t=5.27 the nose had drifted 284° ->
+    //      287° (goal bearing error 27° -> 31°), so the same east detour's
+    //      deviation from the goal crossed the R28c 30° cliff (30.0° was
+    //      accepted, 30.6° rejected) -> NO_SAFE_CANDIDATE -> ~14 s stall
+    //      (joint_v2_000010_2f0cc210).  FIX: lp_max_local_deviation_deg
+    //      30 -> 35 (= the +-35° scan band), in lock-step across types.hpp /
+    //      pybind / il_expert_config.py / both YAMLs.  The local may use its
+    //      full scan band for a legitimate minimal detour; task-33-style
+    //      40-48° spirals are still rejected for the macro.  Combines with
+    //      R28f (rotate to |b_t|<=35° before handing NO_SAFE_CANDIDATE).
+    // R28h (2026-08-23, 9-trajectory batch review — 7 success / 2 fail):
+    // cross-checked the other-AI findings on the r28g data (task 440/33/
+    // 236/491/452/194/475/493/65) and implemented the P0 items:
+    //  P0#1/#2 (local_planner_30hz.cpp): straight-through priority + local
+    //    horizon cap.  14.9% of valid plans had endpoints >5 m (max 8.24 m,
+    //    from the global-history-grid A* returning route.back()); clear-area
+    //    plans bent 0.31-0.53 m.  Now: (a) the straight plan to a target-
+    //    direction endpoint at local range is tried FIRST (planFovTrajectory,
+    //    no EGO lateral freedom); (b) the A* endpoint AND EGO guide are
+    //    capped to the ~3 m receding horizon (route goal stays the full
+    //    target — this is NOT the R28b-reverted local-horizon-A*).
+    //  P0#3: 1° fine re-scan between b0 and the first valid coarse bearing
+    //    -> minimal-necessary detour instead of a 5°-step jump.
+    //  P0#4 (hierarchical_expert_fsm.cpp): SAFE_HOLD no longer counts as a
+    //    failure (task 236 had 6 corrections with ZERO NO_SAFE_CANDIDATE);
+    //    a stationary body is no longer topology evidence — takeover needs
+    //    sustained real NO_SAFE/BLOCKED + observed corridor block.
+    //  P0#5 (macro_expert_5hz.cpp): removed the "stop at current position"
+    //    NORMAL_CORRECTION label (distance_norm=0, terminal_stop) before a
+    //    search turn — the local brakes-then-rotates for pure-rotation
+    //    targets itself, so the TURN is published directly (clean label).
+    // R28i (2026-08-23, task 401 joint_v2_000010_5d9e5002):
+    //  side-commitment + target-side preference so the local planner stops
+    //  flapping right<->left around a blocker and picks the GOAL side.
+    //  Root cause: obs7 (-2.57,12.90) sat ON the goal line (goal 12° right
+    //  of the nose, b_t=-12); the WEST (goal-side) corridor was in obs7's
+    //  occlusion shadow -> UNKNOWN (+3*res/cell), the EAST corridor was
+    //  observed FREE, so the global-grid A* rationally routed EAST (away
+    //  from the goal) and the 30 Hz scan, whose fixed +1 (left)-first
+    //  order tried the wrong side first, flipped between 235° (right,
+    //  correct) and 287° (left, wrong).
+    //  Fixes:
+    //   (a) scan expansion order now tries the TARGET's side first
+    //       ((b_t>=0)?+1:-1) instead of always +1 (left) — the plan bends
+    //       toward the goal, not away (local_planner_30hz.cpp).
+    //   (b) last_plan_side_ commitment: once a side is chosen (set from
+    //       wrapAngle(chosen_b-b_t) in the commit block), the scan keeps
+    //       expanding that side first; it only flips when that side has NO
+    //       valid bearing.  Reset per task (reset()).
+    //   (c) routeAStar goal-line lateral penalty (+0.25/cell per metre off
+    //       the direct start->goal line): the A* hugs the minimal-detour
+    //       (goal) side instead of wandering onto a far observed corridor,
+    //       so the A* and the scan agree on the side (this was the actual
+    //       side-decider in task 401 — it routed EAST at 3.83-4.57 s with
+    //       only a one-tick WEST scan blip at 4.27 s).
+    // R28j (2026-08-23, r28i batch review — 9/9 success but structural):
+    //  FOV-edge saturation + three inconsistent endpoint semantics + A*
+    //  "pretend-plan to the far world goal through UNKNOWN" + upper
+    //  takeover lag.  Data (3670 valid plans): 179 endpoints >30° off the
+    //  nose, 225 >25° off the target, many pinned at 34-35° (the 35°
+    //  deviation guard equals the 35° scan band so it never constrained
+    //  the scanner); the A* 3 m-horizon branch produces 74% of all plans.
+    //  Fixes:
+    //   (a) local_planner_30hz.cpp — A* ROUTE GOAL is now the LOCAL
+    //       OBSERVABLE HORIZON (target direction clamped to ~4.95 m), not
+    //       the full world target threaded through ~11 m of UNKNOWN cells.
+    //       Far UNKNOWN regions no longer distort the current topology or
+    //       the bypass-side choice (R28i's task-401 east choice was exactly
+    //       that).  The full target stays the attract direction; only the
+    //       search is local.  The executed endpoint/guide stay at the ~3 m
+    //       receding horizon (localRouteHorizon()).
+    //   (b) local_planner_30hz.cpp — the legacy "first-valid ±35° scan +
+    //       fine re-scan" is replaced by a SCORED local-frontier scan:
+    //       every bearing in the band is evaluated at 2° and the best is
+    //       scored by J = |b−b_t| + 0.5·lateral + 0.3·curvature +
+    //       0.35·side_flip − 0.25·clearance.  Direct bearing keeps the
+    //       full-range endpoint + corridor-block extended validation
+    //       (R28e); side bearings use the 3 m endpoint == validated front.
+    //       The scanner now optimises minimal detour / progress /
+    //       clearance / side commitment instead of grabbing an arbitrary
+    //       edge bearing.
+    //   (c) local_planner_30hz.cpp — routing/control layering made
+    //       explicit: routing heading = the direction to the 3 m waypoint
+    //       (chosen_b / deviation guard); actual yaw control = the 0.6 m
+    //       pure-pursuit tangent (unchanged).  goal_direction_flu_* still
+    //       encodes the effective (upper/original) target, never the 3 m
+    //       waypoint.
+    //   (d) hierarchical_expert_fsm.cpp — takeover now requires a RECENT
+    //       failure (last_failure_tick_ within one 6-tick macro window) in
+    //       addition to the sustained count and the current corridor-block
+    //       evidence.  A decaying counter from an earlier emergency brake
+    //       no longer authorises takeover once the local has recovered
+    //       (task 475 r28i: TURN_RIGHT at frame 60 with NONE/corridor
+    //       clear).
+    //  NOT changed: the straight-through priority keeps its full-range
+    //  endpoint — the corridor-block extended validation needs the endpoint
+    //  at/ beyond the first blocking cell to reject a blocked chord (a 3 m
+    //  endpoint would validate a clear front-3 m even with a blocker at
+    //  3.5 m).  The 3 m waypoint principle applies to the DETOUR branches.
+    // R29 (2026-08-23): stale-history cells older than the local planning
+    // age no longer hard-veto trajectory validation; local frontier scans
+    // search a preferred small-deviation band before expanding to the full
+    // FOV band; stored-plan tracking reports its real target distance; and
+    // macro takeover requires a longer confirmed failure window.
     m.attr("EXPERT_REVISION") =
-        std::string("r20260822_terminal_capture_microapproach_r26");
+        std::string("r20260823_pool_first_exploration_r30");
 
     // ── Params2D: the single authoritative parameter source ─────────
     py::class_<Params2D>(m, "Params2D")
@@ -617,6 +855,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                        &Params2D::obs_history_max_age_ticks)
         .def_readwrite("obs_free_clear_confirmations",
                        &Params2D::obs_free_clear_confirmations)
+        .def_readwrite("lp_planning_history_max_age_ticks",
+                       &Params2D::lp_planning_history_max_age_ticks)
         .def_readwrite("obs_ground_clearance_m",
                        &Params2D::obs_ground_clearance_m)
         // local planner
@@ -633,10 +873,19 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("ego_ts", &Params2D::ego_ts)
         .def_readwrite("ego_n_segments", &Params2D::ego_n_segments)
         .def_readwrite("ego_max_iter", &Params2D::ego_max_iter)
+        .def_readwrite("ego_lambda_ref", &Params2D::ego_lambda_ref)
         .def_readwrite("lp_max_speed", &Params2D::lp_max_speed)
         .def_readwrite("lp_cruise_speed_mps", &Params2D::lp_cruise_speed_mps)
         .def_readwrite("lp_terminal_micro_approach_m",
                        &Params2D::lp_terminal_micro_approach_m)
+        .def_readwrite("lp_replan_interval_ticks",
+                       &Params2D::lp_replan_interval_ticks)
+        .def_readwrite("lp_pursuit_lookahead_m",
+                       &Params2D::lp_pursuit_lookahead_m)
+        .def_readwrite("lp_track_max_cross_track_m",
+                       &Params2D::lp_track_max_cross_track_m)
+        .def_readwrite("lp_track_min_front_m",
+                       &Params2D::lp_track_min_front_m)
         .def_readwrite("lp_max_accel", &Params2D::lp_max_accel)
         .def_readwrite("lp_eff_accel_mps2", &Params2D::lp_eff_accel_mps2)
         .def_readwrite("lp_max_yaw_rate", &Params2D::lp_max_yaw_rate)
@@ -661,6 +910,10 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("lp_turn_exit_max_yaw_rate",
                        &Params2D::lp_turn_exit_max_yaw_rate)
         .def_readwrite("lp_turn_k", &Params2D::lp_turn_k)
+        .def_readwrite("lp_max_local_deviation_deg",
+                       &Params2D::lp_max_local_deviation_deg)
+        .def_readwrite("lp_preferred_local_deviation_deg",
+                       &Params2D::lp_preferred_local_deviation_deg)
         .def_readwrite("lp_near_goal_heading_relax_distance",
                        &Params2D::lp_near_goal_heading_relax_distance)
         .def_readwrite("lp_near_goal_turn_enter_deg",

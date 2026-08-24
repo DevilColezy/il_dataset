@@ -826,7 +826,15 @@ std::vector<BlueprintTask> DistributionAnalyzer::select(
             // the LEAST-BAD candidate (bounded by max_iter / pool size) so
             // the selector genuinely attempts hard coverage from the pool.
             const CoverageResult cov = evaluateCoverage(acc, cfg_.targets, cfg_);
-            if (cov.hard_minimums_met) break;
+            // `min_tasks` is a real dataset-size floor, not just a final
+            // diagnostic.  Once hard label coverage is satisfied, continue
+            // accepting the least-bad complementary tasks until that floor
+            // is reached; otherwise a balanced but tiny blueprint could pass
+            // the label checks and still be useless for model validation.
+            if (cov.hard_minimums_met &&
+                selected.size() >= static_cast<size_t>(cfg_.min_tasks)) {
+                break;
+            }
         }
 
         selected.push_back(*best);
@@ -901,7 +909,10 @@ std::vector<BlueprintTask> DistributionAnalyzer::select(
                 trial.addTask(selected[i].summary);
             }
             const CoverageResult cov = evaluateCoverage(trial, cfg_.targets, cfg_);
-            if (cov.hard_minimums_met) {
+            const size_t kept_after_drop =
+                selected.size() - sel_by_scene[sid].size();
+            if (cov.hard_minimums_met &&
+                kept_after_drop >= static_cast<size_t>(cfg_.min_tasks)) {
                 for (const size_t i : sel_by_scene[sid]) removed[i] = true;
             }
         }
