@@ -54,6 +54,9 @@ find_package(catkin REQUIRED COMPONENTS
 # ── Eigen3 ──────────────────────────────────────────────────────
 find_package(Eigen3 REQUIRED)
 
+# ── Threads (parallel task preflight: std::async / std::future) ──
+find_package(Threads REQUIRED)
+
 # ── OpenCV (required by flightlib headers) ──────────────────────
 find_package(OpenCV REQUIRED)
 
@@ -135,6 +138,7 @@ target_compile_options(il_hierarchical_expert_lib PRIVATE
 target_link_libraries(il_hierarchical_expert_lib
   ${catkin_LIBRARIES}
   ${IL_DATASET_SAN_FLAGS}
+  Threads::Threads
 )
 
 # ── pybind11 Python module for the hierarchical expert ──────────
@@ -148,6 +152,7 @@ target_link_libraries(_il_hierarchical_expert PRIVATE
   il_hierarchical_expert_lib
   ${catkin_LIBRARIES}
   ${IL_DATASET_SAN_FLAGS}
+  Threads::Threads
   stdc++fs
 )
 

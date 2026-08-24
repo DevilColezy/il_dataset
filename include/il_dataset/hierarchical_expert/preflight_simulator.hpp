@@ -49,6 +49,15 @@ public:
                    const Vec2d& max_bounds, const Vec2d* wall_min = nullptr,
                    const Vec2d* wall_max = nullptr);
 
+    /// Set the dynamics integration step (s) used by step().  Default is
+    /// 1/30 (the real 30 Hz control rate).  A LARGER step (e.g. 1/10)
+    /// makes the vehicle travel further per expert decision — the
+    /// "coarse-step full-trajectory" preflight: same expert decision
+    /// stream (5 Hz macro every 6 ticks, 30 Hz decisions), but the same
+    /// physical path needs fewer ticks, so a full start->goal preflight
+    /// completes faster.  Swept collision / bounds audits remain exact.
+    void setStepDt(double dt) { step_dt_ = std::max(1e-4, dt); }
+
     /// Reset a preflight episode.  start/goal are world XY, initial_yaw is
     /// the Flightmare yaw.
     void resetTask(const Vec2d& start, const Vec2d& goal,
@@ -91,6 +100,7 @@ private:
     bool has_wall_ = false;
     Vec2d wall_min_{-20.0, -20.0};
     Vec2d wall_max_{20.0, 20.0};
+    double step_dt_ = 1.0 / 30.0;  // dynamics integration step (s)
     // Scene-static raycast geometry: extracted ONCE in configure() so
     // synthesizePatch() never rebuilds the vectors every 30 Hz tick.
     std::vector<Vec2d> obstacle_centers_;

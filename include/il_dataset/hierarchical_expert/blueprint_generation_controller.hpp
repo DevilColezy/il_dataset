@@ -29,6 +29,7 @@
 #include "il_dataset/hierarchical_expert/route_qualifier.hpp"
 #include "il_dataset/hierarchical_expert/scene_geometry_cache.hpp"
 #include "il_dataset/hierarchical_expert/scene_profile_generator.hpp"
+#include "il_dataset/hierarchical_expert/segment_labeler.hpp"
 #include "il_dataset/hierarchical_expert/task_candidate_generator.hpp"
 #include "il_dataset/hierarchical_expert/scene_task_blueprint.hpp"
 
@@ -48,6 +49,51 @@ public:
     BlueprintResult generate();
 
 private:
+    /// Scene-level parallel pipeline (new architecture, enabled by
+    /// cfg_.scene_level_parallel).  Main thread generates scene_levels x
+    /// scenes_per_level scene specs (sparse -> dense per level), then
+    /// cfg_.scene_parallel_threads workers run whole scenes concurrently
+    /// (grid -> random start/goal pairs -> greedy toward-goal A* ->
+    /// short/medium/long balance -> quick-expert preflight -> labels);
+    /// finally the main thread merges, balances labels across levels
+    /// (pick / drop / top-up) and reports the expected collection count
+    /// vs cfg_.expected_collect_tasks.
+    BlueprintResult generateSceneParallel();
+
+    /// Run ONE scene of the parallel pipeline (called on a worker thread;
+    /// only reads shared config / runs the const preflightOne).
+    struct SceneWorkResult {
+        bool ok = false;
+        uint64_t scene_id = 0;
+        int level = 0;
+        BlueprintScene scene;
+        std::vector<BlueprintTask> tasks;         // accepted tasks
+        std::vector<BlueprintTask> rejected;      // preflight-rejected
+        std::map<std::string, uint64_t> label_counts;
+        std::map<std::string, uint64_t> dist_counts;
+        // ── behaviour SEGMENT label tally (new preflight planner):
+        //    each task is split into behaviour segments (straight /
+        //    light_avoidance / large_avoidance / detour / medium_detour /
+        //    long_detour); this scene-level map sums the SEGMENT counts
+        //    over all accepted tasks.  `task_segment_counts[i]` holds the
+        //    per-task segment counts (parallel to `tasks`). ─────────
+        std::map<std::string, uint64_t> segment_label_counts;
+        std::vector<std::map<std::string, uint64_t>> task_segment_counts;
+        int candidates_sampled = 0;
+        int preflights_run = 0;
+        uint64_t astar_calls = 0;
+        uint64_t astar_expansions = 0;
+        double wall_ms = 0.0;
+        std::string reason;
+    };
+    /// Worker body: build one scene (cylinders with the level radius band,
+    /// sparse->dense count, surface gap >= 1.2 m, border >= 0.6 m), build
+    /// the 2D grid, sample start/goal pairs, greedy A* connectivity,
+    /// distance balance, quick-expert preflight, local label tally.
+    /// Thread-safe (each call owns its state; only reads *this config).
+    SceneWorkResult runOneScene(int level, int level_index,
+                                uint64_t scene_id, uint64_t seed) const;
+
     /// Cheap staged filter: bounds / clearance / distance / component /
     /// zero-length.  Runs BEFORE any preflight; rejects count as
     /// cheap_filter_rejected.
@@ -73,7 +119,8 @@ private:
                       double yaw_error_signed_deg, uint64_t task_tick_budget,
                       uint64_t& total_preflight_ticks, bool& early_terminated,
                       bool& global_tick_truncated, std::string& reject_reason,
-                      double& depth_proxy_ms) const;
+                      double& depth_proxy_ms,
+                      SegmentLabeler* segmenter = nullptr) const;
 
     /// Legacy 3x3 density x radius strata coverage (manifest compat).
     void updateLegacyStrata(BlueprintResult& result,

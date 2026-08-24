@@ -490,11 +490,61 @@ def _validate_config(cfg):
                    "max_task_generation_attempts"):
             _positive(perf.get(pk, 1),
                       "blueprint_generation.performance.%s" % pk, errors)
-        if bool(perf.get("parallel_tasks", False)):
+        pt = perf.get("parallel_tasks", 0)
+        if isinstance(pt, bool):
+            # legacy key: false -> 0 (serial), true -> 1 (serial)
+            pt = int(pt)
+        if not isinstance(pt, int) or pt < 0:
             errors.append(
-                "blueprint_generation.performance.parallel_tasks is not "
-                "implemented; it must be false (set it to false or remove "
-                "the key)")
+                "blueprint_generation.performance.parallel_tasks must be a "
+                "non-negative integer worker count (0/1 = serial, "
+                "N >= 2 = N parallel task-preflight workers)")
+
+        # ── scene-level parallel pipeline (new architecture) ────────
+        sp = bp.get("scene_parallel", {}) or {}
+        if bool(sp.get("enabled", False)):
+            _positive(sp.get("threads", 8),
+                      "blueprint_generation.scene_parallel.threads", errors)
+            _positive(sp.get("levels", 4),
+                      "blueprint_generation.scene_parallel.levels", errors)
+            _positive(sp.get("scenes_per_level", 10),
+                      "blueprint_generation.scene_parallel.scenes_per_level",
+                      errors)
+            _positive(sp.get("surface_gap_min_m", 1.2),
+                      "blueprint_generation.scene_parallel.surface_gap_min_m",
+                      errors)
+            if float(sp.get("boundary_min_m", 0.6)) < 0.0:
+                errors.append("blueprint_generation.scene_parallel."
+                              "boundary_min_m must be >= 0")
+            ds = float(sp.get("distance_short_max_m", 8.0))
+            dm = float(sp.get("distance_medium_max_m", 16.0))
+            if not (0.0 < ds < dm):
+                errors.append(
+                    "blueprint_generation.scene_parallel.distance_short_max_m "
+                    "must be < distance_medium_max_m (and > 0)")
+            _positive(sp.get("quick_preflight_max_ticks", 500),
+                      "blueprint_generation.scene_parallel."
+                      "quick_preflight_max_ticks", errors)
+            if float(sp.get("quick_preflight_dt_scale", 3.0)) < 1.0:
+                errors.append("blueprint_generation.scene_parallel."
+                              "quick_preflight_dt_scale must be >= 1.0")
+            _positive(sp.get("expected_collect_tasks", 400),
+                      "blueprint_generation.scene_parallel."
+                      "expected_collect_tasks", errors)
+            # radius bands: same length as levels, positive, min <= max
+            rmin = sp.get("level_radius_min", [0.15, 0.5, 1.5, 0.15])
+            rmax = sp.get("level_radius_max", [0.5, 1.5, 3.0, 3.0])
+            nlev = int(sp.get("levels", 4))
+            if not isinstance(rmin, (list, tuple)) or \
+                    not isinstance(rmax, (list, tuple)) or \
+                    len(rmin) != nlev or len(rmax) != nlev or \
+                    any(not isinstance(v, (int, float)) or isinstance(v, bool)
+                        or float(v) <= 0.0 for v in rmin + rmax) or \
+                    any(rmin[i] > rmax[i] for i in range(nlev)):
+                errors.append(
+                    "blueprint_generation.scene_parallel.level_radius_min/"
+                    "max must be lists of %d positive numbers with "
+                    "min[i] <= max[i]" % nlev)
 
         req = bp.get("requirements", {}) or {}
         _positive(req.get("min_selected_scenes", 4),

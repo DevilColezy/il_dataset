@@ -259,8 +259,46 @@ global:
       max_preflight_ticks_per_task: 900
       max_scene_generation_attempts: 96
       max_task_generation_attempts: 600
-      parallel_tasks: false
+      # Parallel closed-loop task preflight workers.  0 or 1 = fully serial
+      # (identical behaviour to the legacy pipeline); N >= 2 runs up to N
+      # preflight simulations concurrently (sampling / cheap filter /
+      # qualification stay serial; outcomes merge in submission order).
+      # Suggested: number of physical cores (e.g. 8).  The global tick /
+      # attempt budgets are shared across workers.
+      parallel_tasks: 0
       scene_switch_penalty: 0.10
+    # ── scene-level parallel pipeline (new architecture) ─────────
+    # Main thread first generates scene_levels x scenes_per_level scene
+    # specs (each level sized by level_radius_min/max; the scenes of a level
+    # go sparse -> dense), then `threads` workers take over whole scenes:
+    # grid -> random start/goal pairs -> greedy toward-goal A* connectivity
+    # -> short/medium/long (direct-line) balance -> quick-expert preflight
+    # (quick_preflight_max_ticks) -> labels.  After all scenes finish the
+    # main thread merges, balances labels across levels (pick / drop /
+    # top-up, approximate) and reports the expected collection count vs
+    # expected_collect_tasks.
+    # Set enabled: true (and threads to your core count) to use it.
+    scene_parallel:
+      enabled: false
+      threads: 16
+      levels: 4
+      scenes_per_level: 10
+      # small / medium / large / mixed radius bands (m)
+      level_radius_min: [0.15, 0.5, 1.5, 0.15]
+      level_radius_max: [0.5, 1.5, 3.0, 3.0]
+      # placement constraints: pairwise surface gap and border clearance
+      surface_gap_min_m: 1.2
+      boundary_min_m: 0.6
+      # direct-line distance bands: short < short_max, medium < medium_max
+      distance_short_max_m: 8.0
+      distance_medium_max_m: 16.0
+      # Full start->goal quick preflight.  Max ticks must reach the goal
+      # (with detours); dt_scale>1 enlarges the dynamics step so the full
+      # trajectory needs fewer ticks and finishes faster.
+      quick_preflight_max_ticks: 200
+      quick_preflight_dt_scale: 6.0
+      # expected final collection size (reasonableness report)
+      expected_collect_tasks: 400
     # Synthetic observation semantics: the warehouse wall envelope MAY
     # appear in the synthetic depth (preflight patch + depth proxy) but it
     # NEVER changes the out-of-bounds audit (that stays the FREE region,

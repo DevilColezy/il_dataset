@@ -35,7 +35,10 @@
 extends: il_dataset_config.yaml
 
 global:
-  output_dir: "/home/devil/flightmare_ws/il_data_joint_v2"
+  # Manifest / dataset output directory.  NOTE: this was hard-coded to a
+  # path on the OTHER machine (/home/devil/...) and must be writable by the
+  # current user — adjust to your machine (e.g. ~/flightmare_ws/il_data_joint_v2).
+  output_dir: "/home/rgzn/flightmare_ws/src/il_dataset/dataset/il_data_joint_v2"
 
   scene_generation:
     seed: 260812
@@ -109,6 +112,31 @@ global:
     performance:
       max_task_candidates_per_scene: 48
       max_total_preflight_ticks: 650000
+      parallel_tasks: 16
+    # ── scene-level parallel pipeline (new architecture) ─────────
+    # 主线程先生成 4 层级(小/中/大/混合) × 10 场景 = 40 个场景规格
+    # (每层从稀疏到密集), 再由 16 个 worker 并行处理每个场景:
+    # 栅格 → 随机起终点 → 贪婪A*连通 → 短/中/长距离均衡 → 简化专家(150tick, 分段标签)
+    # → 标签; 汇总后按层级近似均衡挑选/删除/补齐。
+    scene_parallel:
+      enabled: true
+      threads: 16
+      levels: 4
+      scenes_per_level: 10
+      level_radius_min: [0.15, 0.5, 1.5, 0.15]
+      level_radius_max: [0.5, 1.5, 3.0, 3.0]
+      surface_gap_min_m: 1.2
+      boundary_min_m: 0.6
+      distance_short_max_m: 8.0
+      distance_medium_max_m: 16.0
+      # Full start->goal quick preflight.  Max ticks must be large enough
+      # to REACH the goal (with detours); dt_scale>1 enlarges the dynamics
+      # step (per tick travels dt_scale further) so the full trajectory
+      # needs fewer ticks and finishes faster.  Same expert + same
+      # Params2D clearance as the real collection.
+      quick_preflight_max_ticks: 200
+      quick_preflight_dt_scale: 6.0
+      expected_collect_tasks: 400
     task_generation:
       macro_probe:
         enabled: true

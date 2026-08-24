@@ -234,8 +234,53 @@ void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
             gi("max_scene_generation_attempts", b.max_scene_generation_attempts);
         b.max_task_generation_attempts =
             gi("max_task_generation_attempts", b.max_task_generation_attempts);
-        if (d.contains("parallel_tasks")) b.parallel_tasks = py::cast<bool>(d["parallel_tasks"]);
+        // int worker count (legacy `false` bool casts to 0 = serial).
+        if (d.contains("parallel_tasks")) b.parallel_tasks = py::cast<int>(d["parallel_tasks"]);
         if (d.contains("scene_switch_penalty")) b.scene_switch_penalty = py::cast<double>(d["scene_switch_penalty"]);
+    }
+
+    // ── scene-level parallel pipeline (new architecture) ─────────
+    if (bp.contains("scene_parallel")) {
+        const py::dict d = py::cast<py::dict>(bp["scene_parallel"]);
+        auto gi = [&](const char* k, int dflt) {
+            return d.contains(k) ? py::cast<int>(d[k]) : dflt;
+        };
+        auto gd = [&](const char* k, double dflt) {
+            return d.contains(k) ? py::cast<double>(d[k]) : dflt;
+        };
+        auto gb = [&](const char* k, bool dflt) {
+            return d.contains(k) ? py::cast<bool>(d[k]) : dflt;
+        };
+        auto gvl = [&](const char* k, const std::vector<double>& dflt) {
+            std::vector<double> v = dflt;
+            if (d.contains(k)) {
+                v.clear();
+                for (auto item : py::cast<py::list>(d[k])) {
+                    v.push_back(py::cast<double>(item));
+                }
+            }
+            return v;
+        };
+        b.scene_level_parallel = gb("enabled", false);
+        b.scene_parallel_threads = gi("threads", b.scene_parallel_threads);
+        b.scene_levels = gi("levels", b.scene_levels);
+        b.scenes_per_level = gi("scenes_per_level", b.scenes_per_level);
+        b.level_radius_min_m = gvl("level_radius_min", b.level_radius_min_m);
+        b.level_radius_max_m = gvl("level_radius_max", b.level_radius_max_m);
+        b.obstacle_surface_gap_min_m =
+            gd("surface_gap_min_m", b.obstacle_surface_gap_min_m);
+        b.obstacle_boundary_min_m =
+            gd("boundary_min_m", b.obstacle_boundary_min_m);
+        b.task_distance_short_max_m =
+            gd("distance_short_max_m", b.task_distance_short_max_m);
+        b.task_distance_medium_max_m =
+            gd("distance_medium_max_m", b.task_distance_medium_max_m);
+        b.quick_preflight_max_ticks =
+            gi("quick_preflight_max_ticks", b.quick_preflight_max_ticks);
+        b.quick_preflight_dt_scale =
+            gd("quick_preflight_dt_scale", b.quick_preflight_dt_scale);
+        b.expected_collect_tasks =
+            gi("expected_collect_tasks", b.expected_collect_tasks);
     }
 
     // ── result requirements ───────────────────────────────────────

@@ -416,6 +416,7 @@ class JointV2Manager(object):
             "histograms": dict(btg.get("histograms", {}) or {}),
             "path": dict(btg.get("path", {}) or {}),
             "performance": dict(perf),
+            "scene_parallel": dict(bp.get("scene_parallel", {}) or {}),
             "requirements": dict(req),
             "synthetic_observation": dict(
                 bp.get("synthetic_observation", {}) or {}),

@@ -573,10 +573,61 @@ struct BlueprintGenerationConfig {
     int max_preflight_ticks_per_task = 900;   // 30 s @ 30 Hz
     int max_scene_generation_attempts = 96;
     int max_task_generation_attempts = 600;
-    bool parallel_tasks = false;  // NOT IMPLEMENTED: must stay false
+    // Parallel closed-loop task preflight workers.  0 or 1 = fully serial
+    // (identical behaviour to the pre-parallel pipeline); N >= 2 runs up
+    // to N preflight simulations concurrently.  Sampling / cheap filter /
+    // qualification stay serial; only the expensive 30 Hz preflight runs
+    // in parallel and its outcomes are merged in submission order.
+    int parallel_tasks = 0;  // worker threads for task preflight (0/1 = serial)
     // Legacy constant penalty (weak); the selector now uses a two-stage
     // coverage + scene-consolidation flow (see DistributionAnalyzer::select).
     double scene_switch_penalty = 0.10;
+
+    // ── scene-level parallel generation (new architecture) ─────────
+    // Main thread first generates scene_levels x scenes_per_level scene
+    // SPECS (each level's cylinders sized by level_radius_min/max, the 10
+    // scenes per level go sparse -> dense), then scene_parallel_threads
+    // workers take over whole scenes: each worker builds the 2D grid,
+    // samples many random start/goal pairs, runs a greedy toward-goal A*
+    // connectivity check, balances short/medium/long (direct-line)
+    // distances, generates tasks, and runs the QUICK expert preflight
+    // (quick_preflight_max_ticks) to label them.  After all scenes finish
+    // the main thread merges, balances labels across the 4 levels
+    // (pick/drop/top-up, approximate), and reports the expected collection
+    // count vs the target (expected_collect_tasks).
+    bool scene_level_parallel = false;   // enable the scene-level pipeline
+    int scene_parallel_threads = 8;      // worker threads for scenes
+    int scene_levels = 4;                // small / medium / large / mixed
+    int scenes_per_level = 10;           // scenes per level (sparse -> dense)
+    // Cylinder radius bands per level: [min_m[i], max_m[i]].
+    std::vector<double> level_radius_min_m{0.15, 0.5, 1.5, 0.15};
+    std::vector<double> level_radius_max_m{0.5, 1.5, 3.0, 3.0};
+    // Placement constraints: pairwise SURFACE gap >= obstacle_surface_gap
+    // _min_m (must be traversable), obstacle centre >= boundary_min_m from
+    // the free-region border.
+    double obstacle_surface_gap_min_m = 1.2;
+    double obstacle_boundary_min_m = 0.6;
+    // Direct-line distance bands for the task balance (start-goal
+    // Euclidean): short < short_max, medium [short_max, medium_max],
+    // long > medium_max.  Sampled with a target ratio (1:1:1 default).
+    double task_distance_short_max_m = 8.0;
+    double task_distance_medium_max_m = 16.0;
+    // Quick expert preflight tick cap (simplified expert: same 30 Hz
+    // closed-loop expert, but each task runs at most this many ticks).
+    int quick_preflight_max_ticks = 150;
+    // Coarse-step multiplier for the QUICK preflight: the dynamics
+    // integration step becomes dt_scale/30 s per tick, so the same
+    // physical path needs dt_scale fewer ticks — a full start->goal
+    // preflight finishes faster.  The expert decision stream is unchanged
+    // (one decision per tick, 5 Hz macro every 6 ticks).  Use 1 for the
+    // exact real-time rate.  NOTE: the preflight must reach the GOAL (not
+    // a short truncated window) for the detour / long_detour segment
+    // labels to be meaningful, hence the large tick cap below.
+    double quick_preflight_dt_scale = 3.0;
+    // Expected final collection size — used by the merge stage for the
+    // "how many tasks per scene / per level" budget and the reasonableness
+    // report.
+    int expected_collect_tasks = 400;
 
     // ── synthetic observation / preflight behaviour ────────────────
     // Whether the warehouse wall envelope appears in the synthetic depth

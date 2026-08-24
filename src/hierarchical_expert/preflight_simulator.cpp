@@ -150,6 +150,9 @@ PreflightSimulator::SimStepResult PreflightSimulator::step(
         state_, patch, flight_z_, tick, point_collision || collision_override);
 
     // Integrate the executable 3D BODY/FLU command (shared kinematics).
+    // The integration step is step_dt_ (default 1/30 = real 30 Hz control;
+    // a quick preflight may enlarge it via setStepDt() to speed up the
+    // full start->goal trajectory).
     if (!result.output.terminal) {
         state_ = integrateVehicle3DStep(
             state_,
@@ -157,7 +160,7 @@ PreflightSimulator::SimStepResult PreflightSimulator::step(
                               result.output.target_velocity_flu_y,
                               result.output.target_velocity_flu_z,
                               result.output.target_yaw_rate},
-            1.0 / 30.0, p_);
+            step_dt_, p_);
     }
 
     const Vec2d new_pos2 = HorizontalProjection::position(state_.position);

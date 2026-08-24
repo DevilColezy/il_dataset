@@ -5,13 +5,18 @@
 #include "il_dataset/hierarchical_expert/stall_detector.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <deque>
+#include <future>
 #include <limits>
 #include <map>
+#include <queue>
 #include <set>
+#include <thread>
 
 namespace il_dataset {
 namespace expert {
@@ -115,6 +120,261 @@ inline void accumulateQual(QualificationCounters& dst,
     dst.total_astar_expansions += src.total_astar_expansions;
 }
 
+/// One enqueued closed-loop preflight (parallel batch item).  `task` and
+/// `scene` are owned COPIES so each worker thread reads/writes only its
+/// own item — preflightOne is a pure function of (task, scene, budgets)
+/// and touches no shared state besides the caller-owned counters, which
+/// the worker returns locally.
+struct PendingPreflight {
+    BlueprintTask task;
+    BlueprintScene scene;      // value copy (obstacles are small)
+    uint64_t tick_base = 0;
+    double yaw_err = 0.0;
+    uint64_t task_tick_budget = 0;
+    int probe_side = 0;        // +1 LEFT / -1 RIGHT / 0 ordinary
+};
+
+/// Worker-thread result of one preflight.  `ticks_used` replaces the
+/// serial code's `total_preflight_ticks` out-param; the main thread merges
+/// it into the global budget after joining.
+struct PreflightOutcome {
+    bool accepted = false;
+    TaskDistributionSummary summary;
+    bool early_terminated = false;
+    bool global_tick_truncated = false;
+    std::string reject_reason = "accepted";
+    double depth_proxy_ms = 0.0;
+    uint64_t ticks_used = 0;
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  scene-level parallel pipeline helpers (new architecture)
+// ═══════════════════════════════════════════════════════════════════
+
+/// One scene spec of the new pipeline: level (0..scene_levels-1), index
+/// within the level (sparse -> dense), radius band and target cylinder
+/// count.
+struct SceneSpec {
+    int level = 0;
+    int level_index = 0;
+    uint64_t scene_id = 0;
+    uint64_t seed = 0;
+    int target_count = 0;
+    double rmin = 0.15;
+    double rmax = 0.5;
+};
+
+/// Derive a scene spec from (level, index).  Sparse -> dense within a
+/// level; the target cylinder count is scaled by the radius band (bigger
+/// cylinders => fewer of them; "相对密集但总体稀疏").
+inline SceneSpec makeSceneSpec(const BlueprintGenerationConfig& cfg, int level,
+                               int level_index, uint64_t scene_id,
+                               uint64_t seed) {
+    SceneSpec s;
+    s.level = level;
+    s.level_index = level_index;
+    s.scene_id = scene_id;
+    s.seed = seed;
+    s.rmin = (level >= 0 && level < static_cast<int>(cfg.level_radius_min_m.size()))
+                 ? cfg.level_radius_min_m[level]
+                 : 0.15;
+    s.rmax = (level >= 0 && level < static_cast<int>(cfg.level_radius_max_m.size()))
+                 ? cfg.level_radius_max_m[level]
+                 : 1.5;
+    if (s.rmax >= 2.9 && s.rmin < 0.5) {
+        s.target_count = 3 + level_index;       // mixed: 3..12
+    } else if (s.rmax >= 2.9) {
+        s.target_count = 2 + level_index;       // large: 2..11
+    } else if (s.rmax >= 1.4) {
+        s.target_count = 4 + 2 * level_index;   // medium: 4..22
+    } else {
+        s.target_count = 5 + 2 * level_index;   // small: 5..23
+    }
+    return s;
+}
+
+/// Place `target_count` cylinders in the warehouse FREE region.  Radius is
+/// log-uniform in [rmin, rmax]; every obstacle keeps the pairwise SURFACE
+/// gap >= cfg.obstacle_surface_gap_min_m (traversable) and its centre at
+/// least (radius + cfg.obstacle_boundary_min_m) from the free-region
+/// border.  Stops early (returns the placed count) when a cylinder cannot
+/// be placed within the attempt budget — the scene is then sparser than
+/// requested instead of violating the constraints.
+inline int placeCylinders(const BlueprintGenerationConfig& cfg,
+                          const WarehouseGeometry& wh, int target_count,
+                          double rmin, double rmax, uint64_t seed,
+                          std::vector<BlueprintObstacle>& out) {
+    out.clear();
+    out.reserve(static_cast<size_t>(std::max(0, target_count)));
+    std::mt19937_64 rng(mixSeed(seed, 0xC0BBA0EULL));
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    const Vec2d fmin = wh.freeMin(), fmax = wh.freeMax();
+    const double gap = std::max(0.0, cfg.obstacle_surface_gap_min_m);
+    const double bmin = std::max(0.0, cfg.obstacle_boundary_min_m);
+    const double lo = std::log(std::max(1e-3, rmin));
+    const double hi = std::log(std::max(1e-3, rmax));
+    for (int i = 0; i < target_count; ++i) {
+        const double r = std::exp(lo + u01(rng) * (hi - lo));
+        bool placed = false;
+        for (int att = 0; att < 400 && !placed; ++att) {
+            const double x = fmin.x() + u01(rng) * (fmax.x() - fmin.x());
+            const double y = fmin.y() + u01(rng) * (fmax.y() - fmin.y());
+            // border: centre >= (r + boundary) from the border
+            if (x - r < fmin.x() + bmin || x + r > fmax.x() - bmin ||
+                y - r < fmin.y() + bmin || y + r > fmax.y() - bmin) {
+                continue;
+            }
+            bool ok = true;
+            for (const auto& o : out) {
+                if (std::hypot(x - o.x, y - o.y) < r + o.radius + gap) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                BlueprintObstacle ob;
+                ob.x = x;
+                ob.y = y;
+                ob.radius = r;
+                ob.height_m = cfg.obstacle_height_m;
+                ob.id = i;
+                out.push_back(ob);
+                placed = true;
+            }
+        }
+        if (!placed) break;  // cannot place more — keep what we have
+    }
+    return static_cast<int>(out.size());
+}
+
+/// Distance from point p to segment a-b (Euclidean).
+inline double distToSegment(const Vec2d& p, const Vec2d& a, const Vec2d& b) {
+    const Vec2d ab = b - a;
+    const double len2 = ab.squaredNorm();
+    if (len2 < 1e-12) return (p - a).norm();
+    const double t = std::max(0.0, std::min(1.0, (p - a).dot(ab) / len2));
+    return (p - (a + t * ab)).norm();
+}
+
+/// Blocked-line test used to steer the label balance.  Two strictness
+/// levels:
+///   * strict_core=false (small / medium scenes): a line whose swept disk
+///     passes within `clearance` of an obstacle SURFACE counts as blocked.
+///     These are mostly solvable by the 30 Hz local avoidance, so they
+///     mainly feed the avoidance labels.
+///   * strict_core=true (large / mixed scenes): the line must cut through
+///     the obstacle CORE (distance to centre < 0.6*radius).  The local
+///     FOV cannot bypass it directly, so the 5 Hz macro corrector takes
+///     over → real detour / long_detour segments.  Long detours are only
+///     PHYSICALLY producible in large-obstacle scenes.
+inline bool lineBlocked(const BlueprintScene& scene, const Vec2d& start,
+                        const Vec2d& goal, double clearance,
+                        bool strict_core) {
+    for (const auto& o : scene.obstacles) {
+        const double d = distToSegment(Vec2d(o.x, o.y), start, goal);
+        if (strict_core) {
+            if (d < o.radius * 0.6) return true;
+        } else {
+            if (d < o.radius + clearance) return true;
+        }
+    }
+    return false;
+}
+
+/// Direct-line (start-goal Euclidean) distance class:
+///   0 = short (< task_distance_short_max_m), 1 = medium, 2 = long.
+inline int distClass(const BlueprintGenerationConfig& cfg, double dist_m) {
+    if (dist_m < cfg.task_distance_short_max_m) return 0;
+    if (dist_m < cfg.task_distance_medium_max_m) return 1;
+    return 2;
+}
+
+struct GreedyAStarResult {
+    bool reachable = false;
+    double path_len_m = 0.0;
+    int expansions = 0;
+};
+
+/// Greedy toward-goal A* on the SceneGeometryCache grid: a standard A*
+/// whose heuristic is the Euclidean distance to the goal (so the search
+/// rushes toward the goal).  Used as a FAST connectivity check for the
+/// scene-level pipeline (it does not plan an optimal path, it only decides
+/// reachability under `clearance` and returns a rough path length).
+/// `max_expansions` bounds the search so a genuinely blocked pair is
+/// rejected cheaply.
+inline GreedyAStarResult greedyAStar(const SceneGeometryCache& geo,
+                                     const Vec2d& start, const Vec2d& goal,
+                                     double clearance, int max_expansions) {
+    GreedyAStarResult res;
+    const int w = geo.w(), h = geo.h();
+    const double r = geo.res();
+    const Vec2d minb = geo.minBounds();
+    auto toGrid = [&](const Vec2d& p) -> std::pair<int, int> {
+        return {static_cast<int>(std::lround((p.x() - minb.x()) / r)),
+                static_cast<int>(std::lround((p.y() - minb.y()) / r))};
+    };
+    const auto [sx, sy] = toGrid(start);
+    const auto [gx, gy] = toGrid(goal);
+    if (!geo.inGrid(sx, sy) || !geo.inGrid(gx, gy)) return res;
+    if (!geo.cellFree(gx, gy, clearance)) return res;
+    if (!geo.cellFree(sx, sy, clearance)) return res;
+    const size_t N = static_cast<size_t>(w) * h;
+    auto idx = [&](int ix, int iy) { return static_cast<size_t>(iy) * w + ix; };
+    auto hcost = [&](int ix, int iy) {
+        return std::hypot((ix - gx) * r, (iy - gy) * r);
+    };
+    std::vector<double> g(N, std::numeric_limits<double>::infinity());
+    std::vector<int> came(N, -1);
+    std::vector<char> closed(N, 0);
+    using QNode = std::pair<double, size_t>;
+    std::priority_queue<QNode, std::vector<QNode>, std::greater<QNode>> open;
+    const size_t sid = idx(sx, sy);
+    const size_t gid = idx(gx, gy);
+    g[sid] = 0.0;
+    open.push({hcost(sx, sy), sid});
+    static const int dirs[8][2] = {{1, 0},  {-1, 0}, {0, 1},  {0, -1},
+                                   {1, 1},  {1, -1}, {-1, 1}, {-1, -1}};
+    const double d8 = r * 1.4142135623730951;
+    while (!open.empty() && res.expansions < max_expansions) {
+        const auto top = open.top();
+        open.pop();
+        const size_t id = top.second;
+        if (closed[id]) continue;
+        closed[id] = 1;
+        ++res.expansions;
+        if (id == gid) {
+            double len = 0.0;
+            int cur = static_cast<int>(id);
+            while (came[cur] != -1) {
+                const int px = came[cur] % w, py = came[cur] / w;
+                const int cx = cur % w, cy = cur / w;
+                const bool diag = (cx != px) && (cy != py);
+                len += diag ? d8 : r;
+                cur = came[cur];
+            }
+            res.reachable = true;
+            res.path_len_m = len;
+            return res;
+        }
+        const int ix = static_cast<int>(id % w), iy = static_cast<int>(id / w);
+        for (const auto& d : dirs) {
+            const int nx = ix + d[0], ny = iy + d[1];
+            if (!geo.inGrid(nx, ny)) continue;
+            const size_t nid = idx(nx, ny);
+            if (closed[nid]) continue;
+            if (!geo.cellFree(nx, ny, clearance)) continue;
+            const bool diag = (d[0] != 0) && (d[1] != 0);
+            const double ng = g[id] + (diag ? d8 : r);
+            if (ng < g[nid]) {
+                g[nid] = ng;
+                came[nid] = static_cast<int>(id);
+                open.push({ng + hcost(nx, ny), nid});
+            }
+        }
+    }
+    return res;
+}
+
 }  // namespace
 
 BlueprintGenerationController::BlueprintGenerationController(
@@ -164,7 +424,8 @@ bool BlueprintGenerationController::preflightOne(
     TaskDistributionSummary& summary, double yaw_error_signed_deg,
     uint64_t task_tick_budget, uint64_t& total_preflight_ticks,
     bool& early_terminated, bool& global_tick_truncated,
-    std::string& reject_reason, double& depth_proxy_ms) const {
+    std::string& reject_reason, double& depth_proxy_ms,
+    SegmentLabeler* segmenter) const {
     PreflightSimulator sim(p_);
     Scene2D s2d;
     s2d.min_bounds = cfg_.warehouse.freeMin();
@@ -189,6 +450,12 @@ bool BlueprintGenerationController::preflightOne(
         wall_max = &wall_envelope_max;
     }
     sim.configure(s2d, s2d.min_bounds, s2d.max_bounds, wall_min, wall_max);
+    // Coarse-step quick preflight: a larger dynamics step (dt_scale/30 s)
+    // makes the vehicle travel further per expert decision, so a FULL
+    // start->goal trajectory needs fewer ticks (same expert decision
+    // stream, same 5 Hz macro cadence per 6 ticks).  Default scale 1.0 =
+    // exact real-time 30 Hz behaviour.
+    sim.setStepDt((1.0 / 30.0) * std::max(1.0, cfg_.quick_preflight_dt_scale));
 
     TruthCylinderAudit truth;
     truth.configure(scene.obstacles, p_.drone_radius, s2d.min_bounds,
@@ -225,7 +492,8 @@ bool BlueprintGenerationController::preflightOne(
     const uint64_t budget = std::max<uint64_t>(1, task_tick_budget);
     const uint64_t per_task_budget =
         std::max<uint64_t>(1, cfg_.max_preflight_ticks_per_task);
-    const double dt = 1.0 / std::max(1e-6, cfg_.control_rate_hz);
+    const double dt = (1.0 / std::max(1e-6, cfg_.control_rate_hz)) *
+                      std::max(1.0, cfg_.quick_preflight_dt_scale);
     const uint64_t stride = std::max<uint64_t>(1, cfg_.depth_proxy_sample_stride_ticks);
     uint64_t ticks = 0;
     bool reached = false, collision = false, out_of_bounds = false;
@@ -261,10 +529,15 @@ bool BlueprintGenerationController::preflightOne(
     bool stall_triggered = false;
     // PURE stall detector (shared with the regression tests).  Threshold:
     // speed [m/s] * dt [s/tick] = m/tick — derived from the explicit
-    // control rate (no magic 30.0).
+    // control rate (no magic 30.0).  The WINDOW is rescaled by the dt
+    // scale so the PHYSICAL stall duration stays the same under a coarse
+    // quick-preflight step (90 ticks @ 1/30 s == 15 ticks @ 1/5 s).
     StallDetector stall;
     stall.disp_threshold = cfg_.stall_speed_mps * dt;
-    stall.window_ticks = std::max(1, cfg_.stall_window_ticks);
+    stall.window_ticks = std::max(
+        1, static_cast<int>(
+               static_cast<double>(std::max(1, cfg_.stall_window_ticks)) /
+               std::max(1.0, cfg_.quick_preflight_dt_scale)));
 
     for (uint64_t t = 0; t < budget; ++t) {
         // Depth proxy at stride BEFORE the step (matches runtime: the
@@ -282,6 +555,12 @@ bool BlueprintGenerationController::preflightOne(
         const auto res = sim.step(tick_base + t, false);
         ticks = t + 1;
         const ExpertStepOutput& out = res.output;
+
+        // ── behaviour SEGMENT labeling (optional; the new preflight
+        //    planner feeds this with the per-tick expert output so the
+        //    trajectory is split into straight / avoidance / detour
+        //    segments). ─────────────────────────────────────────────
+        if (segmenter) segmenter->onTick(out);
 
         // ── P0 FIX: capture the step displacement BEFORE updating `prev`.
         //    The old code updated `prev` first, so the stall detector's
@@ -573,6 +852,7 @@ bool BlueprintGenerationController::preflightOne(
                                             : (!reached
                                                    ? "preflight_rejected:goal_not_reached"
                                                    : "preflight_rejected:macro_label_invalid")))));
+        if (segmenter) segmenter->finish();
         return false;
     }
     task.audit.preflight_status = "preflight_accepted";
@@ -623,6 +903,7 @@ bool BlueprintGenerationController::preflightOne(
     } else {
         task.distance_class = "medium";
     }
+    if (segmenter) segmenter->finish();
     return true;
 }
 
@@ -698,14 +979,22 @@ BlueprintResult BlueprintGenerationController::generate() {
     std::vector<BlueprintTask> global_pool;
     std::map<uint64_t, BlueprintScene> scenes;
 
-    // parallel_tasks is NOT implemented: fail fast instead of silently
-    // ignoring the requested concurrency (the il_config validator also
-    // rejects it, this is the C++ guard for direct API users).
-    if (cfg_.parallel_tasks) {
-        result.failure_reason =
-            "parallel_tasks is not implemented (must be false)";
-        return result;
+    // ── scene-level parallel pipeline (new architecture) ─────────
+    // The main thread pre-generates scene_levels x scenes_per_level scene
+    // specs (each level's cylinder radius band, sparse -> dense), then
+    // scene_parallel_threads workers run whole scenes concurrently; the
+    // main thread merges and balances afterwards.
+    if (cfg_.scene_level_parallel) {
+        return generateSceneParallel();
     }
+
+    // Parallel task preflight: cfg_.parallel_tasks worker threads for the
+    // expensive closed-loop simulations (0 or 1 = serial).  preflightOne is
+    // a pure function of (task, scene, budgets), so candidates enqueued in
+    // a batch run concurrently and their outcomes are merged back in
+    // SUBMISSION order (the analyzer / pool / counters see the same
+    // sequence a serial run would, per batch).
+    const int parallel_workers = std::max(1, cfg_.parallel_tasks);
     // use_profile_catalog=false with NO user-provided profiles is a config
     // error: there would be nothing to generate and the run would silently
     // produce zero scenes.  Fail with a clear reason instead.
@@ -780,6 +1069,10 @@ BlueprintResult BlueprintGenerationController::generate() {
         RoundStats rs;
         rs.round = static_cast<uint64_t>(round);
         QualificationCounters qc_round;  // per-round qualification counts
+        // Per-round timing snapshots (for the round log breakdown of the
+        // serial qualification gate vs the parallel preflight).
+        const double qual_ms_start = timing.task_qualification_ms;
+        const double preflight_ms_start = timing.preflight_total_ms;
 
         const int scene_budget = max_scene_candidates - static_cast<int>(scenes.size());
         const int rounds_left = max_rounds - round + 1;
@@ -873,6 +1166,101 @@ BlueprintResult BlueprintGenerationController::generate() {
             uint64_t scene_qualification_expansions = 0;
             bool scene_qualification_budget_exhausted = false;
             int attempts = 0;
+            // ── parallel preflight batch ─────────────────────────────
+            // Sampling / cheap filter / qualification stay serial (they
+            // are cheap and feed the budget checks); the expensive
+            // closed-loop preflight is deferred into batches of up to
+            // `parallel_workers` candidates and executed concurrently.
+            std::vector<PendingPreflight> batch;
+            batch.reserve(static_cast<size_t>(parallel_workers));
+            // Run every pending preflight on its own worker thread, then
+            // merge outcomes back on THIS thread in submission order so
+            // analyzer_ / pools / counters / failure_breakdown see exactly
+            // the serial sequence (per batch).
+            auto flushBatch = [&](std::vector<PendingPreflight>& b) {
+                if (b.empty()) return;
+                const auto t_flush = Clock::now();
+                std::vector<std::future<PreflightOutcome>> futures;
+                futures.reserve(b.size());
+                for (auto& p : b) {
+                    futures.push_back(std::async(
+                        std::launch::async, [this, &p]() {
+                            PreflightOutcome o;
+                            uint64_t local_ticks = 0;
+                            o.accepted = preflightOne(
+                                p.task, p.scene, p.tick_base, o.summary,
+                                p.yaw_err, p.task_tick_budget, local_ticks,
+                                o.early_terminated, o.global_tick_truncated,
+                                o.reject_reason, o.depth_proxy_ms);
+                            o.ticks_used = local_ticks;
+                            return o;
+                        }));
+                }
+                for (size_t i = 0; i < b.size(); ++i) {
+                    PendingPreflight& p = b[i];
+                    PreflightOutcome o = futures[i].get();
+                    BlueprintTask& task = p.task;
+                    const TaskDistributionSummary& summary = o.summary;
+                    const int probe_side = p.probe_side;
+
+                    // Merge the worker's local tick counter into the
+                    // global budget (serial section, no contention).
+                    timing.depth_proxy_total_ms += o.depth_proxy_ms;
+                    ++timing.preflight_count;
+                    timing.preflight_ticks += o.ticks_used;
+                    total_preflight_ticks += o.ticks_used;
+                    ++result.tasks_preflighted;
+                    ++rs.preflight_attempted;
+                    task.summary = summary;
+
+                    // A probe is only a sampling hint by default.  Keep
+                    // the actual preflight label in the candidate pool so
+                    // local yaw-first behaviour is not mistaken for a
+                    // failed task.  Strict matching remains available for
+                    // focused diagnostics.
+                    if (o.accepted && probe_side != 0 &&
+                        cfg_.macro_probe_require_match) {
+                        const bool matched =
+                            probe_side > 0
+                                ? summary.macro_turn_left_count > 0
+                                : summary.macro_turn_right_count > 0;
+                        if (!matched) {
+                            o.accepted = false;
+                            o.reject_reason = "macro_turn_probe_mismatch";
+                        }
+                    }
+                    ++rs.failure_breakdown[o.reject_reason];
+
+                    if (o.global_tick_truncated) {
+                        // The GLOBAL remaining tick budget cut this task
+                        // short (not a normal task timeout): report it and
+                        // stop the whole generation — no further preflight
+                        // can run.
+                        budget_exhausted =
+                            BudgetExhaustion::PREFLIGHT_TICK_BUDGET;
+                    }
+                    if (!o.early_terminated) ++full_preflight_attempted;
+                    if (o.accepted) {
+                        ++timing.preflight_success_count;
+                        ++result.preflight_success_tasks;
+                        ++rs.preflight_success;
+                        if (!o.early_terminated) ++full_preflight_success;
+                        ++full_preflight_success_after_qual;
+                        scene_pool.push_back(task);
+                        global_pool.push_back(task);
+                        analyzer_.addTask(summary);
+                        // Keep deficit-driven task/yaw weights current
+                        // within a round; recomputation is negligible next
+                        // to preflight.
+                        analyzer_.recompute();
+                    } else {
+                        ++timing.preflight_failure_count;
+                        ++result.preflight_failure_count;
+                    }
+                }
+                timing.preflight_total_ms += msSince(t_flush);
+                b.clear();
+            };
             while (static_cast<int>(scene_pool.size()) < task_target &&
                    attempts < cfg_.max_task_generation_attempts &&
                    !budgetExceeded() && !scene_qualification_budget_exhausted) {
@@ -1033,12 +1421,17 @@ BlueprintResult BlueprintGenerationController::generate() {
                 }
 
                 // ── full preflight + distribution summary ───────────
+                // Deferred to the parallel batch: enqueue now, run the
+                // whole batch on worker threads, merge in order.  The
+                // per-task budget is snapshotted from the remaining global
+                // tick budget at enqueue time (serial section, so no
+                // contention); the batch is flushed before new candidates
+                // are enqueued, keeping any overshoot bounded.
                 ++full_preflight_after_qual;
                 // P2 HARD tick budget: the effective per-task budget is
-                // capped by the REMAINING global tick budget, so
-                // total_preflight_ticks can never exceed
-                // max_total_preflight_ticks (a 900-tick task is never
-                // started with only 10 ticks left).
+                // capped by the REMAINING global tick budget, so the
+                // global tick total can never overshoot by more than
+                // (parallel_workers-1) x max_preflight_ticks_per_task.
                 const uint64_t remaining_global_ticks =
                     max_preflight_ticks > total_preflight_ticks
                         ? max_preflight_ticks - total_preflight_ticks
@@ -1047,72 +1440,29 @@ BlueprintResult BlueprintGenerationController::generate() {
                     budget_exhausted = BudgetExhaustion::PREFLIGHT_TICK_BUDGET;
                     break;
                 }
+                // Enqueuing a candidate commits one preflight attempt
+                // (matches the serial accounting: each preflight consumes
+                // exactly one attempt unit).
+                if (total_preflight_attempts >= max_preflights) {
+                    budget_exhausted = BudgetExhaustion::PREFLIGHT_ATTEMPT_BUDGET;
+                    break;
+                }
+                ++total_preflight_attempts;
                 const uint64_t task_tick_budget = std::min<uint64_t>(
                     static_cast<uint64_t>(std::max(1, cfg_.max_preflight_ticks_per_task)),
                     remaining_global_ticks);
-                TaskDistributionSummary summary;
                 const uint64_t tick_base = task.task_id * 600000ull;
-                const auto t_pre = Clock::now();
-                bool early_terminated = false;
-                bool global_tick_truncated = false;
-                std::string reject_reason = "accepted";
-                double depth_proxy_ms = 0.0;
-                const uint64_t ticks_before = total_preflight_ticks;
-                bool accepted = preflightOne(
-                    task, out.scene, tick_base, summary, yaw_err,
-                    task_tick_budget, total_preflight_ticks, early_terminated,
-                    global_tick_truncated, reject_reason, depth_proxy_ms);
-                timing.preflight_total_ms += msSince(t_pre);
-                timing.depth_proxy_total_ms += depth_proxy_ms;
-                ++timing.preflight_count;
-                timing.preflight_ticks += (total_preflight_ticks - ticks_before);
-                ++result.tasks_preflighted;
-                ++total_preflight_attempts;
-                ++rs.preflight_attempted;
-                task.summary = summary;
-
-                // A probe is only a sampling hint by default.  Keep the
-                // actual preflight label in the candidate pool so local
-                // yaw-first behaviour is not mistaken for a failed task.
-                // Strict matching remains available for focused diagnostics.
-                if (accepted && probe_side != 0 &&
-                    cfg_.macro_probe_require_match) {
-                    const bool matched =
-                        probe_side > 0
-                            ? summary.macro_turn_left_count > 0
-                            : summary.macro_turn_right_count > 0;
-                    if (!matched) {
-                        accepted = false;
-                        reject_reason = "macro_turn_probe_mismatch";
-                    }
+                batch.push_back(PendingPreflight{
+                    std::move(task), out.scene, tick_base, yaw_err,
+                    task_tick_budget, probe_side});
+                if (static_cast<int>(batch.size()) >= parallel_workers) {
+                    flushBatch(batch);
+                    if (budget_exhausted != BudgetExhaustion::NONE) break;
                 }
-                ++rs.failure_breakdown[reject_reason];
-
-                if (global_tick_truncated) {
-                    // The GLOBAL remaining tick budget cut this task short
-                    // (not a normal task timeout): report it and stop the
-                    // whole generation — no further preflight can run.
-                    budget_exhausted = BudgetExhaustion::PREFLIGHT_TICK_BUDGET;
-                }
-                if (!early_terminated) ++full_preflight_attempted;
-                if (accepted) {
-                    ++timing.preflight_success_count;
-                    ++result.preflight_success_tasks;
-                    ++rs.preflight_success;
-                    if (!early_terminated) ++full_preflight_success;
-                    ++full_preflight_success_after_qual;
-                    scene_pool.push_back(task);
-                    global_pool.push_back(task);
-                    analyzer_.addTask(summary);
-                    // Keep deficit-driven task/yaw weights current within a
-                    // round; recomputation is negligible next to preflight.
-                    analyzer_.recompute();
-                } else {
-                    ++timing.preflight_failure_count;
-                    ++result.preflight_failure_count;
-                }
-                if (budget_exhausted != BudgetExhaustion::NONE) break;
             }
+            // Flush any remaining candidates before moving on (next scene
+            // or final selection).
+            flushBatch(batch);
             if (timing.preflight_count > 0) {
                 timing.preflight_average_ms =
                     timing.preflight_total_ms /
@@ -1180,7 +1530,7 @@ BlueprintResult BlueprintGenerationController::generate() {
                          "[blueprint] round %llu: scenes=%llu/%llu "
                          "candidates=%llu cheap_rej=%llu preflight=%llu "
                          "success=%llu pool=%llu explore=%s hard=%s soft=%s "
-                         "elapsed_ms=%.1f\n",
+                         "elapsed_ms=%.1f qual_ms=%.1f preflight_ms=%.1f\n",
                          static_cast<unsigned long long>(round),
                          static_cast<unsigned long long>(rs.scenes_valid),
                          static_cast<unsigned long long>(rs.scenes_generated),
@@ -1198,7 +1548,9 @@ BlueprintResult BlueprintGenerationController::generate() {
                              ? "1"
                              : "0",
                          cov.hard_minimums_met ? "1" : "0",
-                         cov.soft_targets_met ? "1" : "0", rs.elapsed_ms);
+                         cov.soft_targets_met ? "1" : "0", rs.elapsed_ms,
+                         timing.task_qualification_ms - qual_ms_start,
+                         timing.preflight_total_ms - preflight_ms_start);
             // Failure breakdown (stall / no_progress are the key signals to
             // watch after the stall-displacement fix).
             if (!rs.failure_breakdown.empty()) {
@@ -1384,6 +1736,583 @@ BlueprintResult BlueprintGenerationController::generate() {
     // ── timing ─────────────────────────────────────────────────────
     timing.total_ms = msSince(t_total);
     result.timing_ms = timing.asMap();
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Scene-level parallel pipeline (new architecture)
+// ═══════════════════════════════════════════════════════════════════
+
+BlueprintGenerationController::SceneWorkResult
+BlueprintGenerationController::runOneScene(int level, int level_index,
+                                           uint64_t scene_id,
+                                           uint64_t seed) const {
+    SceneWorkResult wr;
+    wr.scene_id = scene_id;
+    wr.level = level;
+    const auto t0 = Clock::now();
+    double place_ms = 0.0, grid_ms = 0.0, astar_ms = 0.0, preflight_ms = 0.0;
+    const WarehouseGeometry& wh = cfg_.warehouse;
+    const SceneSpec spec = makeSceneSpec(cfg_, level, level_index, scene_id,
+                                         seed);
+
+    // ── 1. scene: cylinders (surface gap >= 1.2, border >= 0.6) ──
+    BlueprintScene scene;
+    scene.scene_id = scene_id;
+    scene.seed = seed;
+    scene.profile = (level == 0) ? "small"
+                    : (level == 1) ? "medium"
+                    : (level == 2) ? "large" : "mixed";
+    {
+        const auto t1 = Clock::now();
+        scene.actual_obstacle_count = placeCylinders(
+            cfg_, wh, spec.target_count, spec.rmin, spec.rmax, seed,
+            scene.obstacles);
+        place_ms = msSince(t1);
+    }
+    if (scene.actual_obstacle_count == 0) {
+        wr.reason = "no cylinders placed";
+        return wr;
+    }
+    scene.is_empty = false;
+    scene.generation_valid = true;
+    scene.density_class =
+        scene.actual_obstacle_count <= 6 ? "sparse"
+        : scene.actual_obstacle_count <= 14 ? "medium" : "dense";
+    scene.actual_density_class = scene.density_class;
+    scene.actual_radius_class = (spec.rmax >= 2.9) ? "large"
+                                : (spec.rmax >= 1.4) ? "medium" : "small";
+    double rsum = 0.0, rmin_o = 1e9, rmax_o = 0.0;
+    for (const auto& o : scene.obstacles) {
+        rsum += o.radius;
+        rmin_o = std::min(rmin_o, o.radius);
+        rmax_o = std::max(rmax_o, o.radius);
+    }
+    scene.actual_min_radius_m = rmin_o;
+    scene.actual_max_radius_m = rmax_o;
+    scene.metadata.profile = scene.profile;
+    scene.metadata.obstacle_count = scene.actual_obstacle_count;
+    scene.metadata.radius_min = rmin_o;
+    scene.metadata.radius_max = rmax_o;
+    scene.metadata.radius_mean =
+        rsum / static_cast<double>(scene.actual_obstacle_count);
+    scene.metadata.scene_seed = seed;
+    scene.metadata.structure_orientation = "none";
+
+    // ── 2. build the 2D grid ───────────────────────────────────────
+    SceneGeometryCache geo;
+    SceneMetadata meta;
+    {
+        const auto t2 = Clock::now();
+        const bool grid_ok = geo.build(scene, cfg_, meta);
+        grid_ms = msSince(t2);
+        if (!grid_ok) {
+            wr.reason = "grid build failed: " + meta.geometry_failure_reason;
+            wr.scene = scene;
+            return wr;
+        }
+    }
+    scene.metadata = meta;
+    wr.scene = scene;
+
+    // ── 3. sample start/goal pairs, greedy A*, distance balance,
+    //      quick-expert preflight, labels ───────────────────────────
+    const int scene_target = std::max(
+        1, cfg_.expected_collect_tasks /
+               (std::max(1, cfg_.scene_levels) *
+                std::max(1, cfg_.scenes_per_level)));
+    const int base = scene_target / 3;
+    const int rem = scene_target - 3 * base;
+    int dist_targets[3] = {base + (rem > 0 ? 1 : 0),
+                           base + (rem > 1 ? 1 : 0), base};
+    int dist_counts[3] = {0, 0, 0};
+
+    const std::vector<size_t>& cells = geo.validCells();
+    if (cells.size() < 2) {
+        wr.reason = "too few valid free cells";
+        return wr;
+    }
+    const int w = geo.w();
+    auto cellCenterOf = [&](size_t id) {
+        return geo.cellCenter(static_cast<int>(id % w),
+                              static_cast<int>(id / w));
+    };
+    const double astar_clr = cfg_.free_cell_surface_clearance_m;  // == scene valid-cell clearance
+    const uint64_t quick_ticks =
+        static_cast<uint64_t>(std::max(1, cfg_.quick_preflight_max_ticks));
+    std::mt19937_64 rng(mixSeed(spec.seed, 0x7A57A77ULL));
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    // New preflight planner: behaviour SEGMENT labeler (splits each
+    // trajectory into straight / light|large avoidance / detour /
+    // medium|long detour segments).  Same expert + same Params2D as the
+    // real collection, so the clearance parameters are identical.  The
+    // detour-duration thresholds are rescaled by the coarse dt_scale so
+    // the PHYSICAL durations stay fixed.
+    SegmentLabeler segmenter(30.0, 30, 90, cfg_.quick_preflight_dt_scale);
+
+    uint64_t attempts = 0;
+    const uint64_t max_attempts = 900;
+    uint64_t task_seq = 0;
+    // ── blocked / unblocked balance ─────────────────────────────────
+    // A macro detour is triggered by the GEOMETRY (the direct start->goal
+    // line is blocked by an obstacle, so the 5 Hz corrector takes over) —
+    // NOT by the initial yaw.  The blocked share is scaled by the LEVEL:
+    // large / mixed scenes (big cylinders) can actually produce long
+    // detours, small / medium scenes cannot (obstacles are small, the
+    // detour is short) — so small/medium target mostly straight +
+    // avoidance labels, large/mixed target more detour labels.
+    double blocked_ratio = 0.5;
+    if (level >= 2) {
+        blocked_ratio = 0.65;  // large / mixed: more detours
+    } else if (level == 1) {
+        blocked_ratio = 0.40;  // medium
+    } else {
+        blocked_ratio = 0.35;  // small: mostly straight / light avoidance
+    }
+    const int blocked_target =
+        std::max(1, static_cast<int>(std::round(scene_target * blocked_ratio)));
+    const int unblocked_target = std::max(1, scene_target - blocked_target);
+    int blocked_accept = 0, unblocked_accept = 0;
+    while ((dist_counts[0] + dist_counts[1] + dist_counts[2] < scene_target ||
+            blocked_accept < blocked_target ||
+            unblocked_accept < unblocked_target) &&
+           attempts < max_attempts && wr.preflights_run < 120) {
+        ++attempts;
+        // pick the most-deficient distance class
+        int cls = 0;
+        if (dist_counts[0] >= dist_targets[0] &&
+            dist_counts[1] >= dist_targets[1]) {
+            cls = 2;
+        } else if (dist_counts[0] >= dist_targets[0]) {
+            cls = 1;
+        }
+        const bool need_blocked = blocked_accept < blocked_target;
+        const bool need_unblocked = unblocked_accept < unblocked_target;
+        // sample start
+        const Vec2d start = cellCenterOf(cells[rng() % cells.size()]);
+        bool found = false;
+        Vec2d goal;
+        bool line_blocked = false;
+        // ── large / mixed scenes: CONSTRUCT a "goal behind a big
+        //    obstacle" pair when a blocked task is needed.  Random
+        //    sampling rarely hits a CORE-blocked straight line when a
+        //    scene holds only a few big cylinders, so we place the goal
+        //    on the far side of a random obstacle — the straight line then
+        //    provably cuts through its core and forces a macro detour. ──
+        const bool construct_blocked =
+            (level >= 2) && need_blocked && !need_unblocked &&
+            !scene.obstacles.empty();
+        if (construct_blocked) {
+            const double band_center = (cls == 0) ? 6.0
+                                       : (cls == 1) ? 12.0 : 20.0;
+            for (int gatt = 0; gatt < 250 && !found; ++gatt) {
+                const auto& o = scene.obstacles[rng() % scene.obstacles.size()];
+                const Vec2d oc(o.x, o.y);
+                const Vec2d dvec = start - oc;
+                const double ds = dvec.norm();
+                if (ds < 1e-6) continue;
+                const Vec2d dir = dvec / ds;  // obstacle -> start
+                // goal on the far side: start->goal distance = ds + r_goal
+                double r_goal = band_center - ds;
+                if (r_goal < o.radius + astar_clr + 0.5) {
+                    r_goal = o.radius + astar_clr + 0.5;  // clear the far side
+                }
+                const Vec2d g = oc - dir * r_goal;
+                const double d = (g - start).norm();
+                if (distClass(cfg_, d) != cls) continue;
+                if (!geo.pointFreeMain(g, astar_clr)) continue;
+                goal = g;
+                line_blocked = true;  // straight line cuts the core
+                found = true;
+            }
+        }
+        // ordinary sampling (small/medium scenes, or when the needed
+        // blocked/unblocked class can be met by the random draw)
+        if (!construct_blocked && !found) {
+            for (int gatt = 0; gatt < 400 && !found; ++gatt) {
+                const Vec2d g = cellCenterOf(cells[rng() % cells.size()]);
+                const double d = (g - start).norm();
+                if (distClass(cfg_, d) != cls ||
+                    d < cfg_.min_task_distance_m - 1e-9 ||
+                    d > cfg_.max_task_distance_m + 1e-9) {
+                    continue;
+                }
+                const bool blk = lineBlocked(scene, start, g, astar_clr,
+                                             /*strict_core=*/level >= 2);
+                if (need_blocked && !need_unblocked && !blk) continue;
+                if (need_unblocked && !need_blocked && blk) continue;
+                goal = g;
+                line_blocked = blk;
+                found = true;
+            }
+        }
+        if (!found) continue;
+        // greedy toward-goal A* connectivity check (fast)
+        const auto t_astar = Clock::now();
+        GreedyAStarResult astar =
+            greedyAStar(geo, start, goal, astar_clr, 5000);
+        astar_ms += msSince(t_astar);
+        ++wr.astar_calls;
+        wr.astar_expansions += static_cast<uint64_t>(astar.expansions);
+        if (!astar.reachable) continue;
+
+        // build the task
+        BlueprintTask task;
+        task.scene_id = scene_id;
+        task.task_id = scene_id * 100000ULL + task_seq;
+        task.seed = mixSeed(spec.seed, 0x7A57A77ULL + attempts);
+        task.start_x = start.x();
+        task.start_y = start.y();
+        task.goal_x = goal.x();
+        task.goal_y = goal.y();
+        task.flight_height_m = cfg_.flight_height_m;
+        // ── initial yaw: aim at the goal with a MODEST random offset
+        //    (0..35°, mirror-balanced).  A macro detour is decided by the
+        //    blocked-geometry, NOT by a large initial yaw error, so we no
+        //    longer force huge offsets. ─────────────────────────────
+        const double goal_bearing =
+            std::atan2(goal.y() - start.y(), goal.x() - start.x());
+        const double yaw_offset =
+            (u01(rng) < 0.5 ? -1.0 : 1.0) * (35.0 * u01(rng)) * deg2rad(1.0);
+        task.initial_yaw =
+            CoordinateAdapter::expertYawToFlightmare(goal_bearing + yaw_offset);
+        const double expert_yaw =
+            CoordinateAdapter::flightmareYawToExpert(task.initial_yaw);
+        const double yaw_err = wrapAngle(goal_bearing - expert_yaw);
+        task.geom_type = "CLEAR";
+        const double dline = (goal - start).norm();
+        task.distance_class = dline < cfg_.task_distance_short_max_m
+                                  ? "short"
+                                  : (dline < cfg_.task_distance_medium_max_m
+                                         ? "medium"
+                                         : "long");
+        ++wr.candidates_sampled;
+        ++task_seq;
+
+        // ── quick expert preflight (simplified, with behaviour SEGMENT
+        //    labelling — the new preflight planner) ────────────────
+        TaskDistributionSummary summary;
+        uint64_t local_ticks = 0;
+        bool early = false, gtrunc = false;
+        std::string reason = "accepted";
+        double depth_ms = 0.0;
+        const uint64_t tick_base = task.task_id * 600000ull;
+        segmenter.reset();
+        const auto t_pre = Clock::now();
+        const bool accepted =
+            preflightOne(task, scene, tick_base, summary, yaw_err, quick_ticks,
+                         local_ticks, early, gtrunc, reason, depth_ms,
+                         &segmenter);
+        preflight_ms += msSince(t_pre);
+        ++wr.preflights_run;
+        task.summary = summary;
+        // This task's behaviour SEGMENT labels (all behaviours that
+        // occurred anywhere in the trajectory).
+        std::map<std::string, uint64_t> task_seg;
+        for (const auto& kv : segmenter.labelCounts()) {
+            task_seg[kv.first] += kv.second;
+        }
+        // Quick preflight acceptance is RELAXED: the reduced tick budget is
+        // far too short to physically reach the goal (tasks span 4..28 m),
+        // so "reached the goal" would reject everything.  A candidate is
+        // accepted when the quick flight was SAFE (no collision / no
+        // out-of-bounds) and the macro label is valid — the expert's
+        // behaviour label is still meaningful for the balance statistics.
+        // Full-arrival tasks (accepted=true) keep the original label.
+        const bool safe = !summary.collision && !summary.out_of_bounds;
+        const bool macro_ok = task.audit.macro_label_ok;
+        const bool quick_accept = accepted || (safe && macro_ok);
+        if (quick_accept) {
+            if (!accepted && task.behavior_class == "rejected") {
+                // Safe flight that did not reach the goal: re-derive the
+                // behaviour label from the summary (mirrors preflightOne).
+                const uint64_t tl = summary.macro_turn_left_count;
+                const uint64_t tr = summary.macro_turn_right_count;
+                const uint64_t nm = summary.macro_normal_count;
+                if (task.saw_turn_left && nm > 0) {
+                    task.behavior_class = "turn_normal";
+                } else if (tl > 0 && tr == 0) {
+                    task.behavior_class = "turn_left";
+                } else if (tr > 0 && tl == 0) {
+                    task.behavior_class = "turn_right";
+                } else if (tl > 0 && tr > 0) {
+                    task.behavior_class = "turn_both";
+                } else if (task.turn_update_count > 0 ||
+                           task.normal_update_count > 0) {
+                    task.behavior_class = "long_takeover";
+                } else if (nm > 0) {
+                    task.behavior_class = "normal";
+                } else if (summary.local_avoidance_count > 0) {
+                    task.behavior_class = "local_avoidance";
+                } else {
+                    task.behavior_class = "clear";
+                }
+            }
+            wr.tasks.push_back(task);
+            wr.task_segment_counts.push_back(task_seg);
+            for (const auto& kv : task_seg) {
+                wr.segment_label_counts[kv.first] += kv.second;
+            }
+            ++wr.label_counts[task.behavior_class];
+            ++wr.dist_counts[task.distance_class];
+            ++dist_counts[cls];
+            if (line_blocked) {
+                ++blocked_accept;
+            } else {
+                ++unblocked_accept;
+            }
+        } else {
+            task.behavior_class = "rejected";
+            task.side_class = "none";
+            wr.rejected.push_back(task);
+        }
+    }
+    wr.ok = true;
+    wr.wall_ms = msSince(t0);
+    std::fprintf(stderr,
+                 "[blueprint-scene] level %d idx %d scene %llu: cylinders=%d "
+                 "candidates=%d astar_calls=%llu astar_exp=%llu "
+                 "preflights=%d accepted=%zu wall_ms=%.0f "
+                 "[place=%.0f grid=%.0f astar=%.0f preflight=%.0f]",
+                 level, level_index,
+                 static_cast<unsigned long long>(scene_id),
+                 scene.actual_obstacle_count, wr.candidates_sampled,
+                 static_cast<unsigned long long>(wr.astar_calls),
+                 static_cast<unsigned long long>(wr.astar_expansions),
+                 wr.preflights_run, wr.tasks.size(), wr.wall_ms,
+                 place_ms, grid_ms, astar_ms, preflight_ms);
+    if (!wr.segment_label_counts.empty()) {
+        std::fprintf(stderr, " seg=");
+        for (const auto& kv : wr.segment_label_counts) {
+            std::fprintf(stderr, "%s:%llu", kv.first.c_str(),
+                         static_cast<unsigned long long>(kv.second));
+        }
+    }
+    std::fprintf(stderr, "\n");
+    return wr;
+}
+
+BlueprintResult BlueprintGenerationController::generateSceneParallel() {
+    BlueprintResult result;
+    const auto t0 = Clock::now();
+    result.base_seed = cfg_.base_seed;
+
+    const int levels = std::max(1, cfg_.scene_levels);
+    const int per_level = std::max(1, cfg_.scenes_per_level);
+    const int n_threads = std::max(1, cfg_.scene_parallel_threads);
+    const uint64_t n_scenes = static_cast<uint64_t>(levels) * per_level;
+    const int total_target = std::max(1, cfg_.expected_collect_tasks);
+
+    // ── Phase 1: main thread pre-generates the scene specs ────────
+    struct Spec {
+        int level;
+        int idx;
+        uint64_t scene_id;
+        uint64_t seed;
+    };
+    std::vector<Spec> specs;
+    specs.reserve(n_scenes);
+    for (int L = 0; L < levels; ++L) {
+        for (int j = 0; j < per_level; ++j) {
+            const uint64_t scene_id = static_cast<uint64_t>(L) * per_level + j;
+            const uint64_t seed =
+                mixSeed(cfg_.base_seed, 0x5CEA5001ULL + scene_id);
+            specs.push_back({L, j, scene_id, seed});
+        }
+    }
+
+    // ── Phase 2: scene-level parallel (fixed worker pool) ─────────
+    std::vector<SceneWorkResult> results(n_scenes);
+    std::atomic<size_t> next{0};
+    {
+        std::vector<std::thread> pool;
+        pool.reserve(n_threads);
+        for (int t = 0; t < n_threads; ++t) {
+            pool.emplace_back([this, &next, &results, &specs]() {
+                for (;;) {
+                    const size_t i = next.fetch_add(1);
+                    if (i >= specs.size()) break;
+                    const Spec& s = specs[i];
+                    results[i] =
+                        runOneScene(s.level, s.idx, s.scene_id, s.seed);
+                }
+            });
+        }
+        for (auto& th : pool) th.join();
+    }
+
+    // ── Phase 3: merge + label balance + reasonableness ───────────
+    std::vector<std::vector<BlueprintTask>> by_level(
+        static_cast<size_t>(levels));
+    std::vector<BlueprintTask> pool_all;
+    uint64_t total_candidates = 0, total_preflights = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        const SceneWorkResult& r = results[i];
+        if (!r.ok) {
+            if (cfg_.log_rounds) {
+                std::fprintf(stderr,
+                             "[blueprint-scene] scene %llu (level %d) skipped: %s\n",
+                             static_cast<unsigned long long>(r.scene_id),
+                             r.level, r.reason.c_str());
+            }
+            continue;
+        }
+        result.scenes.push_back(r.scene);
+        total_candidates += static_cast<uint64_t>(r.candidates_sampled);
+        total_preflights += static_cast<uint64_t>(r.preflights_run);
+        if (r.level >= 0 && r.level < levels) {
+            for (const auto& t : r.tasks) by_level[static_cast<size_t>(r.level)].push_back(t);
+        }
+        for (const auto& t : r.tasks) pool_all.push_back(t);
+    }
+    result.scenes_generated = result.scenes.size();
+    result.scenes_valid = result.scenes.size();
+    result.tasks_sampled = total_candidates;
+    result.tasks_preflighted = static_cast<uint64_t>(pool_all.size());
+
+    // label overview
+    std::map<std::string, uint64_t> total_labels;
+    for (const auto& t : pool_all) ++total_labels[t.behavior_class];
+
+    // behaviour SEGMENT label overview (new preflight planner: each
+    // trajectory is split into straight / light|large avoidance / detour
+    // / medium|long detour segments).
+    std::map<std::string, uint64_t> total_segment_labels;
+    for (const auto& r : results) {
+        for (const auto& kv : r.segment_label_counts) {
+            total_segment_labels[kv.first] += kv.second;
+        }
+    }
+
+    // ── balance pick: per level, approximate label balance ─────────
+    const int per_level_target = std::max(1, total_target / std::max(1, levels));
+    std::vector<BlueprintTask> selected;
+    std::vector<uint64_t> selected_per_level(static_cast<size_t>(levels), 0);
+    for (int L = 0; L < levels; ++L) {
+        const auto& ltasks = by_level[static_cast<size_t>(L)];
+        if (ltasks.empty()) continue;
+        // group by behaviour label
+        std::map<std::string, std::vector<const BlueprintTask*>> by_label;
+        for (const auto& t : ltasks) by_label[t.behavior_class].push_back(&t);
+        const int n_labels = std::max(1, static_cast<int>(by_label.size()));
+        int per_label = std::max(1, per_level_target / n_labels);
+        std::vector<const BlueprintTask*> picked;
+        std::map<std::string, size_t> next_idx;
+        // first pass: per_label from each label group
+        for (auto& kv : by_label) {
+            const int take = std::min(per_label, static_cast<int>(kv.second.size()));
+            for (int k = 0; k < take; ++k) picked.push_back(kv.second[k]);
+            next_idx[kv.first] = static_cast<size_t>(take);
+        }
+        // top-up: keep the least-represented label ahead, but only from
+        // groups that still have un-picked candidates (a group that ran
+        // out must not block filling from the remaining groups).
+        int guard = 0;
+        while (static_cast<int>(picked.size()) < per_level_target &&
+               static_cast<int>(picked.size()) < static_cast<int>(ltasks.size()) &&
+               guard < 100000) {
+            ++guard;
+            std::map<std::string, int> cnt;
+            for (const auto* p : picked) ++cnt[p->behavior_class];
+            // find the least-represented label that still has candidates
+            const BlueprintTask* best = nullptr;
+            int best_cnt = INT_MAX;
+            std::string best_key;
+            for (auto& kv : by_label) {
+                if (next_idx[kv.first] >= kv.second.size()) continue;  // drained
+                if (cnt[kv.first] < best_cnt) {
+                    best_cnt = cnt[kv.first];
+                    best_key = kv.first;
+                }
+            }
+            if (best_key.empty()) break;
+            best = by_label[best_key][next_idx[best_key]++];
+            picked.push_back(best);
+        }
+        for (const auto* p : picked) {
+            selected.push_back(*p);
+            ++selected_per_level[static_cast<size_t>(L)];
+        }
+    }
+    result.tasks = selected;
+    result.tasks_pool_accepted = static_cast<uint64_t>(pool_all.size());
+    result.tasks_quota_accepted = static_cast<uint64_t>(selected.size());
+    result.preflighted = pool_all;
+
+    // ── reasonableness report ──────────────────────────────────────
+    const double avg = selected.empty()
+                           ? 0.0
+                           : static_cast<double>(selected.size()) /
+                                 std::max<size_t>(1, result.scenes.size());
+    std::fprintf(stderr,
+                 "\n[blueprint-scene] ===== scene-level parallel summary =====\n"
+                 "  scenes ok/planned = %zu / %llu   threads = %d\n"
+                 "  candidates = %llu  quick-preflights = %llu  accepted = %zu\n"
+                 "  selected = %zu  (expected %d)   avg/scene = %.2f\n",
+                 result.scenes.size(), static_cast<unsigned long long>(n_scenes),
+                 n_threads, static_cast<unsigned long long>(total_candidates),
+                 static_cast<unsigned long long>(total_preflights),
+                 pool_all.size(), selected.size(), total_target, avg);
+    for (int L = 0; L < levels; ++L) {
+        std::fprintf(stderr, "  level %d: tasks(accepted)=%zu selected=%llu\n",
+                     L, by_level[static_cast<size_t>(L)].size(),
+                     static_cast<unsigned long long>(selected_per_level[static_cast<size_t>(L)]));
+    }
+    std::fprintf(stderr, "  label distribution (pool):");
+    for (const auto& kv : total_labels) {
+        std::fprintf(stderr, " %s=%llu", kv.first.c_str(),
+                     static_cast<unsigned long long>(kv.second));
+    }
+    std::fprintf(stderr, "\n");
+    std::fprintf(stderr, "  segment-label distribution (pool):");
+    for (const auto& kv : total_segment_labels) {
+        std::fprintf(stderr, " %s=%llu", kv.first.c_str(),
+                     static_cast<unsigned long long>(kv.second));
+    }
+    std::fprintf(stderr, "\n");
+    // per-level segment-label distribution (long detours are only
+    // PHYSICALLY producible in scenes with large obstacles).
+    std::vector<std::map<std::string, uint64_t>> seg_by_level(
+        static_cast<size_t>(levels));
+    for (const auto& r : results) {
+        if (r.level >= 0 && r.level < levels) {
+            for (const auto& kv : r.segment_label_counts) {
+                seg_by_level[static_cast<size_t>(r.level)][kv.first] += kv.second;
+            }
+        }
+    }
+    for (int L = 0; L < levels; ++L) {
+        std::fprintf(stderr, "  level %d segment-labels:", L);
+        for (const auto& kv : seg_by_level[static_cast<size_t>(L)]) {
+            std::fprintf(stderr, " %s=%llu", kv.first.c_str(),
+                         static_cast<unsigned long long>(kv.second));
+        }
+        std::fprintf(stderr, "\n");
+    }
+    const bool reached = static_cast<int>(selected.size()) >=
+                         static_cast<int>(0.8 * total_target);
+    std::fprintf(stderr,
+                 "  reasonableness: expected %d -> got %zu (%s)\n",
+                 total_target, selected.size(),
+                 reached ? "reaches the target (>=80%)" : "below 80% of target");
+    if (!reached) {
+        result.warnings.push_back(
+            "scene-level parallel: selected " +
+            std::to_string(selected.size()) + " < 80% of expected " +
+            std::to_string(total_target) +
+            "; increase scenes_per_level / expected_collect_tasks or relax "
+            "placement constraints");
+    }
+
+    result.generation_ok =
+        !selected.empty() &&
+        static_cast<int>(selected.size()) >= std::max(1, cfg_.min_tasks);
+    if (!result.generation_ok) {
+        result.failure_reason = "insufficient selected tasks";
+    }
+    result.generation_rounds = 1;
+    result.timing_ms["scene_level_total_ms"] = msSince(t0);
+    result.timing_ms["total_ms"] = msSince(t0);
     return result;
 }
 
