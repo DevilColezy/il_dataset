@@ -335,6 +335,7 @@ void HierarchicalExpert::apply3DGoalDirections(ExpertStepOutput& out,
         const Vec2d d2(ex - st.position.x(), ey - st.position.y());
         const double dz = ez - z;
         const double d3 = std::sqrt(d2.squaredNorm() + dz * dz);
+        out.goal_distance_raw_m = d3;  // R29r: raw unclipped 3D range
         if (d3 > 1e-9) {
             const Vec2d xy = d2 / d3;  // normalized by the 3D distance
             const double dn = dz / d3;
@@ -361,6 +362,7 @@ void HierarchicalExpert::apply3DGoalDirections(ExpertStepOutput& out,
         const Vec2d to2 = task_.goal - st.position;
         const double dz = flight_z - z;
         const double d3 = std::sqrt(to2.squaredNorm() + dz * dz);
+        out.navigation_goal_distance_raw_m = d3;  // R29r: raw unclipped range
         Vec2d body(1.0, 0.0);
         double dn = 0.0;
         if (d3 > 1e-9) {
@@ -388,6 +390,7 @@ void HierarchicalExpert::apply3DGoalDirections(ExpertStepOutput& out,
         out.goal_direction_flu_z = 0.0;
         out.goal_distance_clipped_m = 0.0;
         out.goal_distance_norm = 0.0;
+        out.goal_distance_raw_m = 0.0;
         out.effective_direction_token =
             EffectiveTargetAdapter(p_).quantizeBearing(0.0);
 
@@ -396,6 +399,7 @@ void HierarchicalExpert::apply3DGoalDirections(ExpertStepOutput& out,
         out.navigation_goal_direction_flu_z = 0.0;
         out.navigation_goal_distance_clipped_m = 0.0;
         out.navigation_goal_distance_norm = 0.0;
+        out.navigation_goal_distance_raw_m = 0.0;
     }
 }
 

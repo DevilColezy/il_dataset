@@ -675,7 +675,11 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
         // Inside the actual FOV the drone can start moving from standstill;
         // the
         // pure-pursuit yaw tracking aligns the nose while driving.
-        const double range = p_.obs_range_m - 0.5 * p_.obs_resolution;
+        // R29r: ray length = obs_range - te_normal_distance_reserve = 4.5 m,
+        // matching the goal_distance_norm saturation point (0.9 = 4.5 m), so
+        // a saturated norm means "target beyond the ray planning range".
+        const double range =
+            p_.obs_range_m - p_.te_normal_distance_reserve_m;
 
         // (1) target OUTSIDE the camera FOV -> NO local plan this tick:
         //     hand straight to the 5 Hz upper planner (macro target
@@ -846,52 +850,45 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                     1e-6, p_.lp_goal_decay_range_m - stop_m);
                 const double goal_decay = clamp(
                     (goal_along_ray - stop_m) / decay_span, 0.0, 1.0);
-                // R29j (macro-waypoint relaxation, user redesign): a macro
+                // R29q (user redesign, "gradual side-slip speed"): a macro
                 // NORMAL_CORRECTION waypoint is a fly-through detour around
                 // a blocker — the velocity direction necessarily deviates
-                // from the nose/goal axis, so the off-nose penalty and the
-                // nose hard-stop must NOT veto it.  Measured
-                // _failed/000006 (single r=2.5 cylinder): the macro could
-                // never issue a working detour waypoint (every candidate
-                // was rejected by the preview because the strict R29h law
-                // gave ~0 m/s sideways / hard-stopped on the nose-facing
-                // blocker), so it spun in TURN_LEFT/TURN_RIGHT forever.
-                // For a macro waypoint keep full cruise along the clear ray
-                // (yaw_decay=1) and fall back to the vmin floor when the
-                // nose faces a blocker instead of stopping.  Original /
-                // terminal targets keep the strict R29h law.  This mirrors
-                // il_2d_multiscale_debug's guidance contract: the macro
-                // picks an observable, reachable, chord-clear detour
-                // waypoint and the 30 Hz layer is expected to fly it
-                // (sideways if needed), not to veto it.
+                // from the nose/goal axis.  R29j previously forced
+                // yaw_decay=1.0 and a vmin floor for these waypoints, which
+                // removed the side-slip speed penalty and truncated the
+                // distance-based deceleration into a hard 0.5 step near the
+                // waypoint.  R29m now guarantees a waypoint even when the
+                // 30 Hz preview rejects every candidate (OBSERVABLE_FRONTIER
+                // fallback), so the preview veto that motivated R29j is no
+                // longer fatal: a macro waypoint uses the SAME gradual law
+                // as any target — cruise · goal_decay(along-ray) ·
+                // yaw_decay(off-nose) — with no vmin floor and no hard stop
+                // (the nose facing the blocker is the normal detour
+                // attitude; the side-slip penalty already slows the
+                // detour).  Original / terminal targets keep the strict
+                // R29h law (vmin floor + nose hard-stop).
                 const bool macro_waypoint = target.flythrough;
                 const double off_nose_deg =
                     std::fabs(rad2deg(ray_b));
                 const double yaw_decay =
-                    macro_waypoint
-                        ? 1.0
-                        : clamp(1.0 - p_.lp_yaw_decay_per_deg * off_nose_deg,
-                                p_.lp_yaw_decay_min, 1.0);
+                    clamp(1.0 - p_.lp_yaw_decay_per_deg * off_nose_deg,
+                          p_.lp_yaw_decay_min, 1.0);
                 double v_des =
                     p_.lp_cruise_speed_mps * goal_decay * yaw_decay;
                 const bool nose_stop =
                     nose_clear <= handoffClearance() + 1e-6;
                 const bool at_goal = dist <= stop_m;
-                if (nose_stop) {
-                    if (macro_waypoint) {
-                        // Detour waypoint: the nose facing the blocker is
-                        // the normal attitude while the body flies along
-                        // the clear side ray — keep the vmin crawl so the
-                        // detour is executable (never a hard stop on a
-                        // macro rescue waypoint).
-                        v_des = std::max(p_.lp_vmin_speed_mps, v_des);
-                    } else {
-                        // Nose points at/into the blocker while it slews to
-                        // the ray: hard stop.  The body no longer creeps
-                        // along the ray into the nose-facing blocker.
-                        v_des = 0.0;
-                    }
-                } else if (!at_goal) {
+                if (nose_stop && !macro_waypoint) {
+                    // Nose points at/into the blocker while it slews to the
+                    // ray: hard stop.  The body no longer creeps along the
+                    // ray into the nose-facing blocker.  A macro waypoint
+                    // skips this (and the vmin floor below): the nose faces
+                    // the blocker in the normal detour attitude and the
+                    // speed is already set by yaw_decay × goal_decay, so
+                    // the detour decelerates GRADUALLY with side-slip and
+                    // distance (R29q).
+                    v_des = 0.0;
+                } else if (!at_goal && !macro_waypoint) {
                     // Keep a minimum forward speed on a clear ray so the
                     // drone never parks beside a blocker (the old half-speed
                     // behaviour is replaced by this floor).
@@ -2718,7 +2715,11 @@ double LocalPlanner30Hz::raySectorSelect(
     const double fov_half = ray_fov_half_ > 1e-6
                                 ? ray_fov_half_
                                 : 0.5 * deg2rad(p_.obs_fov_deg);
-    const double ray_range = p_.obs_range_m - 0.5 * p_.obs_resolution;
+    // R29r: ray length aligned with the goal_distance_norm saturation point
+    // (obs_range 5.0 - te_normal_distance_reserve 0.5 = 4.5 m; norm 0.9 ==
+    // 4.5 m means the target sits at/beyond the ray planning range).
+    const double ray_range =
+        p_.obs_range_m - p_.te_normal_distance_reserve_m;
     const double inflate = handoffClearance();
     const int max_age = p_.lp_planning_history_max_age_ticks;
     const double step = std::max(1e-3, 0.5 * p_.obs_resolution);

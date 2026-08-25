@@ -1088,6 +1088,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readonly("goal_distance_clipped_m",
                       &ExpertStepOutput::goal_distance_clipped_m)
         .def_readonly("goal_distance_norm", &ExpertStepOutput::goal_distance_norm)
+        .def_readonly("goal_distance_raw_m",
+                      &ExpertStepOutput::goal_distance_raw_m)
         .def_readonly("effective_target_source",
                       &ExpertStepOutput::effective_target_source)
         .def_readonly("target_correction_active",
@@ -1183,6 +1185,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                       &ExpertStepOutput::navigation_goal_distance_clipped_m)
         .def_readonly("navigation_goal_distance_norm",
                       &ExpertStepOutput::navigation_goal_distance_norm)
+        .def_readonly("navigation_goal_distance_raw_m",
+                      &ExpertStepOutput::navigation_goal_distance_raw_m)
         .def_readonly("original_navigation_goal_world_x",
                       &ExpertStepOutput::original_navigation_goal_world_x)
         .def_readonly("original_navigation_goal_world_y",

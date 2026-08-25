@@ -2286,6 +2286,7 @@ class JointV2Manager(object):
             "goal_direction_flu_z": float(out.goal_direction_flu_z),
             "goal_distance_clipped_m": float(out.goal_distance_clipped_m),
             "goal_distance_norm": float(out.goal_distance_norm),
+            "goal_distance_raw_m": float(out.goal_distance_raw_m),
             # ── supervision labels (30 Hz) — the ACTUAL sent command ─
             "target_velocity_flu_x": float(final_vel[0]),
             "target_velocity_flu_y": float(final_vel[1]),
@@ -2382,6 +2383,8 @@ class JointV2Manager(object):
                 float(out.navigation_goal_distance_clipped_m),
             "navigation_goal_distance_norm":
                 float(out.navigation_goal_distance_norm),
+            "navigation_goal_distance_raw_m":
+                float(out.navigation_goal_distance_raw_m),
             # ── 5 Hz diagnostics (privileged) ───────────────────────
             "correction_enter_event": int(out.correction_enter_event),
             "correction_exit_event": int(out.correction_exit_event),

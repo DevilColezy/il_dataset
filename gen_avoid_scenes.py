@@ -143,13 +143,15 @@ SCENES = [
         ],
     },
     # R29o: two obstacles forming a NARROW PASSAGE whose surface gap is
-    # exactly 1.2 m (>= the required passable clearance: 2*0.5 handoff +
-    # margin).  The start->goal line must thread the gap, so the drone has
-    # to fly through the tight passage (not around it).
+    # 1.6 m (>= the required passable clearance: 2*0.5 handoff + margin;
+    # widened from 1.2 m because the 5-deg ray grid cannot thread the
+    # ~0.06 m effective corridor of a 1.2 m gap).  The start->goal line
+    # must thread the gap, so the drone has to fly through the passage
+    # (not around it).
     {
         "name": "S_gap",
         "gap": True,
-        "obstacles": [(-1.2, 12.0, 0.60), (1.2, 12.0, 0.60)],
+        "obstacles": [(-1.4, 12.0, 0.60), (1.4, 12.0, 0.60)],
         "tasks": [
             (0.0, 8.0, 0.0, 16.0, "gap_short"),      # straight through the gap
             (0.0, 6.0, 0.0, 18.0, "gap_medium"),     # longer run through the gap

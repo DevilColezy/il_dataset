@@ -55,6 +55,10 @@ struct ExpertStepOutput {
     double goal_direction_flu_z = 0.0;
     double goal_distance_clipped_m = 0.0;
     double goal_distance_norm = 0.0;
+    // R29r: RAW (unclipped) 3D distance to the effective target, so a
+    // downstream re-normalisation never needs to reconstruct the original
+    // range from the clipped/normalised pair.
+    double goal_distance_raw_m = 0.0;
     // Effective target source (PASS_THROUGH / NORMAL_CORRECTION /
     // TURN_LEFT / TURN_RIGHT) — diagnostic only.
     std::string effective_target_source = "PASS_THROUGH";
@@ -151,6 +155,8 @@ struct ExpertStepOutput {
     double navigation_goal_direction_flu_z = 0.0;
     double navigation_goal_distance_clipped_m = 0.0;
     double navigation_goal_distance_norm = 0.0;
+    // R29r: RAW (unclipped) 3D distance to the ORIGINAL navigation goal.
+    double navigation_goal_distance_raw_m = 0.0;
 
     // ── privileged diagnostics (world-frame; never student inputs) ──
     double original_navigation_goal_world_x = 0.0;
