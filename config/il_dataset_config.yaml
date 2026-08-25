@@ -408,7 +408,16 @@ global:
     backend: "flightmare"
     control_mode: "velocity_yaw_rate"
     simulation_hz: 200.0
-    control_hz:     50.0
+    # R29f: velocity loop 50 -> 200 Hz (now equal to the flightlib
+    # simulation rate, so the Python speed loop and the C++ dynamics run
+    # in lock-step).  The velocity controller is the Python-side speed
+    # loop; the attitude/body-rate layer below is flightlib at 200 Hz.
+    # Finer sampling progressively kills the discretisation contribution
+    # to the ~2.2 Hz underdamped limit cycle (constant-command roll amp:
+    # 50 Hz ~9°, 100 Hz ~4.6°, 200 Hz ~3.5°; 300 Hz saturates ~3.1° so
+    # 200 is the sweet spot).  Data contract unchanged: the expert still
+    # emits 30 Hz commands; only the inner execution is finer.
+    control_hz:     200.0
     render_hz:      20.0
     deterministic_time: true
     velocity_controller:
@@ -434,9 +443,27 @@ global:
       # limit cycle (episode af4159ce) was with kp=36, where P saturated on
       # any error > 0.11 m/s; kp=8 keeps 5× the headroom.  VALIDATE on the
       # attitude loop (roll/pitch in the CSV) before pushing further.
+      # R29e trial (2026-08-25) — REVERTED: kp=8→5, kd=1.2→2.0 was tried to
+      # kill a measured ~2.2 Hz underdamped limit cycle, but REAL collection
+      # got WORSE: with a constant 0.6 m/s command + small yaw rate the
+      # attitude oscillated pitch ±10.7° / roll ±15° (baseline was ±3.5° /
+      # ±9°).  The offline speed-amplitude probe (spdAmp 0.159, apparently
+      # "best") did NOT capture attitude — slower kp adds phase lag under
+      # yaw + varying commands and amplifies the roll/pitch swing.  Keep
+      # the verified kp=8/kd=1.2 baseline; further work should target the
+      # derivative measurement noise (low-pass the 50 Hz velocity
+      # difference in il_dynamics.py) or the 50 Hz velocity-loop rate, not
+      # the PD gains.
       kp_velocity: [8.0, 8.0, 8.0]
       ki_velocity: [0.0, 0.0, 0.0]
       kd_velocity: [1.2, 1.2, 1.2]
+      # R29f trial — REVERTED to 0: a derivative low-pass (tau=0.05) made
+      # things WORSE (roll amp 4.6° -> 15.4°, tracking 0.600 -> 0.577) —
+      # the D term provides the damping, so low-passing it removes damping.
+      # The effective fix is the velocity-loop rate: control_hz 50 -> 100
+      # alone cut the constant-command oscillation (spd amp 0.159 -> 0.051,
+      # roll amp ~9° -> 4.6°).  Keep 0 to disable the filter.
+      derivative_filter_tau_s: 0.0
       maximum_acceleration_mps2: [4.0, 4.0, 2.0]
       maximum_tilt_deg: 35.0
       maximum_yaw_rate_rps: 1.5
@@ -449,6 +476,12 @@ global:
       # Full yaw rate is still clipped to maximum_yaw_rate_rps.
       maximum_yaw_acceleration_rps2: 8.0
       attitude_gain: 6.0
+      # R29g: angular-rate damping on the attitude loop (rotorS / RPG style
+      # rate controller — their dedicated rate loop uses gains 0.1..0.52).
+      # body_rates = -att_gain*att_error - ang_rate_gain*omega adds the
+      # measured body-rate term that damps the ~2 Hz roll/pitch ring;
+      # flightlib has no separate rate controller.  0 disables.
+      angular_rate_gain: 0.5
       maximum_body_rate_rps: 6.0
       integrator_limit: [1.0, 1.0, 0.5]
     reset:
@@ -504,8 +537,21 @@ global:
       dt: 0.1
 
       # ── 3. kinematic limits ──────────────────────────────────────
-      max_speed: 3.0
+      # Max speed cap = desired cruise (user: 2.0).  The command can never
+      # exceed this (reachableCommand hard cap), and raySectorSpeed /
+      # planFovTrajectory use min(cruise, max_speed) = 2.0 throughout.
+      max_speed: 2.0
       cruise_speed_mps: 2.0      # desired cruise for FOV-boundary planning
+      # ── R29h: simplified speed law ──────────────────────────────
+      # v_des = cruise · goal_decay(goal_along_ray) · yaw_decay(|ray_b|)
+      #   goal_decay: linear to 0 at the capture radius (stop AT the point)
+      #   yaw_decay: slower the more the velocity deviates from the nose
+      #   min lp_vmin_speed_mps while progressing on a clear ray
+      #   nose_clear ≤ handoff (0.5) → hard stop; no-solution/out-of-FOV → 0
+      goal_decay_range_m: 2.0    # full speed beyond this goal projection
+      vmin_speed_mps: 0.5        # min forward speed on a clear ray
+      yaw_decay_per_deg: 0.0111  # 45° off-nose → ×0.5
+      yaw_decay_min: 0.5         # yaw-decay floor
       # Command-ramp limit for reachableCommand (m/s^2).  The executable
       # command changes by at most max_accel*dt per tick, and with the
       # command-ramp feedforward this is ALSO the achieved acceleration.
@@ -612,6 +658,16 @@ global:
     corrector:
       observable_frontier_min_distance_m: 1.5
       observable_frontier_min_progress_m: 0.5
+      # R29k: only re-acquire the original goal via search rotation when its
+      # bearing has no OBSERVED OCCUPIED cell within this range (UNKNOWN is
+      # passable).  A blocker directly on it → keep the locked bypass side.
+      goal_direction_min_range_m: 2.0
+      # R29l: a fresh 5 Hz waypoint candidate must beat the held waypoint by
+      # this along-goal progress (m) before it is adopted (anti-jitter).
+      waypoint_update_along_margin: 0.3
+      # R29m: SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL cooldown (5 Hz updates);
+      # prevents depth-evidence flips from oscillating the turn direction.
+      search_rotation_cooldown_5hz: 12
       observable_unknown_margin_cells: 3
       side_evidence_margin: 0.5
       evidence_ray_step_deg: 1.0

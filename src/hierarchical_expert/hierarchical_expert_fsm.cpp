@@ -132,6 +132,7 @@ LocalPlanningAssessment HierarchicalExpertFsm::assessDirectiveTarget(
     assessment.plan_valid = preview.plan_valid;
     assessment.progress_qualified = preview.progress_qualified;
     assessment.local_corridor_blocked = preview.local_corridor_blocked;
+    assessment.nose_blocked_stop = preview.nose_blocked_stop;
     assessment.planner_status = preview.planner_status;
     assessment.failure_reason = preview.failure_reason;
 
@@ -173,8 +174,12 @@ void HierarchicalExpertFsm::updateFailureBookkeeping(
     const FsmStepOutput& out, const FsmInput& in) {
     // The 5 Hz corrector consumes this actual 30 Hz execution history.  A
     // cold preview miss alone never authorizes macro takeover.
+    // R29i: "too close to an obstacle" — the R29h nose-blocked hard stop —
+    // is failure evidence (the macro must rescue), same as an observed
+    // corridor block.
     const bool blocked =
-        out.local.failure_reason == FailureReason::BLOCKED_BY_OBSERVED_OBSTACLE;
+        out.local.failure_reason == FailureReason::BLOCKED_BY_OBSERVED_OBSTACLE ||
+        out.local.nose_blocked_stop;
     // R28h (P0#4 refined): a SAFE_HOLD is benign while TRANSIENT — a brief
     // replan wait, a pre-rotation brake, or an already-safe motion state.
     // Counting every hold frame inflated consecutive_failures_ and drove
@@ -442,9 +447,20 @@ FsmStepOutput HierarchicalExpertFsm::step(const FsmInput& in) {
         // the topology is genuinely blocked; together with persistent real
         // failures this is the sustained large-scale evidence the upper
         // layer must see before taking over.
+        //
+        // R29 (single-mode expert): the 30 Hz local planner NEVER rotates
+        // by itself — a target outside the physical FOV is an immediate
+        // NO_SAFE_CANDIDATE handoff.  "Goal outside FOV" is therefore
+        // takeover evidence on its own, even with a geometrically clear
+        // corridor (measured deadlock joint_v2_000000: local
+        // NO_SAFE_CANDIDATE + macro PASS_THROUGH forever, drone parked).
+        // R29i: a nose-blocked hard stop (too close to an obstacle) is also
+        // unambiguous "local cannot proceed" evidence on its own.
         const bool topology_evidence_ready =
             has_last_local_result_ &&
-            last_local_result_.local_corridor_blocked;
+            (last_local_result_.local_corridor_blocked ||
+             last_local_result_.nose_blocked_stop ||
+             assessment.target_outside_fov);
         assessment.takeover_confirmed =
             persistent_failure && topology_evidence_ready &&
             !dynamic_braking_only;

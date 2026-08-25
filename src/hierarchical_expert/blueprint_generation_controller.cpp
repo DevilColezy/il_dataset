@@ -2012,6 +2012,7 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
         for (const auto& kv : segmenter.labelCounts()) {
             task_seg[kv.first] += kv.second;
         }
+        task.segment_label_counts = task_seg;
         // Quick preflight acceptance is RELAXED: the reduced tick budget is
         // far too short to physically reach the goal (tasks span 4..28 m),
         // so "reached the goal" would reject everything.  A candidate is

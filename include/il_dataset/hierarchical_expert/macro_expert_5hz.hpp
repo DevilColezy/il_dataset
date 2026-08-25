@@ -144,6 +144,12 @@ private:
     double freeRangeAlong(const PlanarState& state,
                           const LocalObservation& obs,
                           double bearing_body) const;
+    // R29k: distance along a world bearing to the first OBSERVED OCCUPIED
+    // cell (UNKNOWN is passable).  Used to gate SEARCH_ROTATION_TOWARD_ORIG
+    // INAL_GOAL on the goal bearing not being blocked.
+    double occupiedRangeAlongFrom(const LocalObservation& obs,
+                                  const Vec2d& from, double bearing_world,
+                                  double max_range) const;
 
     bool extractBlocker(const PlanarState& state, const Vec2d& goal,
                         const LocalObservation& patch,
@@ -200,6 +206,11 @@ private:
     double search_swept_rad_ = 0.0;
     double last_search_yaw_ = 0.0;
     bool has_last_search_yaw_ = false;
+    // R29m: monotonic update counter + last SEARCH_ROTATION_TOWARD_ORIGINAL
+    // _GOAL update, used to cooldown that re-acquisition so depth evidence
+    // flips cannot oscillate the turn direction every boundary.
+    uint64_t update_count_ = 0;
+    uint64_t last_search_rotation_update_ = 0;
     // ── R24 brake-before-search latch ──────────────────────────────
     // A zero-distance brake is a TERMINAL semantic decided once at 5 Hz.
     // The world point is latched at first issue and held FIXED (never

@@ -341,12 +341,34 @@ struct Params2D {
     // ── local planner (30 Hz) ──────────────────────────────────────
     double lp_horizon_s = 4.0;
     double lp_dt = 0.1;
-    double lp_max_speed = 3.0;
+    // Max speed cap (m/s).  Set equal to the desired cruise speed (2.0) so
+    // the command can never exceed the validated cruise level — the
+    // reachableCommand hard cap and every min(cruise, max_speed) now agree.
+    double lp_max_speed = 2.0;
     // Desired cruise speed for the FOV-boundary planner (m/s).  The boundary
     // subgoal is driven at this speed ("末点速度最高可达期望速度") and the
     // terminal approach caps at it.  Lower than lp_max_speed for smoother,
     // more conservative flight (user: 2 m/s).
     double lp_cruise_speed_mps = 2.0;
+    // ── R29h: simplified speed law for the ray sector (user redesign) ──
+    //   v_des = cruise · goal_decay(goal_along_ray) · yaw_decay(|ray_b|)
+    //   goal_decay: linear 1.0 → 0 as the goal's projection along the ray
+    //     drops from lp_goal_decay_range_m to the capture radius — the
+    //     closer to the point, the slower, stop AT it (velocity 0).
+    //   yaw_decay: 1.0 when the velocity runs along the nose, falling to
+    //     lp_yaw_decay_min the more the velocity direction deviates from
+    //     the nose (sideways flight is slower), never below
+    //     lp_vmin_speed_mps while still progressing on a clear ray.
+    //   Nose at/into a blocker (nose_clear ≤ handoffClearance) → HARD STOP
+    //     (velocity 0); the yaw intent keeps slewing so flight resumes once
+    //     the nose clears.  Lost target / every ray blocked / target out of
+    //     FOV → 0 via the existing hand-off branches.
+    //   Replaces the old √(2·a·clearance) raySectorSpeed law + avoid_scale
+    //     + nose-halving (R29c).
+    double lp_goal_decay_range_m = 2.0;   // full speed beyond this projection
+    double lp_vmin_speed_mps = 0.5;       // min forward speed on a clear ray
+    double lp_yaw_decay_per_deg = 0.0111; // 45° off-nose → ×0.5
+    double lp_yaw_decay_min = 0.5;        // yaw-decay floor
     // R26: inside this distance to a TERMINAL target (in FOV, hard-clear
     // straight path) the planner skips the B-spline and drives the
     // proportional terminal controller directly.  Bridges the 0.4-0.8 m
@@ -448,6 +470,11 @@ struct Params2D {
     double lp_turn_exit_deg = 8.0;
     double lp_turn_exit_max_yaw_rate = 0.15;
     double lp_turn_k = 2.5;
+    // R29c: EMA weight for the ray-sector yaw intent (1.0 = no smoothing,
+    // smaller = smoother heading but slower response).  0.35 eases a 5°
+    // ray-switch step over ~3-4 ticks while a sustained goal-regaining
+    // turn still converges.
+    double lp_yaw_smooth_alpha = 0.35;
     // R28c: the local planner must NOT produce big lateral detours — that is
     // the UPPER planner's job (it places bypass waypoints around large
     // blockers).  A selected plan whose endpoint direction deviates from the
@@ -481,6 +508,26 @@ struct Params2D {
     // ── 5 Hz local corrector (visibility judge + target corrector) ──
     double macro_observable_frontier_min_distance_m = 1.5;
     double macro_observable_frontier_min_progress_m = 0.5;
+    // R29k: SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL only re-acquires the
+    // original goal when the goal bearing is traversable — a continuous
+    // FREE run along it of at least this range (m).  When the goal sits
+    // behind the blocker (occluded / UNKNOWN), pulling the nose back to it
+    // just yaws the drone back and forth across the blocked bearing
+    // (measured _failed/000006_02cac96b: TURN_LEFT↔TURN_RIGHT, zero
+    // displacement); the corrector keeps the LOCKED bypass side instead.
+    double macro_goal_direction_min_range_m = 2.0;
+    // R29l: minimum along-goal progress a fresh 5 Hz waypoint candidate
+    // must beat the currently held waypoint by (m) before it is adopted.
+    // A margin prevents preview noise from jittering the waypoint every
+    // boundary while still letting a nearer detour exit take over.
+    double macro_waypoint_update_along_margin = 0.3;
+    // R29m: SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL cooldown (in 5 Hz
+    // corrector updates).  After the corrector pulled the nose toward the
+    // (possibly occluded) original goal once, it must not immediately
+    // re-pull when depth-derived corridor/clearance evidence flips — that
+    // caused the TURN_LEFT↔TURN_RIGHT oscillation (_failed/000006).  During
+    // the cooldown the corrector keeps the LOCKED bypass side.
+    uint32_t macro_search_rotation_cooldown_5hz = 12;
     int    macro_observable_unknown_margin_cells = 3;
     double macro_side_evidence_margin = 0.5;
     double macro_evidence_ray_step_deg = 1.0;
@@ -871,6 +918,13 @@ struct PlannerResult {
     double handoff_clearance_m = std::numeric_limits<double>::quiet_NaN();
     bool dynamic_clearance_blocked = false;
     bool local_limit_cycle_detected = false;
+    // R29i: the R29h speed law hard-stopped because the NOSE points at/into
+    // an observed blocker (nose_clear <= handoffClearance).  A clear ray may
+    // still exist, so this is NOT a corridor block — but it IS "too close to
+    // an obstacle to proceed", and it must accumulate failure evidence so
+    // the 5 Hz macro takes over and rescues (replan to the original goal /
+    // pure rotation around the blocker) instead of parking forever.
+    bool nose_blocked_stop = false;
     uint32_t dynamic_window_candidate_count = 0;
     uint32_t reject_not_known_free = 0;
     uint32_t reject_outside_current_fov = 0;
@@ -1008,6 +1062,11 @@ struct LocalPlanningAssessment {
     bool plan_valid = false;
     bool progress_qualified = false;
     bool local_corridor_blocked = false;
+    // R29i: the local speed law hard-stopped because the nose faces an
+    // observed blocker (see PlannerResult::nose_blocked_stop).  Carried
+    // through the 5 Hz assessment so the macro treats it as takeover
+    // evidence ("too close to an obstacle") and issues the rescue directive.
+    bool nose_blocked_stop = false;
     bool live_original_plan_usable = false;
     bool takeover_confirmed = false;
     PlannerStatus planner_status = PlannerStatus::NO_SAFE_CANDIDATE;

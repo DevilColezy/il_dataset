@@ -38,7 +38,16 @@ global:
   # Manifest / dataset output directory.  NOTE: this was hard-coded to a
   # path on the OTHER machine (/home/devil/...) and must be writable by the
   # current user — adjust to your machine (e.g. ~/flightmare_ws/il_data_joint_v2).
-  output_dir: "/home/rgzn/flightmare_ws/src/il_dataset/dataset/il_data_joint_v2"
+  output_dir: "/home/rgzn/flightmare_ws/il_data_joint_v2"
+
+  # ── Scene-switch render alignment (R29d) ─────────────────────────
+  # After switching the Unity scene, wait settle_time_s for the new layout
+  # to load, then keep requesting + confirming a warm-up render frame until
+  # it matches (bounded by warmup_budget_s) so the first episode never
+  # starts with an un-aligned render pipeline (unmatched_render_rate).
+  scene_runtime:
+    settle_time_s: 8.0
+    warmup_budget_s: 15.0
 
   scene_generation:
     seed: 260812
@@ -299,8 +308,31 @@ global:
       limit_cycle_goal_progress_m: 0.1
       limit_cycle_window_5hz: 15
       takeover_confirm_ticks_30hz: 12
+      # R29k: only re-acquire the original goal via search rotation when its
+      # bearing has no OBSERVED OCCUPIED cell within this range (UNKNOWN is
+      # passable).  A blocker directly on it → keep the locked bypass side.
+      goal_direction_min_range_m: 2.0
+      # R29l: a fresh 5 Hz waypoint candidate must beat the held waypoint by
+      # this along-goal progress (m) before it is adopted (anti-jitter).
+      waypoint_update_along_margin: 0.3
+      # R29m: SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL cooldown (5 Hz updates);
+      # prevents depth-evidence flips from oscillating the turn direction.
+      search_rotation_cooldown_5hz: 12
     local_planner:
       max_yaw_rate: 1.5
+      # ── R29h: simplified speed law (v_des = cruise·goal_decay·yaw_decay) ──
+      # goal_decay: linear to 0 at the capture radius (stop AT the point).
+      # yaw_decay: slower the more the velocity deviates from the nose.
+      # min lp_vmin_speed_mps while progressing; nose_clear ≤ handoff → 0.
+      goal_decay_range_m: 2.0    # full speed beyond this goal projection
+      vmin_speed_mps: 0.5        # min forward speed on a clear ray
+      yaw_decay_per_deg: 0.0111  # 45° off-nose → ×0.5
+      yaw_decay_min: 0.5         # yaw-decay floor
+      # R29c: EMA weight for the ray-sector yaw intent (1.0 = no smoothing;
+      # smaller = smoother heading, slower response).  Smooths the nose
+      # against neighbouring-ray switches; the velocity stays on the clear
+      # ray so avoidance response is unaffected.
+      yaw_smooth_alpha: 0.35
       # R28c: raised from 4.0 so the drone can follow a freshly re-planned
       # trajectory quickly (reverse a full-rate turn in ~0.3 s, not ~0.6 s).
       max_yaw_accel: 8.0

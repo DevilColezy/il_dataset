@@ -1098,8 +1098,21 @@ class JointV2Manager(object):
         # (frame_retries_exceeded / all attempts unmatched).  Actively
         # request one frame and confirm a matching response before the
         # episode starts; the warm-up frame is discarded.
+        #
+        # R29d: keep retrying until a matching frame actually arrives
+        # (bounded by a total warm-up budget, small pause between attempts)
+        # instead of giving up after 3 quick tries — a fresh scene's first
+        # render often needs longer, and starting the first episode before
+        # the render pipeline is aligned reliably trips
+        # unmatched_render_rate (measured: first episode of a new scene at
+        # ~9% unmatched, 3/33, even though the 8 s settle had run).
         warm_ok = False
-        for _ in range(3):
+        warmup_budget_s = float(self._g.get("scene_runtime", {}).get(
+            "warmup_budget_s", 15.0))
+        warmup_deadline = time.time() + max(1.0, warmup_budget_s)
+        warm_attempts = 0
+        while time.time() < warmup_deadline and not warm_ok:
+            warm_attempts += 1
             warm_id = self._next_frame_id
             self._next_frame_id += 1
             self._bridge.send_pose(self._pose_message(
@@ -1108,11 +1121,15 @@ class JointV2Manager(object):
             if m is not None:
                 warm_ok = True
                 break
+            # Brief pause before retrying so Unity can finish the (slow)
+            # first render of the freshly loaded scene.
+            rospy.sleep(0.5)
         if not warm_ok:
             rospy.logwarn(
                 "[Manager] scene %d: warm-up render did not return a "
-                "matching frame within the warm-up budget; the first "
-                "episode of this scene may be rejected", int(scene.scene_id))
+                "matching frame within the warm-up budget (%.1f s, %d "
+                "attempts); the first episode of this scene may be rejected",
+                int(scene.scene_id), warmup_budget_s, warm_attempts)
         if retired:
             rospy.loginfo("[Manager] scene %d: retired %d stale objects",
                           int(scene.scene_id), retired)
@@ -2530,6 +2547,7 @@ def main():
         dry_run=dry_run,
         manifest_file=manifest_file)
     interrupted = False
+    failed = False
     try:
         manager.run()
     except rospy.ROSInterruptException:
@@ -2539,6 +2557,9 @@ def main():
         # raw Ctrl-C during early init can still surface as
         # KeyboardInterrupt; treat it identically.
         interrupted = True
+    except Exception:
+        # Real failure: let the traceback propagate so roslaunch reports it.
+        failed = True
     finally:
         # Individual guards: one resource failing to close must never mask
         # the other.
@@ -2552,15 +2573,16 @@ def main():
                 manager._dynamics.close()
         except Exception:
             pass
-        if interrupted:
-            # Hard-exit on Ctrl-C: skip the interpreter's atexit / pybind
-            # static-destructor phase.  Real collections aborted by Ctrl-C
-            # used to die with SIGABRT (roslaunch reports return value -6)
-            # during that phase (flightlib / zmq static teardown).
-            # os._exit(0) is clean: every dataset file is already
-            # flushed/closed by the writer, and the OS reclaims the ZMQ
-            # sockets / shared libs on process exit.  Non-interrupt errors
-            # still propagate normally so failures are never masked.
+        if interrupted or not failed:
+            # Interrupted OR clean completion: hard-exit, skipping the
+            # interpreter's atexit / pybind static-destructor phase.  Clean
+            # completion ALSO used to crash there ("double free or
+            # corruption (out)", exit -6) because the flightlib / zmq /
+            # expert static teardown corrupts the heap during interpreter
+            # shutdown.  os._exit(0) is clean: every dataset file is
+            # already flushed/closed by the writer, and the OS reclaims the
+            # ZMQ sockets / shared libs on process exit.  Real failures
+            # still propagate normally so they are never masked.
             os._exit(0)
 
 

@@ -154,11 +154,22 @@ class FlightmareDynamicsBackend(DynamicsBackend):
                 .format(e))
 
         # Controller state
+        self._deriv_tau = float(
+            vc_cfg.get("derivative_filter_tau_s", 0.0))
         self._controller = VelocityYawRateController(
             self._kp_vel, self._ki_vel, self._kd_vel,
             self._max_accel, self._max_tilt_deg, self._max_yaw_rate,
-            self._integrator_limit)
+            self._integrator_limit, self._deriv_tau)
         self._attitude_gain = float(vc_cfg.get("attitude_gain", 6.0))
+        # R29g: angular-rate damping on the attitude loop (rotorS / RPG
+        # style).  body_rates = -att_gain*att_error - ang_rate_gain*omega:
+        # the D-on-body-rate term adds the missing rate damping that their
+        # dedicated rate controllers (rotorS rate_controller, rpg
+        # body_rates_p 0.1..0.52) provide — without it the attitude error
+        # is mapped straight to a body-rate command and the loop rings at
+        # ~2 Hz.  0 disables.
+        self._angular_rate_gain = float(
+            vc_cfg.get("angular_rate_gain", 0.5))
         self._max_body_rate = float(vc_cfg.get("maximum_body_rate_rps", 6.0))
         self._last_state = None
         self._commanded_yaw_rate = 0.0
@@ -340,6 +351,8 @@ class FlightmareDynamicsBackend(DynamicsBackend):
         raw = np.asarray(self._quad_dynamics.state(), dtype=np.float64)
         q_wxyz = raw[4:8]
         yaw = self._yaw_from_wxyz(q_wxyz)
+        # body angular velocity (QuadState OME at x[10:13] -> raw[11:14])
+        omega_body = raw[11:14]
 
         rotation = self._rotation_from_wxyz(q_wxyz)
         accel_world = rotation.dot(body_flu_to_flightlib_body(accel_flu))
@@ -360,7 +373,12 @@ class FlightmareDynamicsBackend(DynamicsBackend):
             desired_rotation.T.dot(rotation) - rotation.T.dot(desired_rotation))
         attitude_error = np.array([
             error_matrix[2, 1], error_matrix[0, 2], error_matrix[1, 0]])
-        body_rates = -self._attitude_gain * attitude_error
+        # R29g: angular-rate damping (rotorS / RPG style rate loop).
+        # body_rates = -att_gain*attitude_error - ang_rate_gain*omega:
+        # the measured body-rate term damps the roll/pitch ring without a
+        # separate rate controller in flightlib.
+        body_rates = (-self._attitude_gain * attitude_error -
+                      self._angular_rate_gain * omega_body)
         body_rates[2] += float(np.clip(
             yaw_rate, -self._max_yaw_rate, self._max_yaw_rate))
         body_rates = np.clip(body_rates, -self._max_body_rate, self._max_body_rate)
@@ -382,7 +400,7 @@ class VelocityYawRateController:
     """
 
     def __init__(self, kp, ki, kd, max_accel, max_tilt_deg, max_yaw_rate,
-                 integrator_limit):
+                 integrator_limit, deriv_tau=0.0):
         self._kp = np.asarray(kp, dtype=np.float64)
         self._ki = np.asarray(ki, dtype=np.float64)
         self._kd = np.asarray(kd, dtype=np.float64)
@@ -390,17 +408,26 @@ class VelocityYawRateController:
         self._max_tilt_rad = math.radians(max_tilt_deg)
         self._max_yaw_rate = float(max_yaw_rate)
         self._int_limit = np.asarray(integrator_limit, dtype=np.float64)
+        # R29f: first-order low-pass time constant (s) for the derivative
+        # term.  0 disables filtering.  kd acts on a measured-velocity
+        # difference (control_hz), which is noisy; the noise pumps the
+        # attitude loop and contributes to the ~2.2 Hz roll/pitch limit
+        # cycle.  A tau ~ 0.05 s (cut-off ~3 Hz) keeps real damping while
+        # removing the high-frequency measurement noise.
+        self._deriv_tau = float(deriv_tau)
 
         self._integrator = np.zeros(3, dtype=np.float64)
         self._prev_velocity_world = None
         self._prev_desired_vel_flu = None
         self._prev_command_flu = None
+        self._deriv_filtered = None
 
     def reset(self):
         self._integrator = np.zeros(3, dtype=np.float64)
         self._prev_velocity_world = None
         self._prev_desired_vel_flu = None
         self._prev_command_flu = None
+        self._deriv_filtered = None
 
     def begin_velocity_command(self, desired_vel_flu, duration_s):
         """Feedforward for one piecewise-constant velocity command interval.
@@ -492,18 +519,31 @@ class VelocityYawRateController:
         current_velocity_world = np.asarray(
             current_vel_world, dtype=np.float64)
         if self._prev_velocity_world is None:
-            derivative = np.zeros(3, dtype=np.float64)
+            derivative_raw = np.zeros(3, dtype=np.float64)
         else:
             measured_acceleration_world = (
                 current_velocity_world - self._prev_velocity_world) / max(
                     dt, 1e-9)
-            derivative = -(
+            derivative_raw = -(
                 world_vector_to_body_flu_quat(
                     measured_acceleration_world,
                     current_quaternion_xyzw)
                 if current_quaternion_xyzw is not None else
                 world_vector_to_body_flu(
                     measured_acceleration_world, current_yaw))
+        # R29f: first-order low-pass on the derivative term (alpha =
+        # dt/(tau+dt)).  Without it the D term amplifies the noisy
+        # measured-velocity difference and pumps the attitude loop.
+        if self._deriv_tau > 0.0:
+            alpha = max(dt, 1e-6) / (self._deriv_tau + max(dt, 1e-6))
+            if self._deriv_filtered is None:
+                derivative = derivative_raw
+            else:
+                derivative = (alpha * derivative_raw +
+                              (1.0 - alpha) * self._deriv_filtered)
+            self._deriv_filtered = derivative.copy()
+        else:
+            derivative = derivative_raw
         self._prev_velocity_world = current_velocity_world.copy()
 
         # PID + feedforward

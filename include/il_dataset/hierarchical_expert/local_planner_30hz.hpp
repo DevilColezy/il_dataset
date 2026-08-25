@@ -36,6 +36,8 @@ struct PreviewResult {
     bool progress_qualified = false;
     bool local_corridor_blocked = false;
     bool avoidance_active = false;
+    // R29i: nose-blocked hard stop (see PlannerResult::nose_blocked_stop).
+    bool nose_blocked_stop = false;
     double selected_output_speed_mps = 0.0;
     double min_observed_clearance_m =
         std::numeric_limits<double>::infinity();
@@ -84,6 +86,11 @@ private:
         // Temporary macro waypoints carry explicit internal fly-through
         // semantics even when their remaining distance falls below it.
         bool terminal = false;
+        // R29j: macro NORMAL_CORRECTION detour waypoint flag (from
+        // PlanarTarget::flythrough).  The R29h speed law is relaxed for
+        // these: off-nose flight is expected (sideways detour) and a
+        // nose-facing blocker is not a hard stop.
+        bool flythrough = false;
     };
 
     ResolvedPlanarTarget resolveTarget(const PlanarState& state,
@@ -119,12 +126,14 @@ private:
     /// OCCUPIED cell centre (= drone radius 0.3 + cell 0.1).  No ESDF
     /// geometric envelope — lp_min_clearance is the common static base for
     /// every planner (EGO, straight ray, A*).
-    double handoffClearance() const {
-        // Keep a small cell-discretisation buffer between the vehicle and an
-        // occupied-cell centre; the truth audit is continuous geometry.
-        return p_.lp_min_clearance +
-               std::max(0.0, p_.lp_clearance_discretization_margin_m);
-    }
+    /// UNIFIED minimum clearance (USER DIRECTIVE 2026-08-24): every
+    /// planner/judge clearance is a single 0.5 m value measured from an
+    /// occupied-cell centre (drone radius 0.3 + cell 0.1 + 0.1 safety) —
+    /// the SAME threshold for ray blocking, trajectory validation, the
+    /// speed brake, the hand-off-to-upper-planner gate and the EGO config.
+    /// No per-planner clearance tuning.
+    static constexpr double kMinClearanceM = 0.5;
+    double handoffClearance() const { return kMinClearanceM; }
 
     /// Required centre-to-cell clearance: static handoff robustness plus
     /// one observation reaction interval and the physical stopping distance.
@@ -308,6 +317,37 @@ private:
                              const LocalObservation& obs,
                              const Vec2d& world_direction,
                              double distance_m) const;
+    /// ── RAY-SECTOR SELECTION (user redesign) ─────────────────────
+    /// Cast `kRays` rays every 5° across the camera FOV from the current
+    /// pose, each to (obs_range_m - 0.5) m.  A ray is BLOCKED when any
+    /// sampled point has an observed OCCUPIED cell centre within
+    /// handoffClearance() (the same clearance the trajectory validators
+    /// use, so a chosen ray always passes the executed spline's hard gate).
+    /// Selection (per user design):
+    ///   1. start at the ray whose bearing is CLOSEST to the target
+    ///      bearing; if clear, choose it;
+    ///   2. if blocked, expand outward in PAIRS (one step each side);
+    ///      one clear side -> choose that ray; BOTH clear -> choose the
+    ///      RIGHT one (smaller bearing), unless a committed side is active
+    ///      (last_plan_side_ hysteresis) in which case that side wins;
+    ///   3. both blocked -> keep expanding; when one side is exhausted
+    ///      only the other side advances;
+    ///   4. every ray blocked -> return NaN (the upper planner must take
+    ///      over: macro correction or pure rotation).
+    /// `clear_range` returns the free distance along the chosen ray (to the
+    /// first blocking cell); `nose_clear` returns the free distance along
+    /// the CURRENT NOSE direction (yaw) — the executed body still flies
+    /// along the nose while the yaw slews to the chosen ray, so the speed
+    /// must brake against the nose clearance, not only the ray clearance.
+    /// Returns the chosen ray bearing RELATIVE to yaw, or NaN when all rays
+    /// are blocked.
+    double raySectorSelect(const PlanarState& state,
+                           const LocalObservation& obs, double b_t,
+                           double& clear_range, double& nose_clear) const;
+    /// Speed along the chosen ray: braking-feasible against the observed
+    /// free range (v = sqrt(2·a·(clear_range − handoffClearance))), capped
+    /// by cruise.  Zero when the free range barely exceeds the clearance.
+    double raySectorSpeed(double clear_range) const;
     double stoppingDistance(const PlanarState& state) const;
     bool spaceToStop(const PlanarState& state, const LocalObservation& obs,
                      double dist) const;
@@ -355,6 +395,20 @@ private:
     // that becomes genuinely infeasible may still be abandoned afterwards.
     uint64_t side_commit_until_tick_ = 0;
     uint32_t direct_clear_ticks_ = 0;
+    // ── R29c yaw-intent EMA (ray-sector smoothing) ──────────────────
+    // Last smoothed yaw intent, so neighbouring-ray switches (avg_b steps)
+    // ease the nose instead of jerking it at 30 Hz while the velocity stays
+    // on the clear ray.  Cleared per task; updated only on the mutate path.
+    double last_yaw_intent_ = 0.0;
+    bool has_last_yaw_intent_ = false;
+    // ── Ray-sector FOV shrink (user directive) ────────────────────
+    // When the drone is STUCK repeatedly selecting the OUTERMOST ray with
+    // no progress, shrink the ray FOV half-angle (e.g. 45° -> 40°) so the
+    // sector excludes the edge and the "no solution" hand-off to the upper
+    // planner fires sooner, instead of parking on the edge ray.  0 means
+    // "use the default obs_fov/2".  Eased back open once progress resumes.
+    double ray_fov_half_ = 0.0;  // rad; 0 = default (obs_fov_deg / 2)
+    uint32_t edge_stuck_ticks_ = 0;
     // ── R25 limit-cycle / stagnation detector (mutate path only) ──
     // Sliding window over the distance/bearing to the EFFECTIVE target and
     // the blocked-frame ratio.  When the target is not being approached and

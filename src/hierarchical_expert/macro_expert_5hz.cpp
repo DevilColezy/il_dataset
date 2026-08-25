@@ -138,6 +138,28 @@ double VisibilityTargetCorrector::freeRangeAlong(
     return freeRangeAlongFrom(obs, state.position, state.yaw + bearing_body);
 }
 
+/// Distance along a world bearing to the FIRST observed OCCUPIED cell
+/// (UNKNOWN is PASSABLE — the R29 contract).  Returns max_range when no
+/// occupied cell is met.  Unlike freeRangeAlongFrom (which stops on any
+/// non-FREE cell), this ignores UNKNOWN, so a bearing that is merely
+/// outside the current FOV does not look blocked.
+double VisibilityTargetCorrector::occupiedRangeAlongFrom(
+    const LocalObservation& obs, const Vec2d& from,
+    double bearing_world, double max_range) const {
+    if (!obs.valid() || max_range <= 0.0) return max_range;
+    const Vec2d dir(std::cos(bearing_world), std::sin(bearing_world));
+    const double step = obs.resolution * 0.5;
+    double range = max_range;
+    for (double d = step; d <= max_range + 1e-9; d += step) {
+        const Vec2d p = from + dir * d;
+        if (obs.atWorld(p.x(), p.y()) == CellState::OCCUPIED) {
+            range = d;
+            break;
+        }
+    }
+    return range;
+}
+
 bool VisibilityTargetCorrector::extractBlocker(
     const PlanarState& state, const Vec2d& goal,
     const LocalObservation& patch, double& blocker_min_along,
@@ -569,17 +591,22 @@ TargetCorrectionDirective VisibilityTargetCorrector::makeCorrectionDirective(
                   return a.dist > b.dist;
               });
 
-    // Keep the previous FIXED world waypoint until it is reached or becomes
-    // locally unusable.  Never extrapolate it from the live pose: doing so
-    // turns a finite waypoint into an endless ray and destroys mission-goal
-    // convergence.  Fly-through semantics are carried internally by
-    // PlanarTarget::flythrough, independently of its remaining distance.
+    // R29l (user redesign): re-sample every 5 Hz and adopt a BETTER
+    // candidate, but stay on a currently executing waypoint unless the
+    // fresh sample is clearly better (more progress along the goal axis)
+    // or the held waypoint is no longer executable.  This keeps the 5 Hz
+    // observation fresh — a nearer detour exit is picked up immediately
+    // instead of waiting for the held waypoint to be reached (the old
+    // "arrive-then-update" stalled around large cylinders, e.g. large_short
+    // stuck at (-4.05, 12.97) after reaching its waypoint) — while the
+    // along-progress margin prevents preview noise from jittering the
+    // waypoint every boundary.
     //
-    // R25: a single cold-start preview miss must NOT discard a waypoint
-    // that is still actually executing.  The waypoint is only dropped when
-    // (a) it is reached, (b) `drop_held_waypoint_allowed` is true, meaning
-    // the real 30 Hz execution has failed for >= 3 consecutive 5 Hz updates
-    // (tracked in update()), or (c) a fresh hard obstacle blocks it.
+    // R25 (kept): a single cold-start preview miss must NOT discard a
+    // waypoint that is still actually executing; and a waypoint is never
+    // extrapolated from the live pose (that turns a finite waypoint into
+    // an endless ray).  The held waypoint is only abandoned for a fresh
+    // candidate that is strictly better, or when it stops being executable.
     if (last_directive_.type == TargetCorrectionType::NORMAL_CORRECTION &&
         last_directive_.normalized_distance > 1e-9 &&
         last_directive_.corrected_target_world_valid) {
@@ -601,13 +628,60 @@ TargetCorrectionDirective VisibilityTargetCorrector::makeCorrectionDirective(
             held.reason = "FIXED_WAYPOINT_HELD";
             const LocalPlanningAssessment held_assessment =
                 assess_directive(held);
-            const bool can_hold =
-                !drop_held_waypoint_allowed || live_directive_usable ||
+            const bool held_ok =
                 held_assessment.translation_plan_valid ||
-                held_assessment.rotation_available;
-            if (can_hold) {
+                held_assessment.rotation_available || live_directive_usable;
+            // Progress of the held waypoint along the goal axis (the same
+            // axis sampleSideCandidates uses for along_progress).
+            const Vec2d to_goal = goal - state.position;
+            const double goal_dist = to_goal.norm();
+            const Vec2d axis =
+                goal_dist > 1e-9 ? to_goal / goal_dist : Vec2d(1.0, 0.0);
+            const double held_along = previous_delta.dot(axis);
+            // Best fresh candidate: cands are sorted by along_progress
+            // descending, so the first preview-valid one is the best.
+            double best_cand_along = -1e9;
+            size_t n_preview = 0;
+            constexpr size_t kHeldPreviewBudget = 8;
+            std::vector<uint8_t> held_tokens(
+                static_cast<size_t>(std::max(3, p_.te_direction_bin_count) + 2),
+                0);
+            for (const SideCandidate& cand : cands) {
+                if (n_preview >= kHeldPreviewBudget) break;
+                const int token = adapter_.quantizeBearing(cand.bearing);
+                if (held_tokens[static_cast<size_t>(token)] != 0) continue;
+                held_tokens[static_cast<size_t>(token)] = 1;
+                TargetCorrectionDirective cand_dir = d;
+                cand_dir.direction_token = token;
+                cand_dir.decoded_direction_body =
+                    adapter_.decodeDirectionToken(token);
+                cand_dir.normalized_distance =
+                    adapter_.clampNormalizedDistance(cand.dist);
+                const Vec2d cdw = rot2(cand_dir.decoded_direction_body,
+                                       state.yaw);
+                cand_dir.corrected_target_world =
+                    state.position + cdw * adapter_.normalizedToWorld(
+                        cand_dir.normalized_distance);
+                cand_dir.corrected_target_world_valid = true;
+                cand_dir.turn_direction_world_valid = false;
+                cand_dir.type = TargetCorrectionType::NORMAL_CORRECTION;
+                const LocalPlanningAssessment ca = assess_directive(cand_dir);
+                ++n_preview;
+                if (ca.translation_plan_valid) {
+                    best_cand_along = cand.along_progress;
+                    break;
+                }
+            }
+            const bool adopt_new =
+                !held_ok ||
+                (best_cand_along > held_along +
+                     p_.macro_waypoint_update_along_margin);
+            if (!adopt_new) {
                 return held;
             }
+            // Otherwise fall through to the candidate loop below: a fresh,
+            // strictly-better candidate (or the held one is no longer
+            // executable) is selected there.
         }
     }
 
@@ -647,6 +721,39 @@ TargetCorrectionDirective VisibilityTargetCorrector::makeCorrectionDirective(
             return candidate;
         }
         if (preview_count >= kMaxCandidatePreviews) break;
+    }
+
+    // R29m (user redesign, il_2d_multiscale_debug style): when the 30 Hz
+    // preview rejects EVERY candidate, fall back to the best OBSERVABLE
+    // frontier candidate — cands are sorted by along-progress descending and
+    // sampleSideCandidates already guarantees reachable + traversable
+    // (0.5 m-inflated) + known-FREE continuation.  Real depth around a large
+    // cylinder makes the B-spline clearance / UNKNOWN gates fail right at
+    // the obstacle silhouette even though the candidate is genuinely
+    // reachable (measured _failed/000006_0ba8dd16: NORMAL_CORRECTION=0 and
+    // the corrector spun in TURN_LEFT↔TURN_RIGHT forever).  With the R29j
+    // speed-law relaxation the 30 Hz layer can execute such a fly-through
+    // detour at vmin, so a rejected preview must not leave the corrector
+    // with pure rotation only.
+    if (!cands.empty()) {
+        const SideCandidate& chosen = cands[0];
+        TargetCorrectionDirective fallback = d;
+        const int token = adapter_.quantizeBearing(chosen.bearing);
+        fallback.direction_token = token;
+        fallback.decoded_direction_body =
+            adapter_.decodeDirectionToken(token);
+        const double command_distance = chosen.dist;
+        fallback.normalized_distance =
+            adapter_.clampNormalizedDistance(command_distance);
+        const Vec2d dir_world =
+            rot2(fallback.decoded_direction_body, state.yaw);
+        fallback.corrected_target_world =
+            state.position + dir_world * command_distance;
+        fallback.corrected_target_world_valid = true;
+        fallback.turn_direction_world_valid = false;
+        fallback.type = TargetCorrectionType::NORMAL_CORRECTION;
+        fallback.reason = "NORMAL_CORRECTION_OBSERVABLE_FRONTIER";
+        return fallback;
     }
     return d;
 }
@@ -748,6 +855,9 @@ TargetCorrectionDirective VisibilityTargetCorrector::update(
     const LocalPlanningAssessment& assessment,
     bool live_directive_usable,
     const DirectiveAssessmentFn& assess_directive) {
+    // R29m: monotonic 5 Hz update counter (for the search-rotation
+    // cooldown below).
+    ++update_count_;
     // The corrector runs at 5 Hz.  Count consecutive updates with negligible
     // motion while a correction is active so a stale target cannot hold the
     // vehicle in a permanent brake/hold loop.
@@ -902,14 +1012,13 @@ TargetCorrectionDirective VisibilityTargetCorrector::update(
     const bool recovery_reentry_confirmed =
         correction_active_ &&
         reentry_success_updates_ >= kReentrySuccessUpdates;
-    // R24: if the original goal is OUTSIDE the FOV but the direct corridor
-    // is NOT blocked, the 30 Hz local planner can rotate to re-acquire it
-    // (its own preview reports rotation_available).  Do NOT keep issuing
-    // locked-side search TURNs that push the goal further behind the nose;
-    // hand the original target straight back to local so it rotates toward
-    // the goal.  (joint_v2_000001_469baa3b @22.4 s: goal only 5.6° outside
-    // the left FOV with a clear corridor; the expert instead issued
-    // TURN_RIGHT along the locked side and drove the goal to the tail.)
+    // R24 (legacy): when the goal was OUTSIDE the FOV with a clear corridor,
+    // the local planner used to rotate to re-acquire it, so the macro handed
+    // PASS_THROUGH back to local.  R29 removed local self-rotation: for an
+    // out-of-FOV goal the local always reports NO_SAFE_CANDIDATE and
+    // rotation_available is false, so this branch no longer fires — the
+    // macro stays in correction and issues a goal-toward SEARCH_ROTATION
+    // TURN below instead.
     const bool reacquire_original_goal =
         correction_active_ &&
         assessment.target_outside_fov &&
@@ -977,10 +1086,22 @@ TargetCorrectionDirective VisibilityTargetCorrector::update(
     // it could not (joint_v2_000001_469baa3b: 108/122 locally-BLOCKED
     // frames had no geometric corridor blocker; 133/141 for
     // joint_v2_000000_a411ef5a).
+    //
+    // R29 (single-mode expert): the local never rotates by itself, so a
+    // goal outside the FOV is unambiguous "local cannot proceed" evidence
+    // even when the corridor is clear — the macro must issue a goal-toward
+    // TURN to re-acquire it (otherwise local NO_SAFE_CANDIDATE + macro
+    // PASS_THROUGH deadlock, measured joint_v2_000000).
+    // R29i: a nose-blocked hard stop (too close to an obstacle) is takeover
+    // evidence too — without it the FSM confirms takeover but the macro
+    // still PASS_THROUGHs (its own topology gate below is false) and the
+    // drone parks beside the blocker forever.
     const bool macro_topology_evidence =
         !current_patch.valid() || fresh_obs.direct_corridor_blocked ||
         fresh_obs.unknown_occluded || fresh_obs.fov_boundary_truncated ||
-        assessment.local_corridor_blocked;
+        assessment.local_corridor_blocked ||
+        assessment.nose_blocked_stop ||
+        assessment.target_outside_fov;
     if (!correction_active_ &&
         (!assessment.takeover_confirmed || !macro_topology_evidence)) {
         TargetCorrectionDirective d;
@@ -1074,11 +1195,34 @@ TargetCorrectionDirective VisibilityTargetCorrector::update(
     // (joint_v2_000001_469baa3b @22.4 s: goal 5.6° outside the LEFT FOV,
     // no corridor blocker; the expert rotated RIGHT along the locked side
     // and pushed the goal to the tail.)
+    //
+    // R29k (measured _failed/000006_02cac96b): re-acquiring the original
+    // goal is only useful when that bearing is actually TRAVERSABLE.  With
+    // the drone beside a large cylinder the depth-derived
+    // direct_corridor_blocked flips 0/1 as the nose sweeps, and every
+    // "no blocker" frame re-issued SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL,
+    // pulling the nose back toward the occluded goal — TURN_LEFT↔TURN_RIGHT
+    // every ~1 s, zero displacement, goal_no_progress.  Gate the
+    // re-acquisition on a continuous FREE run of >=
+    // macro_goal_direction_min_range_m along the goal bearing; when it is
+    // blocked / occluded keep the LOCKED bypass side (the swept-angle
+    // logic flips sides only after ~180° of search).  large_short still
+    // re-acquires because its goal bearing (up over the cylinder) has a
+    // long FREE run.
+    // R29m: SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL cooldown.  Once the
+    // corrector has pulled the nose toward the (possibly occluded) goal, it
+    // must not immediately re-pull when depth evidence flips — that is the
+    // TURN_LEFT↔TURN_RIGHT oscillation (_failed/000006_0ba8dd16).  During
+    // the cooldown the corrector keeps the LOCKED bypass side.
+    const bool sr_cooldown_ok =
+        last_search_rotation_update_ == 0 ||
+        (update_count_ - last_search_rotation_update_) >=
+            static_cast<uint64_t>(p_.macro_search_rotation_cooldown_5hz);
     {
         const bool proposed_search_turn_rd =
             d.type == TargetCorrectionType::TURN_LEFT ||
             d.type == TargetCorrectionType::TURN_RIGHT;
-        if (proposed_search_turn_rd &&
+        if (proposed_search_turn_rd && sr_cooldown_ok &&
             !fresh_obs.direct_corridor_blocked) {
             const Vec2d to_goal = original_goal - state.position;
             const double b_goal = wrapAngle(
@@ -1087,18 +1231,37 @@ TargetCorrectionDirective VisibilityTargetCorrector::update(
             const bool goal_left = b_goal > fov_half + 1e-9;
             const bool goal_right = b_goal < -(fov_half + 1e-9);
             if (goal_left || goal_right) {
-                const int n = std::max(3, p_.te_direction_bin_count);
-                d.type = goal_left ? TargetCorrectionType::TURN_LEFT
-                                   : TargetCorrectionType::TURN_RIGHT;
-                d.direction_token = goal_left ? 0 : n + 1;
-                d.decoded_direction_body =
-                    adapter_.decodeDirectionToken(d.direction_token);
-                d.normalized_distance = 1.0;
-                d.corrected_target_world_valid = false;
-                d.turn_direction_world =
-                    rot2(d.decoded_direction_body, state.yaw).normalized();
-                d.turn_direction_world_valid = true;
-                d.reason = "SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL";
+                // R29k: only re-acquire when the goal bearing is not
+                // OBSERVED-OCCUPIED within the minimum range.  We check
+                // OCCUPIED, not FREE: a bearing outside the FOV is UNKNOWN
+                // (passable) and must not suppress re-acquisition
+                // (large_short needs it), while a blocker directly on the
+                // goal bearing keeps the locked bypass side instead
+                // (_failed/000006: pulling the nose back to an occluded
+                // goal yaws the drone back and forth with zero progress).
+                const double goal_occ_range = occupiedRangeAlongFrom(
+                    current_patch, state.position,
+                    state.yaw + b_goal, p_.obs_range_m);
+                if (goal_occ_range <
+                    p_.macro_goal_direction_min_range_m) {
+                    // Goal bearing blocked → keep the locked bypass side
+                    // (leave d as makeCorrectionDirective produced).
+                } else {
+                    const int n = std::max(3, p_.te_direction_bin_count);
+                    d.type = goal_left ? TargetCorrectionType::TURN_LEFT
+                                       : TargetCorrectionType::TURN_RIGHT;
+                    d.direction_token = goal_left ? 0 : n + 1;
+                    d.decoded_direction_body =
+                        adapter_.decodeDirectionToken(d.direction_token);
+                    d.normalized_distance = 1.0;
+                    d.corrected_target_world_valid = false;
+                    d.turn_direction_world =
+                        rot2(d.decoded_direction_body, state.yaw).normalized();
+                    d.turn_direction_world_valid = true;
+                    d.reason = "SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL";
+                    // R29m: start the cooldown so the next re-pull waits.
+                    last_search_rotation_update_ = update_count_;
+                }
             }
         }
     }

@@ -921,6 +921,12 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("ego_lambda_ref", &Params2D::ego_lambda_ref)
         .def_readwrite("lp_max_speed", &Params2D::lp_max_speed)
         .def_readwrite("lp_cruise_speed_mps", &Params2D::lp_cruise_speed_mps)
+        .def_readwrite("lp_goal_decay_range_m",
+                       &Params2D::lp_goal_decay_range_m)
+        .def_readwrite("lp_vmin_speed_mps", &Params2D::lp_vmin_speed_mps)
+        .def_readwrite("lp_yaw_decay_per_deg",
+                       &Params2D::lp_yaw_decay_per_deg)
+        .def_readwrite("lp_yaw_decay_min", &Params2D::lp_yaw_decay_min)
         .def_readwrite("lp_terminal_micro_approach_m",
                        &Params2D::lp_terminal_micro_approach_m)
         .def_readwrite("lp_replan_interval_ticks",
@@ -955,6 +961,7 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("lp_turn_exit_max_yaw_rate",
                        &Params2D::lp_turn_exit_max_yaw_rate)
         .def_readwrite("lp_turn_k", &Params2D::lp_turn_k)
+        .def_readwrite("lp_yaw_smooth_alpha", &Params2D::lp_yaw_smooth_alpha)
         .def_readwrite("lp_max_local_deviation_deg",
                        &Params2D::lp_max_local_deviation_deg)
         .def_readwrite("lp_preferred_local_deviation_deg",
@@ -983,6 +990,12 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                        &Params2D::macro_observable_frontier_min_distance_m)
         .def_readwrite("macro_observable_frontier_min_progress_m",
                        &Params2D::macro_observable_frontier_min_progress_m)
+        .def_readwrite("macro_goal_direction_min_range_m",
+                       &Params2D::macro_goal_direction_min_range_m)
+        .def_readwrite("macro_waypoint_update_along_margin",
+                       &Params2D::macro_waypoint_update_along_margin)
+        .def_readwrite("macro_search_rotation_cooldown_5hz",
+                       &Params2D::macro_search_rotation_cooldown_5hz)
         .def_readwrite("macro_observable_unknown_margin_cells",
                        &Params2D::macro_observable_unknown_margin_cells)
         .def_readwrite("macro_side_evidence_margin",
@@ -1497,7 +1510,9 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("geom_type", &BlueprintTask::geom_type)
         .def_readwrite("summary", &BlueprintTask::summary)
         .def_readwrite("selection_score", &BlueprintTask::selection_score)
-        .def_readwrite("qualification", &BlueprintTask::qualification);
+        .def_readwrite("qualification", &BlueprintTask::qualification)
+        .def_readwrite("segment_label_counts",
+                       &BlueprintTask::segment_label_counts);
 
     py::class_<RoundStats>(m, "RoundStats")
         .def(py::init<>())

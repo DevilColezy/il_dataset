@@ -144,6 +144,10 @@ struct BlueprintTask {
     std::string geom_type = "CLEAR";
     TaskDistributionSummary summary;
     double selection_score = 0.0;  // final greedy selection score
+    // ── behaviour SEGMENT label counts (six classes) observed in the
+    //    preflight trajectory — used by the offline test blueprint to
+    //    measure multi-avoidance / consecutive-avoidance coverage. ──
+    std::map<std::string, uint64_t> segment_label_counts;
     // ── privileged task-qualification diagnostics (manifest only; never
     //    a student input).  Side routes / blocker / stretch are PRIVILEGED
     //    truth and are NEVER fed to the expert. ──────────────────────

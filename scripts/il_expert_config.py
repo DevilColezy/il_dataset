@@ -189,6 +189,21 @@ def build_params(global_cfg, errors=None):
     p.lp_cruise_speed_mps = _num(
         lp.get("cruise_speed_mps"), "he.lp.cruise_speed_mps", problems, 2.0,
         allow_zero=True)
+    # ── R29h: simplified speed law ────────────────────────────────
+    # v_des = cruise · goal_decay(goal_along_ray) · yaw_decay(|ray_b|);
+    # min lp_vmin_speed_mps while progressing on a clear ray; nose_clear ≤
+    # handoff → hard stop (0).  Lost target / all rays blocked / out of FOV
+    # → 0 via the existing hand-off branches.
+    p.lp_goal_decay_range_m = _num(
+        lp.get("goal_decay_range_m"), "he.lp.goal_decay_range_m",
+        problems, 2.0)
+    p.lp_vmin_speed_mps = _num(
+        lp.get("vmin_speed_mps"), "he.lp.vmin_speed_mps", problems, 0.5)
+    p.lp_yaw_decay_per_deg = _num(
+        lp.get("yaw_decay_per_deg"), "he.lp.yaw_decay_per_deg",
+        problems, 0.0111)
+    p.lp_yaw_decay_min = _num(
+        lp.get("yaw_decay_min"), "he.lp.yaw_decay_min", problems, 0.5)
     p.lp_terminal_micro_approach_m = _num(
         lp.get("terminal_micro_approach_m"),
         "he.lp.terminal_micro_approach_m", problems, 0.8,
@@ -309,6 +324,9 @@ def build_params(global_cfg, errors=None):
         "he.lp.turn_exit_max_yaw_rate", problems, 0.15,
         allow_zero=True)
     p.lp_turn_k = _num(lp.get("turn_k"), "he.lp.turn_k", problems, 2.5)
+    p.lp_yaw_smooth_alpha = _num(
+        lp.get("yaw_smooth_alpha"), "he.lp.yaw_smooth_alpha",
+        problems, 0.35, allow_zero=True)
     p.lp_near_goal_heading_relax_distance = _num(
         lp.get("near_goal_heading_relax_distance"),
         "he.lp.near_goal_heading_relax_distance", problems, 1.0)
@@ -349,6 +367,23 @@ def build_params(global_cfg, errors=None):
         mc.get("observable_frontier_min_progress_m"),
         "he.corrector.observable_frontier_min_progress_m", problems, 0.5,
         allow_zero=True)
+    # R29k: only re-acquire the original goal via search rotation when its
+    # bearing is traversable (continuous FREE run >= this range).  Behind a
+    # blocker → keep the locked bypass side.
+    p.macro_goal_direction_min_range_m = _num(
+        mc.get("goal_direction_min_range_m"),
+        "he.corrector.goal_direction_min_range_m", problems, 2.0)
+    # R29l: a fresh 5 Hz waypoint candidate must beat the held waypoint by
+    # this along-goal progress before it is adopted (anti-jitter margin).
+    p.macro_waypoint_update_along_margin = _num(
+        mc.get("waypoint_update_along_margin"),
+        "he.corrector.waypoint_update_along_margin", problems, 0.3,
+        allow_zero=True)
+    # R29m: SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL cooldown (5 Hz updates);
+    # prevents depth-evidence flips from oscillating the turn direction.
+    p.macro_search_rotation_cooldown_5hz = int(_num(
+        mc.get("search_rotation_cooldown_5hz"),
+        "he.corrector.search_rotation_cooldown_5hz", problems, 12))
     p.macro_observable_unknown_margin_cells = int(_num(
         mc.get("observable_unknown_margin_cells"),
         "he.corrector.observable_unknown_margin_cells", problems, 3))

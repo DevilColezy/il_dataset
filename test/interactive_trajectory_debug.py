@@ -57,7 +57,8 @@ def _fmt(value, digits=3):
 
 
 def discover_episodes(root, include_failed=False):
-    """Return episode directories, optionally including rejected episodes."""
+    """Return episode directories, optionally including rejected episodes,
+    newest (by directory mtime) first."""
     if os.path.isfile(root):
         return [os.path.dirname(os.path.abspath(root))]
     if not os.path.isdir(root):
@@ -77,7 +78,8 @@ def discover_episodes(root, include_failed=False):
         ]
         if "data.csv" in filenames:
             episodes.append(os.path.abspath(dirpath))
-    return sorted(episodes)
+    # Newest collection first (most recent episode is the default target).
+    return sorted(episodes, key=lambda p: os.path.getmtime(p), reverse=True)
 
 
 def load_rows(episode_dir):
@@ -89,7 +91,9 @@ def load_rows(episode_dir):
     return rows
 
 
-def find_manifest(root, explicit=None):
+def find_manifest(root, explicit=None, scene_id=None):
+    """Return the manifest matching the given scene_id, else the single /
+    preferred manifest."""
     if explicit:
         return explicit if os.path.isfile(explicit) else None
     if os.path.isfile(root):
@@ -100,6 +104,25 @@ def find_manifest(root, explicit=None):
             candidates.append(os.path.join(root, name))
     if len(candidates) == 1:
         return candidates[0]
+    # Newest manifest first: the most recent collection is what you debug.
+    candidates.sort(key=os.path.getmtime, reverse=True)
+    # Multiple manifests (e.g. avoid_scenes / test_blueprint / joint_v2 in the
+    # same root): pick the newest one whose scenes contain the episode's
+    # scene_id so the obstacle overlay actually matches the collection.
+    if scene_id is not None:
+        for path in candidates:
+            try:
+                with open(path, "r", encoding="utf-8") as stream:
+                    payload = json.load(stream)
+                scene_ids = {
+                    int(s.get("scene_id"))
+                    for s in payload.get("scenes", [])
+                    if s.get("scene_id") is not None
+                }
+                if int(scene_id) in scene_ids:
+                    return path
+            except (OSError, ValueError, TypeError):
+                continue
     preferred = os.path.join(root, "joint_v2_blueprint_manifest.json")
     return preferred if os.path.isfile(preferred) else None
 
@@ -401,8 +424,8 @@ class TopDownViewer:
                   "home/end jump; q/escape quit")
 
 
-def choose_episode(episodes):
-    if len(episodes) == 1:
+def choose_episode(episodes, auto=False):
+    if len(episodes) == 1 or auto:
         return episodes[0]
     print("Available episodes:")
     for i, path in enumerate(episodes):
@@ -439,18 +462,42 @@ def main():
     parser.add_argument("--manifest", default=None,
                         help="optional blueprint manifest for obstacle overlay")
     parser.add_argument("--include-failed", action="store_true",
-                        help="include episodes under _failed in the selector")
+                        help="include episodes under _failed in the selector "
+                             "(default: auto-included for debugging)")
+    parser.add_argument("--committed-only", action="store_true",
+                        help="only committed episodes (exclude _failed)")
+    parser.add_argument("--auto", action="store_true",
+                        help="auto-select the newest episode without prompting")
+    parser.add_argument("--index", type=int, default=None,
+                        help="select episode by index (newest=0); implies --auto")
     args = parser.parse_args()
 
+    include_failed = not args.committed_only
     episodes = discover_episodes(args.data_root,
-                                 include_failed=args.include_failed)
+                                 include_failed=include_failed)
     if not episodes:
         parser.error("no debug episode containing data.csv: %s" % args.data_root)
-    episode = choose_episode(episodes)
+    if args.index is not None:
+        try:
+            episode = episodes[args.index]
+        except IndexError:
+            parser.error("index %d out of range (0..%d)" % (args.index,
+                                                             len(episodes) - 1))
+    else:
+        episode = choose_episode(episodes, auto=args.auto)
     rows = load_rows(episode)
-    manifest = find_manifest(args.data_root, args.manifest)
+    # Scene id of the first row -> auto-match the correct manifest overlay.
+    try:
+        first_scene_id = _int(rows[0], "scene_id", None)
+    except Exception:
+        first_scene_id = None
+    manifest = find_manifest(args.data_root, args.manifest,
+                             scene_id=first_scene_id)
     obstacles = load_scene_obstacles(manifest)
-    print("selected: %s (%d rows)" % (episode, len(rows)))
+    print("selected: %s (%d rows, %s)" % (
+        episode, len(rows),
+        "FAILED: %s" % _text(rows[0], "failure_taxonomy", "?") if
+        _text(rows[0], "episode_valid", "1") != "1" else "committed"))
     print("manifest: %s" % (manifest or "not found; obstacle overlay disabled"))
 
     try:
