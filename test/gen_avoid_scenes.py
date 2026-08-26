@@ -17,11 +17,13 @@ placing start and goal on the same axis as the cylinder centre (the line
 provably cuts the core).  Chain scenes get long line-piercing tasks.
 
 Writes a production-schema manifest to:
-    /home/rgzn/flightmare_ws/il_data_joint_v2/avoid_scenes_manifest.json
+    ~/flightmare_ws/il_data_joint_v2/avoid_scenes_manifest.json
+The output root can be overridden with ``IL_DATASET_OUTPUT_DIR``.
 (loadable by il_manager collection-only mode.)
 
 Usage:
-  PATH=/home/rgzn/anaconda3/bin:$PATH python3 gen_avoid_scenes.py
+  python3 gen_avoid_scenes.py
+  IL_DATASET_OUTPUT_DIR=/path/to/output python3 gen_avoid_scenes.py
 """
 import json
 import math
@@ -30,7 +32,8 @@ import random
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-OUT_DIR = "/home/rgzn/flightmare_ws/il_data_joint_v2"
+OUT_DIR = os.path.expanduser(os.environ.get(
+    "IL_DATASET_OUTPUT_DIR", "~/flightmare_ws/il_data_joint_v2"))
 MANIFEST = os.path.join(OUT_DIR, "avoid_scenes_manifest.json")
 REGION = {"min_x": -7.0, "max_x": 10.0, "min_y": 0.0, "max_y": 30.0}
 

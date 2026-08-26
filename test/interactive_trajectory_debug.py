@@ -56,6 +56,28 @@ def _fmt(value, digits=3):
     return "--" if not math.isfinite(value) else ("%." + str(digits) + "f") % value
 
 
+INFERENCE_FIELDS = (
+    "inference_ms",
+    "model_inference_ms",
+    "inference_time_ms",
+    "model_inference_time_ms",
+)
+
+
+def find_inference_series(rows):
+    """Return ``(field, values)`` for an optional model inference metric.
+
+    Older collector datasets do not contain inference timing.  In that case,
+    or when the column is present but empty, the viewer simply omits the
+    inference subplot.
+    """
+    for field in INFERENCE_FIELDS:
+        values = [_float(row, field) for row in rows]
+        if any(math.isfinite(value) for value in values):
+            return field, values
+    return None, []
+
+
 def discover_episodes(root, include_failed=False):
     """Return episode directories, optionally including rejected episodes,
     newest (by directory mtime) first."""
@@ -249,11 +271,25 @@ class TopDownViewer:
         self.episode_dir = episode_dir
         self.obstacles = obstacles
         self.index = 0
+        self.inference_field, self.inference_values = find_inference_series(rows)
+        self.inference_times = []
+        if self.inference_field is not None:
+            self.inference_times = [
+                (_float(row, "trajectory_time_s", float(index))
+                 if math.isfinite(_float(row, "trajectory_time_s"))
+                 else float(index))
+                for index, row in enumerate(rows)
+            ]
 
         self.x = [_float(r, "x", 0.0) for r in rows]
         self.y = [_float(r, "y", 0.0) for r in rows]
         self.fig = plt.figure(figsize=(14, 8))
-        self.ax = self.fig.add_axes([0.05, 0.08, 0.62, 0.86])
+        if self.inference_field is not None:
+            self.ax = self.fig.add_axes([0.05, 0.31, 0.62, 0.63])
+            self.inference_ax = self.fig.add_axes([0.05, 0.08, 0.62, 0.16])
+        else:
+            self.ax = self.fig.add_axes([0.05, 0.08, 0.62, 0.86])
+            self.inference_ax = None
         self.info = self.fig.add_axes([0.70, 0.05, 0.28, 0.90])
         self.info.set_axis_off()
         self.fig.canvas.mpl_connect("key_press_event", self.on_key)
@@ -328,7 +364,8 @@ class TopDownViewer:
                                   "tab:purple", 1.5)
         self.ax.legend(loc="upper left", fontsize=8)
 
-        lines = self._info_lines(row)
+        self._draw_inference_plot()
+        lines = self._info_lines(row, self.inference_field)
         self.info.clear()
         self.info.set_axis_off()
         self.info.text(0.0, 1.0, "\n".join(lines), va="top", ha="left",
@@ -336,6 +373,30 @@ class TopDownViewer:
         self.fig.canvas.draw_idle()
         if announce:
             row_report(self.index, row, len(self.rows))
+
+    def _draw_inference_plot(self):
+        if self.inference_ax is None:
+            return
+        self.inference_ax.clear()
+        self.inference_ax.plot(
+            self.inference_times, self.inference_values,
+            color="tab:purple", linewidth=1.2, label="inference time")
+        self.inference_ax.axvline(
+            self.inference_times[self.index], color="tab:red",
+            linewidth=1.0, alpha=0.8)
+        current = self.inference_values[self.index]
+        if math.isfinite(current):
+            self.inference_ax.scatter(
+                [self.inference_times[self.index]], [current],
+                color="tab:red", s=28, zorder=3)
+        self.inference_ax.set_title(
+            "Model inference: %s (lower is faster)" % self.inference_field,
+            fontsize=9)
+        self.inference_ax.set_xlabel("trajectory time (s)")
+        self.inference_ax.set_ylabel("ms")
+        self.inference_ax.grid(True, alpha=0.3)
+
+
 
     def _scatter_target(self, row, xkey, ykey, label, color, marker):
         x, y = _float(row, xkey), _float(row, ykey)
@@ -363,10 +424,10 @@ class TopDownViewer:
                       label="nose / +X_FLU")
 
     @staticmethod
-    def _info_lines(row):
+    def _info_lines(row, inference_field=None):
         speed = math.hypot(_float(row, "target_velocity_flu_x", 0.0),
                            _float(row, "target_velocity_flu_y", 0.0))
-        return [
+        lines = [
             "frame: %s / t=%ss" % (_text(row, "episode_frame_index", "?"),
                                     _fmt(_float(row, "trajectory_time_s"))),
             "scene/task: %s / %s" % (_text(row, "scene_id", "?"),
@@ -407,6 +468,18 @@ class TopDownViewer:
                 _text(row, "emergency_brake", "?")),
             "  corridor blocked: %s" % _text(row, "local_corridor_blocked", "?"),
         ]
+        if inference_field is not None:
+            inference_ms = _float(row, inference_field)
+            if math.isfinite(inference_ms):
+                lines.extend([
+                    "",
+                    "MODEL",
+                    "  inference: %sms (%s FPS)" % (
+                        _fmt(inference_ms, 3),
+                        _fmt(1000.0 / inference_ms, 1)
+                        if inference_ms > 0.0 else "--"),
+                ])
+        return lines
 
     def on_key(self, event):
         if event.key in ("right", "down", "n", " "):
