@@ -1,0 +1,15 @@
+<launch>
+  <!-- Temporary DEBUG launch: runs il_manager under gdb to capture the
+       double-free backtrace.  Not for normal collection. -->
+  <param name="use_sim_time" value="false" />
+  <node pkg="il_dataset" type="il_manager.py" name="il_dataset_manager"
+        output="screen" required="true"
+        launch-prefix="gdb -batch -ex run -ex 'thread apply all bt' --args /home/rgzn/anaconda3/bin/python3">
+    <param name="config_file"
+           value="/home/rgzn/flightmare_ws/src/il_dataset/config/il_dataset_joint_v2_config.yaml" />
+    <param name="blueprint_only" value="false" />
+    <param name="dry_run" value="false" />
+    <param name="manifest_file"
+           value="/home/rgzn/flightmare_ws/il_data_joint_v2/avoid_scenes_manifest.json" />
+  </node>
+</launch>

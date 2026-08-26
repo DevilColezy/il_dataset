@@ -555,11 +555,12 @@ struct Params2D {
     // and the world-latched TURN step is published.  2 updates = 0.4 s.
     int    macro_brake_confirm_ticks_5hz = 2;
     // R25: distance at which a fixed NORMAL_CORRECTION waypoint counts as
-    // REACHED (start searching for the next target).  Deliberately
-    // SEPARATE from macro_local_recovery_prefix_m (the lookahead used to
-    // GENERATE a waypoint): a 0.8 m "reached" tolerance let the drone
-    // abandon a bypass waypoint before it actually cleared the obstacle.
-    double macro_waypoint_reached_tolerance_m = 0.3;
+    // REACHED (start searching for the next target).  Must be >= the
+    // 30 Hz stop distance (goal_tolerance_m = 0.4): the unified speed law
+    // stops the vehicle 0.4 m short of ANY target, so a smaller reach
+    // threshold would leave it parked short forever and trip the
+    // no-progress refresh (waypoint_execution_fail_updates_ >= 3).
+    double macro_waypoint_reached_tolerance_m = 0.5;
 
     // ── target encoding protocol (R = obs_range_m, reserve 0.5 m) ───
     int    te_direction_bin_count = 11;

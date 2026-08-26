@@ -694,25 +694,32 @@ TargetCorrectionDirective VisibilityTargetCorrector::makeCorrectionDirective(
         const int token = adapter_.quantizeBearing(chosen.bearing);
         if (previewed_tokens[static_cast<size_t>(token)] != 0) continue;
         previewed_tokens[static_cast<size_t>(token)] = 1;
-        candidate.direction_token = token;
-        candidate.decoded_direction_body =
-            adapter_.decodeDirectionToken(token);
-        const double command_distance = chosen.dist;
-        candidate.normalized_distance =
-            adapter_.clampNormalizedDistance(command_distance);
+        // Use the EXACT geometry-checked world point (chosen.endpoint) as
+        // the corrected target — no quantization re-projection.  The 5 Hz
+        // student regresses the continuous FLU direction, which is
+        // re-derived live from corrected_target_world in the encoder, so a
+        // quantized re-projection (up to ~3.5°, ~0.29 m at 4.8 m) would
+        // silently teach/execute a target off the geometry-validated point.
+        // The direction token is quantized from the exact bearing purely
+        // for the class/token fields.
+        candidate.corrected_target_world = chosen.endpoint;
+        candidate.corrected_target_world_valid = true;
+        candidate.turn_direction_world_valid = false;
+        candidate.type = TargetCorrectionType::NORMAL_CORRECTION;
+        candidate.reason = "NORMAL_CORRECTION_PREVIEW_CERTIFIED";
+        const Vec2d delta = chosen.endpoint - state.position;
+        const double d_norm = delta.norm();
         const Vec2d dir_world =
-            rot2(candidate.decoded_direction_body, state.yaw);
-        candidate.corrected_target_world =
-            state.position + dir_world * command_distance;
+            d_norm > 1e-9 ? delta / d_norm : Vec2d(1.0, 0.0);
+        candidate.decoded_direction_body = rot2(dir_world, -state.yaw);
+        candidate.direction_token = token;
+        candidate.normalized_distance =
+            adapter_.clampNormalizedDistance(d_norm);
         if ((goal - candidate.corrected_target_world).norm() >
             (goal - state.position).norm() -
                 p_.macro_observable_frontier_min_progress_m) {
             continue;
         }
-        candidate.corrected_target_world_valid = true;
-        candidate.turn_direction_world_valid = false;
-        candidate.type = TargetCorrectionType::NORMAL_CORRECTION;
-        candidate.reason = "NORMAL_CORRECTION_PREVIEW_CERTIFIED";
 
         ++preview_count;
         const LocalPlanningAssessment candidate_assessment =
@@ -738,21 +745,23 @@ TargetCorrectionDirective VisibilityTargetCorrector::makeCorrectionDirective(
     if (!cands.empty()) {
         const SideCandidate& chosen = cands[0];
         TargetCorrectionDirective fallback = d;
-        const int token = adapter_.quantizeBearing(chosen.bearing);
-        fallback.direction_token = token;
-        fallback.decoded_direction_body =
-            adapter_.decodeDirectionToken(token);
-        const double command_distance = chosen.dist;
-        fallback.normalized_distance =
-            adapter_.clampNormalizedDistance(command_distance);
-        const Vec2d dir_world =
-            rot2(fallback.decoded_direction_body, state.yaw);
-        fallback.corrected_target_world =
-            state.position + dir_world * command_distance;
+        // Same exact-point contract as the preview loop above: publish the
+        // geometry-checked endpoint directly; token quantized from the
+        // exact bearing for the class/token fields only.
+        fallback.corrected_target_world = chosen.endpoint;
         fallback.corrected_target_world_valid = true;
         fallback.turn_direction_world_valid = false;
         fallback.type = TargetCorrectionType::NORMAL_CORRECTION;
         fallback.reason = "NORMAL_CORRECTION_OBSERVABLE_FRONTIER";
+        const Vec2d delta = chosen.endpoint - state.position;
+        const double d_norm = delta.norm();
+        const Vec2d dir_world =
+            d_norm > 1e-9 ? delta / d_norm : Vec2d(1.0, 0.0);
+        fallback.decoded_direction_body = rot2(dir_world, -state.yaw);
+        fallback.direction_token =
+            adapter_.quantizeBearing(chosen.bearing);
+        fallback.normalized_distance =
+            adapter_.clampNormalizedDistance(d_norm);
         return fallback;
     }
     return d;

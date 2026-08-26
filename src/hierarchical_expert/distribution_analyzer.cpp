@@ -670,7 +670,22 @@ std::map<std::string, double> DistributionAnalyzer::profileTagWeights() const {
 }
 
 std::vector<double> DistributionAnalyzer::taskTypeWeights() const {
+    // Base bias (2026-08-26): collect fewer CLEAR (straight) flights and
+    // more multi-obstacle / detour / narrow / chicane trajectories so the
+    // data carries consecutive-avoidance and mixed-behaviour segments.
+    // Second pass (2026-08-26, #2): push further toward avoidance and
+    // upper-layer takeover tasks (LARGE_OCCLUSION / CHICANE / LONG_DETOUR)
+    // and away from CLEAR, since the 30 Hz student under-produces lateral
+    // velocity and the 5 Hz student needs more genuine takeover labels.
     std::vector<double> w(static_cast<size_t>(kNumTaskGeomTypes), 1.0);
+    w[static_cast<size_t>(TaskGeomType::CLEAR)] = 0.2;
+    w[static_cast<size_t>(TaskGeomType::LOCAL_AVOIDANCE)] = 1.5;
+    w[static_cast<size_t>(TaskGeomType::OFFSET_AVOIDANCE)] = 1.5;
+    w[static_cast<size_t>(TaskGeomType::LARGE_OCCLUSION)] = 2.5;
+    w[static_cast<size_t>(TaskGeomType::MULTI_OBSTACLE)] = 2.0;
+    w[static_cast<size_t>(TaskGeomType::NARROW_BUT_PLANNABLE)] = 2.0;
+    w[static_cast<size_t>(TaskGeomType::LONG_DETOUR)] = 2.0;
+    w[static_cast<size_t>(TaskGeomType::CHICANE)] = 2.5;
     const bool turn_short =
         deficitBelow(deficits_, "macro:turn_left") ||
         deficitBelow(deficits_, "macro:turn_right") ||

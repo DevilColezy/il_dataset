@@ -107,6 +107,7 @@ void LocalPlanner30Hz::reset() {
     current_trajectory_ = PlanarTrajectory{};
     last_command_ = VelocityCommand3D{};
     has_last_command_ = false;
+    last_command_yaw_ = 0.0;
     last_mission_revision_ = 0;
     last_target_position_ = Vec2d(0.0, 0.0);
     last_target_valid_ = false;
@@ -166,8 +167,15 @@ VelocityCommand3D LocalPlanner30Hz::reachableCommand(
     // After that, every output is slew-limited from the previous output;
     // without a planner reset) 鈫?state-pin so we never chase a stale
     // command with a saturated P term.
+    // Re-project the previous command from the body frame in which it was
+    // issued (last_command_yaw_) into the CURRENT body frame.  Without
+    // this, yaw rotation between ticks changes the world-frame velocity
+    // even when the body-frame components are unchanged — e.g. 2 m/s at
+    // 1.5 rad/s yaw rate rotates ~0.05 rad/tick, adding ~0.1 m/s (~3 m/s²)
+    // of unaccounted world acceleration, above the 2 m/s² command ramp.
     const Vec2d prev = has_last_command_
-        ? Vec2d(last_command_.vx_body, last_command_.vy_body)
+        ? rot2(Vec2d(last_command_.vx_body, last_command_.vy_body),
+               last_command_yaw_ - state.yaw)
         : current_v_body;
     // Once emitted, a supervision command must always be the slew base.
     // Switching to measured velocity on tracking lag made the label itself
@@ -231,6 +239,7 @@ bool LocalPlanner30Hz::updateMissionState(const ResolvedPlanarTarget& target,
     if (reset_memory) {
         last_command_ = VelocityCommand3D{};
         has_last_command_ = false;
+        last_command_yaw_ = 0.0;
     }
     last_mission_revision_ = target.mission_revision;
     last_target_position_ = target.position;
@@ -283,6 +292,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
         if (mutate) {
             last_command_ = VelocityCommand3D{};
             has_last_command_ = true;
+            last_command_yaw_ = state.yaw;
             updateMissionState(target, res);
         }
         return res;
@@ -300,6 +310,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
         // lp_max_accel.  Fresh missions re-seed from state below.
         const VelocityCommand3D prev_cmd = last_command_;
         const bool had_cmd = has_last_command_;
+        const double prev_yaw = last_command_yaw_;
         const bool reset_memory = updateMissionState(target, res);
         if (reset_memory) {
             if (mission_changed) {
@@ -309,11 +320,13 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                 last_command_ = VelocityCommand3D{vb.x(), vb.y(), 0.0,
                                                   state.yaw_rate};
                 has_last_command_ = true;
+                last_command_yaw_ = state.yaw;
             } else if (had_cmd) {
                 // Same-mission target jump: keep the old command, ramp to
                 // the new plan smoothly.
                 last_command_ = prev_cmd;
                 has_last_command_ = true;
+                last_command_yaw_ = prev_yaw;
             }
             // if !had_cmd 鈫?leave state-pinned base (first tick after reset).
         }
@@ -386,6 +399,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
             current_trajectory_ = PlanarTrajectory{};
             last_command_ = out;
             has_last_command_ = true;
+            last_command_yaw_ = state.yaw;
         }
         return brake;
     };
@@ -465,6 +479,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
             current_trajectory_ = PlanarTrajectory{};
             last_command_ = out;
             has_last_command_ = true;
+            last_command_yaw_ = state.yaw;
         }
         return res;
     }
@@ -512,6 +527,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
             current_trajectory_ = PlanarTrajectory{};
             last_command_ = out;
             has_last_command_ = true;
+            last_command_yaw_ = state.yaw;
         }
         return res;
     }
@@ -588,6 +604,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
             current_trajectory_ = PlanarTrajectory{};
             last_command_ = out;
             has_last_command_ = true;
+            last_command_yaw_ = state.yaw;
         }
         return res;
     }
@@ -725,6 +742,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                 current_trajectory_ = PlanarTrajectory{};
                 last_command_ = out;
                 has_last_command_ = true;
+                last_command_yaw_ = state.yaw;
             }
             return res;
         }
@@ -839,10 +857,17 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                 //     direction deviates from the nose (sideways is slower).
                 //   Min speed lp_vmin_speed_mps while still progressing on a
                 //     clear ray (never parks beside a blocker).
-                //   Nose at/into a blocker → HARD STOP (0): the yaw intent
-                //     below still slews toward avg_b, so flight resumes once
-                //     the nose clears.  Lost target / all rays blocked / out
-                //     of FOV → 0 via the existing hand-off branches.
+                //   NO nose hard-stop (2026-08-26): the velocity VECTOR is
+                //     along the chosen ray, which raySectorSelect already
+                //     guarantees has >= 0.5 m clearance over the whole
+                //     4.5 m ray range — the nose (yaw) may face a blocker
+                //     during a detour but the body flies sideways along the
+                //     safe ray.  A nose-based stop stalled large-obstacle
+                //     detours (measured S_large r=2.5 -> goal_no_progress).
+                //     Unsafe rays fall to the all-rays-blocked hand-off,
+                //     which brakes (spaceToStop -> emergency_brake).
+                //   Lost target / all rays blocked / out of FOV → 0 via the
+                //     existing hand-off branches.
                 //   Replaces the old √(2·a·clearance) raySectorSpeed law +
                 //     avoid_scale + nose-halving (R29c).
                 const double stop_m = p_.task_goal_tolerance;
@@ -850,24 +875,14 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                     1e-6, p_.lp_goal_decay_range_m - stop_m);
                 const double goal_decay = clamp(
                     (goal_along_ray - stop_m) / decay_span, 0.0, 1.0);
-                // R29q (user redesign, "gradual side-slip speed"): a macro
-                // NORMAL_CORRECTION waypoint is a fly-through detour around
-                // a blocker — the velocity direction necessarily deviates
-                // from the nose/goal axis.  R29j previously forced
-                // yaw_decay=1.0 and a vmin floor for these waypoints, which
-                // removed the side-slip speed penalty and truncated the
-                // distance-based deceleration into a hard 0.5 step near the
-                // waypoint.  R29m now guarantees a waypoint even when the
-                // 30 Hz preview rejects every candidate (OBSERVABLE_FRONTIER
-                // fallback), so the preview veto that motivated R29j is no
-                // longer fatal: a macro waypoint uses the SAME gradual law
-                // as any target — cruise · goal_decay(along-ray) ·
-                // yaw_decay(off-nose) — with no vmin floor and no hard stop
-                // (the nose facing the blocker is the normal detour
-                // attitude; the side-slip penalty already slows the
-                // detour).  Original / terminal targets keep the strict
-                // R29h law (vmin floor + nose hard-stop).
-                const bool macro_waypoint = target.flythrough;
+                // UNIFIED speed law (user redesign 2026-08-25): the 30 Hz
+                // planner applies the SAME law to EVERY target — a macro
+                // NORMAL_CORRECTION waypoint is treated exactly like the
+                // original goal (vmin floor + stop at goal_tolerance).  The
+                // nose hard-stop was removed on 2026-08-26 because the body
+                // flies along the (already 0.5 m-cleared) ray, not the nose.
+                // `target.flythrough` still exists but ONLY decides
+                // terminal-ness (resolveTarget), never the speed law.
                 const double off_nose_deg =
                     std::fabs(rad2deg(ray_b));
                 const double yaw_decay =
@@ -875,37 +890,42 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                           p_.lp_yaw_decay_min, 1.0);
                 double v_des =
                     p_.lp_cruise_speed_mps * goal_decay * yaw_decay;
-                const bool nose_stop =
-                    nose_clear <= handoffClearance() + 1e-6;
                 const bool at_goal = dist <= stop_m;
-                if (nose_stop && !macro_waypoint) {
-                    // Nose points at/into the blocker while it slews to the
-                    // ray: hard stop.  The body no longer creeps along the
-                    // ray into the nose-facing blocker.  A macro waypoint
-                    // skips this (and the vmin floor below): the nose faces
-                    // the blocker in the normal detour attitude and the
-                    // speed is already set by yaw_decay × goal_decay, so
-                    // the detour decelerates GRADUALLY with side-slip and
-                    // distance (R29q).
-                    v_des = 0.0;
-                } else if (!at_goal && !macro_waypoint) {
+                if (!at_goal) {
                     // Keep a minimum forward speed on a clear ray so the
                     // drone never parks beside a blocker (the old half-speed
                     // behaviour is replaced by this floor).
                     v_des = std::max(p_.lp_vmin_speed_mps, v_des);
                 }
-                // Straight reference plan along the chosen ray (diagnostics
-                // / preflight selected trajectory, validated to the same
-                // clearance gate).
+                // Straight reference plan along the chosen ray — a plain
+                // polyline, NO dynamic (B-spline / speed-envelope / FOV)
+                // validation.  The ray sector already guarantees a 0.5 m
+                // static-clearance corridor along this direction, and the
+                // local layer's speed control (goal_decay / yaw_decay /
+                // reachableCommand ramp) owns this tick's safety.  The
+                // committed polyline still feeds the plan/track mechanism
+                // (selected / current_trajectory_ / cruise_mps) so the
+                // non-replan tracking fast-path keeps working.
                 const double cand_range =
                     std::min(dist, localRouteHorizon());
                 endpoint = state.position + ray_dir * cand_range;
                 PlanarTrajectory ray_plan;
-                double ray_min_clear =
-                    std::numeric_limits<double>::infinity();
-                const bool ref_ok = planFovTrajectory(
-                    state, obs, endpoint, v_des, /*terminal=*/false,
-                    ray_plan, ray_min_clear, min_validate_m);
+                ray_plan.valid = true;
+                ray_plan.cruise_mps = v_des;
+                {
+                    const int n_steps = std::max(
+                        2, static_cast<int>(std::ceil(cand_range / 0.5)));
+                    const double v_ref =
+                        std::max(1e-3, std::fabs(v_des));
+                    for (int i = 0; i <= n_steps; ++i) {
+                        const double u =
+                            static_cast<double>(i) / n_steps;
+                        ray_plan.points.push_back(
+                            state.position + ray_dir * (cand_range * u));
+                        ray_plan.yaw.push_back(state.yaw + ray_b);
+                        ray_plan.t.push_back(u * cand_range / v_ref);
+                    }
+                }
                 // Velocity VECTOR along the chosen (clear) ray in the body
                 // frame — the body flies SIDEWAYS out of the obstacle's way
                 // immediately (the slew-lag corner-cut is impossible because
@@ -953,19 +973,19 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                 res.selected_output_speed_mps =
                     std::hypot(out.vx_body, out.vy_body);
                 res.planner_status = PlannerStatus::SAFE_PROGRESSING;
-                // R29i: the nose-blocked hard stop is "too close to an
-                // obstacle" — the 5 Hz macro must be able to take over and
-                // rescue (replan to the original goal / pure rotation).
-                // R29j: on a macro detour waypoint the nose-facing blocker
-                // is NOT a hard stop (vmin crawl instead), so it is not
-                // takeover evidence either.
-                res.nose_blocked_stop = nose_stop && !macro_waypoint;
-                res.selected = ref_ok ? ray_plan : PlanarTrajectory{};
+                // R29i/2026-08-26: nose-blocked takeover evidence removed.
+                // The velocity is along the (already-cleared) ray, not the
+                // nose, so a nose-facing blocker during a detour is NOT a
+                // stall — it stalled large-obstacle detours (measured
+                // S_large r=2.5 -> goal_no_progress).  Unsafe flight
+                // directions fall to the all-rays-blocked hand-off which
+                // sets BLOCKED_BY_OBSERVED_OBSTACLE / NO_SAFE_CANDIDATE.
+                res.nose_blocked_stop = false;
+                res.selected = ray_plan;
                 res.plan_terminal = false;
                 res.plan_end_speed_mps = v_des;
                 res.plan_executed_speed_mps = v_des;
-                res.min_observed_clearance =
-                    ref_ok ? ray_min_clear : observedClearanceAtState();
+                res.min_observed_clearance = observedClearanceAtState();
                 res.avoidance_active =
                     std::fabs(wrapAngle(ray_b - b_t)) > deg2rad(3.0) ||
                     res.local_corridor_blocked || nearObstacle();
@@ -985,6 +1005,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                     current_trajectory_ = ray_plan;
                     last_command_ = out;
                     has_last_command_ = true;
+                    last_command_yaw_ = state.yaw;
                     last_yaw_intent_ = yaw_intent;
                     has_last_yaw_intent_ = true;
                     // Commit the detour side for the next tick's ray-sector
@@ -1079,6 +1100,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                     current_trajectory_ = PlanarTrajectory{};
                     last_command_ = out;
                     has_last_command_ = true;
+                    last_command_yaw_ = state.yaw;
                 }
                 return res;
             }
@@ -1221,6 +1243,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                             current_trajectory_ = PlanarTrajectory{};
                             last_command_ = out;
                             has_last_command_ = true;
+                            last_command_yaw_ = state.yaw;
                             last_yaw_intent_ = yaw_intent;
                             has_last_yaw_intent_ = true;
                         }
@@ -1276,6 +1299,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                         current_trajectory_ = PlanarTrajectory{};
                         last_command_ = out;
                         has_last_command_ = true;
+                        last_command_yaw_ = state.yaw;
                     }
                     return res;
                 }
@@ -1477,6 +1501,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                     current_trajectory_ = PlanarTrajectory{};
                     last_command_ = brake;
                     has_last_command_ = true;
+                    last_command_yaw_ = state.yaw;
                 }
                 return res;
             }
@@ -1507,6 +1532,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                 current_trajectory_ = plan;
                 last_command_ = out;
                 has_last_command_ = true;
+                last_command_yaw_ = state.yaw;
                 // R27: commit the plan metadata so the tracking fast-path
                 // can validate the stored trajectory against the current
                 // target on the non-replan ticks.
@@ -1571,6 +1597,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
             current_trajectory_ = PlanarTrajectory{};
             last_command_ = brake;
             has_last_command_ = true;
+            last_command_yaw_ = state.yaw;
         }
         return res;
     }
@@ -1778,6 +1805,7 @@ PlannerResult LocalPlanner30Hz::trackStoredTrajectory(
     // Keep the command ramp continuous (same as every mutate branch).
     last_command_ = out;
     has_last_command_ = true;
+    last_command_yaw_ = state.yaw;
     return res;
 }
 

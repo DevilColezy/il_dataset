@@ -102,8 +102,9 @@ global:
       distance_long_min_m: 15.0
       radius_small_max_m: 0.6
       radius_large_min_m: 1.4
-      density_sparse_max: 7.0
-      density_dense_min: 14.0
+      # density 阈值 = 占地密度（Σπr²/区域比例），非障碍数量
+      density_sparse_max: 0.06
+      density_dense_min: 0.12
       long_takeover_min_ticks: 30
 
   # ── Blueprint generation (inherits the full section from
@@ -119,7 +120,9 @@ global:
     # These are re-stated explicitly because joint_v2 is the production
     # recipe and the tightened balance / budget gates MUST hold here.
     performance:
-      max_task_candidates_per_scene: 48
+      # 步骤3+4：48→64（序列路径的每场景候选池；scene_parallel 路径由
+      # scene_target + preflights_run<120 决定，此键仅作序列路径上限）
+      max_task_candidates_per_scene: 64
       max_total_preflight_ticks: 650000
       parallel_tasks: 16
     # ── scene-level parallel pipeline (new architecture) ─────────
@@ -132,9 +135,21 @@ global:
       threads: 16
       levels: 4
       scenes_per_level: 10
+      # 每层场景数（覆盖 scenes_per_level）：large/mixed 多采以收集更多宏观规划标签
+      # （步骤3+4：large/mixed 12→14，总场景 40→44，宏观候选 +17%）
+      scenes_per_level_list: [8, 8, 14, 14]
       level_radius_min: [0.15, 0.5, 1.5, 0.15]
-      level_radius_max: [0.5, 1.5, 3.0, 3.0]
-      surface_gap_min_m: 1.2
+      # 步骤3+4：large/mixed 半径上限 3.0→3.5（更大障碍 → 更长绕行 → 更多宏观接管）
+      level_radius_max: [0.5, 1.5, 3.5, 3.5]
+      # 每层目标占地密度（稀疏端→密集端，占地比例）：small/medium/large/mixed。
+      # makeSceneSpec 据此反推障碍数量，避免小尺度空旷、大尺度拥挤。
+      # 步骤3+4：medium/large/mixed occupancy 提升（更多障碍 → 更多避障响应 + 宏观机会；
+      # small 已被 surface_gap 1.6 饱和 ~60 圆柱，保持）。
+      # large 0.07..0.10 → 0.12..0.18：大障碍场景障碍数 2~3 → 4~6，给 construct_blocked
+      # 更多"大障碍背后目标"机会（宏观任务 pool 供应瓶颈在此）。
+      level_occupancy_min: [0.05, 0.09, 0.12, 0.12]
+      level_occupancy_max: [0.08, 0.13, 0.18, 0.16]
+      surface_gap_min_m: 1.6
       boundary_min_m: 0.6
       distance_short_max_m: 8.0
       distance_medium_max_m: 16.0
@@ -145,14 +160,17 @@ global:
       # Params2D clearance as the real collection.
       quick_preflight_max_ticks: 200
       quick_preflight_dt_scale: 6.0
-      expected_collect_tasks: 400
+      # 步骤3+4：400→440（每场景 scene_target 10→11，per_level_target 100→110）
+      expected_collect_tasks: 440
     task_generation:
       macro_probe:
         enabled: true
-        yaw_error_deg: 70.0
-        # A probe biases sampling but does not reject a valid task when the
-        # r29 local yaw-first branch emits a non-macro label.
-        require_match: false
+        yaw_error_deg: 90.0
+        # Require the probed macro-turn label: a probe task that does NOT
+        # produce the requested TURN_LEFT/TURN_RIGHT takeover is rejected
+        # (macro_turn_probe_mismatch) so the pool actually carries upper-
+        # layer takeover tasks instead of a local yaw-first substitute.
+        require_match: true
     # First collect a broad random candidate pool; deficit-driven weighting
     # and greedy selection are applied only after exploration.
     exploration:
@@ -181,27 +199,28 @@ global:
       side_bias: 0.4
       min_route_stretch_for_long_detour: 1.5
     distribution_targets:
-      # ── 5 Hz macro coverage ──────────────────────────────────────
+      # ── 5 Hz macro coverage (weights/targets raised 2026-08-26 to collect
+      #    more macro-planning labels for the 5 Hz student) ────────────
       - {key: "macro:total", metric: "count:macro:total",
-         target: 256, minimum: 128, weight: 0.5, minimum_hard: false}
+         target: 512, minimum: 256, weight: 1.0, minimum_hard: false}
       - {key: "macro:pass", metric: "count:macro:pass",
          target: 128, minimum: 64, weight: 1.0, minimum_hard: true}
       - {key: "macro:normal", metric: "count:macro:normal",
-         target: 128, minimum: 64, weight: 1.0, minimum_hard: true}
+         target: 256, minimum: 128, weight: 2.0, minimum_hard: true}
       # New planner does LOCAL yaw-first turns whenever the target leaves
       # the usable FOV band.  The macro-turn probe is therefore only a
       # post-exploration sampling hint for genuine upper-level takeovers.
       - {key: "macro:turn_left", metric: "count:macro:turn_left",
-         target: 64, minimum: 32, weight: 3.0, minimum_hard: true}
+         target: 96, minimum: 48, weight: 5.0, minimum_hard: true}
       - {key: "macro:turn_right", metric: "count:macro:turn_right",
-         target: 64, minimum: 32, weight: 3.0, minimum_hard: true}
+         target: 96, minimum: 48, weight: 5.0, minimum_hard: true}
       - {key: "corr_angle_total", metric: "hist:macro_correction_angle",
-         target: 192, minimum: 64, weight: 1.0, minimum_hard: true}
+         target: 384, minimum: 192, weight: 2.0, minimum_hard: true}
       # ── 30 Hz local coverage ─────────────────────────────────────
       - {key: "local:avoidance", metric: "count:local:avoidance",
-         target: 128, minimum: 64, weight: 1.2, minimum_hard: true}
+         target: 128, minimum: 64, weight: 1.5, minimum_hard: true}
       - {key: "local:direct", metric: "count:local:direct",
-         target: 128, minimum: 64, weight: 0.4, minimum_hard: false}
+         target: 128, minimum: 64, weight: 0.2, minimum_hard: false}
       - {key: "deflection_total", metric: "hist:local_deflection",
          target: 192, minimum: 64, weight: 1.0, minimum_hard: true}
       # ── depth proxy coverage (hard) ──────────────────────────────
@@ -232,7 +251,7 @@ global:
       - {key: "path:medium", metric: "hist:path_length:1",
          target: 8, minimum: 4, weight: 0.8, minimum_hard: true}
       - {key: "path:long", metric: "hist:path_length:2",
-         target: 8, minimum: 4, weight: 1.2, minimum_hard: true}
+         target: 8, minimum: 4, weight: 1.5, minimum_hard: true}
       # ── balances (structural, soft) ──────────────────────────────
       - {key: "balance:turn",
          metric: "balance:macro:turn_left/macro:turn_right",
@@ -294,10 +313,13 @@ global:
     # latched brake-before-search is released and the TURN step is
     # published (2 updates = 0.4 s).  waypoint_reached_tolerance_m:
     # distance at which a fixed NORMAL_CORRECTION waypoint counts as
-    # reached (kept small so a bypass waypoint is not abandoned early).
+    # reached.  Must be >= the 30 Hz stop distance (goal_tolerance_m,
+    # 0.4): the speed law now stops the vehicle 0.4 m short of ANY target
+    # (waypoint or goal — unified), so a smaller reach threshold would
+    # leave it parked 0.4 m short forever and trip the no-progress refresh.
     corrector:
       brake_confirm_ticks_5hz: 2
-      waypoint_reached_tolerance_m: 0.3
+      waypoint_reached_tolerance_m: 0.5
       # R26: within this distance of the original goal the macro never
       # issues a locked-side search TURN (hands the goal to local, which
       # rotates toward it / micro-approaches).  Only a hard corridor block

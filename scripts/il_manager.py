@@ -2510,9 +2510,15 @@ class JointV2Manager(object):
                     "[Manager] episode %s rejected (%s); retrying once after "
                     "scene warm-up", audit_summary.get("episode_id", "?"),
                     reason)
+                # Retry with a DIFFERENT but still 6-aligned tick base.  The
+                # naive +1 shift makes the 5 Hz macro grid land on
+                # episode_frame_index % 6 == 5, which violates the committed
+                # data contract (macro_update_mask==1 must sit on % 6 == 0)
+                # and fails the strict loader audit.  +6 keeps the grid
+                # aligned while still changing the tick origin.
                 committed, reason, audit_summary, final_dir = \
                     self._collect_task_once(scene, task,
-                                            int(task.task_id) * 600000 + 1)
+                                            int(task.task_id) * 600000 + 6)
             self._used_task_ids.add(int(task.task_id))
             if committed and final_dir:
                 self._committed_dirs.append(final_dir)
@@ -2555,14 +2561,20 @@ def main():
         manager.run()
     except rospy.ROSInterruptException:
         interrupted = True
+        print("[Manager] EXIT CAUSE: ROSInterruptException "
+              "(rospy_shutdown=%s)" % rospy.is_shutdown(), flush=True)
     except KeyboardInterrupt:
         # rospy usually converts SIGINT into ROSInterruptException, but a
         # raw Ctrl-C during early init can still surface as
         # KeyboardInterrupt; treat it identically.
         interrupted = True
+        print("[Manager] EXIT CAUSE: KeyboardInterrupt", flush=True)
     except Exception:
         # Real failure: let the traceback propagate so roslaunch reports it.
         failed = True
+        print("[Manager] EXIT CAUSE: exception (propagating)", flush=True)
+        import traceback
+        traceback.print_exc()
     finally:
         # Individual guards: one resource failing to close must never mask
         # the other.
@@ -2576,6 +2588,9 @@ def main():
                 manager._dynamics.close()
         except Exception:
             pass
+        print("[Manager] EXIT: interrupted=%s failed=%s "
+              "rospy_shutdown=%s" % (interrupted, failed,
+                                     rospy.is_shutdown()), flush=True)
         if interrupted or not failed:
             # Interrupted OR clean completion: hard-exit, skipping the
             # interpreter's atexit / pybind static-destructor phase.  Clean

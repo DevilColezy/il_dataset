@@ -260,6 +260,9 @@ struct SceneMetadata {
     int tiny_count = 0, small_count = 0, medium_count = 0, large_count = 0;
     // obstacles per m^2, scaled by 1000 for readability
     double local_density_proxy = 0.0;
+    // 占地密度 Σ(π r²)/free-region-area (0..1) — density classification
+    // and reporting use this (replaces obstacle-count based density).
+    double occupancy_ratio = 0.0;
     double largest_obstacle_radius = 0.0;
     uint64_t scene_seed = 0;
     int generation_attempt = 0;
@@ -599,13 +602,23 @@ struct BlueprintGenerationConfig {
     int scene_parallel_threads = 8;      // worker threads for scenes
     int scene_levels = 4;                // small / medium / large / mixed
     int scenes_per_level = 10;           // scenes per level (sparse -> dense)
+    // Optional per-level scene counts (sparse -> dense), overriding
+    // scenes_per_level when its size == scene_levels.  Lets large/mixed
+    // levels carry more scenes for more macro-planning labels.
+    std::vector<int> scenes_per_level_list;
     // Cylinder radius bands per level: [min_m[i], max_m[i]].
     std::vector<double> level_radius_min_m{0.15, 0.5, 1.5, 0.15};
     std::vector<double> level_radius_max_m{0.5, 1.5, 3.0, 3.0};
+    // Target occupied-area fraction per level (sparse edge -> dense edge).
+    // makeSceneSpec derives the obstacle COUNT from occupancy_target x
+    // free-area / E[π r²] — the same occupancy reads "not empty" for small
+    // cylinders and "not crammed" for large ones (count alone does not).
+    std::vector<double> level_occupancy_min{0.05, 0.07, 0.04, 0.08};
+    std::vector<double> level_occupancy_max{0.08, 0.11, 0.07, 0.12};
     // Placement constraints: pairwise SURFACE gap >= obstacle_surface_gap
     // _min_m (must be traversable), obstacle centre >= boundary_min_m from
     // the free-region border.
-    double obstacle_surface_gap_min_m = 1.2;
+    double obstacle_surface_gap_min_m = 1.6;
     double obstacle_boundary_min_m = 0.6;
     // Direct-line distance bands for the task balance (start-goal
     // Euclidean): short < short_max, medium [short_max, medium_max],
@@ -742,9 +755,11 @@ struct BlueprintGenerationConfig {
 
     // ── legacy strata thresholds (manifest compatibility only) ─────
     // Used to map realized scenes onto the legacy 3x3 density x radius
-    // strata coverage report; the NEW pipeline balances profiles directly.
-    double density_sparse_max = 7.0;
-    double density_dense_min = 14.0;
+    // strata coverage report.  The density thresholds are OCCUPANCY
+    // RATIOS (Σπ r² / free area), not obstacle counts — the same count of
+    // big cylinders is far denser than small ones.
+    double density_sparse_max = 0.06;
+    double density_dense_min = 0.12;
     double radius_small_max_m = 0.6;
     double radius_large_min_m = 1.4;
 

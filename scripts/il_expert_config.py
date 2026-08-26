@@ -436,7 +436,7 @@ def build_params(global_cfg, errors=None):
         "he.corrector.brake_confirm_ticks_5hz", problems, 2))
     p.macro_waypoint_reached_tolerance_m = _num(
         mc.get("waypoint_reached_tolerance_m"),
-        "he.corrector.waypoint_reached_tolerance_m", problems, 0.3,
+        "he.corrector.waypoint_reached_tolerance_m", problems, 0.5,
         allow_zero=True)
     p.macro_terminal_capture_radius_m = _num(
         mc.get("terminal_capture_radius_m"),

@@ -168,8 +168,9 @@ global:
       distance_long_min_m: 15.0
       radius_small_max_m: 0.6
       radius_large_min_m: 1.4
-      density_sparse_max: 7.0
-      density_dense_min: 14.0
+      # density 阈值 = 占地密度（Σπr²/区域比例），非障碍数量
+      density_sparse_max: 0.06
+      density_dense_min: 0.12
       long_takeover_min_ticks: 30
 
   # ── Blueprint generation (deficit-driven offline pipeline) ────────
@@ -283,11 +284,16 @@ global:
       threads: 16
       levels: 4
       scenes_per_level: 10
+      # 每层场景数（覆盖 scenes_per_level）：large/mixed 多采
+      scenes_per_level_list: [8, 8, 12, 12]
       # small / medium / large / mixed radius bands (m)
       level_radius_min: [0.15, 0.5, 1.5, 0.15]
       level_radius_max: [0.5, 1.5, 3.0, 3.0]
+      # 每层目标占地密度（稀疏端→密集端，占地比例）
+      level_occupancy_min: [0.05, 0.07, 0.04, 0.08]
+      level_occupancy_max: [0.08, 0.11, 0.07, 0.12]
       # placement constraints: pairwise surface gap and border clearance
-      surface_gap_min_m: 1.2
+      surface_gap_min_m: 1.6
       boundary_min_m: 0.6
       # direct-line distance bands: short < short_max, medium < medium_max
       distance_short_max_m: 8.0
@@ -394,8 +400,9 @@ global:
       min_grouped_deflection_samples: 8
       min_grouped_correction_samples: 4
     legacy:
-      density_sparse_max: 7.0
-      density_dense_min: 14.0
+      # 占地密度阈值（Σπr²/区域比例），非障碍数量
+      density_sparse_max: 0.06
+      density_dense_min: 0.12
       radius_small_max_m: 0.6
       radius_large_min_m: 1.4
 

@@ -25,7 +25,14 @@ elseif("${CMAKE_HOST_SYSTEM_PROCESSOR}" STREQUAL "aarch64")
     -mcpu=cortex-a57+crypto
   )
 else()
-  set(IL_DATASET_ARCH_FLAGS -march=native)
+  # R29r: MUST stay ABI-consistent with the prebuilt flightlib (compiled
+  # with the DEFAULT architecture).  -march=native enabled AVX (32-byte)
+  # Eigen alignment in this module while flightlib::Quadrotor uses 16-byte
+  # alignment, so the cross-.so Quadrotor new/delete pair mismatched and
+  # ~Quadrotor's Eigen::aligned_free double-freed (crash on the first
+  # FlightmareDynamicsBridge dealloc: "double free or corruption (out)").
+  # Use the default architecture exactly like flightlib.
+  set(IL_DATASET_ARCH_FLAGS "")
 endif()
 
 # ── AddressSanitizer (optional native crash diagnosis) ────────────────
@@ -147,6 +154,11 @@ pybind11_add_module(_il_hierarchical_expert
 )
 target_compile_options(_il_hierarchical_expert PRIVATE
   ${IL_DATASET_OPT_FLAGS} -Wall -Wextra ${IL_DATASET_SAN_FLAGS} ${IL_DATASET_ARCH_FLAGS}
+  # R29r: hide pybind11 internals so two pybind modules (this one and
+  # _flightmare_dynamics) never clash on pybind11_object_dealloc / type_info
+  # across .so boundaries (caused double-free in FlightmareDynamicsBridge
+  # dealloc).  Only the PYBIND11_MODULE init symbol stays exported.
+  -fvisibility=hidden
 )
 target_link_libraries(_il_hierarchical_expert PRIVATE
   il_hierarchical_expert_lib
@@ -171,6 +183,8 @@ pybind11_add_module(_flightmare_dynamics
 )
 target_compile_options(_flightmare_dynamics PRIVATE
   ${IL_DATASET_OPT_FLAGS} -Wall -Wextra ${IL_DATASET_SAN_FLAGS} ${IL_DATASET_ARCH_FLAGS}
+  # R29r: hide pybind11 internals (see _il_hierarchical_expert note).
+  -fvisibility=hidden
 )
 target_link_libraries(_flightmare_dynamics PRIVATE
   ${catkin_LIBRARIES}

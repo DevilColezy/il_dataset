@@ -368,6 +368,11 @@ private:
     PlanarTrajectory current_trajectory_;
     VelocityCommand3D last_command_;
     bool has_last_command_ = false;
+    // Yaw of the body frame in which last_command_ was issued, so that
+    // reachableCommand can re-project the previous command into the CURRENT
+    // body frame (P1#6).  Without it, inter-tick yaw rotation silently adds
+    // world-frame acceleration beyond the configured lp_max_accel ramp.
+    double last_command_yaw_ = 0.0;
     uint64_t last_mission_revision_ = 0;
     Vec2d last_target_position_{0.0, 0.0};
     bool last_target_valid_ = false;

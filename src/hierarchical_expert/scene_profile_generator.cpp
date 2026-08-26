@@ -18,11 +18,13 @@ inline const char* radiusBand(double r, double tiny_max, double small_max,
     return "large";
 }
 
-/// Legacy density class from obstacle count (manifest compatibility).
-inline const char* legacyDensityClass(double count,
-                                      const BlueprintGenerationConfig& cfg) {
-    if (count <= cfg.density_sparse_max) return "sparse";
-    if (count >= cfg.density_dense_min) return "dense";
+/// Occupancy-ratio density class (Σπr²/free-area fraction).  Replaces the
+/// obstacle-count based classification: the same count of big cylinders is
+/// far denser than small ones.
+inline const char* occupancyDensityClass(double occupancy_ratio,
+                                         const BlueprintGenerationConfig& cfg) {
+    if (occupancy_ratio <= cfg.density_sparse_max) return "sparse";
+    if (occupancy_ratio >= cfg.density_dense_min) return "dense";
     return "medium";
 }
 
@@ -40,9 +42,15 @@ inline const char* legacyRadiusClass(double max_radius, bool is_empty,
 /// balances profiles directly, these are report-only).
 inline void fillLegacySceneClasses(BlueprintScene& scene,
                                    const BlueprintGenerationConfig& cfg) {
-    scene.actual_density_class =
-        legacyDensityClass(static_cast<double>(scene.actual_obstacle_count),
-                           cfg);
+    // 占地密度（Σπr²/free-area）替代障碍数量作密度分类：同一数量的大圆柱
+    // 远比小圆柱密集，数量不能代表场景拥挤度。
+    double occ = 0.0;
+    for (const auto& o : scene.obstacles) {
+        occ += 3.14159265358979323846 * o.radius * o.radius;
+    }
+    const double area = cfg.warehouse.area();
+    if (area > 1e-9) occ /= area;
+    scene.actual_density_class = occupancyDensityClass(occ, cfg);
     scene.density_class = scene.actual_density_class;
     double min_r = std::numeric_limits<double>::infinity();
     double max_r = 0.0;
@@ -118,20 +126,20 @@ void SceneProfileGenerator::buildDefaultCatalog() {
         profiles_.push_back(p);
     };
     //                    name             cmin cmax  rmin  rmax  mode       fixed  struct             clu spread passage weight tags
-    add("empty",             0,   0,  0.10, 1.0, "log_uniform", 0.1, SceneStructure::EMPTY, 0, 0.0, 0.0, 1.0, {"clear"});
-    add("sparse_tiny",       1,   4,  0.05, 0.15, "log_uniform", 0.1, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.0, {"sparse", "tiny"});
-    add("dense_tiny",       20,  30,  0.08, 0.12, "log_uniform", 0.1, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.0, {"dense", "tiny"});
-    add("sparse_small",      1,   5,  0.15, 0.50, "log_uniform", 0.2, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.0, {"sparse", "small"});
-    add("dense_small",       8,  16,  0.15, 0.50, "log_uniform", 0.3, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.0, {"dense", "small"});
-    add("sparse_medium",     1,   4,  0.50, 1.50, "log_uniform", 0.8, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.0, {"sparse", "medium"});
-    add("dense_medium",      5,  10,  0.50, 1.50, "log_uniform", 0.9, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.0, {"dense", "medium"});
-    add("large_single",      1,   1,  4.00, 6.00, "log_uniform", 5.0, SceneStructure::CENTRAL_BLOCKER, 0, 0.0, 0.0, 1.0, {"large", "blocker"});
-    add("large_sparse",      1,   3,  3.00, 6.00, "log_uniform", 4.0, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.0, {"large", "sparse", "blocker"});
-    add("mixed_tiny_small", 10,  20,  0.08, 0.50, "log_uniform", 0.3, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.0, {"mixed"});
-    add("mixed_small_medium", 6, 14,  0.20, 1.50, "log_uniform", 0.7, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.0, {"mixed"});
-    add("mixed_small_large", 4,  10,  0.30, 5.00, "log_uniform", 2.0, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.0, {"mixed", "blocker"});
-    add("mixed_all",         8,  18,  0.10, 5.00, "log_uniform", 2.0, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.0, {"mixed", "blocker"});
-    add("clustered",        10,  20,  0.20, 0.80, "log_uniform", 0.4, SceneStructure::CLUSTERED, 3, 4.0, 0.0, 1.0, {"clustered"});
+    add("empty",             0,   0,  0.10, 1.0, "log_uniform", 0.1, SceneStructure::EMPTY, 0, 0.0, 0.0, 0.2, {"clear"});
+    add("sparse_tiny",       1,   4,  0.05, 0.15, "log_uniform", 0.1, SceneStructure::UNIFORM, 0, 0.0, 0.0, 0.3, {"sparse", "tiny"});
+    add("dense_tiny",       20,  30,  0.08, 0.12, "log_uniform", 0.1, SceneStructure::UNIFORM, 0, 0.0, 0.0, 0.5, {"dense", "tiny"});
+    add("sparse_small",      1,   5,  0.15, 0.50, "log_uniform", 0.2, SceneStructure::UNIFORM, 0, 0.0, 0.0, 0.4, {"sparse", "small"});
+    add("dense_small",       8,  16,  0.15, 0.50, "log_uniform", 0.3, SceneStructure::UNIFORM, 0, 0.0, 0.0, 0.8, {"dense", "small"});
+    add("sparse_medium",     1,   4,  0.50, 1.50, "log_uniform", 0.8, SceneStructure::UNIFORM, 0, 0.0, 0.0, 0.4, {"sparse", "medium"});
+    add("dense_medium",      5,  10,  0.50, 1.50, "log_uniform", 0.9, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.2, {"dense", "medium"});
+    add("large_single",      1,   1,  4.00, 6.00, "log_uniform", 5.0, SceneStructure::CENTRAL_BLOCKER, 0, 0.0, 0.0, 1.8, {"large", "blocker"});
+    add("large_sparse",      1,   3,  3.00, 6.00, "log_uniform", 4.0, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.8, {"large", "sparse", "blocker"});
+    add("mixed_tiny_small", 10,  20,  0.08, 0.50, "log_uniform", 0.3, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.3, {"mixed"});
+    add("mixed_small_medium", 6, 14,  0.20, 1.50, "log_uniform", 0.7, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.5, {"mixed"});
+    add("mixed_small_large", 4,  10,  0.30, 5.00, "log_uniform", 2.0, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.8, {"mixed", "blocker"});
+    add("mixed_all",         8,  18,  0.10, 5.00, "log_uniform", 2.0, SceneStructure::UNIFORM, 0, 0.0, 0.0, 1.8, {"mixed", "blocker"});
+    add("clustered",        10,  20,  0.20, 0.80, "log_uniform", 0.4, SceneStructure::CLUSTERED, 3, 4.0, 0.0, 1.5, {"clustered"});
     // corridor/chicane counts are GEOMETRICALLY feasible: every obstacle
     // sits on one of the two corridor side bands (or a single monotonic
     // chicane line) with at least min_surface_gap (1.4 m) surface spacing
@@ -139,11 +147,11 @@ void SceneProfileGenerator::buildDefaultCatalog() {
     // bands so 4-8 fit; a chicane is a SINGLE line whose consecutive
     // obstacles must be >= 1.4 + r_prev + r apart along the axis, so only
     // 4-5 are robustly placeable (6 would need every radius ~0.4).
-    add("corridor",          4,   8,  0.50, 1.50, "log_uniform", 1.0, SceneStructure::CORRIDOR, 0, 0.0, 2.2, 1.0, {"corridor", "narrow"});
-    add("bottleneck",        4,   8,  0.80, 2.50, "log_uniform", 1.6, SceneStructure::BOTTLENECK, 0, 0.0, 1.8, 1.0, {"narrow", "blocker"});
-    add("chicane",           4,   5,  0.40, 1.20, "log_uniform", 0.8, SceneStructure::CHICANE, 0, 0.0, 2.4, 1.0, {"narrow", "chicane"});
-    add("central_blocker",   1,   4,  2.50, 6.00, "log_uniform", 4.0, SceneStructure::CENTRAL_BLOCKER, 0, 0.0, 0.0, 1.0, {"blocker", "large"});
-    add("edge_clutter",      8,  16,  0.30, 1.20, "log_uniform", 0.7, SceneStructure::EDGE_CLUTTER, 0, 0.0, 0.0, 1.0, {"edge"});
+    add("corridor",          4,   8,  0.50, 1.50, "log_uniform", 1.0, SceneStructure::CORRIDOR, 0, 0.0, 2.2, 1.8, {"corridor", "narrow"});
+    add("bottleneck",        4,   8,  0.80, 2.50, "log_uniform", 1.6, SceneStructure::BOTTLENECK, 0, 0.0, 1.8, 1.5, {"narrow", "blocker"});
+    add("chicane",           4,   5,  0.40, 1.20, "log_uniform", 0.8, SceneStructure::CHICANE, 0, 0.0, 2.4, 1.8, {"narrow", "chicane"});
+    add("central_blocker",   1,   4,  2.50, 6.00, "log_uniform", 4.0, SceneStructure::CENTRAL_BLOCKER, 0, 0.0, 0.0, 1.8, {"blocker", "large"});
+    add("edge_clutter",      8,  16,  0.30, 1.20, "log_uniform", 0.7, SceneStructure::EDGE_CLUTTER, 0, 0.0, 0.0, 1.2, {"edge"});
 }
 
 const SceneProfile* SceneProfileGenerator::findProfile(
@@ -656,6 +664,11 @@ SceneMetadata SceneProfileGenerator::computeMetadata(
     md.local_density_proxy =
         area > 1e-9 ? 1000.0 * static_cast<double>(scene.obstacles.size()) / area
                     : 0.0;
+    double occ = 0.0;
+    for (const auto& o : scene.obstacles) {
+        occ += 3.14159265358979323846 * o.radius * o.radius;
+    }
+    md.occupancy_ratio = area > 1e-9 ? occ / area : 0.0;
     return md;
 }
 

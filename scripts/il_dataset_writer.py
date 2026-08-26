@@ -78,7 +78,7 @@ DATA_SCHEMA_V25_FIELDS = [
     "velocity_flu_x", "velocity_flu_y", "velocity_flu_z",
     "yaw_rate_flu",
     "goal_direction_flu_x", "goal_direction_flu_y", "goal_direction_flu_z",
-    "goal_distance_clipped_m", "goal_distance_norm",
+    "goal_distance_clipped_m", "goal_distance_norm", "goal_distance_raw_m",
     # ── supervision labels (30 Hz) — the ACTUAL sent command ───────
     "target_velocity_flu_x", "target_velocity_flu_y", "target_velocity_flu_z",
     "target_yaw_rate",
@@ -127,6 +127,7 @@ DATA_SCHEMA_V25_FIELDS = [
     "navigation_goal_direction_flu_x", "navigation_goal_direction_flu_y",
     "navigation_goal_direction_flu_z",
     "navigation_goal_distance_clipped_m", "navigation_goal_distance_norm",
+    "navigation_goal_distance_raw_m",
     # ── 5 Hz / two-level privileged diagnostics (never student inputs) ─
     "correction_enter_event", "correction_exit_event",
     "correction_update_event",

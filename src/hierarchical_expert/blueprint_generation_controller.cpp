@@ -181,15 +181,38 @@ inline SceneSpec makeSceneSpec(const BlueprintGenerationConfig& cfg, int level,
     s.rmax = (level >= 0 && level < static_cast<int>(cfg.level_radius_max_m.size()))
                  ? cfg.level_radius_max_m[level]
                  : 1.5;
-    if (s.rmax >= 2.9 && s.rmin < 0.5) {
-        s.target_count = 3 + level_index;       // mixed: 3..12
-    } else if (s.rmax >= 2.9) {
-        s.target_count = 2 + level_index;       // large: 2..11
-    } else if (s.rmax >= 1.4) {
-        s.target_count = 4 + 2 * level_index;   // medium: 4..22
-    } else {
-        s.target_count = 5 + 2 * level_index;   // small: 5..23
-    }
+    // ── Occupancy-driven obstacle count (2026-08-26) ───────────────
+    // target_count = occupancy_target × free-area / E[π r²], where the
+    // target occupancy ramps sparse→dense across the level's scenes.
+    // Replaces the old per-level count table (small 5..23 was too empty
+    // for tiny cylinders, large 2..11 too crammed for big ones).
+    // E[r²] for a log-uniform radius on [rmin,rmax] =
+    // (rmax²-rmin²)/(2·ln(rmax/rmin)); placeCylinders caps the actual
+    // count by the surface-gap constraint anyway.
+    const int n_occ_min = static_cast<int>(cfg.level_occupancy_min.size());
+    const int n_occ_max = static_cast<int>(cfg.level_occupancy_max.size());
+    const double occ_min =
+        (level < n_occ_min) ? cfg.level_occupancy_min[level] : 0.05;
+    const double occ_max =
+        (level < n_occ_max) ? cfg.level_occupancy_max[level] : 0.10;
+    const int per_level =
+        (level >= 0 &&
+         level < static_cast<int>(cfg.scenes_per_level_list.size()))
+            ? std::max(1, cfg.scenes_per_level_list[level])
+            : std::max(1, cfg.scenes_per_level);
+    const double t = per_level > 1
+                         ? static_cast<double>(level_index) / (per_level - 1)
+                         : 0.0;
+    const double occupancy = occ_min + (occ_max - occ_min) * t;
+    const double lr = std::log(
+        std::max(1e-6, s.rmax / std::max(1e-6, s.rmin)));
+    const double er2 = lr > 1e-9
+                           ? (s.rmax * s.rmax - s.rmin * s.rmin) / (2.0 * lr)
+                           : 0.5 * (s.rmin * s.rmin + s.rmax * s.rmax);
+    const double area = cfg.warehouse.area();
+    const double kPi = 3.14159265358979323846;
+    s.target_count = std::max(
+        2, static_cast<int>(std::lround(occupancy * area / (kPi * er2))));
     return s;
 }
 
@@ -1863,16 +1886,25 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
     // avoidance labels, large/mixed target more detour labels.
     double blocked_ratio = 0.5;
     if (level >= 2) {
-        blocked_ratio = 0.65;  // large / mixed: more detours
+        // 步骤3+4：0.65→0.75（large/mixed 更多"大障碍背后目标"构造 → 更多宏观接管）
+        blocked_ratio = 0.75;
     } else if (level == 1) {
-        blocked_ratio = 0.40;  // medium
+        // 步骤3+4：0.40→0.45（medium 更多直线穿障采样 → 更多避障响应）
+        blocked_ratio = 0.45;
     } else {
-        blocked_ratio = 0.35;  // small: mostly straight / light avoidance
+        // 步骤3+4：0.35→0.40（small 更多直线穿障采样 → 更多小尺度避障）
+        blocked_ratio = 0.40;
     }
     const int blocked_target =
         std::max(1, static_cast<int>(std::round(scene_target * blocked_ratio)));
     const int unblocked_target = std::max(1, scene_target - blocked_target);
     int blocked_accept = 0, unblocked_accept = 0;
+    // ── 步骤3+4: macro-turn probe counters (per-scene) ────────────
+    // 序列路径的 macro_probe 只作用于 taskTypeWeights 采样（task_candidate_
+    // generator）；scene_parallel 路径的 geom_type 恒为 CLEAR，该探针从未
+    // 生效——这是宏观 TURN 任务供应不足的根因。这里对 BLOCKED 任务直接
+    // 强制 ±90° 初始 yaw 偏移，使 5Hz 专家起步即触发 TURN 接管。
+    int probe_left_issued = 0, probe_right_issued = 0;
     while ((dist_counts[0] + dist_counts[1] + dist_counts[2] < scene_target ||
             blocked_accept < blocked_target ||
             unblocked_accept < unblocked_target) &&
@@ -1976,9 +2008,9 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
             (u01(rng) < 0.5 ? -1.0 : 1.0) * (35.0 * u01(rng)) * deg2rad(1.0);
         task.initial_yaw =
             CoordinateAdapter::expertYawToFlightmare(goal_bearing + yaw_offset);
-        const double expert_yaw =
+        double expert_yaw =
             CoordinateAdapter::flightmareYawToExpert(task.initial_yaw);
-        const double yaw_err = wrapAngle(goal_bearing - expert_yaw);
+        double yaw_err = wrapAngle(goal_bearing - expert_yaw);
         task.geom_type = "CLEAR";
         const double dline = (goal - start).norm();
         task.distance_class = dline < cfg_.task_distance_short_max_m
@@ -1986,6 +2018,26 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
                                   : (dline < cfg_.task_distance_medium_max_m
                                          ? "medium"
                                          : "long");
+        // ── 步骤3+4: macro-turn probe for BLOCKED tasks ────────────
+        // 对 blocked 任务（直线穿障）强制 ±yaw_error 初始朝向，使 5Hz 专家
+        // 在起步阶段即进入搜索旋转 → 产生真实的 TURN_LEFT / TURN_RIGHT 标签。
+        // 每场景最多 probe blocked_target 个任务；probe 计数在发出时递增（两侧
+        // 交替），匹配失败只是拒绝该候选，blocked_target 仍由普通 blocked 任务
+        // 达成，保证不烧穿 preflight 预算。
+        int probe_side = 0;  // +1 LEFT, -1 RIGHT, 0 = 不强制
+        if (cfg_.macro_probe_enabled && line_blocked &&
+            blocked_accept < blocked_target &&
+            (probe_left_issued + probe_right_issued) < blocked_target) {
+            probe_side =
+                (probe_left_issued <= probe_right_issued) ? 1 : -1;
+            if (probe_side > 0) {
+                ++probe_left_issued;
+            } else {
+                ++probe_right_issued;
+            }
+            forceTurnProbeYaw(task, probe_side,
+                              cfg_.macro_probe_yaw_error_deg, yaw_err);
+        }
         ++wr.candidates_sampled;
         ++task_seq;
 
@@ -2006,6 +2058,22 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
         preflight_ms += msSince(t_pre);
         ++wr.preflights_run;
         task.summary = summary;
+        // ── 步骤3+4: macro-turn probe match check ─────────────────
+        // require_match=true 时 probe 任务必须实际产生所请求的 TURN 标签，
+        // 否则拒绝该候选（不进 pool，也不计入 blocked_accept），继续采样补足。
+        if (probe_side != 0 && cfg_.macro_probe_require_match) {
+            const bool matched =
+                probe_side > 0 ? summary.macro_turn_left_count > 0
+                               : summary.macro_turn_right_count > 0;
+            if (!matched) {
+                task.behavior_class = "rejected";
+                task.side_class = "none";
+                task.audit.preflight_status =
+                    "preflight_rejected:macro_turn_probe_mismatch";
+                wr.rejected.push_back(task);
+                continue;  // 不匹配：跳过 quick_accept，继续采样
+            }
+        }
         // This task's behaviour SEGMENT labels (all behaviours that
         // occurred anywhere in the trajectory).
         std::map<std::string, uint64_t> task_seg;
@@ -2099,9 +2167,19 @@ BlueprintResult BlueprintGenerationController::generateSceneParallel() {
     result.base_seed = cfg_.base_seed;
 
     const int levels = std::max(1, cfg_.scene_levels);
-    const int per_level = std::max(1, cfg_.scenes_per_level);
+    // Per-level scene counts (sparse -> dense), from scenes_per_level_list
+    // when it matches the level count, else the uniform scenes_per_level.
+    std::vector<int> per_level_counts(
+        levels, std::max(1, cfg_.scenes_per_level));
+    if (static_cast<int>(cfg_.scenes_per_level_list.size()) == levels) {
+        for (int L = 0; L < levels; ++L) {
+            per_level_counts[L] =
+                std::max(1, cfg_.scenes_per_level_list[L]);
+        }
+    }
     const int n_threads = std::max(1, cfg_.scene_parallel_threads);
-    const uint64_t n_scenes = static_cast<uint64_t>(levels) * per_level;
+    uint64_t n_scenes = 0;
+    for (int L = 0; L < levels; ++L) n_scenes += per_level_counts[L];
     const int total_target = std::max(1, cfg_.expected_collect_tasks);
 
     // ── Phase 1: main thread pre-generates the scene specs ────────
@@ -2113,12 +2191,13 @@ BlueprintResult BlueprintGenerationController::generateSceneParallel() {
     };
     std::vector<Spec> specs;
     specs.reserve(n_scenes);
+    uint64_t scene_id = 0;
     for (int L = 0; L < levels; ++L) {
-        for (int j = 0; j < per_level; ++j) {
-            const uint64_t scene_id = static_cast<uint64_t>(L) * per_level + j;
+        for (int j = 0; j < per_level_counts[L]; ++j) {
             const uint64_t seed =
                 mixSeed(cfg_.base_seed, 0x5CEA5001ULL + scene_id);
             specs.push_back({L, j, scene_id, seed});
+            ++scene_id;
         }
     }
 

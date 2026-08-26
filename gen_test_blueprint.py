@@ -136,10 +136,20 @@ def main():
           % (wall, result.scenes_valid, result.scenes_generated,
              result.tasks_quota_accepted, result.generation_ok))
 
-    # per-scene level (scene_id // per_level)
+    # per-scene level.  With per-level scene counts (scenes_per_level_list)
+    # the level of scene_id is the cumulative-prefix band, NOT scene_id //
+    # scenes_per_level (that old formula mislabels scenes once the per-level
+    # counts differ).  Falls back to the uniform scenes_per_level when the
+    # list is absent.
     per_level_n = int(sp.get("scenes_per_level", 10))
-    scene_level = {int(s.scene_id): int(s.scene_id) // per_level_n
-                   for s in result.scenes}
+    spl = sp.get("scenes_per_level_list", []) or []
+    scene_level = {}
+    acc = 0
+    for level_i in range(int(sp.get("levels", 4))):
+        cnt = int(spl[level_i]) if level_i < len(spl) else per_level_n
+        for sid in range(acc, acc + max(1, cnt)):
+            scene_level[sid] = level_i
+        acc += max(1, cnt)
     task_level = [scene_level.get(int(t.scene_id), 0) for t in result.tasks]
 
     # ── write test manifest (same schema as production) ────────────

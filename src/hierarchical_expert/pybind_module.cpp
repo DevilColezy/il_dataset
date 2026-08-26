@@ -265,8 +265,16 @@ void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
         b.scene_parallel_threads = gi("threads", b.scene_parallel_threads);
         b.scene_levels = gi("levels", b.scene_levels);
         b.scenes_per_level = gi("scenes_per_level", b.scenes_per_level);
+        if (d.contains("scenes_per_level_list")) {
+            b.scenes_per_level_list.clear();
+            for (auto item : py::cast<py::list>(d["scenes_per_level_list"])) {
+                b.scenes_per_level_list.push_back(py::cast<int>(item));
+            }
+        }
         b.level_radius_min_m = gvl("level_radius_min", b.level_radius_min_m);
         b.level_radius_max_m = gvl("level_radius_max", b.level_radius_max_m);
+        b.level_occupancy_min = gvl("level_occupancy_min", b.level_occupancy_min);
+        b.level_occupancy_max = gvl("level_occupancy_max", b.level_occupancy_max);
         b.obstacle_surface_gap_min_m =
             gd("surface_gap_min_m", b.obstacle_surface_gap_min_m);
         b.obstacle_boundary_min_m =
