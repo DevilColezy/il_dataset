@@ -212,36 +212,4 @@ catkin_install_python(
 )
 
 # ── Offline blueprint tests / benchmark (optional, opt-in) ────────
-# Pure C++17 static sanity tests + raycast micro-benchmark for the
-# deficit-driven Scene/Task Blueprint pipeline.  Build with:
-#   catkin build il_dataset --cmake-args -DIL_DATASET_BUILD_TESTS=ON
-# then run the produced binaries (they are plain executables, no gtest):
-#   ./devel/lib/il_dataset/test_blueprint_geometry
-#   ./devel/lib/il_dataset/bench_blueprint_raycast
-option(IL_DATASET_BUILD_TESTS "Build offline blueprint static tests + benchmark" OFF)
-if(IL_DATASET_BUILD_TESTS)
-  add_executable(test_blueprint_geometry
-    test/test_blueprint_geometry.cpp
-  )
-  target_compile_options(test_blueprint_geometry PRIVATE
-    ${IL_DATASET_OPT_FLAGS} -Wall -Wextra ${IL_DATASET_SAN_FLAGS} ${IL_DATASET_ARCH_FLAGS}
-  )
-  target_link_libraries(test_blueprint_geometry
-    il_hierarchical_expert_lib
-    ${catkin_LIBRARIES}
-    ${IL_DATASET_SAN_FLAGS}
-  )
-
-  add_executable(bench_blueprint_raycast
-    bench/bench_blueprint_raycast.cpp
-  )
-  target_compile_options(bench_blueprint_raycast PRIVATE
-    ${IL_DATASET_OPT_FLAGS} -Wall -Wextra ${IL_DATASET_SAN_FLAGS} ${IL_DATASET_ARCH_FLAGS}
-  )
-  target_link_libraries(bench_blueprint_raycast
-    il_hierarchical_expert_lib
-    ${catkin_LIBRARIES}
-    ${IL_DATASET_SAN_FLAGS}
-  )
-endif()
 

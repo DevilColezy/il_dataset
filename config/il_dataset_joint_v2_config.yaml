@@ -1,7 +1,6 @@
 # ============================================================================
 #  joint_v2 — production collection recipe for the NEW hierarchical local
-#  expert (both il_dataset_collect.launch and
-#  il_dataset_joint_v2_collect.launch use this config by default).
+#  expert (il_dataset_joint_v2_collect.launch uses this config by default).
 # ============================================================================
 #
 #  Deployment contract this dataset trains:

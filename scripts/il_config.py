@@ -1,8 +1,7 @@
 ﻿#!/usr/bin/env python3
 """
 il_config.py  -  Configuration loading / validation for the NEW
-hierarchical local-expert IL dataset collector (both
-il_dataset_collect.launch and il_dataset_joint_v2_collect.launch).
+hierarchical local-expert IL dataset collector.
 
 The production runtime uses exactly one expert parameter source:
   global.hierarchical_expert
@@ -169,7 +168,7 @@ def _pos_list(value, name, errors):
 
 def _validate_config(cfg):
     """Validate the NEW hierarchical local-expert configuration (the single
-    production path used by both launches).
+    production path used by the production launch).
 
     Only the expert-independent infrastructure (fsm / depth / vehicle /
     control / dynamics / navigation / scene_generation / task_generation /

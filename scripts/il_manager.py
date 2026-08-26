@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 il_manager.py  —  The ONLY collection manager (both
-`il_dataset_collect.launch` and `il_dataset_joint_v2_collect.launch` start
-this node).  Production path:
+`il_dataset_joint_v2_collect.launch`.  Production path:
 
     C++ scene/ESDF/task blueprint generation + C++ classifier + quotas
         -> full manifest written FIRST

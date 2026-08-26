@@ -9,9 +9,9 @@ The **only** production path uses **one** C++ expert — the stable
 `il_hierarchical_expert_lib`, pybind module `_il_hierarchical_expert`),
 ported from the read-only reference `il_2d_multiscale_debug`.
 
-- **One node** (`scripts/il_manager.py`) is started by BOTH launches
-  (`il_dataset_collect.launch` and `il_dataset_joint_v2_collect.launch`);
-  there is no legacy/alternative expert path and no config-based dispatch.
+- **One node** (`scripts/il_manager.py`) is started by the single production
+  launch (`il_dataset_joint_v2_collect.launch`); there is no
+  legacy/alternative expert path or config-based dispatch.
 - The manager instantiates **exactly one** `HierarchicalExpert`; it is the
   **sole generator of every horizontal control command** recorded and sent
   to Flightmare.
@@ -486,13 +486,10 @@ gravity / velocity / yaw-rate from the 30 Hz row.
 
 ```bash
 catkin build il_dataset
-# Both launches run the SAME production node; the default config for both
-# is the joint_v2 recipe:
-roslaunch il_dataset il_dataset_collect.launch
 roslaunch il_dataset il_dataset_joint_v2_collect.launch
 
 # Custom config / dry-run / blueprint-only:
-roslaunch il_dataset il_dataset_collect.launch \
+roslaunch il_dataset il_dataset_joint_v2_collect.launch \
     config_file:=/path/to/my_config.yaml dry_run:=true blueprint_only:=true
 ```
 
@@ -513,8 +510,7 @@ viewer displays the world-XY path, current local plan, original/effective
 targets, body-frame target arrows, macro decision, planner status, and
 clearance/braking diagnostics.
 
-The launch never starts or stops AvoidBench: start it separately first
-(see `launch/il_dataset_collect.launch` header).
+The launch never starts or stops AvoidBench: start it separately first.
 
 ## Single source of truth
 

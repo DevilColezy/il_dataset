@@ -3,7 +3,7 @@
 #  (single production path; schema v25 + two_level_expert_labels_v1)
 # ============================================================================
 #
-#  Production path (BOTH launches start il_manager.py with this stack):
+#  Production path (il_dataset_joint_v2_collect.launch starts il_manager.py):
 #    C++ scene/task generation + preflight
 #      -> Flightmare current depth frame
 #      -> C++ local observation + causal history map

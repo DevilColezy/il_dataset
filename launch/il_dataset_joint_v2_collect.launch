@@ -2,7 +2,7 @@
   <!--
     joint_v2 hierarchical local expert collection (production path).
 
-    SAME node and SAME expert stack as il_dataset_collect.launch: the
+    The production node and expert stack are provided by this launch: the
     manager (scripts/il_manager.py) drives exactly ONE C++ HierarchicalExpert
     (_il_hierarchical_expert: 5 Hz VisibilityTargetCorrector + 30 Hz
     LocalPlanner30Hz + EffectiveTargetAdapter + FSM), the sole generator of
@@ -11,7 +11,7 @@
 
     The legacy chain (CausalLocalTargetStream / PrivilegedMicroDetourPlanner
     / old Python MacroExpert / micro-detour controller / goal switcher) is
-    NOT run by this launch nor by il_dataset_collect.launch.
+    NOT run by this launch.
   -->
   <param name="use_sim_time" value="false" />
   <!-- Build first: catkin build il_dataset -->
