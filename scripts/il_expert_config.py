@@ -204,6 +204,9 @@ def build_params(global_cfg, errors=None):
         problems, 0.0111)
     p.lp_yaw_decay_min = _num(
         lp.get("yaw_decay_min"), "he.lp.yaw_decay_min", problems, 0.5)
+    p.lp_ray_target_rel_max_deg = _num(
+        lp.get("ray_target_rel_max_deg"), "he.lp.ray_target_rel_max_deg",
+        problems, p.obs_fov_deg - 10.0)
     p.lp_terminal_micro_approach_m = _num(
         lp.get("terminal_micro_approach_m"),
         "he.lp.terminal_micro_approach_m", problems, 0.8,

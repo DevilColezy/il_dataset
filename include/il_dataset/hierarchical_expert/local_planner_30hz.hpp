@@ -341,9 +341,16 @@ private:
     /// must brake against the nose clearance, not only the ray clearance.
     /// Returns the chosen ray bearing RELATIVE to yaw, or NaN when all rays
     /// are blocked.
+    /// `ray_limit_m` caps the ray length (default 4.5 m = obs_range −
+    /// te_normal_distance_reserve).  Pass the target distance when it is
+    /// closer than 4.5 m so the rays shrink to "just reach the target":
+    /// the centre ray then only tests the path TO the goal, never the
+    /// space BEHIND it, which otherwise blocks the goal direction by a
+    /// far-side obstacle and forces an unnecessary end-zone detour.
     double raySectorSelect(const PlanarState& state,
                            const LocalObservation& obs, double b_t,
-                           double& clear_range, double& nose_clear) const;
+                           double& clear_range, double& nose_clear,
+                           double ray_limit_m = 0.0) const;
     /// Speed along the chosen ray: braking-feasible against the observed
     /// free range (v = sqrt(2·a·(clear_range − handoffClearance))), capped
     /// by cruise.  Zero when the free range barely exceeds the clearance.

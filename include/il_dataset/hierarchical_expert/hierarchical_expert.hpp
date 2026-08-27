@@ -213,6 +213,22 @@ public:
     /// 5 Hz boundary; joint_v2 keeps the original goal fixed per episode).
     void acceptNewGoal(const Vec2d& goal, uint64_t tick);
 
+    // ── External 5 Hz directive injection (student-upper rollouts) ──
+    // When set, the 5 Hz corrector is bypassed and the injected directive
+    // is used on every 5 Hz boundary; the 30 Hz LocalPlanner30Hz runs
+    // completely unchanged.  ``type`` 0=PASS,1=NORMAL,2=TURN_LEFT,
+    // 3=TURN_RIGHT; ``corrected_*`` is the world-latched NORMAL target
+    // point, ``turn_*`` the world-latched unit TURN direction, and
+    // ``normalized_distance`` the distance label (used for NORMAL).
+    void setExternalDirective(int type, double corrected_x, double corrected_y,
+                              double turn_dir_x, double turn_dir_y,
+                              double normalized_distance,
+                              const std::string& reason);
+    void clearExternalDirective();
+    bool externalDirectiveActive() const {
+        return fsm_.externalDirectiveActive();
+    }
+
     /// Preflight access: run a step from an already-integrated observation
     /// without a new depth frame (used by the dry-run simulator which
     /// synthesizes depth rays from the truth scene).  Takes the canonical

@@ -121,6 +121,21 @@ void HierarchicalExpert::acceptNewGoal(const Vec2d& goal, uint64_t tick) {
 }
 
 // ────────────────────────────────────────────────────────────────────
+//  External 5 Hz directive injection (student-upper rollouts)
+// ────────────────────────────────────────────────────────────────────
+void HierarchicalExpert::setExternalDirective(
+    int type, double corrected_x, double corrected_y, double turn_dir_x,
+    double turn_dir_y, double normalized_distance,
+    const std::string& reason) {
+    fsm_.setExternalDirective(type, corrected_x, corrected_y, turn_dir_x,
+                              turn_dir_y, normalized_distance, reason);
+}
+
+void HierarchicalExpert::clearExternalDirective() {
+    fsm_.clearExternalDirective();
+}
+
+// ────────────────────────────────────────────────────────────────────
 //  Output filling (single place that maps FsmStepOutput → CSV fields)
 // ────────────────────────────────────────────────────────────────────
 void HierarchicalExpert::fillOutput(ExpertStepOutput& out,

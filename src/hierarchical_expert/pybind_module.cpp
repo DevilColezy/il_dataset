@@ -879,8 +879,15 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
     // search a preferred small-deviation band before expanding to the full
     // FOV band; stored-plan tracking reports its real target distance; and
     // macro takeover requires a longer confirmed failure window.
+    // R30 (2026-08-27): (1) the ray-sector rays shrink to the target
+    // distance once the target is inside the 4.5 m planning range — the
+    // centre ray only validates the path TO the goal, so an obstacle
+    // BEHIND the goal no longer forces an end-zone detour; (2) the
+    // avoidance ray must stay within FOV−10° of the target bearing — the
+    // target and the avoidance direction can no longer wedge at opposite
+    // FOV edges.
     m.attr("EXPERT_REVISION") =
-        std::string("r20260823_pool_first_exploration_r30");
+        std::string("r20260827_raylimit_fovrel_r30");
 
     // ── Params2D: the single authoritative parameter source ─────────
     py::class_<Params2D>(m, "Params2D")
@@ -935,6 +942,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("lp_yaw_decay_per_deg",
                        &Params2D::lp_yaw_decay_per_deg)
         .def_readwrite("lp_yaw_decay_min", &Params2D::lp_yaw_decay_min)
+        .def_readwrite("lp_ray_target_rel_max_deg",
+                       &Params2D::lp_ray_target_rel_max_deg)
         .def_readwrite("lp_terminal_micro_approach_m",
                        &Params2D::lp_terminal_micro_approach_m)
         .def_readwrite("lp_replan_interval_ticks",
@@ -1261,6 +1270,25 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                  self.acceptNewGoal(Vec2d(goal[0], goal[1]), tick);
              },
              py::arg("goal"), py::arg("tick"))
+        .def("set_external_directive",
+             [](HierarchicalExpert& self, int type, double corrected_x,
+                double corrected_y, double turn_dir_x, double turn_dir_y,
+                double normalized_distance, const std::string& reason) {
+                 self.setExternalDirective(type, corrected_x, corrected_y,
+                                           turn_dir_x, turn_dir_y,
+                                           normalized_distance, reason);
+             },
+             py::arg("type"), py::arg("corrected_x"), py::arg("corrected_y"),
+             py::arg("turn_dir_x"), py::arg("turn_dir_y"),
+             py::arg("normalized_distance"), py::arg("reason"))
+        .def("clear_external_directive",
+             [](HierarchicalExpert& self) {
+                 self.clearExternalDirective();
+             })
+        .def("external_directive_active",
+             [](const HierarchicalExpert& self) -> bool {
+                 return self.externalDirectiveActive();
+             })
         .def("step",
              [](HierarchicalExpert& self, const py::object& pos, double yaw_fm,
                 const py::object& vel_world, double yaw_rate_fm,

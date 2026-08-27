@@ -29,6 +29,9 @@ void HierarchicalExpertFsm::reset(const Task2D& task, uint64_t tick) {
     reentry_guard_ = 0;
     macro_tick_event_ = 0;
     corrector_.reset();
+    // External 5 Hz directive (student-upper rollouts) is per-episode state.
+    external_directive_valid_ = false;
+    external_directive_ = TargetCorrectionDirective{};
     // Initial directive: PASS_THROUGH toward the task goal, event 0.
     directive_ = TargetCorrectionDirective{};
     directive_.valid = true;
@@ -40,6 +43,55 @@ void HierarchicalExpertFsm::reset(const Task2D& task, uint64_t tick) {
     last_local_result_ = PlannerResult{};
     has_last_local_result_ = false;
     local_planner_.reset();
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  External 5 Hz directive injection (student-upper rollouts)
+// ────────────────────────────────────────────────────────────────────
+void HierarchicalExpertFsm::setExternalDirective(
+    int type, double corrected_x, double corrected_y, double turn_dir_x,
+    double turn_dir_y, double normalized_distance,
+    const std::string& reason) {
+    TargetCorrectionDirective d;
+    d.valid = true;
+    d.reason = reason.empty() ? "EXTERNAL_STUDENT" : reason;
+    switch (type) {
+        case 0:
+            d.type = TargetCorrectionType::PASS_THROUGH;
+            break;
+        case 1:
+            d.type = TargetCorrectionType::NORMAL_CORRECTION;
+            d.corrected_target_world = Vec2d(corrected_x, corrected_y);
+            d.corrected_target_world_valid = true;
+            d.direction_token = 0;  // re-quantized by the adapter at encode
+            d.normalized_distance =
+                std::min(1.0, std::max(0.0, normalized_distance));
+            break;
+        case 2:
+            d.type = TargetCorrectionType::TURN_LEFT;
+            d.turn_direction_world = Vec2d(turn_dir_x, turn_dir_y);
+            d.turn_direction_world_valid = true;
+            d.locked_side = SideSelection::LEFT;
+            d.normalized_distance = 1.0;
+            break;
+        case 3:
+            d.type = TargetCorrectionType::TURN_RIGHT;
+            d.turn_direction_world = Vec2d(turn_dir_x, turn_dir_y);
+            d.turn_direction_world_valid = true;
+            d.locked_side = SideSelection::RIGHT;
+            d.normalized_distance = 1.0;
+            break;
+        default:
+            d.type = TargetCorrectionType::PASS_THROUGH;
+            break;
+    }
+    external_directive_ = d;
+    external_directive_valid_ = true;
+}
+
+void HierarchicalExpertFsm::clearExternalDirective() {
+    external_directive_valid_ = false;
+    external_directive_ = TargetCorrectionDirective{};
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -469,10 +521,19 @@ FsmStepOutput HierarchicalExpertFsm::step(const FsmInput& in) {
                 const TargetCorrectionDirective& candidate) {
                 return assessDirectiveTarget(in, candidate);
             };
-        directive_ = corrector_.update(in.state, in.task.goal,
-                                       in.current_patch, in.history,
-                                       assessment, live_directive_usable,
-                                       assess_directive);
+        if (external_directive_valid_) {
+            // Student-upper mode: the injected 5 Hz directive replaces the
+            // corrector's output.  Bump the update event so the local
+            // planner sees a target change exactly like a real correction.
+            TargetCorrectionDirective d = external_directive_;
+            d.update_event = corrector_.bumpDirectiveEvent();
+            directive_ = d;
+        } else {
+            directive_ = corrector_.update(in.state, in.task.goal,
+                                           in.current_patch, in.history,
+                                           assessment, live_directive_usable,
+                                           assess_directive);
+        }
     } else {
         out.macro_tick_ran = false;
     }

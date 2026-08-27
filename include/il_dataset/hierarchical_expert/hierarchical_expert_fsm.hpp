@@ -138,6 +138,25 @@ public:
     }
     const EncodedTargetInput& lastEncoded() const { return last_encoded_; }
 
+    // ── External 5 Hz directive injection (student-upper rollouts) ──
+    // When an external directive is set, the 5 Hz corrector is BYPASSED on
+    // every 5 Hz boundary and the injected directive is used instead.  The
+    // 30 Hz LocalPlanner30Hz runs completely unchanged, so the rollout is a
+    // faithful "student decides where to fly, expert 30 Hz flies there"
+    // test.  ``setExternalDirective`` takes the same semantic fields the
+    // corrector would emit: type (0 PASS,1 NORMAL,2 TURN_LEFT,3 TURN_RIGHT),
+    // a world-latched corrected target point (NORMAL), a world-latched unit
+    // turn direction (TURN) and the normalized distance label.  When
+    // invalid / never set, the expert behaves exactly as before.
+    void setExternalDirective(int type, double corrected_x, double corrected_y,
+                              double turn_dir_x, double turn_dir_y,
+                              double normalized_distance,
+                              const std::string& reason);
+    void clearExternalDirective();
+    bool externalDirectiveActive() const {
+        return external_directive_valid_;
+    }
+
 private:
     bool isTerminal(FsmState s) const;
     void transition(FsmStepOutput& out, FsmState next,
@@ -172,6 +191,9 @@ private:
     bool directive_updated_ = false;
     uint64_t last_delivered_event_ = 0;
     Vec2d last_original_goal_{0.0, 0.0};
+    // External 5 Hz directive (student-upper rollouts); cleared on reset.
+    bool external_directive_valid_ = false;
+    TargetCorrectionDirective external_directive_;
     PlannerResult last_local_result_;
     bool has_last_local_result_ = false;
 

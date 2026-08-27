@@ -369,6 +369,14 @@ struct Params2D {
     double lp_vmin_speed_mps = 0.5;       // min forward speed on a clear ray
     double lp_yaw_decay_per_deg = 0.0111; // 45° off-nose → ×0.5
     double lp_yaw_decay_min = 0.5;        // yaw-decay floor
+    // User redesign: the ray-sector avoidance direction must stay CLOSE to
+    // the target direction — the angle between the chosen avoidance ray and
+    // the target bearing is capped at lp_ray_target_rel_max_deg (FOV − 10°).
+    // The goal is to prevent the target direction and the avoidance
+    // direction from wedging at OPPOSITE FOV edges (e.g. target at +43°,
+    // avoidance at −45°, ~88° apart): avoidance always stays within a
+    // relative band around the target, never at the far FOV edge.
+    double lp_ray_target_rel_max_deg = 80.0;  // FOV 90 − 10
     // R26: inside this distance to a TERMINAL target (in FOV, hard-clear
     // straight path) the planner skips the B-spline and drives the
     // proportional terminal controller directly.  Bridges the 0.4-0.8 m

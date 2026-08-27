@@ -37,8 +37,9 @@ global:
   # Manifest / dataset output directory.  NOTE: this was hard-coded to a
   # path on the OTHER machine (/home/devil/...) and must be writable by the
   # current user — adjust to your machine (e.g. ~/flightmare_ws/il_data_joint_v2).
-  # 2026-08-27: new-expert (two-segment fallback) collection -> isolated dir.
-  output_dir: "/home/rgzn/flightmare_ws/il_data_joint_v2_col_3"
+  # 2026-08-27: R30 collection (ray-limit + FOV-relative avoidance) -> new
+  # isolated dir so the old col_3 data is never cleared by a fresh run.
+  output_dir: "/home/rgzn/flightmare_ws/il_data_joint_v2_col_4"
 
   # ── Scene-switch render alignment (R29d) ─────────────────────────
   # After switching the Unity scene, wait settle_time_s for the new layout
@@ -50,7 +51,7 @@ global:
     warmup_budget_s: 15.0
 
   scene_generation:
-    seed: 260812
+    seed: 260827
     scene_key_prefix: "joint_v2"
     # 10 scenes = scene 0 (explicit EMPTY / CLEAR scene, 0 obstacles) +
     # 9 non-empty sparse/medium/dense × small/medium/large strata aligned
@@ -113,7 +114,7 @@ global:
   #    ([-7,10] x [0,30]) and equals hierarchical_expert.region below. ──
   blueprint_generation:
     enabled: true
-    base_seed: 260812
+    base_seed: 260827
     # The rest of the section (warehouse, profiles, tasks, performance,
     # synthetic_observation, early_termination, distribution_targets,
     # requirements, legacy) is inherited from il_dataset_config.yaml.
@@ -350,6 +351,11 @@ global:
       vmin_speed_mps: 0.5        # min forward speed on a clear ray
       yaw_decay_per_deg: 0.0111  # 45° off-nose → ×0.5
       yaw_decay_min: 0.5         # yaw-decay floor
+      # The chosen avoidance ray stays within this RELATIVE angle of the
+      # target bearing (FOV − 10 = 80°).  Prevents the target direction and
+      # the avoidance direction from wedging at opposite FOV edges (a
+      # target at +43° must not be dodged by flying to the −45° far edge).
+      ray_target_rel_max_deg: 80.0
       # R29c: EMA weight for the ray-sector yaw intent (1.0 = no smoothing;
       # smaller = smoother heading, slower response).  Smooths the nose
       # against neighbouring-ray switches; the velocity stays on the clear

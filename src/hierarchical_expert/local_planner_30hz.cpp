@@ -819,8 +819,8 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
             // this tick: the upper planner takes over (macro target
             // correction or pure rotation around the large obstacle).
             double ray_clear = 0.0, nose_clear = 0.0;
-            const double ray_b =
-                raySectorSelect(state, obs, b_t, ray_clear, nose_clear);
+            const double ray_b = raySectorSelect(
+                state, obs, b_t, ray_clear, nose_clear, tdist);
             // The local layer resolves ANY chosen clear ray (the speed is
             // braking-feasible via raySectorSpeed).  The upper planner is
             // triggered ONLY when the ray sector has NO solution at all
@@ -1159,9 +1159,8 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                     // direct line clears, the terminal stop plan resumes
                     // and goal capture fires.
                     double ray_clear = 0.0, nose_clear = 0.0;
-                    const double ray_b =
-                        raySectorSelect(state, obs, b_t, ray_clear,
-                                        nose_clear);
+                    const double ray_b = raySectorSelect(
+                        state, obs, b_t, ray_clear, nose_clear, dist);
                     if (std::isfinite(ray_b)) {
                         const Vec2d ray_dir(
                             std::cos(state.yaw + ray_b),
@@ -2746,27 +2745,44 @@ bool LocalPlanner30Hz::forwardCorridorSafe(
 
 double LocalPlanner30Hz::raySectorSelect(
     const PlanarState& state, const LocalObservation& obs, double b_t,
-    double& clear_range, double& nose_clear) const {
+    double& clear_range, double& nose_clear, double ray_limit_m) const {
     clear_range = 0.0;
     nose_clear = 0.0;
     constexpr double kStepDeg = 2.0;
     const double fov_half = ray_fov_half_ > 1e-6
                                 ? ray_fov_half_
                                 : 0.5 * deg2rad(p_.obs_fov_deg);
+    // User redesign: the avoidance direction must stay CLOSE to the target
+    // direction — the RELATIVE angle between any side candidate and the
+    // target bearing b_t is capped at lp_ray_target_rel_max_deg (FOV − 10°).
+    // This prevents the target and the avoidance ray from wedging at
+    // OPPOSITE FOV edges (target at +43°, avoidance at −45° → ~88° apart):
+    // avoidance always stays in a relative band around the target.  The
+    // centre ray (index 0) is the target direction itself and always
+    // emitted; side candidates are also clipped to the true fov_half.
+    const double rel_max = deg2rad(p_.lp_ray_target_rel_max_deg);
     // R29r: ray length aligned with the goal_distance_norm saturation point
     // (obs_range 5.0 - te_normal_distance_reserve 0.5 = 4.5 m; norm 0.9 ==
     // 4.5 m means the target sits at/beyond the ray planning range).
-    const double ray_range =
+    // When the caller passes a closer target distance (ray_limit_m > 0),
+    // shrink the rays to "just reach the target": the centre ray then
+    // validates only the path TO the goal — an obstacle BEHIND the goal
+    // (3..4.5 m past a 3 m target) no longer blocks the goal direction and
+    // forces an unnecessary end-zone detour.
+    const double default_ray_range =
         p_.obs_range_m - p_.te_normal_distance_reserve_m;
+    const double ray_range =
+        (ray_limit_m > 0.0) ? std::min(default_ray_range, ray_limit_m)
+                            : default_ray_range;
     const double inflate = handoffClearance();
     const int max_age = p_.lp_planning_history_max_age_ticks;
     const double step = std::max(1e-3, 0.5 * p_.obs_resolution);
 
     // ── Ray distribution: centred on the TARGET bearing ──────────
     // index 0 IS the target direction (zero bearing error), then expand
-    // ±2°, ±4°, ... to both edges of the camera FOV.  An unobstructed
-    // run therefore flies DIRECTLY at the target — no grid offset — and
-    // a blocked centre expands outward in the user's pair rule.
+    // ±2°, ±4°, ... .  Side candidates must stay within rel_max (FOV−10°)
+    // of the target bearing AND within the true fov_half — so avoidance
+    // never wedges at the opposite FOV edge from the target.
     std::vector<double> ang;
     std::vector<int> side;  // 0 = centre, -1 = right (smaller), +1 = left
     ang.push_back(b_t);
@@ -2774,8 +2790,10 @@ double LocalPlanner30Hz::raySectorSelect(
     for (int k = 1; ; ++k) {
         const double l = b_t - static_cast<double>(k) * deg2rad(kStepDeg);
         const double r = b_t + static_cast<double>(k) * deg2rad(kStepDeg);
-        const bool lIn = std::fabs(l) <= fov_half + 1e-9;
-        const bool rIn = std::fabs(r) <= fov_half + 1e-9;
+        const bool lIn = std::fabs(l) <= fov_half + 1e-9 &&
+                         std::fabs(l - b_t) <= rel_max + 1e-9;
+        const bool rIn = std::fabs(r) <= fov_half + 1e-9 &&
+                         std::fabs(r - b_t) <= rel_max + 1e-9;
         if (!lIn && !rIn) break;
         if (lIn) {
             ang.push_back(l);
@@ -2926,7 +2944,10 @@ double LocalPlanner30Hz::raySectorSelect(
              sweep <= kShortRaySweepDeg + 1e-9; sweep += kShortRayStepDeg) {
             if (std::fabs(sweep) < 1e-9) continue;  // b == a already failed
             const double b = a + deg2rad(sweep);
-            if (std::fabs(b) > fov_half + 1e-9) continue;  // stay in FOV
+            // Stay within the true FOV and within rel_max of the target
+            // bearing (avoidance must not wedge at the opposite FOV edge).
+            if (std::fabs(b) > fov_half + 1e-9) continue;
+            if (std::fabs(b - b_t) > rel_max + 1e-9) continue;
             const Vec2d dir_b(std::cos(state.yaw + b),
                               std::sin(state.yaw + b));
             // Furthest clear point along b (clearance >= handoff).
