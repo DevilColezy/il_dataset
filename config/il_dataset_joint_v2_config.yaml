@@ -37,7 +37,8 @@ global:
   # Manifest / dataset output directory.  NOTE: this was hard-coded to a
   # path on the OTHER machine (/home/devil/...) and must be writable by the
   # current user — adjust to your machine (e.g. ~/flightmare_ws/il_data_joint_v2).
-  output_dir: "/home/rgzn/flightmare_ws/il_data_joint_v2"
+  # 2026-08-27: new-expert (two-segment fallback) collection -> isolated dir.
+  output_dir: "/home/rgzn/flightmare_ws/il_data_joint_v2_col_3"
 
   # ── Scene-switch render alignment (R29d) ─────────────────────────
   # After switching the Unity scene, wait settle_time_s for the new layout

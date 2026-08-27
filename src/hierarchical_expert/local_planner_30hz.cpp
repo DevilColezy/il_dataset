@@ -846,6 +846,16 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                 const Vec2d to_goal = target.position - state.position;
                 const double goal_along_ray =
                     std::max(0.0, to_goal.dot(ray_dir));
+                // Two-segment fallback: raySectorSelect returned a SHORT ray
+                // (clear_range < ray_range) so the effective stop point is the
+                // short-ray endpoint, not the full 4.5 m — decelerate toward
+                // the short-ray length (decision 3).
+                const double ray_planning_range =
+                    p_.obs_range_m - p_.te_normal_distance_reserve_m;
+                const double effective_goal =
+                    (ray_clear < ray_planning_range - 1e-3)
+                        ? std::min(goal_along_ray, ray_clear)
+                        : goal_along_ray;
                 // ── R29h: simplified speed law (user redesign) ──
                 // v_des = cruise · goal_decay(goal_along_ray) ·
                 //         yaw_decay(|ray_b|)
@@ -874,7 +884,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
                 const double decay_span = std::max(
                     1e-6, p_.lp_goal_decay_range_m - stop_m);
                 const double goal_decay = clamp(
-                    (goal_along_ray - stop_m) / decay_span, 0.0, 1.0);
+                    (effective_goal - stop_m) / decay_span, 0.0, 1.0);
                 // UNIFIED speed law (user redesign 2026-08-25): the 30 Hz
                 // planner applies the SAME law to EVERY target — a macro
                 // NORMAL_CORRECTION waypoint is treated exactly like the
@@ -2739,7 +2749,7 @@ double LocalPlanner30Hz::raySectorSelect(
     double& clear_range, double& nose_clear) const {
     clear_range = 0.0;
     nose_clear = 0.0;
-    constexpr double kStepDeg = 5.0;
+    constexpr double kStepDeg = 2.0;
     const double fov_half = ray_fov_half_ > 1e-6
                                 ? ray_fov_half_
                                 : 0.5 * deg2rad(p_.obs_fov_deg);
@@ -2754,9 +2764,9 @@ double LocalPlanner30Hz::raySectorSelect(
 
     // ── Ray distribution: centred on the TARGET bearing ──────────
     // index 0 IS the target direction (zero bearing error), then expand
-    // ±5°, ±10°, ... to both edges of the camera FOV.  An unobstructed
-    // run therefore flies DIRECTLY at the target — no 5° grid offset —
-    // and a blocked centre expands outward in the user's pair rule.
+    // ±2°, ±4°, ... to both edges of the camera FOV.  An unobstructed
+    // run therefore flies DIRECTLY at the target — no grid offset — and
+    // a blocked centre expands outward in the user's pair rule.
     std::vector<double> ang;
     std::vector<int> side;  // 0 = centre, -1 = right (smaller), +1 = left
     ang.push_back(b_t);
@@ -2887,6 +2897,63 @@ double LocalPlanner30Hz::raySectorSelect(
             // Both blocked: keep expanding; one side exhausted -> only the
             // other side advances (handled by haveR / haveL above).
             if (!haveR && !haveL) break;
+        }
+    }
+    // ── Two-segment detour fallback (2026-08-27) ─────────────────
+    // First pass (a whole clear 4.5 m ray) failed.  Try a two-hop path:
+    //   pos ──[short ray, clearance >= handoff]──> P
+    //       ──[segment P -> end ray endpoint, clearance >= handoff]──> R_end
+    // The "end ray" is a direction whose 4.5 m ENDPOINT is clear (centre-
+    // first); the "short ray" is the furthest clear point within ±14° of it;
+    // the connecting segment must also be clear.  This lets the local layer
+    // steer around a blocker that a single straight ray cannot pass, without
+    // a full grid search.  The caller decelerates toward the short-ray
+    // length (clear_range < ray_range marks the fallback); on the next tick
+    // the end ray is usually fully clear again and the fast path resumes.
+    constexpr double kShortRayMinLen = 0.5;      // short ray min length (m)
+    constexpr double kShortRaySweepDeg = 14.0;   // end-ray ± sweep (deg)
+    constexpr double kShortRayStepDeg = 2.0;     // short-ray angular step
+    const Vec2d pos2(state.position.x(), state.position.y());
+    for (int k = 0; k < n; ++k) {
+        const double a = ang[k];
+        const Vec2d dir_a(std::cos(state.yaw + a), std::sin(state.yaw + a));
+        const Vec2d r_end = pos2 + dir_a * ray_range;
+        // End-ray endpoint (4.5 m) must be clear.
+        if (obs.minClearanceToOccupied(r_end, inflate, max_age) < inflate) {
+            continue;
+        }
+        for (double sweep = -kShortRaySweepDeg;
+             sweep <= kShortRaySweepDeg + 1e-9; sweep += kShortRayStepDeg) {
+            if (std::fabs(sweep) < 1e-9) continue;  // b == a already failed
+            const double b = a + deg2rad(sweep);
+            if (std::fabs(b) > fov_half + 1e-9) continue;  // stay in FOV
+            const Vec2d dir_b(std::cos(state.yaw + b),
+                              std::sin(state.yaw + b));
+            // Furthest clear point along b (clearance >= handoff).
+            double d_max = 0.0;
+            for (double d = step; d <= ray_range + 1e-9; d += step) {
+                const Vec2d P = pos2 + dir_b * d;
+                if (obs.minClearanceToOccupied(P, inflate, max_age) < inflate) {
+                    break;
+                }
+                d_max = d;
+            }
+            if (d_max < kShortRayMinLen) continue;
+            const Vec2d p_mid = pos2 + dir_b * d_max;
+            // Segment P -> R_end must also be clear.
+            const double seg_len = (r_end - p_mid).norm();
+            if (seg_len < 1e-6) continue;
+            bool seg_ok = true;
+            for (double t = step; t < seg_len; t += step) {
+                const Vec2d q = p_mid + (r_end - p_mid) * (t / seg_len);
+                if (obs.minClearanceToOccupied(q, inflate, max_age) < inflate) {
+                    seg_ok = false;
+                    break;
+                }
+            }
+            if (!seg_ok) continue;
+            clear_range = d_max;   // caller decelerates toward short ray
+            return b;              // lock the short-ray direction this tick
         }
     }
     // Every ray blocked: upper planner must take over.
