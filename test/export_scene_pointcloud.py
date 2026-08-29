@@ -48,8 +48,8 @@ def main() -> None:
     if a.ply:
         ply_path = Path(a.ply)
     else:
-        depth_cfg = {"width": 640, "height": 480, "fov": 90.0, "near": 0.01,
-                     "far": 1000.0,
+        depth_cfg = {"width": 640, "height": 480, "fov": 58.0, "near": 0.28,
+                     "far": 10.0,
                      "t_bc": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]}
         print(f"[pc-export] Connecting to Unity scene {a.scene_id} ...")

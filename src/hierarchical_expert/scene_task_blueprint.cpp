@@ -185,7 +185,11 @@ BlueprintGenerationConfig SceneTaskBlueprintGenerator::makeBlueprintConfig() con
         b.min_task_distance_m = cfg_.min_task_distance_m;
         b.max_task_distance_m = cfg_.max_task_distance_m;
         b.flight_height_m = cfg_.flight_height_m;
+        b.flight_height_min_m = cfg_.flight_height_min_m;
+        b.flight_height_max_m = cfg_.flight_height_max_m;
         b.obstacle_height_m = cfg_.obstacle_height_m;
+        b.obstacle_height_min_m = cfg_.obstacle_height_min_m;
+        b.obstacle_height_max_m = cfg_.obstacle_height_max_m;
         b.task_sample_attempts = cfg_.task_sample_attempts;
         b.max_task_generation_attempts = std::max(
             1, static_cast<int>(cfg_.qualification_attempt_budget));

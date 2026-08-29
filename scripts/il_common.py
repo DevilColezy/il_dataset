@@ -250,8 +250,8 @@ def make_depth_vehicle(ros_pos, yaw, depth_cfg, quaternion_xyzw=None):
         quat = ros_quat_to_unity_quat(quaternion_xyzw)
     else:
         quat = yaw_to_unity_quat(yaw)
-    near = float(depth_cfg.get("near", 0.01))
-    far = float(depth_cfg.get("far", 1000.0))
+    near = float(depth_cfg.get("near", 0.28))
+    far = float(depth_cfg.get("far", 10.0))
     # ── Single-source Unity T_BC (item 十) ─────────────────────────
     # The camera→body matrix MUST come from the SAME validated
     # `depth.t_bc` (16 row-major floats) that il_expert_config feeds into
@@ -272,8 +272,8 @@ def make_depth_vehicle(ros_pos, yaw, depth_cfg, quaternion_xyzw=None):
         "cameras": [{
             "ID": "quadrotor0_0", "channels": 3,
             "width": int(depth_cfg.get("width", 640)),
-            "height": int(depth_cfg.get("height", 480)),
-            "fov": float(depth_cfg.get("fov", 90.0)),
+            "height": int(depth_cfg.get("height", 360)),
+            "fov": float(depth_cfg.get("fov", 58.0)),
             "nearClipPlane": [near] * 4,
             "farClipPlane": [far, 100.0, far, far],
             "T_BC": t_bc,

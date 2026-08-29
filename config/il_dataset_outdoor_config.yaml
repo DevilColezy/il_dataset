@@ -1,0 +1,210 @@
+# ============================================================================
+#  il_dataset_outdoor_config.yaml — 类 B(室外工业高空)采集配方
+#
+#  作业层: flight_height_m ~ U[10, 13](每任务随机,起终点同高)
+#  障碍  : 竖直圆柱,高度 ~ U[14, 20] m(> 作业高度,贯穿作业层),
+#          中心 z = 层中心 11.5 m
+#  region: 工业大区域 [-25,25] x [-25,25](scene 0 INDUSTRIAL)
+#  距离  : 12–30 m(长程,宏观接管机会更多)
+#  半径  : 类 B 四层级 1.0–6.0 m
+#
+#  extends: il_dataset_config.yaml(而非 joint_v2 — 室外参数差异大,
+#  scene_parallel / 配额 / 专家参数在本文件内重新声明)。
+# ============================================================================
+extends: il_dataset_config.yaml
+
+global:
+  output_dir: "/home/rgzn/flightmare_ws/il_data_d435i_col_high"
+
+  # ── Scene-switch render alignment(同 joint_v2)──────────────────
+  scene_runtime:
+    settle_time_s: 8.0
+    warmup_budget_s: 15.0
+
+  scene_id: 0   # INDUSTRIAL(室外)
+
+  scene_generation:
+    seed: 260828
+    scene_key_prefix: "outdoor_high"
+    scene_count: 10
+    tasks_per_scene: 8
+    minimum_tasks_per_scene: 6
+    require_full_strata_coverage: true
+    geometry:
+      minimum_surface_gap_m: 1.40
+      boundary_margin_m: 1.20
+      radius_min_m: 2.00
+      radius_max_m: 10.00
+      max_obstacles: 30
+      height_m: 16.0
+      free_cell_surface_clearance_m: 0.50
+      esdf_resolution_m: 0.10
+
+  task_generation:
+    # 层中心(障碍放置 z + 车辆预热 z)。任务实际高度随机见下。
+    flight_height_m: 16.0
+    min_task_distance_m: 10.0
+    max_task_distance_m: 35.0
+    initial_yaw_bias_deg: 15.0
+    task_sample_attempts: 200
+    candidate_pool_multiplier: 4
+    qualification_attempt_budget: 400
+    preflight_qualification_max_ticks: 1800
+    quotas:
+      min_per_behavior: 2
+      min_turn_per_side: 2
+      max_left_right_imbalance: 2
+      min_per_density_level: 4
+      min_per_radius_level: 4
+      min_per_distance_level: 4
+      distance_short_max_m: 18.0
+      distance_long_min_m: 27.0
+      radius_small_max_m: 4.0
+      radius_large_min_m: 6.0
+      density_sparse_max: 0.06
+      density_dense_min: 0.12
+      long_takeover_min_ticks: 30
+
+  # ── 专家 region:室外工业大区域 ────────────────────────────────
+  hierarchical_expert:
+    region:
+      min_x: -25.0
+      max_x: 25.0
+      min_y: -25.0
+      max_y: 25.0
+    # 高空作业层 flight_height ~ U[10, 13] m:垂直飞行带必须覆盖它。
+    # 默认 z_min=0.8 / z_max=3.0 是室内低空带 —— clampToBand 会把 11 m
+    # 高空的无人机当作“越界”强制拉回 3 m(vz = (3.0 - 11.1)/0.1 ≈ -81),
+    # 导致整批 episode 坠地(unity_collision @ z≈0)。带上移为 [8, 15],
+    # 内带 [8.5, 14.5] 完整覆盖作业层。
+    local_planner:
+      z_min_m: 13.0
+      z_max_m: 19.0
+      vertical_clearance_m: 0.5
+
+  blueprint_generation:
+    enabled: true
+    base_seed: 260828
+    warehouse:
+      free_region: [-25.0, 25.0, -25.0, 25.0]
+      wall_extension_m: 1.0
+    # 已知障碍(点云固定结构):15-17m 高空无固定结构(场景最高 13.1m),
+    # 该文件为空簇 —— 高空障碍全部为动态生成圆柱。
+    known_obstacles_file: "/home/rgzn/flightmare_ws/il_data_baseline/scene0_classB_15.0-17.0m_clusters.json"
+    scene_generation:
+      use_profile_catalog: true
+      profiles: []
+      profile_sequence: []
+      min_surface_gap_m: 1.40
+      boundary_margin_m: 1.20
+      free_cell_surface_clearance_m: 0.50
+      esdf_resolution_m: 0.10
+      min_main_component_area_m2: 200.0
+    task_generation:
+      # 单值 fallback
+      flight_height_m: 16.0
+      obstacle_height_m: 16.0
+      # 每任务随机作业高度(起终点同高)
+      flight_height_min_m: 15.0
+      flight_height_max_m: 17.0
+      # 每障碍随机高度(> 作业高度,贯穿作业层)
+      obstacle_height_min_m: 18.0
+      obstacle_height_max_m: 24.0
+      min_task_distance_m: 10.0
+      max_task_distance_m: 35.0
+      task_sample_attempts: 300
+      task_goal_attempts: 120
+      initial_yaw:
+        edges_deg: [0.0, 15.0, 35.0, 55.0, 90.0, 150.0, 180.0]
+        weights:   [0.8, 1.2, 2.2, 1.6, 1.0, 0.9]
+      depth_proxy:
+        num_rays: 96
+        sample_stride_ticks: 6
+        near_max_m: 1.5
+        mid_max_m: 3.0
+        far_max_m: 5.0
+      histograms:
+        correction_angle_edges_deg: [-90.0, -60.0, -45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0, 60.0, 90.0]
+        correction_distance_edges: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        deflection_edges_deg: [-90.0, -60.0, -30.0, -10.0, 10.0, 30.0, 60.0, 90.0]
+        yaw_rate_edges: [-2.0, -1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0, 2.0]
+        speed_edges: [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+        min_deflection_speed_mps: 0.10
+      path:
+        short_max_m: 18.0
+        long_min_m: 27.0
+      macro_probe:
+        enabled: true
+        yaw_error_deg: 90.0
+        require_match: true
+    performance:
+      max_task_candidates_per_scene: 64
+      max_total_preflight_ticks: 650000
+      parallel_tasks: 16
+    scene_parallel:
+      enabled: true
+      threads: 16
+      levels: 4
+      scenes_per_level: 10
+      scenes_per_level_list: [8, 8, 8, 8]
+      # 类 B 半径层级(放大 2-10m):small 2-4 / medium 4-6 / large 6-10 /
+      # mixed 2-10
+      level_radius_min: [2.0, 4.0, 6.0, 2.0]
+      level_radius_max: [4.0, 6.0, 10.0, 10.0]
+      level_occupancy_min: [0.05, 0.12, 0.18, 0.18]
+      level_occupancy_max: [0.25, 0.35, 0.45, 0.42]
+      surface_gap_min_m: 1.6
+      boundary_min_m: 0.6
+      # 长程距离分层:10-35 m 整体偏长,分层上移
+      # (short 10-18 / medium 18-27 / long 27-35)
+      distance_short_max_m: 18.0
+      distance_medium_max_m: 27.0
+      quick_preflight_max_ticks: 300
+      quick_preflight_dt_scale: 6.0
+      expected_collect_tasks: 320
+    requirements:
+      min_tasks: 240
+      min_tasks_per_scene: 2
+      max_turn_imbalance_ratio: 0.60
+      max_yaw_imbalance_ratio: 0.60
+      min_path_samples_per_class: 1
+      min_grouped_deflection_samples: 1
+      min_grouped_correction_samples: 1
+    exploration:
+      pool_first: true
+      rounds: 2
+      min_pool_tasks: 24
+    synthetic_observation:
+      # 工业场景没有封闭墙:深度代理不得合成仓库围墙。
+      walls_visible_in_observation: false
+    early_termination:
+      stall_window_ticks: 90
+      stall_speed_mps: 0.02
+      min_chicane_alternations: 2
+    control_rate_hz: 30.0
+    task_qualification:
+      enabled: true
+      require_both_sides_feasible: true
+      run_astar_confirmation: true
+      max_astar_expansions: 30000
+      max_side_route_expansions: 20000
+      max_total_side_route_expansions: 1200000
+      max_total_qualification_expansions: 3000000
+      max_expansions_per_scene: 300000
+      start_recovery_max_radius_m: 0.5
+      side_bias: 0.4
+      min_route_stretch_for_long_detour: 1.5
+    distribution_targets:
+      # ── 5 Hz macro coverage(缩放到 32 场景 / ~320 任务)─────────
+      - {key: "macro:total", metric: "count:macro:total",
+         target: 560, minimum: 280, weight: 1.0, minimum_hard: false}
+      - {key: "macro:pass", metric: "count:macro:pass",
+         target: 140, minimum: 70, weight: 1.0, minimum_hard: true}
+      - {key: "macro:normal", metric: "count:macro:normal",
+         target: 280, minimum: 140, weight: 2.0, minimum_hard: true}
+      - {key: "macro:turn_left", metric: "count:macro:turn_left",
+         target: 105, minimum: 52, weight: 5.0, minimum_hard: true}
+      - {key: "macro:turn_right", metric: "count:macro:turn_right",
+         target: 105, minimum: 52, weight: 5.0, minimum_hard: true}
+      - {key: "corr_angle_total", metric: "hist:macro_correction_angle",
+         target: 420, minimum: 210, weight: 2.0, minimum_hard: true}

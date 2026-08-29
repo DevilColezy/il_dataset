@@ -45,9 +45,15 @@ public:
     /// (the synthetic observation casts rays against the walls, but the
     /// out-of-bounds audit always uses the FREE region bounds).  Pass an
     /// empty / identical envelope to disable wall hits.
+    /// `known_rect_min` / `known_rect_max` are the fixed known-obstacle
+    /// AABBs (point-cloud occupancy clusters of the REAL Unity scene):
+    /// they are cast as solid rectangles so the synthetic patch matches
+    /// the runtime depth (the real scene structures are always visible).
     void configure(const Scene2D& scene, const Vec2d& min_bounds,
                    const Vec2d& max_bounds, const Vec2d* wall_min = nullptr,
-                   const Vec2d* wall_max = nullptr);
+                   const Vec2d* wall_max = nullptr,
+                   const std::vector<Vec2d>& known_rect_min = {},
+                   const std::vector<Vec2d>& known_rect_max = {});
 
     /// Set the dynamics integration step (s) used by step().  Default is
     /// 1/30 (the real 30 Hz control rate).  A LARGER step (e.g. 1/10)
@@ -105,6 +111,9 @@ private:
     // synthesizePatch() never rebuilds the vectors every 30 Hz tick.
     std::vector<Vec2d> obstacle_centers_;
     std::vector<double> obstacle_radii_;
+    // Fixed known-obstacle AABBs (real scene point-cloud structures).
+    std::vector<Vec2d> known_rect_min_;
+    std::vector<Vec2d> known_rect_max_;
     // Reusable per-tick ray buffers (avoid per-tick heap allocation).
     std::vector<double> ray_hit_;
     std::vector<bool> ray_seen_;

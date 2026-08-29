@@ -83,6 +83,24 @@ private:
     std::mt19937_64 gen_;
 };
 
+/// A single 2.5D cylinder obstacle (x, y, radius, height).  Shared by the
+/// blueprint types and the scene/task blueprint result types.
+struct BlueprintObstacle {
+    double x = 0.0, y = 0.0;
+    double radius = 0.0;
+    double height_m = 8.0;
+    int id = -1;
+};
+
+/// An axis-aligned known-obstacle rectangle (point-cloud occupancy cluster
+/// bounding box).  Cells inside [min,max] are treated as occupied in the
+/// scene grid; random cylinders keep a surface gap away from it.
+struct KnownRect {
+    double min_x = 0.0, max_x = 0.0;
+    double min_y = 0.0, max_y = 0.0;
+    double height_m = 8.0;
+};
+
 // ═══════════════════════════════════════════════════════════════════
 //  WarehouseGeometry — THE single warehouse coordinate definition
 // ═══════════════════════════════════════════════════════════════════
@@ -511,8 +529,31 @@ struct BlueprintGenerationConfig {
     // ── task generation ────────────────────────────────────────────
     double min_task_distance_m = 4.0;
     double max_task_distance_m = 28.0;  // free region allows up to ~34 m
+    // NEW: reject super-detours.  A start/goal on opposite sides of a wall
+    // / big building is A*-connected only by walking around it; cap the
+    // greedy-A* route at stretch_ratio x straight + slack so such tasks are
+    // never admitted (they waste a long episode on a useless detour).
+    double max_route_stretch_ratio = 4.0;
+    double max_route_stretch_slack_m = 3.0;
     double flight_height_m = 2.0;
+    // NEW: per-task random operating height (2.5D).  When the range is
+    // left at the default (equal to flight_height_m) every task keeps the
+    // legacy single height; otherwise each task draws U[min,max] and its
+    // start/goal share that height (start/goal height are equal).
+    double flight_height_min_m = 2.0;
+    double flight_height_max_m = 2.0;
     double obstacle_height_m = 8.0;
+    // NEW: per-obstacle random height.  Defaults keep the legacy single
+    // height; otherwise each cylinder draws U[min,max] (must exceed the
+    // operating height so the cylinder spans the flight band).
+    double obstacle_height_min_m = 8.0;
+    double obstacle_height_max_m = 8.0;
+    // NEW: fixed known-obstacle AABBs (point-cloud occupancy clusters of
+    // the real Unity scene).  Injected into EVERY generated scene so
+    // obstacle placement, start/goal sampling and A* connectivity all
+    // account for them.  The AABB cells are marked occupied in the scene
+    // grid and random cylinders never overlap them.
+    std::vector<KnownRect> known_rects;
     int task_sample_attempts = 300;     // per candidate start/goal draws
     int task_goal_attempts = 120;       // per candidate goal draws
     // Extra route margin (m) on top of the endpoint clearance used by the
@@ -615,6 +656,11 @@ struct BlueprintGenerationConfig {
     // cylinders and "not crammed" for large ones (count alone does not).
     std::vector<double> level_occupancy_min{0.05, 0.07, 0.04, 0.08};
     std::vector<double> level_occupancy_max{0.08, 0.11, 0.07, 0.12};
+    // Per-level adaptive distance floor: a medium/large level's minimum
+    // start-goal distance is max(min_task_distance_m, scale * rmax), so
+    // big cylinders are never asked to host a short path they cannot
+    // physically connect.  small/mixed keep the full [min, max] band.
+    double distance_min_radius_scale = 2.5;
     // Placement constraints: pairwise SURFACE gap >= obstacle_surface_gap
     // _min_m (must be traversable), obstacle centre >= boundary_min_m from
     // the free-region border.

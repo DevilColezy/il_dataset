@@ -1,0 +1,15 @@
+# ============================================================================
+#  il_dataset_outdoor_test_rect.yaml — 室外高空矩形(AABB)障碍绕行测试
+#
+#  manifest 提供 1 个矩形障碍:8 m(x 宽)× 3 m(y 深)× 24 m 高,位于 (0,0)。
+#  无人机从 (-15,0) 直飞 (15,0),必须绕过矩形的上/下端。
+#  (验证 Unity 能否渲染 AABB、深度是否正确、专家能否绕行矩形。)
+#
+#  extends: il_dataset_outdoor_test_obstacles.yaml(室外高空 15-17m)。
+# ============================================================================
+extends: il_dataset_outdoor_test_obstacles.yaml
+
+global:
+  output_dir: "/home/rgzn/flightmare_ws/il_data_test_rect"
+  scene_generation:
+    scene_key_prefix: "test_rect"

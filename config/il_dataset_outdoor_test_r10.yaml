@@ -1,0 +1,18 @@
+# ============================================================================
+#  il_dataset_outdoor_test_r10.yaml — 室外高空单场景冒烟测试
+#
+#  目标:验证高空垂直带修复(不再坠地)+ 专家绕行半径 10 m 大圆柱。
+#  布局由手写 manifest 提供(collection-only 模式,不重新生成 blueprint):
+#    - 1 个圆柱:圆心 (0,0),半径 10 m,高 20 m(贯穿作业层 11 m)
+#    - 1 个任务:start (-20,0) → goal (20,0),直线穿过圆柱,必须绕行
+#
+#  extends: il_dataset_outdoor_config.yaml(继承高空带 z_min=8/z_max=15、
+#  region [-25,25]²、depth / scene_runtime / 专家参数)。
+# ============================================================================
+extends: il_dataset_outdoor_config.yaml
+
+global:
+  output_dir: "/home/rgzn/flightmare_ws/il_data_test_r10"
+  scene_id: 0   # INDUSTRIAL(室外)
+  scene_generation:
+    scene_key_prefix: "test_r10"

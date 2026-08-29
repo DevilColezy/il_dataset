@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <deque>
 #include <limits>
 #include <utility>
@@ -376,6 +377,14 @@ VisibilityTargetCorrector::sampleSideCandidates(
                                     : std::min(b_goal, b_hi);
     const double b_end = side == SideSelection::LEFT ? b_hi : b_lo;
 
+    // Two-pass collection: (1) STRICT progress — every candidate must move
+    // measurably closer to the goal (the original semantic, keeps the drone
+    // goal-bound); (2) RELAXED retreat — only when pass (1) yields nothing
+    // (a dense cluster forces lateral motion that temporarily increases the
+    // goal distance), allow a candidate up to max_retreat_m beyond the
+    // current goal distance so the corrector can still ISSUE a translational
+    // guide instead of stranding in a pure-rotation search forever.
+    auto collect = [&](bool relaxed) {
     for (int i = 0; i < 2000; ++i) {
         const double b = b_start + static_cast<double>(dir * i) * step_b;
         if (dir > 0 && b > b_end + 1e-9) break;
@@ -404,16 +413,32 @@ VisibilityTargetCorrector::sampleSideCandidates(
             }
             const double along = (endpoint - state.position).dot(axis);
             if (along < p_.macro_observable_frontier_min_progress_m) {
-                continue;
+                // 绕大障碍的第一步是沿障碍表面切向的,相对目标轴可能带负
+                // 分量(暂时"后退")。strict 模式仍强制沿轴前进;仅 relaxed
+                // 回退允许负 along,且不得超出 max_retreat(否则候选会无限
+                // 远离原目标,永远桥接不出绕过障碍的推进)。
+                if (!relaxed ||
+                    along < -p_.macro_observable_frontier_max_retreat_m) {
+                    continue;
+                }
             }
             // A temporary waypoint must make measurable progress toward the
             // original mission goal.  Mere local reachability is not enough:
             // an indefinitely reachable side ray previously carried the
             // vehicle from 7.2 m to 14.3 m away from the goal.
             const double endpoint_goal_dist = (goal - endpoint).norm();
-            if (endpoint_goal_dist >
-                goal_dist - p_.macro_observable_frontier_min_progress_m) {
-                continue;
+            if (relaxed) {
+                // Fallback pass: allow a bounded temporary retreat, never
+                // beyond max_retreat_m farther than the current distance.
+                if (endpoint_goal_dist >
+                    goal_dist + p_.macro_observable_frontier_max_retreat_m) {
+                    continue;
+                }
+            } else {
+                if (endpoint_goal_dist >
+                    goal_dist - p_.macro_observable_frontier_min_progress_m) {
+                    continue;
+                }
             }
             if (strict &&
                 std::fabs(wrapAngle(b - b_goal)) > fov_half + 1e-9) {
@@ -456,6 +481,9 @@ VisibilityTargetCorrector::sampleSideCandidates(
             out.push_back(c);
         }
     }
+    };  // end collect(lambda)
+    collect(false);
+    if (out.empty()) collect(true);
     return out;
 }
 
@@ -516,13 +544,32 @@ SideSelection VisibilityTargetCorrector::selectSide(
         ++pairs;
     }
     if (pairs < std::max(1, p_.macro_min_evidence_ray_pairs)) {
-        // Too little paired evidence to judge free space 鈥?prefer the
-        // side the ORIGINAL goal lies on (same rule as the ambiguity
-        // fallback below; fixed RIGHT only when the goal is dead ahead).
-        if (std::fabs(b_goal) > 1e-9) {
-            return b_goal > 0.0 ? SideSelection::LEFT
-                                : SideSelection::RIGHT;
+        // The paired-ray window is centred on the ORIGINAL-GOAL bearing:
+        // when the goal is outside the FOV the window falls completely
+        // outside it and no evidence is gathered (pairs==0), so the old
+        // code degraded straight to a goal-side guess.  But the local map
+        // already knows which side has the free space (the drone just flew
+        // in from there / a wall spans one side).  Re-scan the evidence
+        // rays centred on the NOSE instead and prefer the more open side
+        // (measured: cylinder-wall test t=240 goal 135 deg out of FOV and
+        // the LEFT side is the wall; nose-centred scan favours RIGHT).
+        double nose_left = 0.0, nose_right = 0.0;
+        int nose_pairs = 0;
+        for (double db = d_beta; db <= fov / 2.0 - 1e-6; db += d_beta) {
+            const double bl = db;     // LEFT of the nose
+            const double br = -db;    // RIGHT of the nose
+            nose_left += freeRangeAlong(state, patch, bl);
+            nose_right += freeRangeAlong(state, patch, br);
+            ++nose_pairs;
         }
+        if (nose_pairs > 0) {
+            const double m = p_.macro_side_evidence_margin;
+            const double nla = nose_left / nose_pairs;
+            const double nra = nose_right / nose_pairs;
+            if (nla > nra + m) return SideSelection::LEFT;
+            if (nra > nla + m) return SideSelection::RIGHT;
+        }
+        // Still ambiguous: prefer RIGHT (user design: tie -> right).
         return SideSelection::RIGHT;
     }
     const double left_avg = left_total / static_cast<double>(pairs);
@@ -539,15 +586,87 @@ SideSelection VisibilityTargetCorrector::selectSide(
     // detour away from a west goal (it then stalled at the blocker
     // boundary) and turned joint_v2_000000 (a turn_right task) into a
     // LEFT bypass that the preflight predicted as TURN_RIGHT.
-    if (std::fabs(b_goal) > 1e-9) {
-        return b_goal > 0.0 ? SideSelection::LEFT : SideSelection::RIGHT;
-    }
+    // Ambiguous free-range evidence: prefer RIGHT (user design: tie -> right).
     return SideSelection::RIGHT;  // goal exactly dead ahead 鈫?fixed RIGHT
 }
 
 // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 //  Correction directive construction
 // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+// ─────────────────────────────────────────────────────────────────────
+//  Large-obstacle tangent slide guide (USER DESIGN 2026-08-29).
+// ─────────────────────────────────────────────────────────────────────
+TargetCorrectionDirective VisibilityTargetCorrector::makeSlideDirective(
+    const PlanarState& state, const Vec2d& goal,
+    const LocalFreeGrid& grid, SideSelection side) const {
+    TargetCorrectionDirective d;
+    d.valid = true;
+    d.locked_side = side;
+    // NORMAL guide point (NOT a pure-rotation TURN — the 30 Hz layer spins
+    // in place forever on TURN).  slide_guide makes the 30 Hz layer rotate
+    // toward it even outside the FOV (turn hysteresis), then drive to it.
+    d.type = TargetCorrectionType::NORMAL_CORRECTION;
+    d.slide_guide = true;
+    d.corrected_target_world_valid = false;
+    // 绕行方向 = 沿障碍表面切向 + 径向远离分量(62° 切向 / 38° 径向)。
+    // 纯切向在贴近表面(0.5-inflated 有效 clearance<0.5)时 30 Hz 拒绝;
+    // 径向分量让滑行时 clearance 增长。
+    Vec2d radial(0.0, 0.0);
+    double best_d = std::numeric_limits<double>::infinity();
+    if (grid.valid()) {
+        for (int iy = 0; iy < grid.height; ++iy) {
+            for (int ix = 0; ix < grid.width; ++ix) {
+                if (grid.blocked[grid.idx(ix, iy)] == 0) continue;
+                const Vec2d cp = grid.origin + Vec2d(
+                    (ix + 0.5) * grid.resolution,
+                    (iy + 0.5) * grid.resolution);
+                const double dd = (cp - state.position).norm();
+                if (dd < best_d) {
+                    best_d = dd;
+                    radial = state.position - cp;
+                }
+            }
+        }
+    }
+    Vec2d slide_dir(0.0, 0.0);
+    if (radial.norm() > 1e-9) {
+        radial.normalize();
+        Vec2d tangent(-radial.y(), radial.x());
+        if (side == SideSelection::RIGHT) tangent = -tangent;
+        const double beta = deg2rad(62.0);
+        slide_dir = radial * std::cos(beta) + tangent * std::sin(beta);
+        slide_dir.normalize();
+    } else {
+        // 局部网格无占用(观测失效):回退垂直目标轴。
+        const Vec2d to_goal = goal - state.position;
+        const double gd = to_goal.norm();
+        const Vec2d axis = gd > 1e-9 ? to_goal / gd : Vec2d(1.0, 0.0);
+        const int sgn = side == SideSelection::LEFT ? 1 : -1;
+        const double ang =
+            std::atan2(axis.y(), axis.x()) + sgn * (M_PI / 2.0);
+        slide_dir = Vec2d(std::cos(ang), std::sin(ang));
+    }
+    // 引导点距离:足够远让 30 Hz 持续推进,但 < obs_range(非纯旋转)。
+    const double guide_dist =
+        std::min(0.8 * p_.obs_range_m, 4.0);
+    const Vec2d guide_pt = state.position + slide_dir * guide_dist;
+    d.corrected_target_world = guide_pt;
+    d.corrected_target_world_valid = true;
+    d.turn_direction_world_valid = false;
+    d.decoded_direction_body = rot2(slide_dir, -state.yaw);
+    d.normalized_distance =
+        adapter_.clampNormalizedDistance(guide_dist);
+    d.reason = "TURN_GUIDE_SLIDE";
+    std::fprintf(stderr, "[TGS] SLIDE trigger pos=(%.2f,%.2f) dir=(%.2f,%.2f) best_d=%.2f guide=(%.2f,%.2f)\n",
+                 state.position.x(), state.position.y(),
+                 slide_dir.x(), slide_dir.y(),
+                 best_d, guide_pt.x(), guide_pt.y());
+    return d;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  Correction directive construction
+// ─────────────────────────────────────────────────────────────────────
 TargetCorrectionDirective VisibilityTargetCorrector::makeCorrectionDirective(
     const PlanarState& state, const Vec2d& goal,
     const LocalObservation& patch, const LocalFreeGrid& grid,
@@ -590,6 +709,24 @@ TargetCorrectionDirective VisibilityTargetCorrector::makeCorrectionDirective(
                   }
                   return a.dist > b.dist;
               });
+
+    // USER DESIGN (2026-08-29): 大障碍(直接走廊堵 + 两侧严格 bypass 都
+    // 不可行)时直接给出绕行引导,不再试 NORMAL 候选 —— 候选会把无人机带
+    // 到障碍轮廓(0.5-inflated 有效 clearance<0.5),30 Hz 无法执行而卡死
+    // (measured: 10 m big-box, 候选 preview 通过但沿它爬向 silhouette 后
+    // 停滞)。 这里在无人机还离障碍 1-2 m(有效 clearance 足够 30 Hz 执行)
+    // 时就绕行,30 Hz 沿切向+径向滑行绕过角点。
+    if (has_blocker) {
+        const bool left_strict = !sampleSideCandidates(
+            state, goal, patch, grid, true, blocker_min_along,
+            SideSelection::LEFT, /*strict=*/true).empty();
+        const bool right_strict = !sampleSideCandidates(
+            state, goal, patch, grid, true, blocker_min_along,
+            SideSelection::RIGHT, /*strict=*/true).empty();
+        if (!left_strict && !right_strict) {
+            return makeSlideDirective(state, goal, grid, side);
+        }
+    }
 
     // R29l (user redesign): re-sample every 5 Hz and adopt a BETTER
     // candidate, but stay on a currently executing waypoint unless the
@@ -725,23 +862,34 @@ TargetCorrectionDirective VisibilityTargetCorrector::makeCorrectionDirective(
         const LocalPlanningAssessment candidate_assessment =
             assess_directive(candidate);
         if (candidate_assessment.translation_plan_valid) {
+            std::fprintf(stderr, "[TGS] PREVIEW_OK cand_b=%.1f endpoint=(%.2f,%.2f)\n",
+                         chosen.bearing * 180.0 / M_PI,
+                         chosen.endpoint.x(), chosen.endpoint.y());
             return candidate;
         }
         if (preview_count >= kMaxCandidatePreviews) break;
     }
 
-    // R29m (user redesign, il_2d_multiscale_debug style): when the 30 Hz
-    // preview rejects EVERY candidate, fall back to the best OBSERVABLE
-    // frontier candidate — cands are sorted by along-progress descending and
-    // sampleSideCandidates already guarantees reachable + traversable
-    // (0.5 m-inflated) + known-FREE continuation.  Real depth around a large
-    // cylinder makes the B-spline clearance / UNKNOWN gates fail right at
-    // the obstacle silhouette even though the candidate is genuinely
-    // reachable (measured _failed/000006_0ba8dd16: NORMAL_CORRECTION=0 and
-    // the corrector spun in TURN_LEFT↔TURN_RIGHT forever).  With the R29j
-    // speed-law relaxation the 30 Hz layer can execute such a fly-through
-    // detour at vmin, so a rejected preview must not leave the corrector
-    // with pure rotation only.
+    // ─────────────────────────────────────────────────────────────────────
+    // 大障碍绕行引导 (USER DESIGN, 2026-08-29): 当 30 Hz preview 拒绝了
+    // 每一个候选 (即没有任何可执行的平移绕行目标) 时, 纯 TURN 只会原地
+    // 旋转死循环 (实测 10 m big-box: TURN_LEFT↔TURN_RIGHT 每 ~180° 切换,
+    // 零位移, goal_no_progress); 而 fallback 的 observable-frontier 候选
+    // 在障碍轮廓处同样不可执行 (B-spline clearance / UNKNOWN 门在 silhouette
+    // 处失败)。 宏观必须"指引绕行": 输出锁定侧的切向世界方向 (垂直目标
+    // 轴)。 无人机此时必然在障碍表面外侧 (它刚逼近障碍), 该切向射线保持
+    // >= 观测余量, 30 Hz 层转过去后沿表面滑行; 绕过角点后
+    // direct_corridor_blocked 清零, 主循环的 SEARCH_ROTATION_TOWARD_
+    // ORIGINAL_GOAL 分支会把机头转回目标, 继续直飞。
+    if (d.type == TargetCorrectionType::TURN_LEFT ||
+        d.type == TargetCorrectionType::TURN_RIGHT) {
+        return makeSlideDirective(state, goal, grid, side);
+    }
+
+    // R29m (kept as a last resort): best OBSERVABLE frontier candidate when
+    // preview rejected everything and the current directive is not a TURN
+    // (e.g. a non-TURN fallback path).  For TURN_* the TURN_GUIDE_SLIDE
+    // above already returned, so this branch is reached only defensively.
     if (!cands.empty()) {
         const SideCandidate& chosen = cands[0];
         TargetCorrectionDirective fallback = d;
@@ -808,6 +956,8 @@ bool VisibilityTargetCorrector::directiveChanged(
 void VisibilityTargetCorrector::reset() {
     correction_active_ = false;
     locked_side_ = SideSelection::NONE;
+    slide_active_ = false;
+    slide_goal_dist_start_ = std::numeric_limits<double>::infinity();
     update_event_ = 0;
     correction_enter_event_ = 0;
     correction_exit_event_ = 0;
@@ -833,6 +983,8 @@ void VisibilityTargetCorrector::reset() {
 void VisibilityTargetCorrector::resetForNewGoal() {
     correction_active_ = false;
     locked_side_ = SideSelection::NONE;
+    slide_active_ = false;
+    slide_goal_dist_start_ = std::numeric_limits<double>::infinity();
     stagnant_update_count_ = 0;
     reentry_success_updates_ = 0;
     search_episode_active_ = false;
@@ -945,9 +1097,21 @@ TargetCorrectionDirective VisibilityTargetCorrector::update(
     // only proves that the target can be looked at.  Release the corrected
     // target solely after three consecutive 5 Hz previews prove a genuine
     // translational path to the original target.
+    //
+    // A cold A* preview can be optimistic: it may route around a blocker
+    // (e.g. a tight cylinder wall) while the real B-spline / clearance
+    // gates cannot execute it — releasing on that evidence alone strands
+    // the drone in NO_SAFE_CANDIDATE right after the release and breaks the
+    // locked-side continuation (measured: cylinder-wall test t=288 NORMAL_
+    // CORRECTION froze in place, t=294 released on preview, t=301 local
+    // NO_SAFE_CANDIDATE).  Require the local layer to be ACTUALLY
+    // ADVANCING (not stagnant) during the correction while the preview
+    // keeps certifying the original target.
     constexpr uint32_t kReentrySuccessUpdates = 3;
     if (correction_active_) {
-        if (assessment.translation_plan_valid) {
+        const bool local_actually_advancing =
+            stagnant_update_count_ == 0;
+        if (assessment.translation_plan_valid && local_actually_advancing) {
             reentry_success_updates_ = std::min(
                 reentry_success_updates_ + 1, kReentrySuccessUpdates);
         } else {
@@ -1021,6 +1185,14 @@ TargetCorrectionDirective VisibilityTargetCorrector::update(
     const bool recovery_reentry_confirmed =
         correction_active_ &&
         reentry_success_updates_ >= kReentrySuccessUpdates;
+    // 区分"转向目标"与"转出目标(绕障侧)"两种 TURN。绕障旋转完成后目标
+    // 仍在 FOV 外,此时必须保持锁定侧继续探索(NORMAL 桥接 / 继续绕障搜索),
+    // 而不是立刻"重新获取原始目标"把机头拉回目标方向 —— 那会把刚揭示的
+    // 绕行出口又转出视野,形成 TURN↔PASS 极限环(密集小障碍 + 远目标)。
+    const bool previous_turn_detour =
+        (last_directive_.type == TargetCorrectionType::TURN_LEFT ||
+         last_directive_.type == TargetCorrectionType::TURN_RIGHT) &&
+        last_directive_.reason != "SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL";
     // R24 (legacy): when the goal was OUTSIDE the FOV with a clear corridor,
     // the local planner used to rotate to re-acquire it, so the macro handed
     // PASS_THROUGH back to local.  R29 removed local self-rotation: for an
@@ -1032,7 +1204,64 @@ TargetCorrectionDirective VisibilityTargetCorrector::update(
         correction_active_ &&
         assessment.target_outside_fov &&
         !fresh_obs.direct_corridor_blocked &&
-        assessment.rotation_available;
+        assessment.rotation_available &&
+        !previous_turn_detour;
+    // ---- 3) Goal OUTSIDE the FOV with a bearing that is not OBSERVED-
+    // OCCUPIED: TURN toward the goal to re-acquire it.  Unconditional — no
+    // search-rotation cooldown, no takeover-confirmation delay.  Lock the
+    // GOAL-BEARING side so the follow-up correction leads back toward the
+    // original goal instead of circling it.  A bearing that is OBSERVED-
+    // OCCUPIED is left to the normal locked-side correction below (rotating
+    // there would only reveal the blocker). ----
+    if (!fresh_obs.goal_inside_fov) {
+        const Vec2d to_goal = original_goal - state.position;
+        const double b_goal = wrapAngle(
+            std::atan2(to_goal.y(), to_goal.x()) - state.yaw);
+        const double fov_half = 0.5 * deg2rad(p_.obs_fov_deg);
+        const bool goal_left = b_goal > fov_half + 1e-9;
+        const bool goal_right = b_goal < -(fov_half + 1e-9);
+        if (goal_left || goal_right) {
+            const double goal_occ_range = occupiedRangeAlongFrom(
+                current_patch, state.position, state.yaw + b_goal,
+                p_.obs_range_m);
+            if (goal_occ_range >= p_.macro_goal_direction_min_range_m) {
+                const int n = std::max(3, p_.te_direction_bin_count);
+                TargetCorrectionDirective d;
+                d.valid = true;
+                d.type = goal_left ? TargetCorrectionType::TURN_LEFT
+                                   : TargetCorrectionType::TURN_RIGHT;
+                d.direction_token = goal_left ? 0 : n + 1;
+                d.decoded_direction_body =
+                    adapter_.decodeDirectionToken(d.direction_token);
+                d.normalized_distance = 1.0;
+                d.corrected_target_world_valid = false;
+                d.turn_direction_world =
+                    rot2(d.decoded_direction_body, state.yaw).normalized();
+                d.turn_direction_world_valid = true;
+                d.locked_side = goal_left ? SideSelection::LEFT
+                                          : SideSelection::RIGHT;
+                d.reason = "SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL";
+                const bool entering = !correction_active_;
+                if (entering) {
+                    correction_active_ = true;
+                    ++correction_enter_event_;
+                }
+                locked_side_ = d.locked_side;
+                stagnant_update_count_ = 0;
+                reentry_success_updates_ = 0;
+                search_episode_active_ = false;
+                search_swept_rad_ = 0.0;
+                has_last_search_yaw_ = false;
+                const bool changed =
+                    entering || last_directive_.type != d.type;
+                if (changed) ++update_event_;
+                d.update_event = update_event_;
+                last_directive_ = d;
+                return d;
+            }
+        }
+    }
+
     if (goal_capture_lock ||
         (!correction_active_ && direct_local_available) ||
         recovery_reentry_confirmed ||
@@ -1191,9 +1420,34 @@ TargetCorrectionDirective VisibilityTargetCorrector::update(
     }
     const bool drop_held_allowed =
         waypoint_execution_fail_updates_ >= 3;
-    TargetCorrectionDirective d = makeCorrectionDirective(
-        state, original_goal, planning_observation, grid, locked_side_,
-        live_directive_usable, drop_held_allowed, assess_directive);
+    // USER DESIGN (2026-08-29): SLIDE 位置锁定 —— 一旦开始大障碍绕行引导,
+    // 持续 SLIDE(引导点随位置平滑推进)直到目标距离显著减小(真正绕过角
+    // 点)。 绝不依赖 extractBlocker(深度),否则无人机转动把障碍转出 FOV
+    // 时锁会断,宏观每 5 Hz 在 SLIDE 与 NORMAL 之间切换,引导点乱跳,30 Hz
+    // 追不上 (measured: guide (14.47,-3.48) ↔ (7.50,-0.12) 交替,零位移)。
+    TargetCorrectionDirective d;
+    if (slide_active_) {
+        const double gd_now = (original_goal - state.position).norm();
+        if (slide_goal_dist_start_ - gd_now > 2.0) {
+            // 目标距离已减小 2 m → 已绕过角点,退出 SLIDE 交回正常逻辑。
+            slide_active_ = false;
+            d = makeCorrectionDirective(
+                state, original_goal, planning_observation, grid,
+                locked_side_, live_directive_usable, drop_held_allowed,
+                assess_directive);
+        } else {
+            d = makeSlideDirective(state, original_goal, grid, locked_side_);
+        }
+    } else {
+        d = makeCorrectionDirective(
+            state, original_goal, planning_observation, grid, locked_side_,
+            live_directive_usable, drop_held_allowed, assess_directive);
+        if (d.slide_guide) {
+            slide_active_ = true;
+            slide_goal_dist_start_ =
+                (original_goal - state.position).norm();
+        }
+    }
     d.locked_side = locked_side_;
 
     // R24: a pure-rotation search step must first serve "re-acquire the
@@ -1232,7 +1486,8 @@ TargetCorrectionDirective VisibilityTargetCorrector::update(
             d.type == TargetCorrectionType::TURN_LEFT ||
             d.type == TargetCorrectionType::TURN_RIGHT;
         if (proposed_search_turn_rd && sr_cooldown_ok &&
-            !fresh_obs.direct_corridor_blocked) {
+            !fresh_obs.direct_corridor_blocked &&
+            !previous_turn_detour) {
             const Vec2d to_goal = original_goal - state.position;
             const double b_goal = wrapAngle(
                 std::atan2(to_goal.y(), to_goal.x()) - state.yaw);
@@ -1270,6 +1525,9 @@ TargetCorrectionDirective VisibilityTargetCorrector::update(
                     d.reason = "SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL";
                     // R29m: start the cooldown so the next re-pull waits.
                     last_search_rotation_update_ = update_count_;
+                    std::fprintf(stderr, "[TGS] SR_TO_GOAL pos=(%.2f,%.2f) b_goal=%.1f\n",
+                                 state.position.x(), state.position.y(),
+                                 b_goal * 180.0 / M_PI);
                 }
             }
         }
@@ -1287,19 +1545,12 @@ TargetCorrectionDirective VisibilityTargetCorrector::update(
     // target from the other planner.
     if (progress_watchdog &&
         d.type == TargetCorrectionType::NORMAL_CORRECTION) {
-        const int n = std::max(3, p_.te_direction_bin_count);
-        const bool left = locked_side_ == SideSelection::LEFT;
-        d.type = left ? TargetCorrectionType::TURN_LEFT
-                      : TargetCorrectionType::TURN_RIGHT;
-        d.direction_token = left ? 0 : n + 1;
-        d.decoded_direction_body = adapter_.decodeDirectionToken(
-            d.direction_token);
-        d.normalized_distance = 1.0;
-        d.corrected_target_world_valid = false;
-        d.turn_direction_world =
-            rot2(d.decoded_direction_body, state.yaw).normalized();
-        d.turn_direction_world_valid = true;
-        d.reason = "LOCAL_BLOCKED_SEARCH_ROTATION_NO_PROGRESS";
+        // USER DESIGN (2026-08-29): a preview-certified NORMAL that stalls
+        // (measured: 10 m big-box — preview passes a frontier candidate, the
+        // drone creeps toward the silhouette then stops) must switch to the
+        // tangent slide guide (NORMAL + slide_guide), not a 50° pure-rotation
+        // search (which spun in place forever).
+        d = makeSlideDirective(state, original_goal, grid, locked_side_);
     }
 
     // A distance==1 directive is a strict pure-rotation label.  R28h

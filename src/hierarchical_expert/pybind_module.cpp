@@ -162,8 +162,31 @@ void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
     // ── tasks ─────────────────────────────────────────────────────
     b.min_task_distance_m = get_d("min_task_distance_m", b.min_task_distance_m);
     b.max_task_distance_m = get_d("max_task_distance_m", b.max_task_distance_m);
+    b.max_route_stretch_ratio =
+        get_d("max_route_stretch_ratio", b.max_route_stretch_ratio);
+    b.max_route_stretch_slack_m =
+        get_d("max_route_stretch_slack_m", b.max_route_stretch_slack_m);
     b.flight_height_m = get_d("flight_height_m", b.flight_height_m);
+    b.flight_height_min_m = get_d("flight_height_min_m", b.flight_height_m);
+    b.flight_height_max_m = get_d("flight_height_max_m", b.flight_height_m);
     b.obstacle_height_m = get_d("obstacle_height_m", b.obstacle_height_m);
+    b.obstacle_height_min_m = get_d("obstacle_height_min_m", b.obstacle_height_m);
+    b.obstacle_height_max_m = get_d("obstacle_height_max_m", b.obstacle_height_m);
+    if (bp.contains("known_rects")) {
+        b.known_rects.clear();
+        for (py::handle h : py::cast<py::sequence>(bp["known_rects"])) {
+            const py::dict rd = py::cast<py::dict>(h);
+            KnownRect r;
+            r.min_x = py::cast<double>(rd["min_x"]);
+            r.max_x = py::cast<double>(rd["max_x"]);
+            r.min_y = py::cast<double>(rd["min_y"]);
+            r.max_y = py::cast<double>(rd["max_y"]);
+            r.height_m = rd.contains("height_m")
+                             ? py::cast<double>(rd["height_m"])
+                             : b.obstacle_height_m;
+            b.known_rects.push_back(r);
+        }
+    }
     b.task_sample_attempts = get_i("task_sample_attempts", b.task_sample_attempts);
     b.task_goal_attempts = get_i("task_goal_attempts", b.task_goal_attempts);
 
@@ -275,6 +298,8 @@ void parseBlueprintConfig(const py::dict& bp, BlueprintGenerationConfig& b) {
         b.level_radius_max_m = gvl("level_radius_max", b.level_radius_max_m);
         b.level_occupancy_min = gvl("level_occupancy_min", b.level_occupancy_min);
         b.level_occupancy_max = gvl("level_occupancy_max", b.level_occupancy_max);
+        b.distance_min_radius_scale =
+            gd("distance_min_radius_scale", b.distance_min_radius_scale);
         b.obstacle_surface_gap_min_m =
             gd("surface_gap_min_m", b.obstacle_surface_gap_min_m);
         b.obstacle_boundary_min_m =
@@ -886,8 +911,26 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
     // avoidance ray must stay within FOV−10° of the target bearing — the
     // target and the avoidance direction can no longer wedge at opposite
     // FOV edges.
+    //
+    // r20260829_d435i_fov72.95_noise: the camera is now D435i-aligned —
+    // Unity vertical FOV 58° (depth.fov), expert HORIZONTAL FOV 72.95°
+    // (obs_fov_deg), near=0.28 m (D435i Min-Z), far=10 m, and the depth
+    // frame gets multiplicative Gaussian noise (sigma = 0.02*depth) before
+    // the expert step.  All labels are generated against the D435i FOV.
+    //
+    // r20260829_d435i_fullh88.8_noise_5m: FULL-HORIZONTAL capture —
+    // depth is 848x480 (D435i nominal 87°x58° @848x480), expert
+    // HORIZONTAL FOV 88.80° (obs_fov_deg = 2*atan(tan(29°)*848/480)).
+    // The camera captures [0.28, 10] m but only 0-5 m is used (expert
+    // range_m=5; PNG encoded with max_m=5 clips the rest to the far
+    // marker).  Noise injection unchanged (sigma = 0.02*depth).
+    //
+    // r20260829_d435i_fullh89.2_640x360_noise_5m: switched capture to
+    // 640x360 (16:9) — expert HORIZONTAL FOV 89.16° (obs_fov_deg =
+    // 2*atan(tan(29°)*640/360)); everything else unchanged (vertical
+    // FOV 58°, near 0.28, far 10, use 0-5 m only, noise 0.02*depth).
     m.attr("EXPERT_REVISION") =
-        std::string("r20260827_raylimit_fovrel_r30");
+        std::string("r20260829_d435i_fullh89.2_640x360_noise_5m_TGS");
 
     // ── Params2D: the single authoritative parameter source ─────────
     py::class_<Params2D>(m, "Params2D")
@@ -1007,6 +1050,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                        &Params2D::macro_observable_frontier_min_distance_m)
         .def_readwrite("macro_observable_frontier_min_progress_m",
                        &Params2D::macro_observable_frontier_min_progress_m)
+        .def_readwrite("macro_observable_frontier_max_retreat_m",
+                       &Params2D::macro_observable_frontier_max_retreat_m)
         .def_readwrite("macro_goal_direction_min_range_m",
                        &Params2D::macro_goal_direction_min_range_m)
         .def_readwrite("macro_waypoint_update_along_margin",
@@ -1340,7 +1385,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def("configure",
              [](PreflightSimulator& self, const std::vector<double>& min_bounds,
                 const std::vector<double>& max_bounds,
-                const std::vector<std::vector<double>>& obstacles) {
+                const std::vector<std::vector<double>>& obstacles,
+                const std::vector<std::vector<double>>& known_rects) {
                  Scene2D scene;
                  scene.min_bounds = Vec2d(min_bounds[0], min_bounds[1]);
                  scene.max_bounds = Vec2d(max_bounds[0], max_bounds[1]);
@@ -1354,10 +1400,18 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                      ob.id = id++;
                      scene.obstacles.push_back(ob);
                  }
-                 self.configure(scene, scene.min_bounds, scene.max_bounds);
+                 std::vector<Vec2d> rmin, rmax;
+                 for (const auto& r : known_rects) {
+                     if (r.size() < 4) continue;
+                     rmin.emplace_back(r[0], r[1]);
+                     rmax.emplace_back(r[2], r[3]);
+                 }
+                 self.configure(scene, scene.min_bounds, scene.max_bounds,
+                                nullptr, nullptr, rmin, rmax);
              },
              py::arg("min_bounds"), py::arg("max_bounds"),
-             py::arg("obstacles"))
+             py::arg("obstacles"),
+             py::arg("known_rects") = std::vector<std::vector<double>>{})
         .def("reset_task",
              [](PreflightSimulator& self, const std::vector<double>& start,
                 const std::vector<double>& goal, double initial_yaw_fm,
@@ -1743,7 +1797,15 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                      get_int("minimum_tasks_per_scene", 6);
                  c.base_seed = get_uint("base_seed", 260812);
                  c.flight_height_m = get_dbl("flight_height_m", 2.0);
+                 c.flight_height_min_m =
+                     get_dbl("flight_height_min_m", c.flight_height_m);
+                 c.flight_height_max_m =
+                     get_dbl("flight_height_max_m", c.flight_height_m);
                  c.obstacle_height_m = get_dbl("obstacle_height_m", 8.0);
+                 c.obstacle_height_min_m =
+                     get_dbl("obstacle_height_min_m", c.obstacle_height_m);
+                 c.obstacle_height_max_m =
+                     get_dbl("obstacle_height_max_m", c.obstacle_height_m);
                  c.require_full_strata_coverage =
                      cfg.contains("require_full_strata_coverage")
                          ? py::cast<bool>(cfg["require_full_strata_coverage"])

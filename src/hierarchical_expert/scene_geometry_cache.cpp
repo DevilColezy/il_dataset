@@ -42,6 +42,21 @@ bool SceneGeometryCache::build(const BlueprintScene& scene,
                 const double d = (cw - Vec2d(o.x, o.y)).norm() - o.radius;
                 best = std::min(best, d);
             }
+            // Known-obstacle AABBs: centre inside -> hard-occupied; centre
+            // outside -> centre-to-surface distance joins the ESDF so the
+            // clearance decays smoothly near a real-scene structure.
+            for (const auto& kr : cfg.known_rects) {
+                if (cw.x() >= kr.min_x && cw.x() <= kr.max_x &&
+                    cw.y() >= kr.min_y && cw.y() <= kr.max_y) {
+                    best = -1.0;
+                    break;
+                }
+                const double dx = std::max({kr.min_x - cw.x(), 0.0,
+                                            cw.x() - kr.max_x});
+                const double dy = std::max({kr.min_y - cw.y(), 0.0,
+                                            cw.y() - kr.max_y});
+                best = std::min(best, std::hypot(dx, dy));
+            }
             dist_[id] = best;
             comp_[id] = best > free_min + 1e-9 ? 0 : -1;
         }

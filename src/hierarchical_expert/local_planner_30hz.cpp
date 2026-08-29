@@ -492,7 +492,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
     // drone parks in brake-before-rotation (SAFE_HOLD) forever even while a
     // clear ray exists (measured: joint_v2_000008_99225302, stuck 7 s
     // beside the r=2.5 cylinder because the target sat ~66° off-nose).
-    if (!pure_rotation_target &&
+    if (!pure_rotation_target && !target.slide_guide &&
         std::fabs(bearing) > actual_fov_half + 1e-9 &&
         dist > p_.task_goal_tolerance) {
         const VelocityCommand3D out = reachableCommand(
@@ -566,9 +566,14 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
         // way out; force-release after a bounded turn (~2.3 s at 30 Hz,
         // enough for any single <=200掳 turn at max yaw rate) into the
         // normal brake/hold path so the 5 Hz corrector can re-plan (stall
-        // detection refreshes the target).
-        const uint64_t kMaxTurnTicks = 70;        // 2.3 s
-        const uint64_t kTurnCooldownTicks = 60;   // 2.0 s hard-brake hold
+        // detection refreshes the target).  200 ticks (~6.7 s) = a full
+        // 360 sweep: while turning the 5 Hz layer keeps re-sampling and
+        // bridges a translational guide once the detour direction enters
+        // the FOV (a 10 m cylinder needs ~125 deg+ before its tangential
+        // escape is visible; the old 70-tick budget cut it short at
+        // ~115 deg).
+        const uint64_t kMaxTurnTicks = 200;      // 6.7 s, full 360 deg sweep
+        const uint64_t kTurnCooldownTicks = 60;  // 2.0 s hard-brake hold
         ++turn_ticks_;
         if (turn_ticks_ > kMaxTurnTicks) {
             turn_hysteresis_active_ = false;
@@ -1619,6 +1624,7 @@ LocalPlanner30Hz::ResolvedPlanarTarget LocalPlanner30Hz::resolveTarget(
     resolved.update_event = target.update_event;
     resolved.mission_revision = target.mission_revision;
     resolved.normalized_distance = target.normalized_distance;
+    resolved.slide_guide = target.slide_guide;
     resolved.valid = target.valid();
     if (!resolved.valid) return resolved;
 

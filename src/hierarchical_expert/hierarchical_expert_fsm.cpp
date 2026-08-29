@@ -118,6 +118,7 @@ LocalTarget HierarchicalExpertFsm::makeLocalTarget(
     // direction and normalized distance travel alongside it solely as the
     // student/data-label contract.
     t.planar.position_world = encoded.effective_target_world;
+    t.planar.slide_guide = encoded.slide_guide;
     t.planar.world_valid =
         encoded.valid && encoded.effective_target_world_valid;
     t.planar.direction_body = encoded.direction_body;

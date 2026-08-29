@@ -162,6 +162,8 @@ struct SceneSpec {
     int target_count = 0;
     double rmin = 0.15;
     double rmax = 0.5;
+    double dmin = 0.0;  // adaptive start-goal distance floor
+    double dmax = 0.0;  // adaptive start-goal distance ceiling
 };
 
 /// Derive a scene spec from (level, index).  Sparse -> dense within a
@@ -181,6 +183,16 @@ inline SceneSpec makeSceneSpec(const BlueprintGenerationConfig& cfg, int level,
     s.rmax = (level >= 0 && level < static_cast<int>(cfg.level_radius_max_m.size()))
                  ? cfg.level_radius_max_m[level]
                  : 1.5;
+    // ── 尺度自适应距离 ──────────────────────────────────────────
+    // medium(1)/large(2) 层抬升 start-goal 距离下限:大尺度障碍的短路径
+    // 连不通(dmin = max(min_task, scale×rmax));small(0)/mixed(3) 保持全
+    // 范围(大障碍任务由 A* 连通性自然过滤)。
+    s.dmin = cfg.min_task_distance_m;
+    s.dmax = cfg.max_task_distance_m;
+    if (level == 1 || level == 2) {
+        s.dmin = std::max(cfg.min_task_distance_m,
+                          cfg.distance_min_radius_scale * s.rmax);
+    }
     // ── Occupancy-driven obstacle count (2026-08-26) ───────────────
     // target_count = occupancy_target × free-area / E[π r²], where the
     // target occupancy ramps sparse→dense across the level's scenes.
@@ -236,6 +248,12 @@ inline int placeCylinders(const BlueprintGenerationConfig& cfg,
     const double bmin = std::max(0.0, cfg.obstacle_boundary_min_m);
     const double lo = std::log(std::max(1e-3, rmin));
     const double hi = std::log(std::max(1e-3, rmax));
+    // centre -> AABB surface distance (0 inside).
+    auto rectDist = [](double x, double y, const KnownRect& r) {
+        const double dx = std::max({r.min_x - x, 0.0, x - r.max_x});
+        const double dy = std::max({r.min_y - y, 0.0, y - r.max_y});
+        return std::hypot(dx, dy);
+    };
     for (int i = 0; i < target_count; ++i) {
         const double r = std::exp(lo + u01(rng) * (hi - lo));
         bool placed = false;
@@ -255,11 +273,21 @@ inline int placeCylinders(const BlueprintGenerationConfig& cfg,
                 }
             }
             if (ok) {
+                for (const auto& kr : cfg.known_rects) {
+                    if (rectDist(x, y, kr) < r + gap) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if (ok) {
                 BlueprintObstacle ob;
                 ob.x = x;
                 ob.y = y;
                 ob.radius = r;
-                ob.height_m = cfg.obstacle_height_m;
+                ob.height_m = cfg.obstacle_height_min_m +
+                    u01(rng) * (cfg.obstacle_height_max_m -
+                                cfg.obstacle_height_min_m);
                 ob.id = i;
                 out.push_back(ob);
                 placed = true;
@@ -472,7 +500,19 @@ bool BlueprintGenerationController::preflightOne(
         wall_min = &wall_envelope_min;
         wall_max = &wall_envelope_max;
     }
-    sim.configure(s2d, s2d.min_bounds, s2d.max_bounds, wall_min, wall_max);
+    // Fixed known-obstacle AABBs (real scene point-cloud structures) must
+    // enter the synthetic patch too, otherwise the preflight sees a MUCH
+    // emptier world than the runtime depth and wrongly certifies tasks the
+    // real expert will fail.
+    std::vector<Vec2d> known_min, known_max;
+    known_min.reserve(cfg_.known_rects.size());
+    known_max.reserve(cfg_.known_rects.size());
+    for (const auto& kr : cfg_.known_rects) {
+        known_min.emplace_back(kr.min_x, kr.min_y);
+        known_max.emplace_back(kr.max_x, kr.max_y);
+    }
+    sim.configure(s2d, s2d.min_bounds, s2d.max_bounds, wall_min, wall_max,
+                  known_min, known_max);
     // Coarse-step quick preflight: a larger dynamics step (dt_scale/30 s)
     // makes the vehicle travel further per expert decision, so a FULL
     // start->goal trajectory needs fewer ticks (same expert decision
@@ -1840,15 +1880,33 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
 
     // ── 3. sample start/goal pairs, greedy A*, distance balance,
     //      quick-expert preflight, labels ───────────────────────────
+    // scene_target = expected / total scenes, using the ACTUAL per-level
+    // scene count (scenes_per_level_list) — the old formula used the fixed
+    // scenes_per_level default and silently shrank every scene's quota
+    // (e.g. 16 scenes x 160 expected => 4 tasks/scene instead of 10).
+    const int per_level_scenes =
+        (level >= 0 &&
+         level < static_cast<int>(cfg_.scenes_per_level_list.size()))
+            ? std::max(1, cfg_.scenes_per_level_list[level])
+            : std::max(1, cfg_.scenes_per_level);
     const int scene_target = std::max(
         1, cfg_.expected_collect_tasks /
-               (std::max(1, cfg_.scene_levels) *
-                std::max(1, cfg_.scenes_per_level)));
-    const int base = scene_target / 3;
-    const int rem = scene_target - 3 * base;
-    int dist_targets[3] = {base + (rem > 0 ? 1 : 0),
-                           base + (rem > 1 ? 1 : 0), base};
+               (std::max(1, cfg_.scene_levels) * per_level_scenes));
+    // 中间多两端短:short : medium : long = 1 : 2 : 1 — the bulk of each
+    // scene sits in the MID distance band (richer avoidance behaviour),
+    // while the extreme short/long bands stay covered but sparse.
+    const int unit = std::max(1, scene_target / 4);
+    int dist_targets[3] = {unit, scene_target - 2 * unit, unit};
     int dist_counts[3] = {0, 0, 0};
+    // ── 尺度自适应距离分层:在 [spec.dmin, spec.dmax] 内均分三档 ──
+    // 大尺度层的 dmin 已抬升 → 整层都是较长距离, 不再分配短路径。
+    const double d_lo = spec.dmin, d_hi = spec.dmax;
+    const double d_band = std::max(1e-6, (d_hi - d_lo) / 3.0);
+    auto dcls = [&](double d) {
+        if (d < d_lo + d_band) return 0;
+        if (d < d_lo + 2.0 * d_band) return 1;
+        return 2;
+    };
 
     const std::vector<size_t>& cells = geo.validCells();
     if (cells.size() < 2) {
@@ -1874,7 +1932,7 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
     SegmentLabeler segmenter(30.0, 30, 90, cfg_.quick_preflight_dt_scale);
 
     uint64_t attempts = 0;
-    const uint64_t max_attempts = 900;
+    const uint64_t max_attempts = 2000;
     uint64_t task_seq = 0;
     // ── blocked / unblocked balance ─────────────────────────────────
     // A macro detour is triggered by the GEOMETRY (the direct start->goal
@@ -1886,14 +1944,13 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
     // avoidance labels, large/mixed target more detour labels.
     double blocked_ratio = 0.5;
     if (level >= 2) {
-        // 步骤3+4：0.65→0.75（large/mixed 更多"大障碍背后目标"构造 → 更多宏观接管）
-        blocked_ratio = 0.75;
+        // 放宽(large/mixed 0.75→0.50):blocked 直线穿障在短距离+高密度下
+        // 难构造, 是每场景任务量的瓶颈; 降低占比让更多任务能生成。
+        blocked_ratio = 0.50;
     } else if (level == 1) {
-        // 步骤3+4：0.40→0.45（medium 更多直线穿障采样 → 更多避障响应）
-        blocked_ratio = 0.45;
+        blocked_ratio = 0.35;
     } else {
-        // 步骤3+4：0.35→0.40（small 更多直线穿障采样 → 更多小尺度避障）
-        blocked_ratio = 0.40;
+        blocked_ratio = 0.30;
     }
     const int blocked_target =
         std::max(1, static_cast<int>(std::round(scene_target * blocked_ratio)));
@@ -1908,7 +1965,7 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
     while ((dist_counts[0] + dist_counts[1] + dist_counts[2] < scene_target ||
             blocked_accept < blocked_target ||
             unblocked_accept < unblocked_target) &&
-           attempts < max_attempts && wr.preflights_run < 120) {
+           attempts < max_attempts && wr.preflights_run < 300) {
         ++attempts;
         // pick the most-deficient distance class
         int cls = 0;
@@ -1935,8 +1992,9 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
             (level >= 2) && need_blocked && !need_unblocked &&
             !scene.obstacles.empty();
         if (construct_blocked) {
-            const double band_center = (cls == 0) ? 6.0
-                                       : (cls == 1) ? 12.0 : 20.0;
+            const double band_center = (cls == 0) ? (d_lo + 0.5 * d_band)
+                                       : (cls == 1) ? (d_lo + 1.5 * d_band)
+                                       : (d_lo + 2.5 * d_band);
             for (int gatt = 0; gatt < 250 && !found; ++gatt) {
                 const auto& o = scene.obstacles[rng() % scene.obstacles.size()];
                 const Vec2d oc(o.x, o.y);
@@ -1951,7 +2009,7 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
                 }
                 const Vec2d g = oc - dir * r_goal;
                 const double d = (g - start).norm();
-                if (distClass(cfg_, d) != cls) continue;
+                if (dcls(d) != cls) continue;
                 if (!geo.pointFreeMain(g, astar_clr)) continue;
                 goal = g;
                 line_blocked = true;  // straight line cuts the core
@@ -1964,9 +2022,9 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
             for (int gatt = 0; gatt < 400 && !found; ++gatt) {
                 const Vec2d g = cellCenterOf(cells[rng() % cells.size()]);
                 const double d = (g - start).norm();
-                if (distClass(cfg_, d) != cls ||
-                    d < cfg_.min_task_distance_m - 1e-9 ||
-                    d > cfg_.max_task_distance_m + 1e-9) {
+                if (dcls(d) != cls ||
+                    d < spec.dmin - 1e-9 ||
+                    d > spec.dmax + 1e-9) {
                     continue;
                 }
                 const bool blk = lineBlocked(scene, start, g, astar_clr,
@@ -1982,11 +2040,25 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
         // greedy toward-goal A* connectivity check (fast)
         const auto t_astar = Clock::now();
         GreedyAStarResult astar =
-            greedyAStar(geo, start, goal, astar_clr, 5000);
+            greedyAStar(geo, start, goal, astar_clr, 10000);
         astar_ms += msSince(t_astar);
         ++wr.astar_calls;
         wr.astar_expansions += static_cast<uint64_t>(astar.expansions);
         if (!astar.reachable) continue;
+        // NEW: reject absurdly long detours.  A start/goal pair on OPPOSITE
+        // sides of a wall / big building is A*-connected only by walking all
+        // the way around the structure — the resulting episode is a useless
+        // "super-detour" for the 5 Hz student.  Cap the route length at
+        // stretch_ratio x straight + slack.
+        {
+            const double straight = (goal - start).norm();
+            const double max_route =
+                straight * cfg_.max_route_stretch_ratio +
+                cfg_.max_route_stretch_slack_m;
+            if (astar.path_len_m > max_route) {
+                continue;
+            }
+        }
 
         // build the task
         BlueprintTask task;
@@ -1997,7 +2069,8 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
         task.start_y = start.y();
         task.goal_x = goal.x();
         task.goal_y = goal.y();
-        task.flight_height_m = cfg_.flight_height_m;
+        task.flight_height_m = cfg_.flight_height_min_m +
+            u01(rng) * (cfg_.flight_height_max_m - cfg_.flight_height_min_m);
         // ── initial yaw: aim at the goal with a MODEST random offset
         //    (0..35°, mirror-balanced).  A macro detour is decided by the
         //    blocked-geometry, NOT by a large initial yaw error, so we no
@@ -2013,11 +2086,9 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
         double yaw_err = wrapAngle(goal_bearing - expert_yaw);
         task.geom_type = "CLEAR";
         const double dline = (goal - start).norm();
-        task.distance_class = dline < cfg_.task_distance_short_max_m
-                                  ? "short"
-                                  : (dline < cfg_.task_distance_medium_max_m
-                                         ? "medium"
-                                         : "long");
+        const int dcls_line = dcls(dline);
+        task.distance_class = dcls_line == 0 ? "short"
+                              : (dcls_line == 1 ? "medium" : "long");
         // ── 步骤3+4: macro-turn probe for BLOCKED tasks ────────────
         // 对 blocked 任务（直线穿障）强制 ±yaw_error 初始朝向，使 5Hz 专家
         // 在起步阶段即进入搜索旋转 → 产生真实的 TURN_LEFT / TURN_RIGHT 标签。

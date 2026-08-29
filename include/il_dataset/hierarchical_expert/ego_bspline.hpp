@@ -79,7 +79,7 @@ public:
         int max_iter = 60;
         double nearest_search_r = 1.6;  // nearest-OCCUPIED search radius (m)
         // Soft FOV bound (rad) for the FOV penalty term.
-        double fov_half_rad = 0.785398; // physical 90 deg camera FOV / 2
+        double fov_half_rad = 0.778064; // physical 89.16 deg camera FOV / 2 (44.58 deg)
         // Speed profile / validation (mirrors local_planner_30hz params).
         double cruise_mps = 2.0;
         double eff_accel_mps2 = 2.0;
@@ -90,7 +90,7 @@ public:
         double obs_range_m = 5.0;
         uint32_t max_history_age_ticks = 45;
         double obs_resolution = 0.1;
-        double obs_fov_deg = 90.0;  // hard FOV validation bound (±fov/2)
+        double obs_fov_deg = 89.16;  // hard FOV validation bound (±fov/2)
         double lp_dt = 0.1;
         double horizon_s = 4.0;
         // R28: force the non-terminal receding-horizon validation to cover

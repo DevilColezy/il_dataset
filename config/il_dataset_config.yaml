@@ -56,21 +56,37 @@ global:
     settle_time_s:           8.0
     settle_keepalive_hz:     5.0
 
-  # ── Depth camera ───────────────────────────────────────────────────
+  # ── Depth camera (D435i-aligned, FULL-HORIZONTAL 640x360) ──────
+  # depth.fov is the VERTICAL camera FOV (Unity Camera.fieldOfView
+  # semantics) = D435i depth ~58°.  640x360 is 16:9 and gives the D435i
+  # FULL horizontal FOV: 2*atan(tan(29°)*640/360) = 89.16° (D435i nominal
+  # 87°×58°, full horizontal).  The camera CAPTURES the full range
+  # [near=0.28, far=10] (D435i Min-Z .. effective range), but only the
+  # first max_m=5.0 m is USED: the C++ expert consumes range_m=5 (deeper
+  # pixels are "far", never obstacles) and the PNG is encoded with
+  # max_m=5 (depth beyond 5 m clips to the far marker), so training sees
+  # 0-5 m only.  The expert consumes the HORIZONTAL FOV
+  # (hierarchical_expert.observation.fov_deg = 89.16), derived below.
   depth:
     width:  640
-    height: 480
-    fov:    90.0
-    max_m:   5.0
-    near:    0.01
-    far:  1000.0
+    height: 360
+    fov:    58.0      # VERTICAL FOV = D435i depth ~58°
+    max_m:   5.0      # encode/use only 0-5 m (deeper clipped to far)
+    near:    0.28     # = D435i Min-Z (0.28 m); no closer-range data
+    far:    10.0      # = D435i effective depth range (full-range capture)
+    # D435i stereo-depth noise is applied at TRAINING time (train.py /
+    # train_macro.py --depth-noise-std-ratio, default 0.02), NOT during
+    # collection: the dataset stores CLEAN depth so the noise level stays
+    # tunable and the clean data is reusable for other noise levels.
+    # This flag is kept for legacy/debug only (0 = no collection noise).
+    noise_std_ratio: 0.0
     # Unity T_BC (camera->body), 16 floats row-major.  MUST match the
     # camera sent to Unity (il_common.make_depth_vehicle): identity
-    # rotation + 0.3 m forward offset.  The C++ observation builder
+    # rotation + 0.15 m forward offset.  The C++ observation builder
     # derives the true camera pose from the vehicle pose + this extrinsic.
     t_bc: [1.0, 0.0, 0.0, 0.0,
            0.0, 1.0, 0.0, 0.0,
-           0.0, 0.0, 1.0, 0.3,
+           0.0, 0.0, 1.0, 0.15,
            0.0, 0.0, 0.0, 1.0]
 
   # ── Vehicle geometry ───────────────────────────────────────────────
@@ -527,7 +543,10 @@ global:
     goal_tolerance_m: 0.40
     episode_timeout_s: 0.0
     observation:
-      fov_deg: 90.0
+      # HORIZONTAL FOV (the C++ expert consumes a horizontal FOV):
+      # = 2*atan(tan(58°/2)*640/360) = 89.16° (D435i full horizontal,
+      # 16:9).  Only range_m=5 is used for obstacle judgement.
+      fov_deg: 89.16
       range_m: 5.0
       resolution: 0.10
       ray_angular_res_deg: 0.5

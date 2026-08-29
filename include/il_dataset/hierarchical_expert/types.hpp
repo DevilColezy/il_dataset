@@ -303,7 +303,11 @@ struct Params2D {
 
     // ── observation (perception range R is the single student input
     //    distance; keep R = 5.0 m for joint_v2) ─────────────────────
-    double obs_fov_deg = 90.0;
+    // HORIZONTAL FOV of the depth camera (D435i FULL-HORIZONTAL, 640x360):
+    // the C++ expert consumes a HORIZONTAL FOV = 2*atan(tan(58deg/2)*
+    // 640/360) = 89.16 deg (depth.fov in the YAML is the VERTICAL Unity
+    // FOV = 58 deg).  Only obs_range_m=5 of the captured depth is used.
+    double obs_fov_deg = 89.16;
     double obs_range_m = 5.0;
     double obs_resolution = 0.1;
     double obs_ray_angular_res_deg = 0.5;
@@ -376,7 +380,7 @@ struct Params2D {
     // direction from wedging at OPPOSITE FOV edges (e.g. target at +43°,
     // avoidance at −45°, ~88° apart): avoidance always stays within a
     // relative band around the target, never at the far FOV edge.
-    double lp_ray_target_rel_max_deg = 80.0;  // FOV 90 − 10
+    double lp_ray_target_rel_max_deg = 63.0;  // FOV 73 − 10
     // R26: inside this distance to a TERMINAL target (in FOV, hard-clear
     // straight path) the planner skips the B-spline and drives the
     // proportional terminal controller directly.  Bridges the 0.4-0.8 m
@@ -516,6 +520,13 @@ struct Params2D {
     // ── 5 Hz local corrector (visibility judge + target corrector) ──
     double macro_observable_frontier_min_distance_m = 1.5;
     double macro_observable_frontier_min_progress_m = 0.5;
+    // NEW: when NO side candidate makes progress toward the goal (a dense
+    // cluster forces lateral motion that must temporarily INCREASE the goal
+    // distance), allow a candidate up to this far beyond the current goal
+    // distance instead of returning nothing — returning nothing strands the
+    // corrector in a pure-rotation search forever.  The progress-first pass
+    // always wins when any candidate exists; this is only the fallback.
+    double macro_observable_frontier_max_retreat_m = 2.0;
     // R29k: SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL only re-acquires the
     // original goal when the goal bearing is traversable — a continuous
     // FREE run along it of at least this range (m).  When the goal sits
@@ -829,6 +840,10 @@ struct PlanarTarget {
     // Internal expert semantic, never persisted as a student input. A fixed
     // macro waypoint remains fly-through inside the 4.5 m label ceiling.
     bool flythrough = false;
+    // USER DESIGN (2026-08-29): large-obstacle slide guide — the 30 Hz layer
+    // must rotate toward this target even outside the FOV (turn hysteresis)
+    // then drive to it, instead of handing back to the macro.
+    bool slide_guide = false;
     // Directive update event (5 Hz ZOH boundary).  A change alone NEVER
     // resets planner memory.
     uint64_t update_event = 0;
@@ -1028,6 +1043,12 @@ struct TargetCorrectionDirective {
     // bounded turn step is issued.
     Vec2d turn_direction_world{1.0, 0.0};
     bool turn_direction_world_valid = false;
+    // USER DESIGN (2026-08-29): large-obstacle slide guide.  NORMAL_CORRECTION
+    // whose corrected_target_world is a tangent+radial detour guide: the 30 Hz
+    // layer must rotate toward it (turn hysteresis) even when it is outside
+    // the FOV, then drive to it — NOT hand back to the macro and NOT spin as
+    // a pure-rotation TURN.  Set only by makeSlideDirective.
+    bool slide_guide = false;
     // Side locked for the current correction episode (NONE when not
     // correcting).
     SideSelection locked_side = SideSelection::NONE;
@@ -1092,6 +1113,9 @@ struct EncodedTargetInput {
     Vec2d effective_target_world{0.0, 0.0};
     bool effective_target_world_valid = false;
     TargetCorrectionType source_type = TargetCorrectionType::PASS_THROUGH;
+    // Slide-guide flag carried from the 5 Hz directive (see
+    // TargetCorrectionDirective::slide_guide).
+    bool slide_guide = false;
     // ── 3D extension: effective target altitude (world z, m).  TURN
     //    targets are pure rotation ⇒ z = state.z; PASS / NORMAL carry the
     //    mission altitude. ────────────────────────────────────────────

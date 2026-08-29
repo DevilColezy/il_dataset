@@ -449,7 +449,7 @@ bool TaskCandidateGenerator::sample(
             out.goal_x = goal.x();
             out.goal_y = goal.y();
             out.initial_yaw = initial_yaw_fm;
-            out.flight_height_m = cfg_.flight_height_m;
+            out.flight_height_m = rng.uniform(cfg_.flight_height_min_m, cfg_.flight_height_max_m);
             out.audit.goal_distance_m = d;
             out.geom_type = taskGeomTypeName(proxy);
             out.audit.straight_distance_m = d;
@@ -476,7 +476,7 @@ bool TaskCandidateGenerator::sample(
         out.goal_x = fallback_goal.x();
         out.goal_y = fallback_goal.y();
         out.initial_yaw = initial_yaw_fm;
-        out.flight_height_m = cfg_.flight_height_m;
+        out.flight_height_m = rng.uniform(cfg_.flight_height_min_m, cfg_.flight_height_max_m);
         out.audit.goal_distance_m = (fallback_goal - fallback_start).norm();
         out.audit.straight_distance_m = out.audit.goal_distance_m;
         out.geom_type = taskGeomTypeName(fallback_type);
@@ -554,7 +554,7 @@ bool TaskCandidateGenerator::sampleAcrossReference(
         out.goal_x = goal.x();
         out.goal_y = goal.y();
         out.initial_yaw = initial_yaw_fm;
-        out.flight_height_m = cfg_.flight_height_m;
+        out.flight_height_m = rng.uniform(cfg_.flight_height_min_m, cfg_.flight_height_max_m);
         out.audit.goal_distance_m = d;
         out.audit.straight_distance_m = d;
         out.geom_type = taskGeomTypeName(proxy);

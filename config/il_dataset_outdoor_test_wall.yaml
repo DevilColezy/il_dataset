@@ -1,0 +1,15 @@
+# ============================================================================
+#  il_dataset_outdoor_test_wall.yaml — 室外高空圆柱墙绕行测试
+#
+#  一排 13 根圆柱(半径 0.3 m,柱心间距 0.8 m → 表面间隙 0.2 m,无人机 0.6 m
+#  直径穿不过)沿 y 从 -4.8 到 +4.8 紧密排列,构成 10 m 长"墙"。无人机从
+#  (-10,0) 直飞 (10,0),必须绕过墙的一端(上方或下方)。
+#
+#  extends: il_dataset_outdoor_test_obstacles.yaml(室外高空 15-17m)。
+# ============================================================================
+extends: il_dataset_outdoor_test_obstacles.yaml
+
+global:
+  output_dir: "/home/rgzn/flightmare_ws/il_data_test_wall"
+  scene_generation:
+    scene_key_prefix: "test_wall"

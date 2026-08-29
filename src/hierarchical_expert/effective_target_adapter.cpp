@@ -117,6 +117,7 @@ EncodedTargetInput EffectiveTargetAdapter::encode(
             out.effective_target_world =
                 directive.corrected_target_world;
             out.effective_target_world_valid = true;
+            out.slide_guide = directive.slide_guide;
             break;
         }
         case TargetCorrectionType::TURN_LEFT:

@@ -223,7 +223,8 @@ bool SceneProfileGenerator::placeOne(const BlueprintScene& scene,
     out.x = x;
     out.y = y;
     out.radius = r;
-    out.height_m = cfg.obstacle_height_m;
+    out.height_m = rng.uniform(cfg.obstacle_height_min_m,
+                               cfg.obstacle_height_max_m);
     out.id = static_cast<int>(scene.obstacles.size());
     return true;
 }
@@ -448,7 +449,9 @@ bool SceneProfileGenerator::realizeStructured(
 
         if (!candidate || !std::isfinite(x) || !std::isfinite(y)) continue;
         if (!placementValid(sc, x, y, r, cfg)) continue;
-        addObstacle(sc, x, y, r, cfg.obstacle_height_m);
+        addObstacle(sc, x, y, r,
+                    rng.uniform(cfg.obstacle_height_min_m,
+                                cfg.obstacle_height_max_m));
         // Update the per-side spacing hint only AFTER a successful
         // placement (failed candidates never pollute the spacing state).
         if (cand_spacing_update) {

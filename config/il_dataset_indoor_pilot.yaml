@@ -1,0 +1,18 @@
+# ============================================================================
+#  il_dataset_indoor_pilot.yaml — 阶段 2 类 A 室内小规模试点
+#
+#  与 il_dataset_indoor_config.yaml 相同(高度/障碍随机 + 仓库 region),
+#  仅缩小场景规模: 8 场景(scenes_per_level_list [2,2,2,2]),
+#  expected_collect_tasks=400 → scene_target=10/场景 → ~80 任务。
+# ============================================================================
+extends: il_dataset_indoor_config.yaml
+
+global:
+  # 试点独立目录(阶段 4 全量再合并到 col_5)
+  output_dir: "/home/rgzn/flightmare_ws/il_data_joint_v2_col5_pilot_indoor"
+  scene_generation:
+    scene_key_prefix: "indoor_pilot"
+  blueprint_generation:
+    scene_parallel:
+      scenes_per_level_list: [2, 2, 2, 2]
+      expected_collect_tasks: 400

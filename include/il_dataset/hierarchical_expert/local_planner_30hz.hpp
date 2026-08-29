@@ -91,6 +91,10 @@ private:
         // these: off-nose flight is expected (sideways detour) and a
         // nose-facing blocker is not a hard stop.
         bool flythrough = false;
+        // USER DESIGN (2026-08-29): large-obstacle slide guide — rotate
+        // toward this target even outside the FOV (turn hysteresis), then
+        // drive to it instead of handing back to the macro.
+        bool slide_guide = false;
     };
 
     ResolvedPlanarTarget resolveTarget(const PlanarState& state,

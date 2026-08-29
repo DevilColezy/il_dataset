@@ -1,0 +1,40 @@
+# ============================================================================
+#  il_dataset_indoor_config.yaml — 类 A(室内仓库低空)采集配方
+#
+#  作业层: flight_height_m ~ U[0.5, 2.0](每任务随机,起终点同高)
+#  障碍  : 竖直圆柱,高度 ~ U[3, 6] m(> 作业高度,贯穿作业层),
+#          中心 z = 层中心 1.25 m(由 task_generation.flight_height_m 提供)
+#  region: 沿用仓库 [-7,10] x [0,30]
+#  extends: il_dataset_joint_v2_config.yaml(region / 配额 / 专家参数不变)
+#
+#  输出合并目录 il_data_joint_v2_col_5(与室外 run 合并)。
+# ============================================================================
+extends: il_dataset_joint_v2_config.yaml
+
+global:
+  output_dir: "/home/rgzn/flightmare_ws/il_data_d435i_col_indoor"
+
+  # episode 目录前缀:与其他 run(室外高空/低空)区分,合并时无 id 冲突
+  scene_generation:
+    scene_key_prefix: "indoor"
+
+  # 层中心(障碍放置 z + 车辆预热 z)。任务实际高度由
+  # blueprint_generation.task_generation.flight_height_min/max 随机。
+  task_generation:
+    flight_height_m: 1.25
+
+  blueprint_generation:
+    task_generation:
+      # 单值 fallback(缺省时任务/障碍仍回落到该高度)
+      flight_height_m: 1.25
+      obstacle_height_m: 1.25
+      # 每任务随机作业高度(起终点同高)
+      flight_height_min_m: 0.5
+      flight_height_max_m: 2.0
+      # 每障碍随机高度(> 作业高度,贯穿作业层)
+      obstacle_height_min_m: 3.0
+      obstacle_height_max_m: 6.0
+      # start-goal 距离(室内短程):注意必须写在 blueprint_generation 层,
+      # 采样用这里的 min/max(global.task_generation 的 2-15 不作用于蓝图采样)
+      min_task_distance_m: 2.0
+      max_task_distance_m: 15.0

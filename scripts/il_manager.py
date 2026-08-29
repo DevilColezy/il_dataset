@@ -201,6 +201,8 @@ class JointV2Manager(object):
             pass
 
         self._depth_cfg = self._g.get("depth", {})
+        # Deterministic RNG for D435i-style depth noise (sim-to-real).
+        self._noise_rng = np.random.default_rng(20260829)
         self._perception_range = float(
             self._g.get("dataset_logging", {}).get("perception_range_m",
                                                    self._params.obs_range_m))
@@ -270,6 +272,45 @@ class JointV2Manager(object):
     # ═══════════════════════════════════════════════════════════════
     #  Full C++ blueprint generation (deficit-driven pipeline)
     # ═══════════════════════════════════════════════════════════════
+    def _known_rects(self, bp):
+        """Load fixed known-obstacle AABBs.
+
+        Two sources (merged):
+          * blueprint_generation.known_rects — inline list of
+            {min_x,max_x,min_y,max_y,height_m}
+          * blueprint_generation.known_obstacles_file — a cluster JSON
+            (from slice_pointcloud_layers.py) whose clusters are converted
+            to their bounding-box AABB with a height spanning the flight
+            band (obstacle_height_max_m).
+        """
+        rects = list(bp.get("known_rects", []) or [])
+        fpath = bp.get("known_obstacles_file", "") or ""
+        if fpath:
+            fpath = os.path.expanduser(str(fpath))
+            if not os.path.isfile(fpath):
+                raise ValueError("known_obstacles_file not found: %s" % fpath)
+            with open(fpath) as f:
+                data = json.load(f)
+            btg = bp.get("task_generation", {}) or {}
+            hgt = float(btg.get(
+                "obstacle_height_max_m",
+                btg.get("obstacle_height_m", 8.0)))
+            for c in (data.get("clusters", []) or []):
+                w = float(c.get("w", 0.0))
+                hh = float(c.get("h", 0.0))
+                x = float(c.get("x", 0.0))
+                y = float(c.get("y", 0.0))
+                if w <= 0.0 or hh <= 0.0:
+                    continue
+                rects.append({
+                    "min_x": x - w / 2.0,
+                    "max_x": x + w / 2.0,
+                    "min_y": y - hh / 2.0,
+                    "max_y": y + hh / 2.0,
+                    "height_m": hgt,
+                })
+        return rects
+
     def _blueprint_config_dict(self):
         """Build the C++ SceneTaskBlueprintGenerator.Config from YAML.
 
@@ -404,8 +445,24 @@ class JointV2Manager(object):
                         tg.get("max_task_distance_m", 20.0))),
             "flight_height_m": float(
                 btg.get("flight_height_m", tg.get("flight_height_m", 2.0))),
+            "flight_height_min_m": float(
+                btg.get("flight_height_min_m",
+                        btg.get("flight_height_m",
+                                tg.get("flight_height_m", 2.0)))),
+            "flight_height_max_m": float(
+                btg.get("flight_height_max_m",
+                        btg.get("flight_height_m",
+                                tg.get("flight_height_m", 2.0)))),
             "obstacle_height_m": float(
                 btg.get("obstacle_height_m", geo.get("height_m", 8.0))),
+            "obstacle_height_min_m": float(
+                btg.get("obstacle_height_min_m",
+                        btg.get("obstacle_height_m",
+                                geo.get("height_m", 8.0)))),
+            "obstacle_height_max_m": float(
+                btg.get("obstacle_height_max_m",
+                        btg.get("obstacle_height_m",
+                                geo.get("height_m", 8.0)))),
             "task_sample_attempts": int(
                 btg.get("task_sample_attempts",
                         tg.get("task_sample_attempts", 300))),
@@ -414,6 +471,7 @@ class JointV2Manager(object):
             "depth_proxy": dict(btg.get("depth_proxy", {}) or {}),
             "histograms": dict(btg.get("histograms", {}) or {}),
             "path": dict(btg.get("path", {}) or {}),
+            "known_rects": self._known_rects(bp),
             "performance": dict(perf),
             "scene_parallel": dict(bp.get("scene_parallel", {}) or {}),
             "requirements": dict(req),
@@ -905,12 +963,19 @@ class JointV2Manager(object):
         for sd in payload.get("scenes", []):
             s = SimpleNamespace()
             s.scene_id = int(sd["scene_id"])
-            s.obstacles = [
-                SimpleNamespace(
+            s.obstacles = []
+            for o in sd.get("obstacles", []):
+                nobj = SimpleNamespace(
                     id=int(o["id"]), x=float(o["x"]), y=float(o["y"]),
-                    radius=float(o["radius"]),
+                    radius=float(o.get("radius", 0.0)),
                     height_m=float(o["height_m"]))
-                for o in sd.get("obstacles", [])]
+                # 矩形障碍(可选 w/h):存在时按 AABB 渲染(size=[w,h,h]),
+                # 否则按圆柱(radius)渲染。
+                nobj.w = (float(o["w"]) if o.get("w") is not None
+                          else None)
+                nobj.h = (float(o["h"]) if o.get("h") is not None
+                          else None)
+                s.obstacles.append(nobj)
             scenes.append(s)
 
         def _task(td):
@@ -986,7 +1051,7 @@ class JointV2Manager(object):
         caller must NEVER fabricate an all-zero frame and continue.
         """
         w = int(self._depth_cfg.get("width", 640))
-        h = int(self._depth_cfg.get("height", 480))
+        h = int(self._depth_cfg.get("height", 360))
         expected_len = w * h * 4  # float32
 
         frame_id = merged.get("pub_frame_id")
@@ -1026,6 +1091,30 @@ class JointV2Manager(object):
             return None, ratio, frame_id, collision, "no_valid_depth"
         return depth_m, ratio, frame_id, collision, ""
 
+    def _apply_depth_noise(self, depth_m):
+        """D435i stereo-depth noise at the COLLECTOR (kept for legacy/debug
+        only).  The production pipeline stores CLEAN depth and applies the
+        D435i noise at TRAINING time instead (train.py
+        --depth-noise-std-ratio), so this is disabled by default
+        (noise_std_ratio: 0.0 in the YAML).  When enabled it injects a
+        multiplicative Gaussian sigma = noise_std_ratio * depth (m) AFTER
+        decode and BEFORE the expert step AND the PNG encode, so labels
+        stay self-consistent with the noised student input.  Invalid
+        (<=0 / non-finite) pixels stay invalid; results clip to [0, max_m]."""
+        ratio = float(self._depth_cfg.get("noise_std_ratio", 0.0))
+        if ratio <= 0.0:
+            return depth_m
+        valid = np.isfinite(depth_m) & (depth_m > 0)
+        if not np.any(valid):
+            return depth_m
+        max_m = float(self._depth_cfg.get("max_m", 5.0))
+        sigma = ratio * np.abs(depth_m)
+        noisy = depth_m + self._noise_rng.normal(
+            0.0, 1.0, depth_m.shape).astype(np.float64) * sigma
+        noisy = np.clip(noisy, 0.0, max_m)
+        noisy[~valid] = depth_m[~valid]
+        return noisy
+
     # ═══════════════════════════════════════════════════════════════
     #  Unity / Flightmare lifecycle
     # ═══════════════════════════════════════════════════════════════
@@ -1063,16 +1152,34 @@ class JointV2Manager(object):
             return
         objects = []
         for o in scene.obstacles:
-            objects.append({
-                "ID": "cyl_s%d_%d" % (int(scene.scene_id), int(o.id)),
-                "prefabID": "Object",
-                # Unity coords [x, y(up), z]: x_fwd -> x, y_left -> z.
-                "position": [float(o.x), float(self._flight_height),
-                             float(o.y)],
-                "rotation": [0.0, 0.0, 0.0, 1.0],
-                "size": [float(o.radius) * 2.0, float(o.height_m),
-                         float(o.radius) * 2.0],
-            })
+            is_rect = getattr(o, "w", None) is not None and \
+                getattr(o, "h", None) is not None
+            if is_rect:
+                # AABB box via the Transparen_Cube prefab (benchmark format).
+                # Position = [world x, centre height, world y], size =
+                # [x-width, height, y-length].  The generator sets the side =
+                # 2*r so the AABB faces sit on the circumscribed circle along
+                # the axes — depth reads the TRUE collision distance and the
+                # expert detours instead of flying into the circle ring.
+                objects.append({
+                    "ID": "cyl_s%d_%d" % (int(scene.scene_id), int(o.id)),
+                    "prefabID": "Transparen_Cube",
+                    "position": [float(o.x), float(self._flight_height),
+                                 float(o.y)],
+                    "rotation": [0.0, 0.0, 0.0, 1.0],
+                    "size": [float(o.w), float(o.height_m), float(o.h)],
+                })
+            else:
+                objects.append({
+                    "ID": "cyl_s%d_%d" % (int(scene.scene_id), int(o.id)),
+                    "prefabID": "Object",
+                    # Unity coords [x, y(up), z]: x_fwd -> x, y_left -> z.
+                    "position": [float(o.x), float(self._flight_height),
+                                 float(o.y)],
+                    "rotation": [0.0, 0.0, 0.0, 1.0],
+                    "size": [float(o.radius) * 2.0, float(o.height_m),
+                             float(o.radius) * 2.0],
+                })
         wire_objects, retired = il_common.build_replacing_object_update(
             objects, self._known_object_ids)
         # Remember the scene objects so every following pose re-sends them.
@@ -1366,6 +1473,10 @@ class JointV2Manager(object):
                 frame_id, depth_m, raw_ratio, unity_collision, latency_ms, \
                     recv_t, send_t = matched
                 audit.matched += 1
+                # D435i sim-to-real: inject stereo-depth noise on the SAME
+                # depth_m that feeds the expert AND the PNG (labels stay
+                # self-consistent with the noised input).
+                depth_m = self._apply_depth_noise(depth_m)
                 if latency_ms > self._max_latency_ms:
                     audit.latency_violations += 1
                 if latency_ms > self._catastrophic_latency_ms:
@@ -1396,7 +1507,7 @@ class JointV2Manager(object):
                     [float(vel[0]), float(vel[1]), float(vel[2])], yaw_rate,
                     np.ascontiguousarray(depth_m, dtype=np.float32).ravel(),
                     int(self._depth_cfg.get("width", 640)),
-                    int(self._depth_cfg.get("height", 480)),
+                    int(self._depth_cfg.get("height", 360)),
                     [float(pos[0]), float(pos[1]), float(pos[2])],
                     [float(q[0]), float(q[1]), float(q[2]), float(q[3])],
                     flight_h, int(tick), collision_flag)
@@ -1991,13 +2102,17 @@ class JointV2Manager(object):
 
     def _clear_collection_output(self, output_root):
         """Remove every file/dir under `output_root` EXCEPT the blueprint
-        manifest(s) (`*_manifest.json`), so each real collection run starts
-        from a clean dataset and never mixes old episodes into the new one.
+        manifest(s) (`*_manifest.json`) and the YAML config(s) (`*.yaml`), so
+        each real collection run starts from a clean dataset, never mixes old
+        episodes into the new one, and never deletes a test config that sits
+        beside the manifest (e.g. il_data_high_test/config.yaml).
         Never touches anything outside `output_root`."""
         if not output_root or not os.path.isdir(output_root):
             return
         kept = set()
-        for m in glob.glob(os.path.join(output_root, "*_manifest.json")):
+        for m in glob.glob(os.path.join(output_root, "joint_v2_blueprint_manifest*.json")):
+            kept.add(os.path.abspath(m))
+        for m in glob.glob(os.path.join(output_root, "*.yaml")):
             kept.add(os.path.abspath(m))
         for name in sorted(os.listdir(output_root)):
             p = os.path.join(output_root, name)
@@ -2023,8 +2138,13 @@ class JointV2Manager(object):
             self._send_scene_to_unity(scene)
             self._last_scene_id = int(scene.scene_id)
         task_id = int(task.task_id)
-        episode_id = "joint_v2_%06d_%s" % (
-            self._episode_id_counter, uuid.uuid4().hex[:8])
+        # Episode ids carry the scene key prefix so multiple collection runs
+        # (indoor / outdoor_high / outdoor_low) can be merged into ONE
+        # dataset root without id collisions.
+        key_prefix = (self._g.get("scene_generation", {}) or {}).get(
+            "scene_key_prefix", "joint_v2")
+        episode_id = "%s_%06d_%s" % (
+            key_prefix, self._episode_id_counter, uuid.uuid4().hex[:8])
         self._episode_id_counter += 1
         ds_cfg = self._g.get("dataset_logging", {}) or {}
         writer = il_dataset_writer.DatasetWriter(

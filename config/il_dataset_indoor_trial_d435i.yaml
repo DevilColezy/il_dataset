@@ -1,0 +1,69 @@
+# ============================================================================
+#  il_dataset_indoor_trial_d435i.yaml — D435i 640x360 满水平试采
+#
+#  继承 il_dataset_indoor_config.yaml(室内仓库、0.5-2m 作业层、圆柱障碍),
+#  相机参数经主配置链已对齐 D435i:
+#    - 640x360 (16:9), 垂直 FOV 58°, 水平 FOV 89.16°
+#    - near 0.28 m (Min-Z), far 10 m (满量程采集), max_m 5 m (5m 截断)
+#    - noise_std_ratio 0.0 (采集完美深度, 训练时加噪声)
+#
+#  本试采仅验证: Unity 640x360 渲染 / 专家行为(89.16° 水平 + 0.28m 盲区)
+#  / PNG 尺寸与 5m 截断编码。小规模: 4 场景 x 每场景 ~5 任务。
+# ============================================================================
+extends: il_dataset_indoor_config.yaml
+
+global:
+  # 独立试采目录(验证通过后再全量采集到正式目录)
+  output_dir: "/home/rgzn/flightmare_ws/il_data_d435i_trial"
+
+  scene_generation:
+    scene_key_prefix: "d435i_trial"
+
+  blueprint_generation:
+    scene_parallel:
+      # 每层 1 场景 x 4 层 = 4 场景。 室内仓库区域下每场景 placement 约
+      # 只能产出 2 个合格任务(seen: candidates=2/scene), 故 expected 设小
+      # 到与实际匹配 (>= 80% 判定), 避免 generation_ok=false 直接退出。
+      scenes_per_level_list: [1, 1, 1, 1]
+      expected_collect_tasks: 10
+    # 试采: 把 distribution 硬性下限全部降到可被 ~8 任务满足的水平。
+    # 生产 config 的 minimum 是按数百任务规模设计的, 小试采不可能达到。
+    # count 类 minimum=1; hist 类 bin 可能缺样本, minimum=0; balance 软。
+    distribution_targets:
+      - {key: "macro:total", metric: "count:macro:total", target: 8, minimum: 0, weight: 1.0, minimum_hard: false}
+      - {key: "macro:pass", metric: "count:macro:pass", target: 8, minimum: 1, weight: 1.0, minimum_hard: false}
+      - {key: "macro:normal", metric: "count:macro:normal", target: 8, minimum: 1, weight: 1.0, minimum_hard: false}
+      - {key: "macro:turn_left", metric: "count:macro:turn_left", target: 4, minimum: 1, weight: 1.0, minimum_hard: false}
+      - {key: "macro:turn_right", metric: "count:macro:turn_right", target: 4, minimum: 1, weight: 1.0, minimum_hard: false}
+      - {key: "corr_angle_total", metric: "hist:macro_correction_angle", target: 8, minimum: 1, weight: 1.0, minimum_hard: false}
+      - {key: "local:avoidance", metric: "count:local:avoidance", target: 8, minimum: 1, weight: 1.0, minimum_hard: false}
+      - {key: "local:direct", metric: "count:local:direct", target: 8, minimum: 1, weight: 0.2, minimum_hard: false}
+      - {key: "deflection_total", metric: "hist:local_deflection", target: 8, minimum: 1, weight: 1.0, minimum_hard: false}
+      - {key: "depth:near", metric: "count:depth:near", target: 8, minimum: 1, weight: 1.0, minimum_hard: false}
+      - {key: "depth:mid", metric: "count:depth:mid", target: 8, minimum: 1, weight: 1.0, minimum_hard: false}
+      - {key: "depth:far", metric: "count:depth:far", target: 8, minimum: 1, weight: 1.2, minimum_hard: false}
+      - {key: "depth:free", metric: "count:depth:free", target: 8, minimum: 1, weight: 1.0, minimum_hard: false}
+      - {key: "yaw:bin0", metric: "hist:yaw_error_abs:0", target: 2, minimum: 0, weight: 1.0, minimum_hard: false}
+      - {key: "yaw:bin1", metric: "hist:yaw_error_abs:1", target: 2, minimum: 0, weight: 1.0, minimum_hard: false}
+      - {key: "yaw:bin2", metric: "hist:yaw_error_abs:2", target: 2, minimum: 0, weight: 1.0, minimum_hard: false}
+      - {key: "yaw:bin3", metric: "hist:yaw_error_abs:3", target: 2, minimum: 0, weight: 1.0, minimum_hard: false}
+      - {key: "yaw:bin4", metric: "hist:yaw_error_abs:4", target: 2, minimum: 0, weight: 1.0, minimum_hard: false}
+      - {key: "yaw:bin5", metric: "hist:yaw_error_abs:5", target: 2, minimum: 0, weight: 1.0, minimum_hard: false}
+      - {key: "path:short", metric: "hist:path_length:0", target: 2, minimum: 0, weight: 0.8, minimum_hard: false}
+      - {key: "path:medium", metric: "hist:path_length:1", target: 2, minimum: 0, weight: 0.8, minimum_hard: false}
+      - {key: "path:long", metric: "hist:path_length:2", target: 2, minimum: 0, weight: 1.2, minimum_hard: false}
+      - {key: "balance:turn", metric: "balance:macro:turn_left/macro:turn_right", target: 1.0, minimum: 0.0, weight: 1.0, minimum_hard: false}
+      - {key: "balance:yaw", metric: "balance:yaw:left/yaw:right", target: 1.0, minimum: 0.0, weight: 1.0, minimum_hard: false}
+    requirements:
+      min_tasks: 8
+      min_tasks_per_scene: 2
+      max_tasks_per_scene: 16
+      min_selected_scenes: 4
+      max_turn_imbalance_ratio: 1.0
+      max_yaw_imbalance_ratio: 1.0
+      min_path_samples_per_class: 1
+      min_grouped_deflection_samples: 1
+      min_grouped_correction_samples: 1
+      min_macro_ticks_per_class: 1
+      min_depth_samples_per_band: 1
+      min_yaw_samples_per_bin: 1

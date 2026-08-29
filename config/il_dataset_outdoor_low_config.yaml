@@ -1,0 +1,98 @@
+# ============================================================================
+#  il_dataset_outdoor_low_config.yaml — 类 A(室外工业低空)采集配方
+#
+#  作业层: flight_height_m ~ U[0.5, 2.0](每任务随机,起终点同高)
+#  障碍  : 竖直圆柱,高度 ~ U[3, 6] m(> 作业高度,贯穿作业层),
+#          中心 z = 层中心 1.25 m
+#  region: 工业大区域 [-25,25] x [-25,25](scene 0 INDUSTRIAL)
+#  距离  : 12–30 m(长程)
+#  半径  : 类 A 四层级 0.1–3.0 m(同室内)
+#  已知障碍: scene0 作业层 0.5-2m 点云占据簇(大簇 AABB 注入)
+#
+#  extends: il_dataset_outdoor_config.yaml(共享工业 region / 配额 /
+#  专家参数),仅覆盖高度 / 半径 / 距离分层 / 已知障碍文件。
+# ============================================================================
+extends: il_dataset_outdoor_config.yaml
+
+global:
+  output_dir: "/home/rgzn/flightmare_ws/il_data_d435i_col_low"
+
+  scene_generation:
+    seed: 260829
+    scene_key_prefix: "outdoor_low"
+    geometry:
+      height_m: 6.5
+      radius_min_m: 0.10
+      radius_max_m: 3.00
+
+  task_generation:
+    flight_height_m: 6.5
+    min_task_distance_m: 5.0
+    max_task_distance_m: 20.0
+
+  # 室外低空(0.5-2m)点云存在一条北围墙(y≈24.8,横跨整个 x)。围墙以北是
+  # 死区,起终点若靠近围墙会被 A* 连成"绕围墙两端"的超长绕行任务。裁剪
+  # region y 上限到 24.0(围墙南侧留 0.65m 余量),起终点永不跨越围墙。
+  hierarchical_expert:
+    region:
+      min_x: -25.0
+      max_x: 25.0
+      min_y: -25.0
+      max_y: 24.0
+    # 作业层 5.0-8.0 m:垂直飞行带覆盖 [4, 10](内带 [4.5, 9.5] 含作业层)。
+    # 本文件 extends il_dataset_outdoor_config.yaml,若不覆盖会继承其高空带
+    # [13, 19],把 6 m 的无人机经 clampToBand 强行拉上 13 m。
+    local_planner:
+      z_min_m: 4.0
+      z_max_m: 10.0
+      vertical_clearance_m: 0.5
+
+  blueprint_generation:
+    base_seed: 260829
+    # 北围墙裁剪:free_region 与 hierarchical_expert.region 保持一致。
+    warehouse:
+      free_region: [-25.0, 25.0, -25.0, 24.0]
+    # 类 A 室外中空:作业层 5-8m 的点云占据簇(大簇)
+    known_obstacles_file: "/home/rgzn/flightmare_ws/il_data_baseline/scene0_classA_5.0-8.0m_clusters.json"
+    task_generation:
+      flight_height_m: 6.5
+      obstacle_height_m: 6.5
+      flight_height_min_m: 5.0
+      flight_height_max_m: 8.0
+      obstacle_height_min_m: 9.0
+      obstacle_height_max_m: 14.0
+      min_task_distance_m: 5.0
+      max_task_distance_m: 20.0
+    scene_parallel:
+      # 类 A 半径层级:small 0.1-0.5 / medium 0.5-1.5 / large 1.5-3.0 /
+      # mixed 0.1-3.0
+      scenes_per_level_list: [4, 4, 4, 4]
+      level_radius_min: [0.15, 0.5, 1.5, 0.15]
+      level_radius_max: [0.5, 1.5, 3.0, 3.0]
+      level_occupancy_min: [0.05, 0.09, 0.12, 0.12]
+      level_occupancy_max: [0.12, 0.18, 0.25, 0.22]
+      distance_short_max_m: 10.0
+      distance_medium_max_m: 15.0
+      expected_collect_tasks: 160
+    requirements:
+      min_tasks: 120
+      min_tasks_per_scene: 2
+      max_turn_imbalance_ratio: 0.60
+      max_yaw_imbalance_ratio: 0.60
+      min_path_samples_per_class: 1
+      min_grouped_deflection_samples: 1
+      min_grouped_correction_samples: 1
+    distribution_targets:
+      # ── 类 A 配额(缩放到 16 场景 / ~160 任务)──────────────────
+      - {key: "macro:total", metric: "count:macro:total",
+         target: 184, minimum: 92, weight: 1.0, minimum_hard: false}
+      - {key: "macro:pass", metric: "count:macro:pass",
+         target: 46, minimum: 23, weight: 1.0, minimum_hard: true}
+      - {key: "macro:normal", metric: "count:macro:normal",
+         target: 92, minimum: 46, weight: 2.0, minimum_hard: true}
+      - {key: "macro:turn_left", metric: "count:macro:turn_left",
+         target: 35, minimum: 17, weight: 5.0, minimum_hard: true}
+      - {key: "macro:turn_right", metric: "count:macro:turn_right",
+         target: 35, minimum: 17, weight: 5.0, minimum_hard: true}
+      - {key: "corr_angle_total", metric: "hist:macro_correction_angle",
+         target: 138, minimum: 69, weight: 2.0, minimum_hard: true}

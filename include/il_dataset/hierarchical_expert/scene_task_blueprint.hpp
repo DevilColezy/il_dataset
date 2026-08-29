@@ -66,13 +66,6 @@ namespace expert {
 // ═══════════════════════════════════════════════════════════════════
 //  POD results (exposed to Python via pybind)
 // ═══════════════════════════════════════════════════════════════════
-struct BlueprintObstacle {
-    double x = 0.0, y = 0.0;
-    double radius = 0.0;
-    double height_m = 8.0;
-    int id = -1;
-};
-
 struct BlueprintScene {
     uint64_t scene_id = 0;
     uint64_t seed = 0;
@@ -291,7 +284,15 @@ public:
         int minimum_tasks_per_scene = 6;
         uint64_t base_seed = 260812;
         double flight_height_m = 2.0;
+        // NEW: per-task random operating height range (2.5D).  Defaults
+        // equal flight_height_m (legacy single-height behaviour).
+        double flight_height_min_m = 2.0;
+        double flight_height_max_m = 2.0;
         double obstacle_height_m = 8.0;
+        // NEW: per-obstacle random height range (must exceed the
+        // operating height so the cylinder spans the flight band).
+        double obstacle_height_min_m = 8.0;
+        double obstacle_height_max_m = 8.0;
         bool require_full_strata_coverage = true;
         double min_surface_gap_m = 1.40;
         double boundary_margin_m = 1.20;

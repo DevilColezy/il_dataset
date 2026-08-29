@@ -1,0 +1,18 @@
+# ============================================================================
+#  il_dataset_outdoor_test_obstacles.yaml — 室外高空 15-17m 障碍绕行测试
+#
+#  用生成脚本产出的 manifest(collection-only 模式):
+#    - 21 个单障碍测试:半径 {0.1,0.5,1.0,3.0,6.0,10.0,15.0} ×
+#      表面距离 {0.6,2.5,6.0}
+#    - 1 个多障碍测试:10m 主障碍 + 两侧 6 个小障碍(验证绕行中局部避障)
+#
+#  extends: il_dataset_outdoor_config.yaml(高空 15-17m、垂直带 [13,19]、
+#  region [-25,25]²、depth / 专家参数)。
+# ============================================================================
+extends: il_dataset_outdoor_config.yaml
+
+global:
+  output_dir: "/home/rgzn/flightmare_ws/il_data_test_obstacles"
+  scene_id: 0   # INDUSTRIAL(室外)
+  scene_generation:
+    scene_key_prefix: "test_obs"

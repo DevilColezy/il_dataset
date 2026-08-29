@@ -45,7 +45,7 @@ REQUIRED_MODULES = [
 DEFAULT_T_BC = [
     1.0, 0.0, 0.0, 0.0,
     0.0, 1.0, 0.0, 0.0,
-    0.0, 0.0, 1.0, 0.3,
+    0.0, 0.0, 1.0, 0.15,
     0.0, 0.0, 0.0, 1.0,
 ]
 
@@ -197,11 +197,15 @@ def _validate_config(cfg):
     # ── depth (fixed camera; R is the single perception range) ────
     depth = g.get("depth", {})
     _positive(depth.get("width", 640), "global.depth.width", errors)
-    _positive(depth.get("height", 480), "global.depth.height", errors)
-    _positive(depth.get("fov", 90.0), "global.depth.fov", errors)
+    _positive(depth.get("height", 360), "global.depth.height", errors)
+    _positive(depth.get("fov", 58.0), "global.depth.fov", errors)
     _positive(depth.get("max_m", 5.0), "global.depth.max_m", errors)
+    noise_ratio = float(depth.get("noise_std_ratio", 0.0))
+    if not (0.0 <= noise_ratio <= 1.0):
+        errors.append("global.depth.noise_std_ratio must be in [0, 1] "
+                      "(0 disables D435i-style depth noise)")
     depth_max = float(depth.get("max_m", 5.0))
-    depth_fov = float(depth.get("fov", 90.0))
+    depth_fov = float(depth.get("fov", 58.0))
     # ── depth.t_bc (item 十): the SINGLE camera->body matrix shared by the
     #    Unity wire (make_depth_vehicle) and the C++ CameraRig2D.  It must
     #    be 16 finite row-major floats, the last row must be (0,0,0,1) and
@@ -672,7 +676,7 @@ def _validate_config(cfg):
             % fit_need)
 
     obs = he.get("observation", {}) or {}
-    fov = float(obs.get("fov_deg", 90.0))
+    fov = float(obs.get("fov_deg", 73.0))
     perception = float(obs.get("range_m", 5.0))
     _bounded(fov, "hierarchical_expert.observation.fov_deg", 1.0, 180.0,
              errors)
@@ -681,12 +685,21 @@ def _validate_config(cfg):
               "hierarchical_expert.observation.resolution", errors)
     _positive(obs.get("ray_angular_res_deg", 0.5),
               "hierarchical_expert.observation.ray_angular_res_deg", errors)
-    # Item 十: depth.fov and observation.fov_deg are the SAME camera FOV
-    # (Unity wire + expert), and depth.max_m must cover observation.range_m.
-    if abs(depth_fov - fov) > 1e-6:
+    # Item 十 (D435i-aligned): depth.fov is the VERTICAL camera FOV (Unity
+    # Camera.fieldOfView semantics), while observation.fov_deg is the
+    # HORIZONTAL FOV the C++ expert consumes.  With a WxH image they are
+    # related by fov_h = 2*atan(tan(fov_v/2) * W/H), so they must satisfy
+    # that relationship, NOT be equal.
+    dw = float(depth.get("width", 640))
+    dh = float(depth.get("height", 360))
+    fov_h_expected = 2.0 * math.degrees(math.atan(
+        math.tan(math.radians(depth_fov) / 2.0) * (dw / dh)))
+    if abs(fov_h_expected - fov) > 0.1:
         errors.append(
-            "global.depth.fov must equal "
-            "hierarchical_expert.observation.fov_deg (single camera source)")
+            "hierarchical_expert.observation.fov_deg (%.4f deg) must equal "
+            "the horizontal FOV derived from global.depth.fov (vertical "
+            "%.4f deg) and the %dx%d image aspect (expected %.4f deg)"
+            % (fov, depth_fov, int(dw), int(dh), fov_h_expected))
     if perception > depth_max + 1e-6:
         errors.append("hierarchical_expert.observation.range_m must be "
                       "<= depth.max_m")

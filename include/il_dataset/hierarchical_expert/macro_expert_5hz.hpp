@@ -168,6 +168,17 @@ private:
         bool drop_held_waypoint_allowed,
         const DirectiveAssessmentFn& assess_directive) const;
 
+    /// USER DESIGN (2026-08-29): large-obstacle tangent slide guide.  When
+    /// the direct corridor is blocked and NEITHER side has a strict bypass
+    /// (obstacle fills the FOV), the macro must guide the detour instead of
+    /// NORMAL candidates (which pull the drone to the silhouette where the
+    /// 30 Hz layer cannot move) or pure TURN (which spins in place).  Emits
+    /// a world-locked tangent direction = surface-tangent + radial-away
+    /// blend, so the 30 Hz layer slides around the box keeping clearance.
+    TargetCorrectionDirective makeSlideDirective(
+        const PlanarState& state, const Vec2d& goal,
+        const LocalFreeGrid& grid, SideSelection side) const;
+
     /// Distance at which a fixed NORMAL_CORRECTION waypoint counts as
     /// REACHED (max of task tolerance and the dedicated waypoint
     /// tolerance).  Deliberately separate from the recovery-prefix lookahead.
@@ -188,6 +199,15 @@ private:
     // ── 5 Hz internal memory ──
     bool correction_active_ = false;
     SideSelection locked_side_ = SideSelection::NONE;
+    // USER DESIGN (2026-08-29): large-obstacle slide-guide latch.  Once the
+    // macro starts the tangent slide it stays latched (each 5 Hz tick
+    // re-issues makeSlideDirective) until the goal distance has dropped
+    // meaningfully (the corner is actually bypassed) — NOT until
+    // extractBlocker flips (it depends on the live depth and unlatches when
+    // the drone rotates the obstacle out of the FOV, measured: guide jumped
+    // between SLIDE and NORMAL every 5 Hz).
+    bool slide_active_ = false;
+    double slide_goal_dist_start_ = std::numeric_limits<double>::infinity();
     uint64_t update_event_ = 0;
     uint64_t correction_enter_event_ = 0;
     uint64_t correction_exit_event_ = 0;

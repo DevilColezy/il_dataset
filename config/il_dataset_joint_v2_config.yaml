@@ -75,8 +75,8 @@ global:
 
   task_generation:
     flight_height_m: 2.0
-    min_task_distance_m: 4.0
-    max_task_distance_m: 28.0
+    min_task_distance_m: 2.0
+    max_task_distance_m: 15.0
     # Initial yaw: aim at the goal + left/right symmetric random bias.
     initial_yaw_bias_deg: 15.0
     # Oversampling (blueprint-only, never a Flightmare flight timeout).
@@ -99,8 +99,8 @@ global:
       min_per_density_level: 4
       min_per_radius_level: 4
       min_per_distance_level: 4
-      distance_short_max_m: 9.0
-      distance_long_min_m: 15.0
+      distance_short_max_m: 5.0
+      distance_long_min_m: 10.0
       radius_small_max_m: 0.6
       radius_large_min_m: 1.4
       # density 阈值 = 占地密度（Σπr²/区域比例），非障碍数量
@@ -138,7 +138,7 @@ global:
       scenes_per_level: 10
       # 每层场景数（覆盖 scenes_per_level）：large/mixed 多采以收集更多宏观规划标签
       # （步骤3+4：large/mixed 12→14，总场景 40→44，宏观候选 +17%）
-      scenes_per_level_list: [8, 8, 14, 14]
+      scenes_per_level_list: [4, 4, 4, 4]
       level_radius_min: [0.15, 0.5, 1.5, 0.15]
       # 步骤3+4：large/mixed 半径上限 3.0→3.5（更大障碍 → 更长绕行 → 更多宏观接管）
       level_radius_max: [0.5, 1.5, 3.5, 3.5]
@@ -149,20 +149,20 @@ global:
       # large 0.07..0.10 → 0.12..0.18：大障碍场景障碍数 2~3 → 4~6，给 construct_blocked
       # 更多"大障碍背后目标"机会（宏观任务 pool 供应瓶颈在此）。
       level_occupancy_min: [0.05, 0.09, 0.12, 0.12]
-      level_occupancy_max: [0.08, 0.13, 0.18, 0.16]
+      level_occupancy_max: [0.12, 0.18, 0.25, 0.22]
       surface_gap_min_m: 1.6
       boundary_min_m: 0.6
-      distance_short_max_m: 8.0
-      distance_medium_max_m: 16.0
+      distance_short_max_m: 5.0
+      distance_medium_max_m: 10.0
       # Full start->goal quick preflight.  Max ticks must be large enough
       # to REACH the goal (with detours); dt_scale>1 enlarges the dynamics
       # step (per tick travels dt_scale further) so the full trajectory
       # needs fewer ticks and finishes faster.  Same expert + same
       # Params2D clearance as the real collection.
-      quick_preflight_max_ticks: 200
+      quick_preflight_max_ticks: 300
       quick_preflight_dt_scale: 6.0
       # 步骤3+4：400→440（每场景 scene_target 10→11，per_level_target 100→110）
-      expected_collect_tasks: 440
+      expected_collect_tasks: 160
     task_generation:
       macro_probe:
         enabled: true
@@ -203,71 +203,72 @@ global:
       # ── 5 Hz macro coverage (weights/targets raised 2026-08-26 to collect
       #    more macro-planning labels for the 5 Hz student) ────────────
       - {key: "macro:total", metric: "count:macro:total",
-         target: 512, minimum: 256, weight: 1.0, minimum_hard: false}
+         target: 184, minimum: 92, weight: 1.0, minimum_hard: false}
       - {key: "macro:pass", metric: "count:macro:pass",
-         target: 128, minimum: 64, weight: 1.0, minimum_hard: true}
+         target: 46, minimum: 23, weight: 1.0, minimum_hard: true}
       - {key: "macro:normal", metric: "count:macro:normal",
-         target: 256, minimum: 128, weight: 2.0, minimum_hard: true}
+         target: 92, minimum: 46, weight: 2.0, minimum_hard: true}
       # New planner does LOCAL yaw-first turns whenever the target leaves
       # the usable FOV band.  The macro-turn probe is therefore only a
       # post-exploration sampling hint for genuine upper-level takeovers.
       - {key: "macro:turn_left", metric: "count:macro:turn_left",
-         target: 96, minimum: 48, weight: 5.0, minimum_hard: true}
+         target: 35, minimum: 17, weight: 5.0, minimum_hard: true}
       - {key: "macro:turn_right", metric: "count:macro:turn_right",
-         target: 96, minimum: 48, weight: 5.0, minimum_hard: true}
+         target: 35, minimum: 17, weight: 5.0, minimum_hard: true}
       - {key: "corr_angle_total", metric: "hist:macro_correction_angle",
-         target: 384, minimum: 192, weight: 2.0, minimum_hard: true}
+         target: 138, minimum: 69, weight: 2.0, minimum_hard: true}
       # ── 30 Hz local coverage ─────────────────────────────────────
       - {key: "local:avoidance", metric: "count:local:avoidance",
-         target: 128, minimum: 64, weight: 1.5, minimum_hard: true}
+         target: 46, minimum: 23, weight: 1.5, minimum_hard: true}
       - {key: "local:direct", metric: "count:local:direct",
-         target: 128, minimum: 64, weight: 0.2, minimum_hard: false}
+         target: 46, minimum: 23, weight: 0.2, minimum_hard: false}
       - {key: "deflection_total", metric: "hist:local_deflection",
-         target: 192, minimum: 64, weight: 1.0, minimum_hard: true}
+         target: 69, minimum: 23, weight: 1.0, minimum_hard: true}
       # ── depth proxy coverage (hard) ──────────────────────────────
       - {key: "depth:near", metric: "count:depth:near",
-         target: 160, minimum: 64, weight: 1.0, minimum_hard: true}
+         target: 58, minimum: 23, weight: 1.0, minimum_hard: true}
       - {key: "depth:mid", metric: "count:depth:mid",
-         target: 160, minimum: 64, weight: 1.0, minimum_hard: true}
+         target: 58, minimum: 23, weight: 1.0, minimum_hard: true}
       - {key: "depth:far", metric: "count:depth:far",
-         target: 160, minimum: 64, weight: 1.2, minimum_hard: true}
+         target: 58, minimum: 23, weight: 1.2, minimum_hard: true}
       - {key: "depth:free", metric: "count:depth:free",
-         target: 160, minimum: 64, weight: 1.0, minimum_hard: true}
+         target: 58, minimum: 23, weight: 1.0, minimum_hard: true}
       # ── initial yaw coverage (hard per bin) ──────────────────────
       - {key: "yaw:bin0", metric: "hist:yaw_error_abs:0",
-         target: 6, minimum: 3, weight: 1.0, minimum_hard: true}
+         target: 2, minimum: 1, weight: 1.0, minimum_hard: true}
       - {key: "yaw:bin1", metric: "hist:yaw_error_abs:1",
-         target: 6, minimum: 3, weight: 1.0, minimum_hard: true}
+         target: 2, minimum: 1, weight: 1.0, minimum_hard: true}
       - {key: "yaw:bin2", metric: "hist:yaw_error_abs:2",
-         target: 6, minimum: 3, weight: 1.0, minimum_hard: true}
+         target: 2, minimum: 1, weight: 1.0, minimum_hard: true}
       - {key: "yaw:bin3", metric: "hist:yaw_error_abs:3",
-         target: 6, minimum: 3, weight: 1.0, minimum_hard: true}
+         target: 2, minimum: 1, weight: 1.0, minimum_hard: true}
       - {key: "yaw:bin4", metric: "hist:yaw_error_abs:4",
-         target: 6, minimum: 3, weight: 1.0, minimum_hard: true}
+         target: 2, minimum: 1, weight: 1.0, minimum_hard: true}
       - {key: "yaw:bin5", metric: "hist:yaw_error_abs:5",
-         target: 6, minimum: 3, weight: 1.0, minimum_hard: true}
+         target: 2, minimum: 1, weight: 1.0, minimum_hard: true}
       # ── path length coverage (hard per class) ────────────────────
       - {key: "path:short", metric: "hist:path_length:0",
-         target: 8, minimum: 4, weight: 0.8, minimum_hard: true}
+         target: 3, minimum: 2, weight: 0.8, minimum_hard: true}
       - {key: "path:medium", metric: "hist:path_length:1",
-         target: 8, minimum: 4, weight: 0.8, minimum_hard: true}
+         target: 3, minimum: 2, weight: 0.8, minimum_hard: true}
       - {key: "path:long", metric: "hist:path_length:2",
-         target: 8, minimum: 4, weight: 1.5, minimum_hard: true}
+         target: 3, minimum: 2, weight: 1.5, minimum_hard: true}
       # ── balances (structural, soft) ──────────────────────────────
       - {key: "balance:turn",
          metric: "balance:macro:turn_left/macro:turn_right",
-         target: 0.20, minimum: 0.20, weight: 3.0, minimum_hard: false}
+         target: 0.30, minimum: 0.30, weight: 3.0, minimum_hard: false}
       - {key: "balance:yaw", metric: "balance:yaw:left/yaw:right",
-         target: 0.20, minimum: 0.20, weight: 1.0, minimum_hard: false}
+         target: 0.30, minimum: 0.30, weight: 1.0, minimum_hard: false}
     requirements:
-      min_tasks: 160
-      min_tasks_per_scene: 8
-      max_tasks_per_scene: 16
+      min_tasks: 120
+      min_tasks_per_scene: 2
+      max_tasks_per_scene: 12
       min_selected_scenes: 4
-      max_turn_imbalance_ratio: 0.20
-      max_yaw_imbalance_ratio: 0.20
-      min_grouped_deflection_samples: 8
-      min_grouped_correction_samples: 4
+      max_turn_imbalance_ratio: 0.60
+      max_yaw_imbalance_ratio: 0.60
+      min_path_samples_per_class: 1
+      min_grouped_deflection_samples: 1
+      min_grouped_correction_samples: 1
     # Real-collection top-up (item 十): after the first Flightmare pass,
     # the 5 Hz / 30 Hz label distributions are re-derived from the
     # COMMITTED episodes ONLY and the soft gaps caused by real episode
@@ -296,7 +297,9 @@ global:
     macro_route_clearance_margin_m: 0.0
     goal_tolerance_m: 0.40
     observation:
-      fov_deg: 90.0
+      # HORIZONTAL FOV (D435i full-horizontal, 640x360 16:9):
+      # 2*atan(tan(58°/2)*640/360) = 89.16°.
+      fov_deg: 89.16
       range_m: 5.0
       resolution: 0.10
       ray_angular_res_deg: 0.5
@@ -352,10 +355,10 @@ global:
       yaw_decay_per_deg: 0.0111  # 45° off-nose → ×0.5
       yaw_decay_min: 0.5         # yaw-decay floor
       # The chosen avoidance ray stays within this RELATIVE angle of the
-      # target bearing (FOV − 10 = 80°).  Prevents the target direction and
+      # target bearing (FOV − 10 = 63°).  Prevents the target direction and
       # the avoidance direction from wedging at opposite FOV edges (a
-      # target at +43° must not be dodged by flying to the −45° far edge).
-      ray_target_rel_max_deg: 80.0
+      # target at +33° must not be dodged by flying to the −36° far edge).
+      ray_target_rel_max_deg: 63.0
       # R29c: EMA weight for the ray-sector yaw intent (1.0 = no smoothing;
       # smaller = smoother heading, slower response).  Smooths the nose
       # against neighbouring-ray switches; the velocity stays on the clear

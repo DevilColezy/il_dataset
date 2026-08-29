@@ -27,7 +27,9 @@ void PreflightSimulator::configure(const Scene2D& scene,
                                    const Vec2d& min_bounds,
                                    const Vec2d& max_bounds,
                                    const Vec2d* wall_min,
-                                   const Vec2d* wall_max) {
+                                   const Vec2d* wall_max,
+                                   const std::vector<Vec2d>& known_rect_min,
+                                   const std::vector<Vec2d>& known_rect_max) {
     scene_ = scene;
     min_bounds_ = min_bounds;
     max_bounds_ = max_bounds;
@@ -37,6 +39,8 @@ void PreflightSimulator::configure(const Scene2D& scene,
         wall_min_ = *wall_min;
         wall_max_ = *wall_max;
     }
+    known_rect_min_ = known_rect_min;
+    known_rect_max_ = known_rect_max;
     // P2: cache the scene-static circle geometry ONCE here so every
     // synthesizePatch() tick reuses it (no per-tick vector rebuild).
     obstacle_centers_.clear();
@@ -103,9 +107,16 @@ LocalObservation PreflightSimulator::synthesizePatch(uint64_t tick) {
         rig.rayWorldDirXY(bearing, dir);
         // ANALYTIC ray-circle + ray-wall intersection: O(obstacles) per
         // ray, no spatial marching (was O(range/steps x obstacles)).
-        const double hit = rayNearestObstacleHit(
+        double hit = rayNearestObstacleHit(
             cam2, Vec2d(dir[0], dir[1]), obstacle_centers_, obstacle_radii_,
             has_wall_, wall_min_, wall_max_);
+        // Fixed known-obstacle AABBs (real scene point-cloud structures):
+        // solid rectangles so the synthetic patch matches the runtime depth.
+        for (size_t k = 0; k < known_rect_min_.size(); ++k) {
+            hit = std::min(hit, rayRectHit(cam2, Vec2d(dir[0], dir[1]),
+                                           known_rect_min_[k],
+                                           known_rect_max_[k]));
+        }
         ray_hit_[static_cast<size_t>(i)] =
             (hit > range) ? std::numeric_limits<double>::infinity() : hit;
         ray_seen_[static_cast<size_t>(i)] = true;  // valid return
