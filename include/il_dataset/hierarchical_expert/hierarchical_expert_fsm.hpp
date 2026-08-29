@@ -62,9 +62,8 @@ struct FsmStepOutput {
     uint8_t target_correction_type = 0;  // TargetCorrectionType
     std::string target_correction_type_name = "PASS_THROUGH";
     bool target_correction_active = false;
-    // R24: persistent terminal/brake-only semantic of the current ZOH
-    // directive (true = the corrected target is a stop target, never
-    // fly-through).  Diagnostic; mirrors the directive flag.
+    // Persistent terminal-stop flag of the current ZOH directive (always
+    // false: the arbiter never issues terminal stops).  Diagnostic.
     bool directive_terminal_stop = false;
     int32_t target_direction_token = -1;
     double target_direction_x_body = 1.0;

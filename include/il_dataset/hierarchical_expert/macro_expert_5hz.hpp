@@ -1,21 +1,36 @@
 #pragma once
 /// @file   macro_expert_5hz.hpp
-/// @brief  5 Hz VisibilityTargetCorrector — local observability judge
-///         + target corrector.
+/// @brief  5 Hz local-target arbiter (the upper expert).
 ///
-/// The 5 Hz expert answers exactly one question on every real 5 Hz
-/// boundary (tick % 6 == 0):
+/// The upper expert is NOT a second local planner.  It answers exactly one
+/// question on every real 5 Hz boundary (tick % 6 == 0):
 ///
-///   "Do the current FOV and its causal local history contain enough
-///    information for the 30 Hz expert to finish its OWN local avoidance?"
+///   "Which target should the 30 Hz local expert chase right now?"
 ///
-///   * YES → PASS_THROUGH the original target (the local planner owns
-///     out-of-FOV target rotation as well as visible reactive avoidance);
-///   * NO  → temporarily correct the tracked target:
-///       - NORMAL_CORRECTION: a quantized in-FOV frontier on the locked
-///         side;
-///       - TURN_LEFT / TURN_RIGHT: one bounded world-latched direction
-///         step when the current local information has no usable frontier.
+/// It never plans trajectories and never decides HOW the local expert
+/// moves.  It only chooses among three directives:
+///
+///   * PASS        — keep chasing the ORIGINAL task goal;
+///   * TURN(dir)   — stop translating and rotate the requested direction
+///                   into the FOV (pure rotation, world-latched);
+///   * CORRECTION  — chase a visible, in-FOV, locally-executable
+///                   temporary waypoint (world-latched, event-driven).
+///
+/// The arbiter has exactly two modes:
+///
+///   DIRECT — the original goal is the attention centre:
+///       goal trackable             → PASS
+///       goal outside FOV           → TURN(goal direction)
+///       local persistently blocked → BYPASS
+///
+///   BYPASS — the blocker / bypass frontier is the attention centre.  On
+///       entry the PRIMARY blocker (the occupied component crossing the
+///       vehicle→goal corridor) is identified and ONE side (LEFT/RIGHT) is
+///       committed to.  Corrections are HELD (event-driven update, never
+///       re-sampled every tick) until they are reached or no longer locally
+///       feasible.  The original goal's FOV status is deliberately ignored
+///       while in BYPASS.  BYPASS exits only when the original goal
+///       re-enters the local expert's capability set.
 ///
 /// INFORMATION BOUNDARY (enforced by the interface).  At runtime the
 /// corrector may ONLY read:
@@ -75,7 +90,13 @@ public:
     const AvoidanceObservability& lastObservability() const {
         return last_obs_;
     }
-    bool correctionActive() const { return correction_active_; }
+    /// True while the current directive is NOT PASS_THROUGH (the macro is
+    /// overriding the original target with a TURN or a CORRECTION).
+    bool correctionActive() const {
+        return last_directive_.type != TargetCorrectionType::PASS_THROUGH;
+    }
+    /// True while the arbiter is in BYPASS mode (see the file header).
+    bool bypassActive() const { return bypass_active_; }
     SideSelection lockedSide() const { return locked_side_; }
     uint64_t correctionEnterEvent() const { return correction_enter_event_; }
     uint64_t correctionExitEvent() const { return correction_exit_event_; }
@@ -84,11 +105,10 @@ public:
     const TargetCorrectionDirective& lastDirective() const {
         return last_directive_;
     }
-    /// Recovery/re-entry guard (reported in 30 Hz ticks; 1 means the macro
-    /// layer still owns the target).  Losing sight of a blocker during search
-    /// is not evidence that it has been bypassed.
+    /// Macro-owns-target guard (reported in 30 Hz ticks; 1 means the macro
+    /// layer still owns the target).
     int reentryGuardRemaining(uint64_t /*tick*/) const {
-        return correction_active_ ? 1 : 0;
+        return correctionActive() ? 1 : 0;
     }
 
 private:
@@ -144,12 +164,6 @@ private:
     double freeRangeAlong(const PlanarState& state,
                           const LocalObservation& obs,
                           double bearing_body) const;
-    // R29k: distance along a world bearing to the first OBSERVED OCCUPIED
-    // cell (UNKNOWN is passable).  Used to gate SEARCH_ROTATION_TOWARD_ORIG
-    // INAL_GOAL on the goal bearing not being blocked.
-    double occupiedRangeAlongFrom(const LocalObservation& obs,
-                                  const Vec2d& from, double bearing_world,
-                                  double max_range) const;
 
     bool extractBlocker(const PlanarState& state, const Vec2d& goal,
                         const LocalObservation& patch,
@@ -167,17 +181,6 @@ private:
         SideSelection side, bool live_directive_usable,
         bool drop_held_waypoint_allowed,
         const DirectiveAssessmentFn& assess_directive) const;
-
-    /// USER DESIGN (2026-08-29): large-obstacle tangent slide guide.  When
-    /// the direct corridor is blocked and NEITHER side has a strict bypass
-    /// (obstacle fills the FOV), the macro must guide the detour instead of
-    /// NORMAL candidates (which pull the drone to the silhouette where the
-    /// 30 Hz layer cannot move) or pure TURN (which spins in place).  Emits
-    /// a world-locked tangent direction = surface-tangent + radial-away
-    /// blend, so the 30 Hz layer slides around the box keeping clearance.
-    TargetCorrectionDirective makeSlideDirective(
-        const PlanarState& state, const Vec2d& goal,
-        const LocalFreeGrid& grid, SideSelection side) const;
 
     /// Distance at which a fixed NORMAL_CORRECTION waypoint counts as
     /// REACHED (max of task tolerance and the dedicated waypoint
@@ -197,64 +200,36 @@ private:
     Params2D p_;
     EffectiveTargetAdapter adapter_;
     // ── 5 Hz internal memory ──
-    bool correction_active_ = false;
+    // DIRECT(false) / BYPASS(true) mode flag (see the file header).  In
+    // DIRECT the original goal is the attention centre; in BYPASS the
+    // committed blocker side / bypass frontier is the attention centre.
+    bool bypass_active_ = false;
+    // Side committed for the current BYPASS episode (NONE in DIRECT).
     SideSelection locked_side_ = SideSelection::NONE;
-    // USER DESIGN (2026-08-29): large-obstacle slide-guide latch.  Once the
-    // macro starts the tangent slide it stays latched (each 5 Hz tick
-    // re-issues makeSlideDirective) until the goal distance has dropped
-    // meaningfully (the corner is actually bypassed) — NOT until
-    // extractBlocker flips (it depends on the live depth and unlatches when
-    // the drone rotates the obstacle out of the FOV, measured: guide jumped
-    // between SLIDE and NORMAL every 5 Hz).
-    bool slide_active_ = false;
-    double slide_goal_dist_start_ = std::numeric_limits<double>::infinity();
     uint64_t update_event_ = 0;
     uint64_t correction_enter_event_ = 0;
     uint64_t correction_exit_event_ = 0;
     uint64_t correction_update_event_ = 0;
-    // Progress watchdog for a correction episode.  The upper planner runs at
-    // 5 Hz, so a bounded counter is enough to break a repeated brake/hold
-    // loop without introducing global or scene state.
+    // Progress watchdog: consecutive 5 Hz updates with negligible motion
+    // while a BYPASS correction is active.  Forces an event-driven
+    // correction refresh instead of holding a stale waypoint forever.
     uint32_t stagnant_update_count_ = 0;
     Vec2d last_state_position_{0.0, 0.0};
     bool has_last_state_position_ = false;
+    // Consecutive 5 Hz updates in which the original goal is locally
+    // trackable (translation valid + in FOV + clear corridor).  BYPASS
+    // exits only after this is confirmed several times in a row.
     uint32_t reentry_success_updates_ = 0;
-    // A search episode includes both its braking handoff and the following
-    // TURN steps.  Keeping this phase explicit prevents the 5 Hz brake
-    // directive from resetting the accumulated yaw sweep every cycle.
-    bool search_episode_active_ = false;
-    double search_swept_rad_ = 0.0;
-    double last_search_yaw_ = 0.0;
-    bool has_last_search_yaw_ = false;
-    // R29m: monotonic update counter + last SEARCH_ROTATION_TOWARD_ORIGINAL
-    // _GOAL update, used to cooldown that re-acquisition so depth evidence
-    // flips cannot oscillate the turn direction every boundary.
-    uint64_t update_count_ = 0;
-    uint64_t last_search_rotation_update_ = 0;
-    // ── R24 brake-before-search latch ──────────────────────────────
-    // A zero-distance brake is a TERMINAL semantic decided once at 5 Hz.
-    // The world point is latched at first issue and held FIXED (never
-    // rewritten to the live pose every cycle — that turned a brake into a
-    // moving target) until the vehicle has been stationary for the
-    // confirmation window; only then may the TURN search step be released.
-    bool brake_latched_ = false;
-    Vec2d brake_world_point_{0.0, 0.0};
-    uint32_t brake_stationary_updates_ = 0;
-    // ── R25 held-waypoint execution-failure counter ───────────────
-    // Consecutive 5 Hz updates in which the currently held NORMAL_CORRECTION
+    // Consecutive 5 Hz updates in which the committed BYPASS side produced
+    // no feasible correction.  After a threshold the side commitment flips
+    // (a rare, decisive event — never a per-tick side switch).
+    uint32_t side_exhaustion_updates_ = 0;
+    // Consecutive 5 Hz updates in which the currently held CORRECTION
     // waypoint is NOT actually executing (live_directive_usable=false) AND
     // its cold preview also fails.  Only after >= 3 consecutive failures is
     // the waypoint allowed to be dropped (a single cold preview miss must
     // not discard an actively-executing safe waypoint).
     uint32_t waypoint_execution_fail_updates_ = 0;
-    // ── R26 macro-level limit-cycle watchdog (original-goal based) ─
-    // The local detector watches the CURRENT effective target, but the
-    // macro switches goal<->TURN so each switch resets the local bearing
-    // evidence (measured: task 65 PASS/TURN_RIGHT loop at 0.48 m, ~36 s).
-    // Track the ORIGINAL goal: no progress for the window forces a fresh
-    // handoff to local.
-    double lc_goal_dist_start_ = std::numeric_limits<double>::infinity();
-    uint64_t lc_no_progress_ticks_ = 0;
     TargetCorrectionDirective last_directive_;
     AvoidanceObservability last_obs_;
 };

@@ -150,7 +150,15 @@ def find_manifest(root, explicit=None, scene_id=None):
 
 
 def load_scene_obstacles(manifest_path):
-    """Return scene_id -> [(x, y, radius), ...] from an optional manifest."""
+    """Return ``scene_id -> [obstacle, ...]`` from an optional manifest.
+
+    Each obstacle is a ``(x, y, radius, w, h)`` tuple.  Cylinders carry
+    ``w = h = None`` and are rendered as circles.  Square boxes carry their
+    AABB side lengths in ``w``/``h`` (rendered as rectangles) while ``radius``
+    stays the circumscribed-circle radius used by the truth collision audit —
+    both shapes are drawn so the overlay matches what the depth camera sees
+    (the box faces) AND what the collision judge uses (the circle).
+    """
     if not manifest_path:
         return {}
     try:
@@ -165,8 +173,12 @@ def load_scene_obstacles(manifest_path):
         obstacles = []
         for obstacle in scene.get("obstacles", []):
             try:
+                w = obstacle.get("w")
+                h = obstacle.get("h")
                 obstacles.append((float(obstacle["x"]), float(obstacle["y"]),
-                                  float(obstacle["radius"])))
+                                  float(obstacle["radius"]),
+                                  float(w) if w is not None else None,
+                                  float(h) if h is not None else None))
             except (KeyError, TypeError, ValueError):
                 continue
         try:
@@ -261,12 +273,13 @@ class TopDownViewer:
     def __init__(self, rows, episode_dir, obstacles):
         try:
             import matplotlib.pyplot as plt
-            from matplotlib.patches import Circle
+            from matplotlib.patches import Circle, Rectangle
         except ImportError as exc:
             raise RuntimeError(
                 "matplotlib is required in the WSL Python environment") from exc
         self.plt = plt
         self.Circle = Circle
+        self.Rectangle = Rectangle
         self.rows = rows
         self.episode_dir = episode_dir
         self.obstacles = obstacles
@@ -332,9 +345,22 @@ class TopDownViewer:
                      color="tab:blue", linewidth=2.0, label="history")
 
         scene_id = _int(row, "scene_id", -1)
-        for ox, oy, radius in self.obstacles.get(scene_id, []):
-            self.ax.add_patch(self.Circle((ox, oy), radius, color="0.25",
-                                           alpha=0.25, linewidth=0))
+        for ox, oy, radius, w, h in self.obstacles.get(scene_id, []):
+            if w is not None and h is not None:
+                # Square box: the depth camera sees the AABB faces, so draw
+                # the rectangle; the truth collision judge uses the circle
+                # (radius == circumscribed radius), drawn dashed on top.
+                self.ax.add_patch(self.Rectangle(
+                    (ox - w / 2.0, oy - h / 2.0), w, h,
+                    facecolor="0.25", edgecolor="none", alpha=0.25,
+                    zorder=2))
+                self.ax.add_patch(self.Circle((ox, oy), radius,
+                                              fill=False, color="0.25",
+                                              linestyle="--", linewidth=0.8,
+                                              alpha=0.6, zorder=3))
+            else:
+                self.ax.add_patch(self.Circle((ox, oy), radius, color="0.25",
+                                              alpha=0.25, linewidth=0))
 
         sx, sy = _float(row, "x", 0.0), _float(row, "y", 0.0)
         self.ax.scatter([sx], [sy], c="tab:blue", s=70, zorder=8,

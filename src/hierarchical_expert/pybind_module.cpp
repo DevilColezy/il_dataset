@@ -941,10 +941,6 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("region_min_y", &Params2D::region_min_y)
         .def_readwrite("region_max_y", &Params2D::region_max_y)
         .def_readwrite("drone_radius", &Params2D::drone_radius)
-        .def_readwrite("scene_safety_clearance",
-                       &Params2D::scene_safety_clearance)
-        .def_readwrite("macro_route_clearance_margin",
-                       &Params2D::macro_route_clearance_margin)
         .def_readwrite("task_goal_tolerance", &Params2D::task_goal_tolerance)
         .def_readwrite("task_episode_timeout_s",
                        &Params2D::task_episode_timeout_s)
@@ -972,7 +968,6 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                        &Params2D::ego_lambda_feasibility)
         .def_readwrite("ego_lambda_fitness", &Params2D::ego_lambda_fitness)
         .def_readwrite("ego_lambda_fov", &Params2D::ego_lambda_fov)
-        .def_readwrite("ego_clearance_m", &Params2D::ego_clearance_m)
         .def_readwrite("ego_ts", &Params2D::ego_ts)
         .def_readwrite("ego_n_segments", &Params2D::ego_n_segments)
         .def_readwrite("ego_max_iter", &Params2D::ego_max_iter)
@@ -1016,7 +1011,6 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("lp_obstacle_reaction_time_s",
                        &Params2D::lp_obstacle_reaction_time_s)
         .def_readwrite("lp_control_period_s", &Params2D::lp_control_period_s)
-        .def_readwrite("lp_turn_enter_deg", &Params2D::lp_turn_enter_deg)
         .def_readwrite("lp_turn_exit_deg", &Params2D::lp_turn_exit_deg)
         .def_readwrite("lp_turn_exit_max_yaw_rate",
                        &Params2D::lp_turn_exit_max_yaw_rate)
@@ -1024,12 +1018,6 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("lp_yaw_smooth_alpha", &Params2D::lp_yaw_smooth_alpha)
         .def_readwrite("lp_max_local_deviation_deg",
                        &Params2D::lp_max_local_deviation_deg)
-        .def_readwrite("lp_preferred_local_deviation_deg",
-                       &Params2D::lp_preferred_local_deviation_deg)
-        .def_readwrite("lp_near_goal_heading_relax_distance",
-                       &Params2D::lp_near_goal_heading_relax_distance)
-        .def_readwrite("lp_near_goal_turn_enter_deg",
-                       &Params2D::lp_near_goal_turn_enter_deg)
         .def_readwrite("lp_terminal_speed_gain",
                        &Params2D::lp_terminal_speed_gain)
         .def_readwrite("lp_terminal_max_speed", &Params2D::lp_terminal_max_speed)
@@ -1052,12 +1040,6 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                        &Params2D::macro_observable_frontier_min_progress_m)
         .def_readwrite("macro_observable_frontier_max_retreat_m",
                        &Params2D::macro_observable_frontier_max_retreat_m)
-        .def_readwrite("macro_goal_direction_min_range_m",
-                       &Params2D::macro_goal_direction_min_range_m)
-        .def_readwrite("macro_waypoint_update_along_margin",
-                       &Params2D::macro_waypoint_update_along_margin)
-        .def_readwrite("macro_search_rotation_cooldown_5hz",
-                       &Params2D::macro_search_rotation_cooldown_5hz)
         .def_readwrite("macro_observable_unknown_margin_cells",
                        &Params2D::macro_observable_unknown_margin_cells)
         .def_readwrite("macro_side_evidence_margin",
@@ -1086,16 +1068,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                        &Params2D::macro_takeover_confirm_ticks_30hz)
         .def_readwrite("macro_unknown_recovery_threshold_ticks",
                        &Params2D::macro_unknown_recovery_threshold_ticks)
-        .def_readwrite("macro_brake_confirm_ticks_5hz",
-                       &Params2D::macro_brake_confirm_ticks_5hz)
         .def_readwrite("macro_waypoint_reached_tolerance_m",
                        &Params2D::macro_waypoint_reached_tolerance_m)
-        .def_readwrite("macro_terminal_capture_radius_m",
-                       &Params2D::macro_terminal_capture_radius_m)
-        .def_readwrite("macro_limit_cycle_goal_progress_m",
-                       &Params2D::macro_limit_cycle_goal_progress_m)
-        .def_readwrite("macro_limit_cycle_window_5hz",
-                       &Params2D::macro_limit_cycle_window_5hz)
         // target encoding
         .def_readwrite("te_direction_bin_count",
                        &Params2D::te_direction_bin_count)

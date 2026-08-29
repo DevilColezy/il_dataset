@@ -485,11 +485,7 @@ struct BlueprintGenerationConfig {
     // ── Clearance hierarchy (port of the 2D reference semantics).  Every
     //    component (SceneGenerator / SceneGeometryCache / TaskSampler /
     //    RouteQualifier / LocalPlanner) MUST use these accessors instead of
-    //    scattering magic numbers.  The 2D reference uses:
-    //      scene_safety_clearance 0.5  -> endpoint/connectivity
-    //      route clearance = safety + macro_route_clearance_margin(0.1)
-    //                        + clearance_discretization_margin(0.05) = 0.65
-    //    Mapped to the 2.5D parameters below (same values, formula kept).
+    //    scattering magic numbers.
     /// Endpoint (start/goal centre->surface) clearance: the drone centre
     /// must sit on a cell strictly beyond this from any obstacle surface.
     double endpointRequiredClearance() const {

@@ -291,11 +291,6 @@ struct Params2D {
     // never inside the observation-to-command path.
     double drone_radius = 0.15;
 
-    // ── scene safety parameters (STATIC configuration; used by the
-    //    30 Hz handoff envelope, never runtime privileged info) ─────
-    double scene_safety_clearance = 0.5;
-    double macro_route_clearance_margin = 0.1;
-
     // ── task sampling / judgement ──────────────────────────────────
     double task_goal_tolerance = 0.4;
     // <= 0 disables the episode timeout (wall-tick based).
@@ -322,19 +317,6 @@ struct Params2D {
     // still sees current and recent history, while a stale cell must be
     // refreshed before it can force a HOLD/macro takeover.
     uint32_t lp_planning_history_max_age_ticks = 45;
-    // R26: within this distance of the ORIGINAL goal the macro layer locks
-    // terminal capture: it must never issue a locked-side search TURN; the
-    // target is handed to local (rotate toward the goal / micro-approach).
-    // Only a genuine HARD corridor block may release the capture state.
-    double macro_terminal_capture_radius_m = 1.0;
-    // R26: macro-level limit-cycle watchdog on the ORIGINAL goal.  The
-    // LOCAL detector watches the current effective target, but the macro
-    // switches goal<->TURN so each switch resets the local bearing
-    // evidence.  When the original-goal distance has not decreased by
-    // >= macro_limit_cycle_goal_progress_m for macro_limit_cycle_window_5hz
-    // consecutive 5 Hz updates, the macro forces a handoff to local.
-    double macro_limit_cycle_goal_progress_m = 0.1;
-    int    macro_limit_cycle_window_5hz = 15;   // 3 s at 5 Hz
     // Ground / below-flight-plane filtering: pixels whose 3D point lies
     // more than this far BELOW the camera are the floor / below the flight
     // plane (e.g. the ground at z=0 seen from a ~2 m flight) and are NOT
@@ -467,7 +449,6 @@ struct Params2D {
     double ego_lambda_feasibility = 0.2; // velocity/accel feasibility
     double ego_lambda_fitness = 0.8;     // guidance toward the detour guide
     double ego_lambda_fov = 0.3;         // soft FOV-wedge penalty
-    double ego_clearance_m = 0.4;        // collision distance = 4 cells (0.3 radius + 0.1 cell)
     double ego_ts = 0.4;                 // initial B-spline knot span (s)
     int    ego_n_segments = 8;
     int    ego_max_iter = 60;
@@ -478,7 +459,6 @@ struct Params2D {
     // this weight.  0 disables only the cost term.
     double ego_lambda_ref = 0.3;
     double lp_control_period_s = 0.0333333333;
-    double lp_turn_enter_deg = 42.0;
     double lp_turn_exit_deg = 8.0;
     double lp_turn_exit_max_yaw_rate = 0.15;
     double lp_turn_k = 2.5;
@@ -501,13 +481,6 @@ struct Params2D {
     // may use its full scan band; beyond it (task-33-style 40°+) the plan is
     // still rejected and handed to the macro.
     double lp_max_local_deviation_deg = 35.0;
-    // Prefer the smallest local steering correction first.  The planner may
-    // expand to lp_max_local_deviation_deg only when no candidate exists in
-    // this preferred band, preventing an otherwise clear small opening from
-    // being replaced by a FOV-edge detour.
-    double lp_preferred_local_deviation_deg = 20.0;
-    double lp_near_goal_heading_relax_distance = 1.0;
-    double lp_near_goal_turn_enter_deg = 75.0;
     double lp_terminal_speed_gain = 1.0;
     double lp_terminal_max_speed = 0.6;
     double lp_terminal_max_yaw_rate = 0.5;
@@ -527,26 +500,6 @@ struct Params2D {
     // corrector in a pure-rotation search forever.  The progress-first pass
     // always wins when any candidate exists; this is only the fallback.
     double macro_observable_frontier_max_retreat_m = 2.0;
-    // R29k: SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL only re-acquires the
-    // original goal when the goal bearing is traversable — a continuous
-    // FREE run along it of at least this range (m).  When the goal sits
-    // behind the blocker (occluded / UNKNOWN), pulling the nose back to it
-    // just yaws the drone back and forth across the blocked bearing
-    // (measured _failed/000006_02cac96b: TURN_LEFT↔TURN_RIGHT, zero
-    // displacement); the corrector keeps the LOCKED bypass side instead.
-    double macro_goal_direction_min_range_m = 2.0;
-    // R29l: minimum along-goal progress a fresh 5 Hz waypoint candidate
-    // must beat the currently held waypoint by (m) before it is adopted.
-    // A margin prevents preview noise from jittering the waypoint every
-    // boundary while still letting a nearer detour exit take over.
-    double macro_waypoint_update_along_margin = 0.3;
-    // R29m: SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL cooldown (in 5 Hz
-    // corrector updates).  After the corrector pulled the nose toward the
-    // (possibly occluded) original goal once, it must not immediately
-    // re-pull when depth-derived corridor/clearance evidence flips — that
-    // caused the TURN_LEFT↔TURN_RIGHT oscillation (_failed/000006).  During
-    // the cooldown the corrector keeps the LOCKED bypass side.
-    uint32_t macro_search_rotation_cooldown_5hz = 12;
     int    macro_observable_unknown_margin_cells = 3;
     double macro_side_evidence_margin = 0.5;
     double macro_evidence_ray_step_deg = 1.0;
@@ -569,10 +522,6 @@ struct Params2D {
     double macro_local_target_event_tolerance_m = 0.05;
     int    macro_takeover_confirm_ticks_30hz = 12;
     int    macro_unknown_recovery_threshold_ticks = 60;
-    // Consecutive 5 Hz updates the vehicle must remain at/below the
-    // stationary speed before a latched brake-before-search is released
-    // and the world-latched TURN step is published.  2 updates = 0.4 s.
-    int    macro_brake_confirm_ticks_5hz = 2;
     // R25: distance at which a fixed NORMAL_CORRECTION waypoint counts as
     // REACHED (start searching for the next target).  Must be >= the
     // 30 Hz stop distance (goal_tolerance_m = 0.4): the unified speed law
@@ -840,10 +789,6 @@ struct PlanarTarget {
     // Internal expert semantic, never persisted as a student input. A fixed
     // macro waypoint remains fly-through inside the 4.5 m label ceiling.
     bool flythrough = false;
-    // USER DESIGN (2026-08-29): large-obstacle slide guide — the 30 Hz layer
-    // must rotate toward this target even outside the FOV (turn hysteresis)
-    // then drive to it, instead of handing back to the macro.
-    bool slide_guide = false;
     // Directive update event (5 Hz ZOH boundary).  A change alone NEVER
     // resets planner memory.
     uint64_t update_event = 0;
@@ -1030,25 +975,14 @@ struct TargetCorrectionDirective {
     // NORMAL_CORRECTION: world point locked during the 5 Hz period.
     Vec2d corrected_target_world{0.0, 0.0};
     bool corrected_target_world_valid = false;
-    // PERSISTENT terminal/brake-only semantic (R24).  When true, the
-    // corrected_target_world is a TERMINAL brake point: the 30 Hz planner
-    // must STOP at it and never fly through it.  This is decided ONCE at
-    // 5 Hz and held on the directive — it must NEVER be re-derived from
-    // the live distance every 30 Hz tick (the vehicle coasts a few cm past
-    // the point and would otherwise flip from terminal-brake back to
-    // fly-through).  Set only by the brake-before-search path; all other
-    // directives keep it false.
+    // Retained for output-schema compatibility; the current arbiter never
+    // issues a terminal stop (corrections are always fly-through), so this
+    // is always false.
     bool terminal_stop = false;
     // TURN_LEFT / TURN_RIGHT: world-frame UNIT direction captured when the
     // bounded turn step is issued.
     Vec2d turn_direction_world{1.0, 0.0};
     bool turn_direction_world_valid = false;
-    // USER DESIGN (2026-08-29): large-obstacle slide guide.  NORMAL_CORRECTION
-    // whose corrected_target_world is a tangent+radial detour guide: the 30 Hz
-    // layer must rotate toward it (turn hysteresis) even when it is outside
-    // the FOV, then drive to it — NOT hand back to the macro and NOT spin as
-    // a pure-rotation TURN.  Set only by makeSlideDirective.
-    bool slide_guide = false;
     // Side locked for the current correction episode (NONE when not
     // correcting).
     SideSelection locked_side = SideSelection::NONE;
@@ -1113,9 +1047,6 @@ struct EncodedTargetInput {
     Vec2d effective_target_world{0.0, 0.0};
     bool effective_target_world_valid = false;
     TargetCorrectionType source_type = TargetCorrectionType::PASS_THROUGH;
-    // Slide-guide flag carried from the 5 Hz directive (see
-    // TargetCorrectionDirective::slide_guide).
-    bool slide_guide = false;
     // ── 3D extension: effective target altitude (world z, m).  TURN
     //    targets are pure rotation ⇒ z = state.z; PASS / NORMAL carry the
     //    mission altitude. ────────────────────────────────────────────

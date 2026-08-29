@@ -118,16 +118,12 @@ LocalTarget HierarchicalExpertFsm::makeLocalTarget(
     // direction and normalized distance travel alongside it solely as the
     // student/data-label contract.
     t.planar.position_world = encoded.effective_target_world;
-    t.planar.slide_guide = encoded.slide_guide;
     t.planar.world_valid =
         encoded.valid && encoded.effective_target_world_valid;
     t.planar.direction_body = encoded.direction_body;
     t.planar.normalized_distance = encoded.normalized_distance;
-    // R24: a directive flagged terminal_stop (brake-before-search) is a
-    // PERSISTENT stop semantic.  Fly-through is decided by that flag, NOT
-    // re-derived from the live distance every 30 Hz tick — otherwise a
-    // brake point the vehicle coasts a few cm past flips back to
-    // fly-through and the planner accelerates through its own brake.
+    // A correction is always a fly-through waypoint (the arbiter never
+    // issues a terminal stop); PASS is the original goal.
     t.planar.flythrough =
         directive.type == TargetCorrectionType::NORMAL_CORRECTION &&
         !directive.terminal_stop &&
@@ -201,9 +197,8 @@ LocalPlanningAssessment HierarchicalExpertFsm::assessDirectiveTarget(
           !preview.local_corridor_blocked));
     const bool temporary_correction =
         directive.type == TargetCorrectionType::NORMAL_CORRECTION;
-    // A terminal_stop brake is a genuine STOP target: its preview must be
-    // allowed to be plan_terminal (and must not require fly-through
-    // progress).  Ordinary temporary waypoints stay fly-through semantics.
+    // A terminal stop (currently never issued) would be a genuine STOP
+    // target; ordinary corrections stay fly-through semantics.
     const bool terminal_brake = temporary_correction && directive.terminal_stop;
     const bool translation_semantics_valid =
         temporary_correction

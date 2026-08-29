@@ -63,9 +63,8 @@ struct ExpertStepOutput {
     // TURN_LEFT / TURN_RIGHT) — diagnostic only.
     std::string effective_target_source = "PASS_THROUGH";
     bool target_correction_active = false;
-    // R24: persistent terminal/brake-only semantic of the current ZOH
-    // directive (1 = the corrected target is a stop target, never
-    // fly-through).  Diagnostic; zero-order held with the directive.
+    // Persistent terminal-stop flag of the current ZOH directive (always
+    // false: the arbiter never issues terminal stops).  Diagnostic.
     bool directive_terminal_stop = false;
     int effective_direction_token = -1;  // quantized token of live direction
     // Effective world target (diagnostic; world-latched for NORMAL).

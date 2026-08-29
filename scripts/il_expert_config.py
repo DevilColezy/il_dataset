@@ -116,13 +116,6 @@ def build_params(global_cfg, errors=None):
 
     p.drone_radius = _num(he.get("drone_radius_m"),
                           "he.drone_radius_m", problems, 0.15)
-    p.scene_safety_clearance = _num(
-        he.get("scene_safety_clearance_m"),
-        "he.scene_safety_clearance_m", problems, 0.5, allow_zero=True)
-    p.macro_route_clearance_margin = _num(
-        he.get("macro_route_clearance_margin_m"),
-        "he.macro_route_clearance_margin_m", problems, 0.1,
-        allow_zero=True)
     p.task_goal_tolerance = _num(
         he.get("goal_tolerance_m"), "he.goal_tolerance_m", problems, 0.4)
     p.task_episode_timeout_s = _num(
@@ -251,9 +244,6 @@ def build_params(global_cfg, errors=None):
     p.lp_max_local_deviation_deg = _num(
         lp.get("max_local_deviation_deg"),
         "he.lp.max_local_deviation_deg", problems, 35.0)
-    p.lp_preferred_local_deviation_deg = _num(
-        lp.get("preferred_local_deviation_deg"),
-        "he.lp.preferred_local_deviation_deg", problems, 20.0)
     # ── vertical channel (3D expert extension) ────────────────────
     p.lp_max_vz = _num(lp.get("max_vz"), "he.lp.max_vz", problems, 1.0)
     p.lp_max_v_accel = _num(lp.get("max_v_accel"),
@@ -300,9 +290,6 @@ def build_params(global_cfg, errors=None):
     p.ego_lambda_fov = _num(
         lp.get("ego_lambda_fov"), "he.lp.ego_lambda_fov",
         problems, 0.3, allow_zero=True)
-    p.ego_clearance_m = _num(
-        lp.get("ego_clearance_m"), "he.lp.ego_clearance_m",
-        problems, 0.55)
     p.ego_ts = _num(lp.get("ego_ts"), "he.lp.ego_ts", problems, 0.4)
     p.ego_n_segments = int(_num(
         lp.get("ego_n_segments"), "he.lp.ego_n_segments", problems, 8))
@@ -318,8 +305,6 @@ def build_params(global_cfg, errors=None):
     p.lp_control_period_s = _num(lp.get("control_period_s"),
                                  "he.lp.control_period_s", problems,
                                  1.0 / 30.0)
-    p.lp_turn_enter_deg = _num(lp.get("turn_enter_deg"),
-                               "he.lp.turn_enter_deg", problems, 42.0)
     p.lp_turn_exit_deg = _num(lp.get("turn_exit_deg"),
                               "he.lp.turn_exit_deg", problems, 8.0)
     p.lp_turn_exit_max_yaw_rate = _num(
@@ -330,12 +315,6 @@ def build_params(global_cfg, errors=None):
     p.lp_yaw_smooth_alpha = _num(
         lp.get("yaw_smooth_alpha"), "he.lp.yaw_smooth_alpha",
         problems, 0.35, allow_zero=True)
-    p.lp_near_goal_heading_relax_distance = _num(
-        lp.get("near_goal_heading_relax_distance"),
-        "he.lp.near_goal_heading_relax_distance", problems, 1.0)
-    p.lp_near_goal_turn_enter_deg = _num(
-        lp.get("near_goal_turn_enter_deg"),
-        "he.lp.near_goal_turn_enter_deg", problems, 75.0)
     p.lp_terminal_speed_gain = _num(
         lp.get("terminal_speed_gain"), "he.lp.terminal_speed_gain",
         problems, 1.0)
@@ -370,23 +349,6 @@ def build_params(global_cfg, errors=None):
         mc.get("observable_frontier_min_progress_m"),
         "he.corrector.observable_frontier_min_progress_m", problems, 0.5,
         allow_zero=True)
-    # R29k: only re-acquire the original goal via search rotation when its
-    # bearing is traversable (continuous FREE run >= this range).  Behind a
-    # blocker → keep the locked bypass side.
-    p.macro_goal_direction_min_range_m = _num(
-        mc.get("goal_direction_min_range_m"),
-        "he.corrector.goal_direction_min_range_m", problems, 2.0)
-    # R29l: a fresh 5 Hz waypoint candidate must beat the held waypoint by
-    # this along-goal progress before it is adopted (anti-jitter margin).
-    p.macro_waypoint_update_along_margin = _num(
-        mc.get("waypoint_update_along_margin"),
-        "he.corrector.waypoint_update_along_margin", problems, 0.3,
-        allow_zero=True)
-    # R29m: SEARCH_ROTATION_TOWARD_ORIGINAL_GOAL cooldown (5 Hz updates);
-    # prevents depth-evidence flips from oscillating the turn direction.
-    p.macro_search_rotation_cooldown_5hz = int(_num(
-        mc.get("search_rotation_cooldown_5hz"),
-        "he.corrector.search_rotation_cooldown_5hz", problems, 12))
     p.macro_observable_unknown_margin_cells = int(_num(
         mc.get("observable_unknown_margin_cells"),
         "he.corrector.observable_unknown_margin_cells", problems, 3))
@@ -434,24 +396,10 @@ def build_params(global_cfg, errors=None):
     p.macro_unknown_recovery_threshold_ticks = int(_num(
         mc.get("unknown_recovery_threshold_ticks"),
         "he.corrector.unknown_recovery_threshold_ticks", problems, 60))
-    p.macro_brake_confirm_ticks_5hz = int(_num(
-        mc.get("brake_confirm_ticks_5hz"),
-        "he.corrector.brake_confirm_ticks_5hz", problems, 2))
     p.macro_waypoint_reached_tolerance_m = _num(
         mc.get("waypoint_reached_tolerance_m"),
         "he.corrector.waypoint_reached_tolerance_m", problems, 0.5,
         allow_zero=True)
-    p.macro_terminal_capture_radius_m = _num(
-        mc.get("terminal_capture_radius_m"),
-        "he.corrector.terminal_capture_radius_m", problems, 1.0,
-        allow_zero=True)
-    p.macro_limit_cycle_goal_progress_m = _num(
-        mc.get("limit_cycle_goal_progress_m"),
-        "he.corrector.limit_cycle_goal_progress_m", problems, 0.1,
-        allow_zero=True)
-    p.macro_limit_cycle_window_5hz = int(_num(
-        mc.get("limit_cycle_window_5hz"),
-        "he.corrector.limit_cycle_window_5hz", problems, 15))
 
     # ── target encoding protocol ──────────────────────────────────
     te = he.get("target_encoding", {}) or {}

@@ -492,7 +492,7 @@ PlannerResult LocalPlanner30Hz::computePlan(const PlanarState& state,
     // drone parks in brake-before-rotation (SAFE_HOLD) forever even while a
     // clear ray exists (measured: joint_v2_000008_99225302, stuck 7 s
     // beside the r=2.5 cylinder because the target sat ~66° off-nose).
-    if (!pure_rotation_target && !target.slide_guide &&
+    if (!pure_rotation_target &&
         std::fabs(bearing) > actual_fov_half + 1e-9 &&
         dist > p_.task_goal_tolerance) {
         const VelocityCommand3D out = reachableCommand(
@@ -1624,7 +1624,6 @@ LocalPlanner30Hz::ResolvedPlanarTarget LocalPlanner30Hz::resolveTarget(
     resolved.update_event = target.update_event;
     resolved.mission_revision = target.mission_revision;
     resolved.normalized_distance = target.normalized_distance;
-    resolved.slide_guide = target.slide_guide;
     resolved.valid = target.valid();
     if (!resolved.valid) return resolved;
 
