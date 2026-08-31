@@ -66,11 +66,11 @@ global:
     far:  1000.0
     # Unity T_BC (camera->body), 16 floats row-major.  MUST match the
     # camera sent to Unity (il_common.make_depth_vehicle): identity
-    # rotation + 0.3 m forward offset.  The C++ observation builder
+    # rotation + 0.15 m forward offset.  The C++ observation builder
     # derives the true camera pose from the vehicle pose + this extrinsic.
     t_bc: [1.0, 0.0, 0.0, 0.0,
            0.0, 1.0, 0.0, 0.0,
-           0.0, 0.0, 1.0, 0.3,
+           0.0, 0.0, 1.0, 0.15,
            0.0, 0.0, 0.0, 1.0]
 
   # ── Vehicle geometry ───────────────────────────────────────────────
@@ -473,15 +473,26 @@ global:
       derivative_filter_tau_s: 0.0
       maximum_acceleration_mps2: [4.0, 4.0, 2.0]
       maximum_tilt_deg: 35.0
-      maximum_yaw_rate_rps: 1.5
+      maximum_yaw_rate_rps: 3.141592653589793
       # R28c: raised from 4.0 in lock-step with local_planner.max_yaw_accel
-      # (8.0).  This is the PYTHON-side command ramp (il_dynamics.py) on the
-      # commanded yaw rate — flightlib has NO yaw-rate/acceleration limit in
-      # C++, so it is not a hard simulator cap, just the executable ramp.
-      # With 4.0 a full-rate (1.5 rad/s) turn reversal took ~0.75 s, too
+      # (8.0).  This ramp is applied by the native C++ controller before the
+      # command reaches flightlib.  It is a controller command limit, not a
+      # motor-level simulator limit.
+      # With 4.0 a full-rate (pi rad/s) turn reversal took ~0.75 s, too
       # clumsy to follow a freshly re-planned trajectory; 8.0 halves it.
       # Full yaw rate is still clipped to maximum_yaw_rate_rps.
       maximum_yaw_acceleration_rps2: 8.0
+      # Used when Ego supplies a full PositionCommand.  kx/kv from Ego take
+      # precedence when non-zero; these values are the stable fallback for
+      # trajectory phases where Ego publishes zero gains.
+      position_kp: [1.5, 1.5, 1.0]
+      position_kd: [0.4, 0.4, 0.3]
+      yaw_position_gain: 2.5
+      # Stable trajectory mode: use Ego position, velocity and yaw angle;
+      # ignore the trajectory acceleration, yaw-rate feedforward, and the
+      # velocity-command-difference feedforward.  Set to
+      # position_velocity_accel_yaw to restore all trajectory outputs.
+      trajectory_control_mode: position_velocity_yaw
       attitude_gain: 6.0
       # R29g: angular-rate damping on the attitude loop (rotorS / RPG style
       # rate controller — their dedicated rate loop uses gains 0.1..0.52).
@@ -570,9 +581,9 @@ global:
       # actually stops where it plans to.
       eff_accel_mps2: 2.0
       # Must not exceed the Flightmare velocity-controller backend limit
-      # (dynamics.velocity_controller.maximum_yaw_rate_rps = 1.5) so the
+      # (dynamics.velocity_controller.maximum_yaw_rate_rps = pi) so the
       # recorded label equals the actually executed command.
-      max_yaw_rate: 1.5
+      max_yaw_rate: 3.141592653589793
       # R28c: raised from 4.0 — a 4 rad/s^2 ramp took ~0.6 s to reverse a
       # full-rate turn, too clumsy to follow a freshly re-planned trajectory.
       max_yaw_accel: 8.0

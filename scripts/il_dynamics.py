@@ -66,6 +66,14 @@ class DynamicsBackend:
               initial_velocity=np.zeros(3), initial_angular_velocity=np.zeros(3)):
         raise NotImplementedError
 
+    def step_trajectory_command(self, velocity_command_flu, yaw_rate_command,
+                                duration_s, position_world,
+                                acceleration_world, desired_yaw,
+                                position_gain=None, velocity_gain=None):
+        """Apply a full trajectory sample when the backend supports it."""
+        return self.step_velocity_command(
+            velocity_command_flu, yaw_rate_command, duration_s)
+
     def get_state(self):
         raise NotImplementedError
 
@@ -137,7 +145,8 @@ class FlightmareDynamicsBackend(DynamicsBackend):
             vc_cfg.get("maximum_acceleration_mps2", [4.0, 4.0, 2.0]),
             dtype=np.float64)
         self._max_tilt_deg = float(vc_cfg.get("maximum_tilt_deg", 35.0))
-        self._max_yaw_rate = float(vc_cfg.get("maximum_yaw_rate_rps", 1.5))
+        self._max_yaw_rate = float(
+            vc_cfg.get("maximum_yaw_rate_rps", np.pi))
         self._max_yaw_acceleration = float(
             vc_cfg.get("maximum_yaw_acceleration_rps2", 4.0))
         self._integrator_limit = np.array(
@@ -171,8 +180,40 @@ class FlightmareDynamicsBackend(DynamicsBackend):
         self._angular_rate_gain = float(
             vc_cfg.get("angular_rate_gain", 0.5))
         self._max_body_rate = float(vc_cfg.get("maximum_body_rate_rps", 6.0))
+        self._position_kp = np.array(
+            vc_cfg.get("position_kp", [1.5, 1.5, 1.0]), dtype=np.float64)
+        self._position_kd = np.array(
+            vc_cfg.get("position_kd", [0.4, 0.4, 0.3]), dtype=np.float64)
+        self._yaw_position_gain = float(
+            vc_cfg.get("yaw_position_gain", 2.5))
+        self._trajectory_control_mode = str(
+            vc_cfg.get("trajectory_control_mode",
+                       "position_velocity_yaw")).strip().lower()
+        if self._trajectory_control_mode not in (
+                "position_velocity_yaw", "position_velocity_accel_yaw"):
+            raise ValueError(
+                "unsupported trajectory_control_mode: {}".format(
+                    self._trajectory_control_mode))
+        self._use_trajectory_acceleration = (
+            self._trajectory_control_mode == "position_velocity_accel_yaw")
+        self._use_trajectory_yaw_rate = (
+            self._trajectory_control_mode == "position_velocity_accel_yaw")
+        self._use_trajectory_velocity_feedforward = (
+            self._trajectory_control_mode == "position_velocity_accel_yaw")
         self._last_state = None
         self._commanded_yaw_rate = 0.0
+
+        # Keep the controller and 200 Hz inner integration loop in the
+        # native bridge. Python still owns configuration and the public
+        # backend interface, but no longer crosses pybind for each step.
+        self._quad_dynamics.configure_velocity_controller(
+            self._kp_vel, self._ki_vel, self._kd_vel, self._max_accel,
+            self._max_tilt_deg, self._max_yaw_rate,
+            self._max_yaw_acceleration, self._integrator_limit,
+            self._deriv_tau, self._attitude_gain, self._angular_rate_gain,
+            self._max_body_rate, self._sim_hz, self._control_hz,
+            self._use_trajectory_acceleration, self._use_trajectory_yaw_rate,
+            self._use_trajectory_velocity_feedforward)
 
         rospy.loginfo("[Dynamics] Flightmare backend initialized (%s). "
                       "sim=%.0fHz ctrl=%.0fHz render=%.0fHz",
@@ -271,9 +312,66 @@ class FlightmareDynamicsBackend(DynamicsBackend):
             acceleration_flu=world_vector_to_body_flu_quat(accel, q_xyzw),
             simulation_time_s=sim_time)
 
+    def controller_debug(self):
+        """Return the last native controller sample as JSON-safe values."""
+        return dict(self._quad_dynamics.controller_debug())
+
     def step_velocity_command(self, velocity_command_flu, yaw_rate_command,
                                duration_s):
         """Apply velocity command for duration_s, stepping dynamics internally."""
+        command = np.asarray(velocity_command_flu, dtype=np.float64)
+        if command.shape != (3,) or not np.all(np.isfinite(command)):
+            return False
+        if not np.isfinite(yaw_rate_command) or duration_s <= 0.0:
+            return False
+        # The native bridge owns the complete controller and inner loop.
+        return bool(self._quad_dynamics.step_velocity_command(
+            command, float(yaw_rate_command), float(duration_s),
+            np.full(3, np.nan, dtype=np.float64),
+            np.full(3, np.nan, dtype=np.float64), float("nan"),
+            np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64),
+            0.0))
+
+    def step_trajectory_command(self, velocity_command_flu, yaw_rate_command,
+                                duration_s, position_world,
+                                acceleration_world, desired_yaw,
+                                position_gain=None, velocity_gain=None):
+        """Use all available Ego PositionCommand fields in native control."""
+        command = np.asarray(velocity_command_flu, dtype=np.float64)
+        position = np.asarray(position_world, dtype=np.float64)
+        acceleration = np.asarray(acceleration_world, dtype=np.float64)
+        if (command.shape != (3,) or position.shape != (3,) or
+                acceleration.shape != (3,)):
+            return False
+        if (not np.all(np.isfinite(command)) or
+                not np.all(np.isfinite(position)) or
+                not np.all(np.isfinite(acceleration)) or
+                not np.isfinite(yaw_rate_command) or
+                not np.isfinite(duration_s) or duration_s <= 0.0 or
+                not np.isfinite(desired_yaw)):
+            return False
+        if position_gain is None:
+            position_gain = self._position_kp
+        if velocity_gain is None:
+            velocity_gain = self._position_kd
+        position_gain = np.asarray(position_gain, dtype=np.float64)
+        velocity_gain = np.asarray(velocity_gain, dtype=np.float64)
+        if (position_gain.shape != (3,) or velocity_gain.shape != (3,) or
+                not np.all(np.isfinite(position_gain)) or
+                not np.all(np.isfinite(velocity_gain))):
+            return False
+        # Ego publishes zero kx/kv in some trajectory phases.  Treat that as
+        # unspecified and retain the backend's stable, configurable gains.
+        if np.all(np.abs(position_gain) < 1e-12):
+            position_gain = self._position_kp
+        if np.all(np.abs(velocity_gain) < 1e-12):
+            velocity_gain = self._position_kd
+        return bool(self._quad_dynamics.step_velocity_command(
+            command, float(yaw_rate_command), float(duration_s), position,
+            acceleration, float(desired_yaw), position_gain, velocity_gain,
+            self._yaw_position_gain))
+
+        # Legacy Python implementation retained below as reference only.
         if duration_s <= 0:
             return True
 

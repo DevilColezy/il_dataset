@@ -45,7 +45,7 @@ REQUIRED_MODULES = [
 DEFAULT_T_BC = [
     1.0, 0.0, 0.0, 0.0,
     0.0, 1.0, 0.0, 0.0,
-    0.0, 0.0, 1.0, 0.3,
+    0.0, 0.0, 1.0, 0.15,
     0.0, 0.0, 0.0, 1.0,
 ]
 
@@ -263,7 +263,7 @@ def _validate_config(cfg):
             float(dyn.get("control_hz", 50.0)):
         errors.append("dynamics.simulation_hz must be >= control_hz")
     vc = (dyn.get("velocity_controller", {}) or {})
-    backend_yaw_rate = float(vc.get("maximum_yaw_rate_rps", 1.5))
+    backend_yaw_rate = float(vc.get("maximum_yaw_rate_rps", math.pi))
     backend_yaw_accel = float(vc.get("maximum_yaw_acceleration_rps2", 4.0))
     if not bool(vc.get("use_existing_flightmare_controller", False)):
         errors.append(
@@ -710,7 +710,7 @@ def _validate_config(cfg):
               "hierarchical_expert.local_planner.max_speed", errors)
     _positive(lp.get("max_accel", 2.0),
               "hierarchical_expert.local_planner.max_accel", errors)
-    _positive(lp.get("max_yaw_rate", 1.5),
+    _positive(lp.get("max_yaw_rate", math.pi),
               "hierarchical_expert.local_planner.max_yaw_rate", errors)
     _positive(lp.get("max_yaw_accel", 4.0),
               "hierarchical_expert.local_planner.max_yaw_accel", errors)
@@ -718,7 +718,7 @@ def _validate_config(cfg):
               "hierarchical_expert.local_planner.min_clearance", errors)
     _positive(lp.get("control_period_s", 1.0 / 30.0),
               "hierarchical_expert.local_planner.control_period_s", errors)
-    if float(lp.get("max_yaw_rate", 1.5)) > backend_yaw_rate + 1e-6:
+    if float(lp.get("max_yaw_rate", math.pi)) > backend_yaw_rate + 1e-6:
         errors.append(
             "hierarchical_expert.local_planner.max_yaw_rate must not exceed "
             "the Flightmare backend limit (%g)" % backend_yaw_rate)

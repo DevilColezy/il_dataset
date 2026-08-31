@@ -70,17 +70,17 @@ def _parse_t_bc(value, errors, name="depth.t_bc"):
     [m0,m1,m2, m4,m5,m6, m8,m9,m10].  (m[0:9] would wrongly include the
     4th-column elements m3/m7 and drop m9/m10, turning even the identity
     matrix into a singular one.)  Defaults to the identity rotation +
-    [0, 0, 0.3] forward offset, which MUST match the camera actually sent
+    [0, 0, 0.15] forward offset, which MUST match the camera actually sent
     to Unity (il_common.make_depth_vehicle).
     """
     if value is None:
-        return [0.0, 0.0, 0.3], [1, 0, 0, 0, 1, 0, 0, 0, 1]
+        return [0.0, 0.0, 0.15], [1, 0, 0, 0, 1, 0, 0, 0, 1]
     if not isinstance(value, (list, tuple)) or len(value) != 16 or \
             any(not isinstance(v, (int, float)) or isinstance(v, bool) or
                 not math.isfinite(float(v)) for v in value):
         errors.append("%s must be a list of 16 finite numbers (row-major 4x4)"
                       % name)
-        return [0.0, 0.0, 0.3], [1, 0, 0, 0, 1, 0, 0, 0, 1]
+        return [0.0, 0.0, 0.15], [1, 0, 0, 0, 1, 0, 0, 0, 1]
     m = [float(v) for v in value]
     translation = [m[3], m[7], m[11]]
     rotation = [m[0], m[1], m[2],

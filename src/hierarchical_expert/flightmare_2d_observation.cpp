@@ -314,7 +314,7 @@ LocalObservation Flightmare2DObservation::buildFromRays(
 
     // ── Vehicle's own body volume is trivially known-free. ─────────
     // The camera is mounted AHEAD of the vehicle centre (T_BC forward
-    // offset, default 0.3 m), so the vehicle's own cells and the blind
+    // offset, default 0.15 m), so the vehicle's own cells and the blind
     // region up to the camera lie OUTSIDE the FOV wedge.  Candidate
     // trajectories start at the vehicle centre; without marking these
     // cells FREE the planner rejects every candidate (the trajectory
