@@ -21,6 +21,142 @@ inline double distToSegment(const Vec2d& p, const Vec2d& a, const Vec2d& b) {
     return (p - (a + ab * t)).norm();
 }
 
+/// Signed distance from a point to an axis-aligned box boundary (negative
+/// inside, 0 on the surface, positive outside).  Exact.
+inline double pointToBoxSignedDist(const Vec2d& p, double cx, double cy,
+                                   double half_w, double half_h) {
+    const double qx = std::fabs(p.x() - cx) - half_w;
+    const double qy = std::fabs(p.y() - cy) - half_h;
+    const double outside =
+        std::sqrt(std::max(qx, 0.0) * std::max(qx, 0.0) +
+                  std::max(qy, 0.0) * std::max(qy, 0.0));
+    const double inside = std::min(std::max(qx, qy), 0.0);
+    return outside + inside;
+}
+
+/// Exact distance between two finite segments.
+inline double distSegmentSegment(const Vec2d& p1, const Vec2d& q1,
+                                 const Vec2d& p2, const Vec2d& q2) {
+    const Vec2d d1 = q1 - p1, d2 = q2 - p2, r = p1 - p2;
+    const double a = d1.dot(d1), e = d2.dot(d2), f = d2.dot(r);
+    const double eps = 1e-12;
+    double s = 0.0, t = 0.0;
+    if (a <= eps && e <= eps) return r.norm();
+    if (a <= eps) {
+        t = clamp(f / e, 0.0, 1.0);
+    } else {
+        const double c = d1.dot(r);
+        if (e <= eps) {
+            s = clamp(-c / a, 0.0, 1.0);
+        } else {
+            const double b = d1.dot(d2);
+            const double denom = a * e - b * b;
+            s = std::fabs(denom) > eps
+                    ? clamp((b * f - c * e) / denom, 0.0, 1.0)
+                    : 0.0;
+            t = (b * s + f) / e;
+            if (t < 0.0) {
+                t = 0.0;
+                s = clamp(-c / a, 0.0, 1.0);
+            } else if (t > 1.0) {
+                t = 1.0;
+                s = clamp((b - c) / a, 0.0, 1.0);
+            }
+        }
+    }
+    return (p1 + d1 * s - (p2 + d2 * t)).norm();
+}
+
+/// Slab-clip the segment against the box.  Returns false when disjoint;
+/// otherwise [tmin, tmax] is the portion of the segment inside the box.
+inline bool clipSegmentToAABB(const Vec2d& a, const Vec2d& b, double cx,
+                              double cy, double half_w, double half_h,
+                              double& tmin, double& tmax) {
+    const double minx = cx - half_w, maxx = cx + half_w;
+    const double miny = cy - half_h, maxy = cy + half_h;
+    tmin = 0.0;
+    tmax = 1.0;
+    const double dx = b.x() - a.x();
+    const double dy = b.y() - a.y();
+    const double eps = 1e-12;
+    if (std::fabs(dx) < eps) {
+        if (a.x() < minx || a.x() > maxx) return false;
+    } else {
+        double t1 = (minx - a.x()) / dx;
+        double t2 = (maxx - a.x()) / dx;
+        if (t1 > t2) std::swap(t1, t2);
+        tmin = std::max(tmin, t1);
+        tmax = std::min(tmax, t2);
+        if (tmin > tmax) return false;
+    }
+    if (std::fabs(dy) < eps) {
+        if (a.y() < miny || a.y() > maxy) return false;
+    } else {
+        double t1 = (miny - a.y()) / dy;
+        double t2 = (maxy - a.y()) / dy;
+        if (t1 > t2) std::swap(t1, t2);
+        tmin = std::max(tmin, t1);
+        tmax = std::min(tmax, t2);
+        if (tmin > tmax) return false;
+    }
+    return true;
+}
+
+/// Exact distance from a finite segment to an axis-aligned box (>= 0; 0 iff
+/// the segment intersects the box).  Disjoint case = min of the two endpoint
+/// point-to-box distances and the four segment-to-edge distances.
+inline double distSegmentToAABB(const Vec2d& a, const Vec2d& b, double cx,
+                                double cy, double half_w, double half_h) {
+    double t0, t1;
+    if (clipSegmentToAABB(a, b, cx, cy, half_w, half_h, t0, t1)) {
+        return 0.0;
+    }
+    double best = std::min(
+        std::max(0.0, pointToBoxSignedDist(a, cx, cy, half_w, half_h)),
+        std::max(0.0, pointToBoxSignedDist(b, cx, cy, half_w, half_h)));
+    const Vec2d corners[4] = {
+        Vec2d(cx - half_w, cy - half_h), Vec2d(cx + half_w, cy - half_h),
+        Vec2d(cx + half_w, cy + half_h), Vec2d(cx - half_w, cy + half_h)};
+    for (int i = 0; i < 4; ++i) {
+        best = std::min(best, distSegmentSegment(a, b, corners[i],
+                                                 corners[(i + 1) % 4]));
+    }
+    return best;
+}
+
+/// Signed minimum clearance from a segment to a box (negative when the
+/// segment penetrates the box).  The disjoint case is exact; the penetrating
+/// case is the deepest penetration found by minimising the convex signed
+/// distance over the inside interval.
+inline double segmentToBoxSignedMin(const Vec2d& a, const Vec2d& b, double cx,
+                                    double cy, double half_w, double half_h) {
+    double t0, t1;
+    if (!clipSegmentToAABB(a, b, cx, cy, half_w, half_h, t0, t1)) {
+        return distSegmentToAABB(a, b, cx, cy, half_w, half_h);
+    }
+    auto signedAt = [&](double t) {
+        const Vec2d p = a + (b - a) * t;
+        return pointToBoxSignedDist(p, cx, cy, half_w, half_h);
+    };
+    double lo = t0, hi = t1;
+    constexpr double kInvPhi = 0.6180339887498949;
+    double m1 = hi - kInvPhi * (hi - lo);
+    double m2 = lo + kInvPhi * (hi - lo);
+    double f1 = signedAt(m1), f2 = signedAt(m2);
+    for (int i = 0; i < 64; ++i) {
+        if (f1 < f2) {
+            hi = m2; m2 = m1; f2 = f1;
+            m1 = hi - kInvPhi * (hi - lo);
+            f1 = signedAt(m1);
+        } else {
+            lo = m1; m1 = m2; f1 = f2;
+            m2 = lo + kInvPhi * (hi - lo);
+            f2 = signedAt(m2);
+        }
+    }
+    return std::min(f1, f2);
+}
+
 }  // namespace
 
 // ═══════════════════════════════════════════════════════════════════
@@ -41,7 +177,9 @@ double TruthCylinderAudit::pointClearance(double x, double y) const {
     double best = std::numeric_limits<double>::infinity();
     const Vec2d p(x, y);
     for (const auto& o : obstacles_) {
-        const double d = (p - Vec2d(o.x, o.y)).norm() - o.radius;
+        const double d = o.isBox()
+            ? pointToBoxSignedDist(p, o.x, o.y, o.half_w, o.half_h)
+            : (p - Vec2d(o.x, o.y)).norm() - o.radius;
         best = std::min(best, d);
     }
     return best;
@@ -52,7 +190,9 @@ double TruthCylinderAudit::segmentMinClearance(double x0, double y0, double x1,
     const Vec2d a(x0, y0), b(x1, y1);
     double best = std::numeric_limits<double>::infinity();
     for (const auto& o : obstacles_) {
-        const double d = distToSegment(Vec2d(o.x, o.y), a, b) - o.radius;
+        const double d = o.isBox()
+            ? segmentToBoxSignedMin(a, b, o.x, o.y, o.half_w, o.half_h)
+            : distToSegment(Vec2d(o.x, o.y), a, b) - o.radius;
         best = std::min(best, d);
     }
     return best;
@@ -62,8 +202,10 @@ bool TruthCylinderAudit::segmentCollision(double x0, double y0, double x1,
                                           double y1) const {
     const Vec2d a(x0, y0), b(x1, y1);
     for (const auto& o : obstacles_) {
-        if (distToSegment(Vec2d(o.x, o.y), a, b) <
-            o.radius + vehicle_radius_ - 1e-9) {
+        const double d = o.isBox()
+            ? distSegmentToAABB(a, b, o.x, o.y, o.half_w, o.half_h)
+            : distToSegment(Vec2d(o.x, o.y), a, b) - o.radius;
+        if (d < vehicle_radius_ - 1e-9) {
             return true;
         }
     }
@@ -115,7 +257,9 @@ void TruthCylinderAudit::brakeRisk(double x, double y, double vx, double vy,
 
     for (const auto& o : obstacles_) {
         const Vec2d rel = p - Vec2d(o.x, o.y);
-        const double d_surface = rel.norm() - o.radius;
+        const double d_surface = o.isBox()
+            ? pointToBoxSignedDist(p, o.x, o.y, o.half_w, o.half_h)
+            : rel.norm() - o.radius;
         double rk = 0.0;
         bool wd = false;
         eval(rel, d_surface, rk, wd);

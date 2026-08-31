@@ -216,7 +216,9 @@ struct BlueprintResult {
 };
 
 // ═══════════════════════════════════════════════════════════════════
-//  Exact-cylinder truth audit (judge-only; continuous swept segments)
+//  Exact obstacle truth audit (judge-only; continuous swept segments).
+//  Cylinders use exact circle geometry; boxes use the exact AABB
+//  (half_w / half_h), never the circumscribed-circle approximation.
 // ═══════════════════════════════════════════════════════════════════
 class TruthCylinderAudit {
 public:
@@ -229,15 +231,15 @@ public:
 
     /// MINIMUM swept clearance of the moving body (a disk of
     /// `vehicle_radius`) along the segment P0→P1, w.r.t. every exact
-    /// cylinder: min over obstacles of (dist(segment, center) - radius).
-    /// This is EXACT (analytic segment–circle distance), not a sampled
-    /// approximation.  Value = drone centre→surface distance along the
-    /// swept path.
+    /// obstacle (cylinder: dist(segment, center) - radius; box: segment-to-
+    /// AABB surface distance, negative when penetrating).  This is EXACT
+    /// analytic geometry, not a sampled approximation.  Value = drone
+    /// centre→surface distance along the swept path.
     double segmentMinClearance(double x0, double y0, double x1,
                                double y1) const;
 
     /// Swept collision of the body disk along the segment: true iff any
-    /// cylinder surface comes within `vehicle_radius` of the segment.
+    /// obstacle surface comes within `vehicle_radius` of the segment.
     bool segmentCollision(double x0, double y0, double x1, double y1) const;
 
     /// True if the drone disk (radius r) swept along the segment crosses

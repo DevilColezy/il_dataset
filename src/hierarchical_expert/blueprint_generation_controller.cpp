@@ -288,6 +288,17 @@ inline int placeCylinders(const BlueprintGenerationConfig& cfg,
                 ob.height_m = cfg.obstacle_height_min_m +
                     u01(rng) * (cfg.obstacle_height_max_m -
                                 cfg.obstacle_height_min_m);
+                // 1/2 of the obstacles are square BOXES (axis-aligned
+                // cuboids).  The half-extent r/sqrt(2) keeps the box inside
+                // the same circumscribed circle of radius r used for
+                // generation / spacing, so the layout constraints are
+                // unchanged; the truth audit, preflight depth and runtime
+                // rendering all use the exact AABB.
+                if (u01(rng) < 0.5) {
+                    const double half = r / std::sqrt(2.0);
+                    ob.half_w = half;
+                    ob.half_h = half;
+                }
                 ob.id = i;
                 out.push_back(ob);
                 placed = true;
@@ -482,7 +493,18 @@ bool BlueprintGenerationController::preflightOne(
     s2d.min_bounds = cfg_.warehouse.freeMin();
     s2d.max_bounds = cfg_.warehouse.freeMax();
     s2d.valid = true;
+    std::vector<Vec2d> known_min, known_max;
+    known_min.reserve(cfg_.known_rects.size() + scene.obstacles.size());
+    known_max.reserve(cfg_.known_rects.size() + scene.obstacles.size());
     for (const auto& o : scene.obstacles) {
+        if (o.isBox()) {
+            // Box obstacles enter the synthetic depth as AABB rects (the
+            // runtime renders Transparen_Cube AABBs), NOT as circles — the
+            // ray-cast uses rayRectHit for known rects.
+            known_min.emplace_back(o.x - o.half_w, o.y - o.half_h);
+            known_max.emplace_back(o.x + o.half_w, o.y + o.half_h);
+            continue;
+        }
         Obstacle2D ob;
         ob.center = Vec2d(o.x, o.y);
         ob.radius = o.radius;
@@ -504,9 +526,6 @@ bool BlueprintGenerationController::preflightOne(
     // enter the synthetic patch too, otherwise the preflight sees a MUCH
     // emptier world than the runtime depth and wrongly certifies tasks the
     // real expert will fail.
-    std::vector<Vec2d> known_min, known_max;
-    known_min.reserve(cfg_.known_rects.size());
-    known_max.reserve(cfg_.known_rects.size());
     for (const auto& kr : cfg_.known_rects) {
         known_min.emplace_back(kr.min_x, kr.min_y);
         known_max.emplace_back(kr.max_x, kr.max_y);
@@ -942,6 +961,7 @@ bool BlueprintGenerationController::preflightOne(
     } else {
         task.behavior_class = "clear";
     }
+    summary.behavior_class = task.behavior_class;
 
     task.saw_turn_left = saw_turn_left;
     task.saw_turn_right = saw_turn_right;
@@ -2187,6 +2207,7 @@ BlueprintGenerationController::runOneScene(int level, int level_index,
                 } else {
                     task.behavior_class = "clear";
                 }
+                task.summary.behavior_class = task.behavior_class;
             }
             wr.tasks.push_back(task);
             wr.task_segment_counts.push_back(task_seg);
@@ -2460,6 +2481,44 @@ BlueprintResult BlueprintGenerationController::generateSceneParallel() {
         static_cast<int>(selected.size()) >= std::max(1, cfg_.min_tasks);
     if (!result.generation_ok) {
         result.failure_reason = "insufficient selected tasks";
+    }
+    // ── coverage on the SELECTED subset (same semantics as the serial
+    //    path): the scene-parallel path previously never evaluated the
+    //    distribution targets, so hard minimums were silently ignored and
+    //    generation_ok stayed true even when e.g. the behavior:turn_both /
+    //    behavior:long_takeover floors were unmet.  Evaluate now and gate
+    //    generation_ok on hard_minimums_met exactly like the serial path. ─
+    const std::vector<DistributionTarget>& effective_targets =
+        analyzer_.targets();
+    DistributionAccumulator sel_acc;
+    sel_acc.configure(cfg_);
+    for (const auto& t : selected) sel_acc.addTask(t.summary);
+    const CoverageResult sel_cov =
+        evaluateCoverage(sel_acc, effective_targets, cfg_);
+    result.hard_minimums_met = sel_cov.hard_minimums_met;
+    result.soft_targets_met = sel_cov.soft_targets_met;
+    for (const auto& w : sel_cov.warnings) result.warnings.push_back(w);
+    result.remaining_deficits.clear();
+    for (const auto& d : sel_cov.deficits) {
+        if (d.deficit > 1e-9 || d.excess > 1e-9 || d.below_minimum) {
+            result.remaining_deficits.push_back(d.summary());
+        }
+    }
+    result.unmet_quotas.clear();
+    for (const auto& w : sel_cov.warnings) {
+        if (w.find("[HARD]") != std::string::npos) {
+            result.unmet_quotas.push_back(w);
+        }
+    }
+    fillDistributionReport(result, sel_acc);
+    result.generation_ok =
+        result.hard_minimums_met &&
+        !selected.empty() &&
+        static_cast<int>(selected.size()) >= std::max(1, cfg_.min_tasks);
+    if (!result.generation_ok) {
+        result.failure_reason = result.hard_minimums_met
+                                    ? "insufficient selected tasks"
+                                    : "distribution minimum coverage unmet";
     }
     result.generation_rounds = 1;
     result.timing_ms["scene_level_total_ms"] = msSince(t0);

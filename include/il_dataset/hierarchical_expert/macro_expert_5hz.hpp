@@ -26,11 +26,17 @@
 ///   BYPASS — the blocker / bypass frontier is the attention centre.  On
 ///       entry the PRIMARY blocker (the occupied component crossing the
 ///       vehicle→goal corridor) is identified and ONE side (LEFT/RIGHT) is
-///       committed to.  Corrections are HELD (event-driven update, never
-///       re-sampled every tick) until they are reached or no longer locally
-///       feasible.  The original goal's FOV status is deliberately ignored
-///       while in BYPASS.  BYPASS exits only when the original goal
-///       re-enters the local expert's capability set.
+///       committed to as a GUIDANCE CONSTRAINT, never a fixed motion
+///       direction.  Corrections are short (1.5–2.5 m) observation hops
+///       chosen, from the CURRENT depth, as the locally-executable short
+///       target that reveals the most NEW bypass visibility (passable
+///       angular frontier, the blocker's currently visible edge, clearance,
+///       and whether goal-wrapping free space has appeared).  They are HELD
+///       (event-driven update) until reached or no longer locally feasible.
+///       TURN is issued only to gain more observation (world-latched); the
+///       committed side is flipped only after a completed scan still finds
+///       no passable frontier on that side.  BYPASS exits only when the
+///       original goal re-enters the local expert's capability set.
 ///
 /// INFORMATION BOUNDARY (enforced by the interface).  At runtime the
 /// corrector may ONLY read:
@@ -151,13 +157,16 @@ private:
         double bearing = 0.0;
         double dist = 0.0;
         double along_progress = 0.0;
+        // Known-FREE continuation beyond the endpoint along the same ray
+        // (m) — the primary "new bypass visibility" signal.
+        double cont = 0.0;
         bool certified = false;
     };
     std::vector<SideCandidate> sampleSideCandidates(
         const PlanarState& state, const Vec2d& goal,
         const LocalObservation& patch, const LocalFreeGrid& grid,
         bool has_blocker, double blocker_min_along, SideSelection side,
-        bool strict) const;
+        bool strict, const Vec2d& axis, double max_distance_m) const;
 
     double freeRangeAlongFrom(const LocalObservation& obs, const Vec2d& from,
                               double bearing_world) const;
@@ -174,6 +183,15 @@ private:
     SideSelection selectSide(const PlanarState& state,
                              const LocalObservation& patch,
                              const Vec2d& goal) const;
+
+    /// Deepest passable body-frame bearing on the committed side (rad,
+    /// CCW + = LEFT): the most-sideward bearing that still observes a
+    /// known-FREE ray of >= macro_observable_unknown_margin_cells.  NaN
+    /// when the side has no passable ray at all.  This is the direction a
+    /// TURN points at to reveal new bypass space.
+    double sideFrontierBearing(const PlanarState& state,
+                               const LocalObservation& patch,
+                               SideSelection side) const;
 
     TargetCorrectionDirective makeCorrectionDirective(
         const PlanarState& state, const Vec2d& goal,
@@ -204,7 +222,10 @@ private:
     // DIRECT the original goal is the attention centre; in BYPASS the
     // committed blocker side / bypass frontier is the attention centre.
     bool bypass_active_ = false;
-    // Side committed for the current BYPASS episode (NONE in DIRECT).
+    // Side committed for the current BYPASS episode (NONE in DIRECT).  A
+    // GUIDANCE constraint, not a fixed motion direction: each fresh
+    // correction re-derives the side's passable frontier / blocker edge /
+    // clearance / goal-wrap from the CURRENT depth and the LIVE goal axis.
     SideSelection locked_side_ = SideSelection::NONE;
     uint64_t update_event_ = 0;
     uint64_t correction_enter_event_ = 0;
@@ -220,16 +241,19 @@ private:
     // trackable (translation valid + in FOV + clear corridor).  BYPASS
     // exits only after this is confirmed several times in a row.
     uint32_t reentry_success_updates_ = 0;
-    // Consecutive 5 Hz updates in which the committed BYPASS side produced
-    // no feasible correction.  After a threshold the side commitment flips
-    // (a rare, decisive event — never a per-tick side switch).
-    uint32_t side_exhaustion_updates_ = 0;
     // Consecutive 5 Hz updates in which the currently held CORRECTION
     // waypoint is NOT actually executing (live_directive_usable=false) AND
     // its cold preview also fails.  Only after >= 3 consecutive failures is
     // the waypoint allowed to be dropped (a single cold preview miss must
     // not discard an actively-executing safe waypoint).
     uint32_t waypoint_execution_fail_updates_ = 0;
+    // ── BYPASS observation phase.  A TURN is a FIXED world-latched
+    //    observation step: it is held until the latched heading is consumed
+    //    (the nose actually points at the side frontier).  Only after that
+    //    completed scan — when a fresh regeneration still finds no passable
+    //    frontier on the committed side — is the side flipped.  No
+    //    turn-count / swept-angle / wall-time heuristic.
+    bool search_active_ = false;
     TargetCorrectionDirective last_directive_;
     AvoidanceObservability last_obs_;
 };

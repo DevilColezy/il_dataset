@@ -1416,6 +1416,8 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
         .def_readwrite("y", &BlueprintObstacle::y)
         .def_readwrite("radius", &BlueprintObstacle::radius)
         .def_readwrite("height_m", &BlueprintObstacle::height_m)
+        .def_readwrite("half_w", &BlueprintObstacle::half_w)
+        .def_readwrite("half_h", &BlueprintObstacle::half_h)
         .def_readwrite("id", &BlueprintObstacle::id);
 
     py::class_<BlueprintScene>(m, "BlueprintScene")
@@ -1710,6 +1712,12 @@ PYBIND11_MODULE(_il_hierarchical_expert, m) {
                      ob.y = o[1];
                      ob.radius = o[2];
                      ob.height_m = o.size() > 3 ? o[3] : 8.0;
+                     // Optional AABB FULL side lengths [w, h] (elements 4/5).
+                     // The audit stores half-extents; both zero = cylinder.
+                     if (o.size() > 5) {
+                         ob.half_w = o[4] > 0.0 ? o[4] * 0.5 : 0.0;
+                         ob.half_h = o[5] > 0.0 ? o[5] * 0.5 : 0.0;
+                     }
                      ob.id = id++;
                      obs.push_back(ob);
                  }

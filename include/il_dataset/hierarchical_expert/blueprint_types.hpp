@@ -83,13 +83,21 @@ private:
     std::mt19937_64 gen_;
 };
 
-/// A single 2.5D cylinder obstacle (x, y, radius, height).  Shared by the
+/// A single 2.5D obstacle (cylinder or axis-aligned box), shared by the
 /// blueprint types and the scene/task blueprint result types.
+///
+/// A cylinder is described by (x, y, radius).  A box additionally carries
+/// non-zero AABB half-extents ``half_w``/``half_h``; its ``radius`` stays the
+/// circumscribed-circle radius (used for generation / spacing statistics),
+/// but the truth audit uses the exact AABB when both half-extents are set.
 struct BlueprintObstacle {
     double x = 0.0, y = 0.0;
     double radius = 0.0;
     double height_m = 8.0;
+    double half_w = 0.0;  // box half-width (0 for cylinders)
+    double half_h = 0.0;  // box half-height (0 for cylinders)
     int id = -1;
+    bool isBox() const { return half_w > 0.0 && half_h > 0.0; }
 };
 
 /// An axis-aligned known-obstacle rectangle (point-cloud occupancy cluster
@@ -362,6 +370,11 @@ struct TaskDistributionSummary {
     uint64_t scene_id = 0;
     std::string scene_profile;
     std::string task_geom_type = "CLEAR";
+    // behaviour class derived from the preflight macro/local labels
+    // (clear / local_avoidance / turn_left / turn_right / turn_both /
+    // turn_normal / long_takeover / normal).  Enables task-level
+    // distribution targets via the "behavior:<class>" metric.
+    std::string behavior_class = "clear";
 
     // geometry / path
     double straight_distance_m = 0.0;

@@ -39,7 +39,20 @@ bool SceneGeometryCache::build(const BlueprintScene& scene,
             }
             double best = std::numeric_limits<double>::infinity();
             for (const auto& o : scene.obstacles) {
-                const double d = (cw - Vec2d(o.x, o.y)).norm() - o.radius;
+                double d;
+                if (o.isBox()) {
+                    // Exact signed centre->surface distance to the AABB
+                    // (negative inside), matching the runtime depth / truth
+                    // audit — not the circumscribed circle.
+                    const double qx = std::fabs(cw.x() - o.x) - o.half_w;
+                    const double qy = std::fabs(cw.y() - o.y) - o.half_h;
+                    const double outside =
+                        std::hypot(std::max(qx, 0.0), std::max(qy, 0.0));
+                    const double inside = std::min(std::max(qx, qy), 0.0);
+                    d = outside + inside;
+                } else {
+                    d = (cw - Vec2d(o.x, o.y)).norm() - o.radius;
+                }
                 best = std::min(best, d);
             }
             // Known-obstacle AABBs: centre inside -> hard-occupied; centre

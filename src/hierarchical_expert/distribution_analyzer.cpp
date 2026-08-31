@@ -38,6 +38,7 @@ void DistributionAccumulator::addTask(const TaskDistributionSummary& s) {
                                    : 0;
     counts["profile:" + s.scene_profile] += 1;
     counts["geom:" + s.task_geom_type] += 1;
+    counts["behavior:" + s.behavior_class] += 1;
     if (s.initial_yaw_error_signed_deg >= 0.0) {
         counts["yaw:left"] += 1;
     } else {
@@ -125,6 +126,9 @@ inline double taskCountForKey(const TaskDistributionSummary& s,
     }
     if (key.rfind("geom:", 0) == 0) {
         return s.task_geom_type == key.substr(5) ? 1.0 : 0.0;
+    }
+    if (key.rfind("behavior:", 0) == 0) {
+        return s.behavior_class == key.substr(9) ? 1.0 : 0.0;
     }
     return 0.0;
 }

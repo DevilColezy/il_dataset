@@ -575,7 +575,11 @@ class JointV2Manager(object):
                 "failure_reason": str(s.failure_reason),
                 "obstacles": [
                     {"id": int(o.id), "x": float(o.x), "y": float(o.y),
-                     "radius": float(o.radius), "height_m": float(o.height_m)}
+                     "radius": float(o.radius), "height_m": float(o.height_m),
+                     "w": (2.0 * float(o.half_w)
+                           if float(o.half_w) > 0.0 else None),
+                     "h": (2.0 * float(o.half_h)
+                           if float(o.half_h) > 0.0 else None)}
                     for o in s.obstacles],
             })
 
@@ -1310,9 +1314,15 @@ class JointV2Manager(object):
         scene_id = int(scene.scene_id)
         task_id = int(task.task_id)
 
-        # Configure the exact-cylinder truth audit for this scene.
+        # Configure the truth audit for this scene.  Cylinders carry only
+        # [x, y, radius, height]; boxes additionally carry their AABB full
+        # side lengths [w, h] so the judge checks the exact rectangle instead
+        # of the circumscribed circle.
         obstacles = [[float(o.x), float(o.y), float(o.radius),
-                      float(o.height_m)] for o in scene.obstacles]
+                      float(o.height_m),
+                      float(o.w) if getattr(o, "w", None) is not None else 0.0,
+                      float(o.h) if getattr(o, "h", None) is not None else 0.0]
+                     for o in scene.obstacles]
         self._truth.configure(
             obstacles, float(self._vehicle_radius),
             [float(self._region_min[0]), float(self._region_min[1])],
